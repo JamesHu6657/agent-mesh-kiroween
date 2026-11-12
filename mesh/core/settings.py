@@ -55,6 +55,11 @@ def get_default_settings(home: str) -> Dict[str, Any]:
         "outbox.max_attempts": 3,
         "approval.ttl_seconds": 86400,
         "notify.command": None,
+        # Productize: "warn" lets a vendor adapter launch without matching committed smoke
+        # evidence (the gap is reported by probe/doctor and in the assign response);
+        # "strict" is the M3 evidence gate. Testing mode defaults to strict so the
+        # acceptance suite keeps exercising the gate; tests opt into warn explicitly.
+        "adapter.evidence_mode": "strict" if is_testing_mode() else "warn",
         # Testing-only knob (see validate_setting): the passphrase lockout window.
         "auth.lockout_window_s": 300,
         # Testing-only knob (see validate_setting): the lead-turn retry backoff, which
@@ -212,6 +217,17 @@ def validate_setting(
                 exit_code=c.EXIT_USAGE,
                 message=f"Setting '{key}' must be a non-empty array of strings or null",
                 details={"key": key, "expected": "non-empty array of strings or null", "got": val},
+            )
+        return val
+
+    # 5b. adapter.evidence_mode
+    if key == "adapter.evidence_mode":
+        if val not in ("warn", "strict"):
+            raise MeshError(
+                code=c.INVALID_SETTING,
+                exit_code=c.EXIT_USAGE,
+                message=f"Setting '{key}' must be \"warn\" or \"strict\"",
+                details={"key": key, "expected": ["warn", "strict"], "got": val},
             )
         return val
 

@@ -25,7 +25,7 @@ from mesh.core.db import transaction
 from mesh.core.events import record_event
 from mesh.core.ids import generate_id
 from mesh.core.leases import get_lease_ttl_s
-from mesh.core.paths import get_install_root
+from mesh.core.paths import get_mesh_bin_dir, get_install_root
 from mesh.core.clock import parse_utc
 from mesh.core.proc import ScanResult, get_proc_stat, is_tgid_alive
 from mesh.core.prompts import (
@@ -139,7 +139,7 @@ def build_child_env(
     env["MESH_PROJECT_ID"] = project_id
     env["MESH_SOCKET"] = socket_path
     install_root = get_install_root()
-    env["PATH"] = os.path.join(install_root, "bin") + os.pathsep + env.get("PATH", "")
+    env["PATH"] = get_mesh_bin_dir() + os.pathsep + env.get("PATH", "")
     env["PYTHONPATH"] = install_root
     return env
 
@@ -162,7 +162,7 @@ def build_lead_child_env(
     env["MESH_PROJECT_ID"] = project_id
     env["MESH_SOCKET"] = socket_path
     install_root = get_install_root()
-    env["PATH"] = os.path.join(install_root, "bin") + os.pathsep + env.get("PATH", "")
+    env["PATH"] = get_mesh_bin_dir() + os.pathsep + env.get("PATH", "")
     env["PYTHONPATH"] = install_root
     return env
 

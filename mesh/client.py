@@ -89,48 +89,9 @@ class MeshClient:
             )
 
         if user:
-            # Passphrase read from fd or tty
-            passphrase_fd = getattr(args, "passphrase_fd", None)
-            if passphrase_fd is not None:
-                try:
-                    # Rewind if seekable
-                    try:
-                        os.lseek(passphrase_fd, 0, os.SEEK_SET)
-                    except OSError:
-                        pass
-                    # Duplicate fd to read without closing original
-                    dup_fd = os.dup(passphrase_fd)
-                    with os.fdopen(dup_fd, "r", encoding="utf-8") as f:
-                        passphrase = f.read().rstrip("\r\n")
-                except Exception as exc:
-                    raise MeshError(
-                        code=c.INVALID_ARGUMENT,
-                        exit_code=c.EXIT_USAGE,
-                        message=f"Failed to read passphrase from fd {passphrase_fd}: {exc}",
-                    )
-            else:
-                # Disallow reading passphrase from env (plan §7.1, checklist G17: MESH_PASSPHRASE ignored)
-                # Try reading from /dev/tty
-                if os.isatty(0):
-                    try:
-                        passphrase = getpass.getpass("Enter user passphrase: ")
-                    except Exception:
-                        raise MeshError(
-                            code=c.NO_TTY,
-                            exit_code=c.EXIT_UNAUTHENTICATED,
-                            message="No TTY available for passphrase prompt and --passphrase-fd not provided",
-                        )
-                else:
-                    # Check if /dev/tty can be opened directly
-                    try:
-                        with open("/dev/tty", "r") as tty_in:
-                            passphrase = getpass.getpass("Enter user passphrase: ", stream=sys.stderr)
-                    except Exception:
-                        raise MeshError(
-                            code=c.NO_TTY,
-                            exit_code=c.EXIT_UNAUTHENTICATED,
-                            message="No TTY available for passphrase prompt and --passphrase-fd not provided",
-                        )
+            # Passphrase: fd, file, env opt-in, then tty (mesh/core/passphrase.py)
+            from mesh.core.passphrase import read_passphrase
+            passphrase = read_passphrase(args)
 
             if not passphrase:
                 raise MeshError(

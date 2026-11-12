@@ -628,9 +628,16 @@ def handle_doctor(args: argparse.Namespace) -> Dict[str, Any]:
 
         return {"violations": []}
 
-    # Default doctor health check
+    # Default doctor health check, plus cheap environment checks (productize): platform,
+    # python, git, init state, daemon, agent CLIs on PATH and the evidence mode. They are
+    # advisory: "status" stays about the home itself; failing checks carry a hint.
+    from mesh.cli.commands.doctor_env import environment_checks
+
+    checks = environment_checks(home_dir, db_present, testing_mode=testing_mode)
     return {
         "status": "healthy",
         "install_root": install_root,
         "home": home_dir,
+        "checks": checks,
+        "problems": [f"{x['name']}: {x['detail']} -> {x.get('hint', '')}" for x in checks if not x["ok"]],
     }

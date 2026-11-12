@@ -1,6 +1,6 @@
 """The /proc environ read race in run_targets (m3-runtargets-race, review #20 fix round).
 
-On grokbot-box (gVisor), reading /proc/<pid>/environ right after Popen missed
+On a gVisor dev box, reading /proc/<pid>/environ right after Popen missed
 MESH_RUN_ID in 92/200 cases: get_proc_environ returned {} so "not visible yet"
 looked like "no match". An empty/unreadable environ of a young own-uid process is
 UNKNOWN; it is taken only through a confirmed identity, a trusted group or PPid

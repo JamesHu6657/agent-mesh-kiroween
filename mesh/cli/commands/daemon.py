@@ -85,7 +85,8 @@ def handle_daemon_start(args: argparse.Namespace) -> Dict[str, Any]:
         pass
 
     install_root = get_install_root()
-    bin_mesh = os.path.join(install_root, "bin", "mesh")
+    from mesh.core.paths import get_mesh_bin_dir
+    bin_mesh = os.path.join(get_mesh_bin_dir(), "mesh")
 
     env = dict(os.environ)
     # Detached spawn

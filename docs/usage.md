@@ -64,9 +64,14 @@ There are three kinds of credential.
 
 `mesh init` sets one user passphrase (at least 12 characters). It is stored only as a
 `scrypt` verifier (`N=2**15, r=8, p=1, dklen=64`); `K_user` (the MAC key) is derived at
-request time and never stored. User commands read the passphrase with `getpass` from
-`/dev/tty`, or from `--passphrase-fd N`. A passphrase in argv, in the environment, or
-in the JSON stdin body is rejected (`PASSPHRASE_SOURCE_REJECTED`).
+request time and never stored. User commands read the passphrase from the first of:
+`--passphrase-fd N`, `--passphrase-file PATH`, `MESH_PASSPHRASE_FILE`,
+`MESH_PASSPHRASE`, then `getpass` on `/dev/tty`. A passphrase file must be owned by
+the user and mode 0600 (else `INSECURE_PERMISSIONS`). `MESH_PASSPHRASE` is readable by
+other processes of the same user, so prefer the file; meshd strips every `MESH_*`
+variable from launched agents. A passphrase in argv or in the JSON stdin body is
+rejected (`PASSPHRASE_SOURCE_REJECTED`). `mesh setup` runs init, daemon start and the
+first lead agent in one step (README, Quick start). Note that a launched agent runs as the same user and can read a passphrase file, so with a file source an agent could also make `--user` calls such as approving its own gated actions; keep the file only where every agent is trusted, or use the terminal prompt when approvals matter.
 
 After five failures within five minutes from peers outside a run session, user auth is
 locked for five minutes (`LOCKED_OUT`). Failures are recorded as `auth.failed` events
@@ -225,6 +230,13 @@ principal, capability, scope, and fence; a requester cannot approve its own requ
 relayer cannot approve for a project it leads; an executor run token cannot approve,
 relay, create tasks, or act outside its task; stale writes are rejected by fencing; and
 a process inside a run may use only that run's token.
+
+**Known limitation: idempotent replay and changed authority.** A request repeated
+with the same idempotency key returns the stored response before authorization is
+checked again. If the caller's authority changed in between (for example project
+leadership moved to another agent), the replay still returns the old success with
+`idempotent_replay: true`. Nothing is executed again; only the earlier result is
+returned. Re-checking authority before a replay is planned.
 
 **What `mesh audit verify` detects.** It detects DB-only tampering: forged direct
 approvals and user events written by editing `mesh.db`, *provided* the forger has not

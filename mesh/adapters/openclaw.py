@@ -24,6 +24,8 @@ class OpenclawAdapter(Adapter):
 
     id = "openclaw"
     kind = "vendor"
+    #: Productize: stub adapter (no command builder yet); warn mode never waives evidence for it.
+    implemented = False
     binary_names = ["openclaw"]
     planned_version = None
     liveness = "none"

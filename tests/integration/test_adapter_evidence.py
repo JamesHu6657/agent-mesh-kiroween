@@ -204,7 +204,10 @@ class TestAdapterEvidence(unittest.TestCase):
             finally:
                 conn.close()
             self.assertEqual(data["launch_enabled"], expected.ok)
-            self.assertEqual(data["launch_reason"], expected.reason)
+            # Productize: a non-testing meshd defaults to evidence_mode "warn", where a
+            # failing evidence check is waived and reported as evidence_warning instead.
+            self.assertEqual(data["launch_reason"], None if expected.ok else expected.reason)
+            self.assertEqual(data.get("evidence_warning"), expected.warning)
             self.assertNotEqual(expected.results_path and os.path.dirname(expected.results_path), self.results)
             self.assertNotEqual(data["capabilities"]["headless"]["results_file"],
                                 os.path.join(self.results, "droid-1.3.0-2026-11-20.json"))

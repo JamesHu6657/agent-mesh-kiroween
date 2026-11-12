@@ -51,7 +51,7 @@ from mesh.daemon import children
 POLL_S = 0.2
 KILL_WAIT_S = 10.0
 KILL_RETRY_S = 30.0
-# /proc/<pid>/environ can lag after Popen (92/200 misses on grokbot-box/gVisor): an
+# /proc/<pid>/environ can lag after Popen (92/200 misses on a gVisor dev box): an
 # empty or unreadable environ is UNKNOWN, not "no MESH_RUN_ID". Nothing here sleeps:
 # an UNKNOWN pid is simply read again on the next scan (the next tick).
 # Only young processes of the daemon's own uid can be UNKNOWN (review #20 Q2): started

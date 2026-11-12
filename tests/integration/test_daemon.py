@@ -475,21 +475,38 @@ class TestDaemonIntegration(unittest.TestCase):
         self.assertNotIn("wrong-password-123456", json.dumps(resp_evt))
 
     def test_passphrase_sources(self) -> None:
-        """ACC: G17 - Passphrase in stdin JSON rejected; env MESH_PASSPHRASE ignored."""
+        """ACC: G17 - Passphrase in stdin JSON rejected; no source -> NO_TTY; env/file sources are opt-in."""
         # Stdin with passphrase key
         stdin_json = json.dumps({"passphrase": "some-passphrase", "key": "task.default_timeout_s", "value": 600})
         rc, resp = self.harness.cli("config", "set", "task.default_timeout_s", "600", "--input", "-", user=True, stdin=stdin_json)
         self.assertEqual(rc, c.EXIT_USAGE)
         self.assertEqual(resp["error"]["code"], c.PASSPHRASE_SOURCE_REJECTED)
 
-        # MESH_PASSPHRASE in env is ignored; without fd and without tty -> NO_TTY exit 3 (G17: setsid -w ... </dev/null)
-        cmd = ["setsid", "-w", self.harness.bin_mesh, "--home", self.harness.home, "whoami", "--user"]
-        env = dict(self.harness.get_env())
-        env["MESH_PASSPHRASE"] = "ignored"
-        proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env)
-        self.assertEqual(proc.returncode, c.EXIT_UNAUTHENTICATED)
-        resp = json.loads(proc.stdout)
-        self.assertEqual(resp["error"]["code"], c.NO_TTY)
+        # No fd, no file, no env and no tty -> NO_TTY exit 3 (G17: setsid -w ... </dev/null)
+        def run(extra_env=None, *extra):
+            cmd = ["setsid", "-w", self.harness.bin_mesh, "--home", self.harness.home, "whoami", "--user", *extra]
+            env = {k: v for k, v in self.harness.get_env().items() if not k.startswith("MESH_PASSPHRASE")}
+            env.update(extra_env or {})
+            proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env)
+            return proc.returncode, json.loads(proc.stdout)
+
+        rc, resp = run()
+        self.assertEqual((rc, resp["error"]["code"]), (c.EXIT_UNAUTHENTICATED, c.NO_TTY))
+        # Opt-in sources (productize): MESH_PASSPHRASE, MESH_PASSPHRASE_FILE, --passphrase-file.
+        rc, resp = run({"MESH_PASSPHRASE": "wrong-passphrase-123456"})
+        self.assertEqual((rc, resp["error"]["code"]), (c.EXIT_UNAUTHENTICATED, c.PASSPHRASE_INVALID))
+        rc, resp = run({"MESH_PASSPHRASE": self.harness.passphrase})
+        self.assertEqual(rc, 0, resp)
+        rc, resp = run({"MESH_PASSPHRASE_FILE": self.harness.passphrase_file})
+        self.assertEqual(rc, 0, resp)
+        rc, resp = run(None, "--passphrase-file", self.harness.passphrase_file)
+        self.assertEqual(rc, 0, resp)
+        loose = os.path.join(self.harness.fixtures_dir, "loose-pass")
+        with open(loose, "w", encoding="utf-8") as f:
+            f.write(self.harness.passphrase)
+        os.chmod(loose, 0o644)
+        rc, resp = run(None, "--passphrase-file", loose)
+        self.assertEqual((rc, resp["error"]["code"]), (c.EXIT_USAGE, c.INSECURE_PERMISSIONS))
 
     def test_idempotency_and_dry_run(self) -> None:
         """ACC: B5, B6 - Idempotency key replay and dry-run."""

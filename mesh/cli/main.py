@@ -144,6 +144,8 @@ def create_parent_parser() -> argparse.ArgumentParser:
     parent.add_argument("--format", choices=["json", "text"], default=argparse.SUPPRESS, help="Output format (default: json)")
     parent.add_argument("--user", action="store_true", default=argparse.SUPPRESS, help="Authenticate as direct human user")
     parent.add_argument("--passphrase-fd", type=int, default=argparse.SUPPRESS, help="File descriptor to read passphrase from")
+    parent.add_argument("--passphrase-file", default=argparse.SUPPRESS,
+                        help="0600 file holding the passphrase (env: MESH_PASSPHRASE_FILE or MESH_PASSPHRASE)")
     parent.add_argument("--token-file", default=argparse.SUPPRESS, help="Path to 0600 file containing agent token")
     parent.add_argument("--input", default=argparse.SUPPRESS, help="Read JSON parameters from FILE or '-' for stdin")
     parent.add_argument("--idempotency-key", default=argparse.SUPPRESS, help="Unique key for safe mutation replay (1-128 chars)")
@@ -190,6 +192,8 @@ def build_parser() -> MeshArgumentParser:
     register_run_commands(subparsers, parent_parser)
     register_workspace_commands(subparsers, parent_parser)
     register_doctor_commands(subparsers, parent_parser)
+    from mesh.cli.commands.setup import register_setup_command
+    register_setup_command(subparsers, parent_parser)
     register_audit_commands(subparsers, parent_parser)
 
     return root_parser
@@ -200,6 +204,7 @@ GLOBAL_FLAG_DESTS = {
     "format",
     "user",
     "passphrase_fd",
+    "passphrase_file",
     "token_file",
     "input",
     "idempotency_key",
@@ -387,6 +392,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         setattr(args, "user", False)
     if not hasattr(args, "passphrase_fd"):
         setattr(args, "passphrase_fd", None)
+    if not hasattr(args, "passphrase_file"):
+        setattr(args, "passphrase_file", None)
     if not hasattr(args, "token_file"):
         setattr(args, "token_file", None)
     if not hasattr(args, "input"):

@@ -57,6 +57,14 @@ REASONS = ("no_probe_version", "no_smoke_evidence", "evidence_stale", "evidence_
 #: Empty since M4 (kiro N13 passed, m4-kiro-n13); kept as a tool for future holds.
 LAUNCH_HOLDS: Dict[str, str] = {}
 REPO_ROOT = Path(mesh.__file__).resolve().parents[1]
+#: Productize: a checkout holding tests/smoke/results and tests/fixtures/real, for installs
+#: where the package is not run from a clone (pipx/uv tool install). Default: REPO_ROOT.
+EVIDENCE_ROOT_ENV = "MESH_EVIDENCE_ROOT"
+
+
+def evidence_root(env: Optional[Dict[str, str]] = None) -> Path:
+    value = (env if env is not None else os.environ).get(EVIDENCE_ROOT_ENV)
+    return Path(os.path.abspath(os.path.expanduser(value))) if value else REPO_ROOT
 
 
 @dataclass
@@ -70,6 +78,8 @@ class Evidence:
     captured_at_utc: Optional[str] = None
     errors: List[str] = field(default_factory=list)
     milestone: Optional[str] = None  # set only by a launch hold (L11)
+    #: warn mode: the evidence reason that was waived (launch allowed with a warning).
+    warning: Optional[str] = None
 
     def __bool__(self) -> bool:
         """Truthiness is the verdict, so ``if not launch_allowed(...)`` refuses (Kiro r5 finding 2)."""
@@ -96,7 +106,7 @@ def results_dir(testing_mode: bool, env: Optional[Dict[str, str]] = None) -> Opt
     if testing_mode:
         o = _override(env)
         return Path(os.path.abspath(o)) if o else None
-    return REPO_ROOT / "tests" / "smoke" / "results"
+    return evidence_root(env) / "tests" / "smoke" / "results"
 
 
 def fixture_root(testing_mode: bool, env: Optional[Dict[str, str]] = None) -> Optional[Path]:
@@ -104,7 +114,7 @@ def fixture_root(testing_mode: bool, env: Optional[Dict[str, str]] = None) -> Op
     if testing_mode:
         o = _override(env)
         return Path(os.path.abspath(o)).parent if o else None
-    return REPO_ROOT / "tests" / "fixtures" / "real"
+    return evidence_root(env) / "tests" / "fixtures" / "real"
 
 
 PROBE_OK_STATUSES = ("partially_verified", "verified")
@@ -175,7 +185,8 @@ def load_evidence(adapter_id: str, testing_mode: bool, probed_version: Optional[
         ev.reason, ev.errors = "evidence_invalid", [f"unreadable results file: {exc}"]
         return ev
     froot = fixture_root(testing_mode, env)
-    errors = smoke_schema.validate(doc, str(REPO_ROOT), fixture_root=str(froot) if froot else None)
+    root = REPO_ROOT if testing_mode else evidence_root(env)
+    errors = smoke_schema.validate(doc, str(root), fixture_root=str(froot) if froot else None)
     side = smoke_schema._check_sidecar(path)
     if side:
         errors.append(f"results file: {side}")
@@ -217,7 +228,35 @@ def effective_launch(conn: Optional[sqlite3.Connection], adapter, testing_mode: 
     version, probed_at = latest_probe(conn, adapter.id, binary)
     ev = load_evidence(adapter.id, testing_mode, version, env,
                        binary_changed=bool(version) and binary_changed_since(binary, probed_at))
-    return apply_hold(ev, adapter.id, testing_mode, env)
+    ev = apply_hold(ev, adapter.id, testing_mode, env)
+    if (not ev.ok and ev.reason != "launch_held" and getattr(adapter, "implemented", True)
+            and evidence_mode(conn, testing_mode) == "warn"):
+        # Productize: evidence gaps are warnings by default; launch holds still refuse
+        # (apply_hold only marks passing evidence, so check the hold table here too).
+        held = held_milestone(adapter.id, testing_mode, env)
+        if held:
+            ev.reason, ev.milestone = "launch_held", held
+        else:
+            ev.ok, ev.warning = True, ev.reason
+    return ev
+
+
+def evidence_mode(conn: Optional[sqlite3.Connection], testing_mode: bool) -> str:
+    """``adapter.evidence_mode``: ``warn`` (default outside testing mode) or ``strict``."""
+    default = "strict" if testing_mode else "warn"
+    if conn is None:
+        return default
+    try:
+        row = conn.execute("SELECT value_json FROM settings WHERE key = 'adapter.evidence_mode';").fetchone()
+    except sqlite3.Error:
+        return default
+    if row is None or row[0] is None:
+        return default
+    try:
+        val = json.loads(row[0])
+    except ValueError:
+        return default
+    return val if val in ("warn", "strict") else default
 
 
 def _unheld(testing_mode: bool, env: Optional[Dict[str, str]] = None) -> set:
@@ -323,5 +362,6 @@ def apply_to_probe(data: Dict[str, Any], adapter, ev: Evidence) -> Dict[str, Any
         data["launch_milestone"] = None if ev.ok else (
             ev.milestone or getattr(adapter, "launch_milestone", None) or "M3")
     data["launch_reason"] = None if ev.ok else ev.reason
+    data["evidence_warning"] = ev.warning
     data["results_file"] = rfile
     return data

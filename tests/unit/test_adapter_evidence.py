@@ -119,7 +119,9 @@ class EffectiveLaunchTest(EvidenceBase):
         self.assertEqual(evidence.results_dir(False, self.env), committed)
         self.assertEqual(evidence.fixture_root(False, self.env), evidence.REPO_ROOT / "tests" / "fixtures" / "real")
         non_testing = self.launch(testing_mode=False)
-        self.assertFalse(non_testing.ok)
+        # Productize: outside testing mode the default evidence_mode is "warn", so a
+        # failing check is waived with a warning; the override is still ignored.
+        self.assertTrue((not non_testing.ok) or non_testing.warning, non_testing)
         self.assertNotEqual(non_testing.results_path, path)
         if smoke_schema.load_latest(str(committed), "droid") is None:
             self.assertEqual(non_testing.reason, "no_smoke_evidence")

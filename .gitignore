@@ -22,3 +22,9 @@ id_*
 # Kiroween rule: nothing under /.kiro may be ignored (overrides the generic rules above)
 !.kiro/
 !.kiro/**
+
+# packaging artefacts
+build/
+dist/
+*.egg-info/
+.venv/

@@ -87,40 +87,8 @@ def _handle_top(args: argparse.Namespace) -> Dict[str, Any]:
 
 def handle_init(args: argparse.Namespace) -> Dict[str, Any]:
     """Handle mesh init command."""
-    # Obtain passphrase
-    passphrase_fd = getattr(args, "passphrase_fd", None)
-    if passphrase_fd is not None:
-        try:
-            dup_fd = os.dup(passphrase_fd)
-            with os.fdopen(dup_fd, "r", encoding="utf-8") as f:
-                passphrase = f.read().rstrip("\r\n")
-        except Exception as exc:
-            raise MeshError(
-                code=c.INVALID_ARGUMENT,
-                exit_code=c.EXIT_USAGE,
-                message=f"Failed to read passphrase from fd {passphrase_fd}: {exc}",
-            )
-    else:
-        # Check /dev/tty
-        if os.isatty(0):
-            try:
-                passphrase = getpass.getpass("Enter user passphrase (>= 12 chars): ")
-            except Exception:
-                raise MeshError(
-                    code=c.NO_TTY,
-                    exit_code=c.EXIT_UNAUTHENTICATED,
-                    message="No TTY available for passphrase prompt and --passphrase-fd not provided",
-                )
-        else:
-            try:
-                with open("/dev/tty", "r") as tty_in:
-                    passphrase = getpass.getpass("Enter user passphrase (>= 12 chars): ", stream=sys.stderr)
-            except Exception:
-                raise MeshError(
-                    code=c.NO_TTY,
-                    exit_code=c.EXIT_UNAUTHENTICATED,
-                    message="No TTY available for passphrase prompt and --passphrase-fd not provided",
-                )
+    from mesh.core.passphrase import read_passphrase
+    passphrase = read_passphrase(args, "Enter user passphrase (>= 12 chars): ")
 
     res = init_mesh_home(home=args.home, passphrase=passphrase)
     return res
