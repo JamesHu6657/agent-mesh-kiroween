@@ -59,14 +59,34 @@ def _mesh_env() -> Dict[str, str]:
     return env
 
 
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        view = view[n:]
+
+
 def _run(home: str, argv: List[str], passphrase: Optional[str] = None) -> Tuple[int, Dict[str, Any]]:
     cmd = _mesh_cmd() + ["--home", home, "--format", "json"] + argv
     pass_fds: Tuple[int, ...] = ()
     r = w = None
     if passphrase is not None:
         r, w = os.pipe()
-        os.write(w, passphrase.encode("utf-8"))
-        os.close(w)
+        data = passphrase.encode("utf-8")
+
+        def _feed() -> None:
+            # A writer thread, so a passphrase longer than the pipe buffer cannot
+            # block setup before the child starts reading (Linear round 3 P3).
+            try:
+                _write_all(w, data)
+            except OSError:
+                pass
+            finally:
+                os.close(w)
+
+        import threading
+        feeder = threading.Thread(target=_feed, daemon=True)
+        feeder.start()
         cmd += ["--passphrase-fd", str(r)]
         pass_fds = (r,)
     try:
@@ -75,6 +95,7 @@ def _run(home: str, argv: List[str], passphrase: Optional[str] = None) -> Tuple[
     finally:
         if r is not None:
             os.close(r)
+            feeder.join(timeout=5)
     try:
         body = json.loads(proc.stdout) if proc.stdout.strip() else {}
     except ValueError:
@@ -106,6 +127,51 @@ def token_path_for(home: str, lead: str, token_dir: Optional[str]) -> str:
     return os.path.join(tdir, name)
 
 
+def _configured_roots(home: str) -> List[str]:
+    """The configured workspaces.root and every registered project repository, read
+    straight from the database (read-only). Empty when there is no database yet."""
+    import sqlite3
+
+    db = os.path.join(home, "mesh.db")
+    roots: List[str] = []
+    if not os.path.isfile(db):
+        return roots
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5.0)
+    except sqlite3.Error:
+        return roots
+    try:
+        try:
+            row = conn.execute("SELECT value_json FROM settings WHERE key = 'workspaces.root';").fetchone()
+            if row and row[0]:
+                val = json.loads(row[0])
+                if isinstance(val, str) and val:
+                    roots.append(os.path.realpath(os.path.expanduser(val)))
+        except (sqlite3.Error, ValueError):
+            pass
+        try:
+            for (rp,) in conn.execute("SELECT DISTINCT repo_path FROM projects WHERE repo_path IS NOT NULL;"):
+                if rp:
+                    roots.append(os.path.realpath(rp))
+        except sqlite3.Error:
+            pass
+    finally:
+        conn.close()
+    return roots
+
+
+def _enclosing_git_worktree(directory: str) -> Optional[str]:
+    """The nearest ancestor of ``directory`` (inclusive) holding a ``.git`` entry, or None."""
+    cur = os.path.realpath(directory)
+    while True:
+        if os.path.lexists(os.path.join(cur, ".git")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return None
+        cur = parent
+
+
 def _check_token_destination(home: str, path: str) -> None:
     """Refuse destinations the client would later reject, or that are not plain files we
     own (Linear PR30 P2-1, P2-3). Called before a token is issued."""
@@ -120,6 +186,16 @@ def _check_token_destination(home: str, path: str) -> None:
             raise _usage(f"token file {path} would be inside {bad}; Mesh refuses token files there. "
                          "Use a directory outside the Mesh home's runs/ and workspaces/ (default ~/.config/agent-mesh)",
                          token_file=path, conflict=bad)
+    for bad in _configured_roots(home):
+        if is_path_equal_or_parent(bad, real):
+            raise _usage(f"token file {path} would be inside {bad} (a workspace root or project repository "
+                         "agents can read); choose a token directory outside it (default ~/.config/agent-mesh)",
+                         token_file=path, conflict=bad)
+    git_top = _enclosing_git_worktree(tdir)
+    if git_top:
+        raise _usage(f"token file {path} would be inside the git work tree {git_top}; a credential there can be "
+                     "committed or read by agents. Choose a token directory outside any repository",
+                     token_file=path, conflict=git_top)
     if os.path.islink(path):
         raise _usage(f"token file {path} is a symlink; refusing to write through it", token_file=path)
     if os.path.lexists(path) and not os.path.isfile(path):

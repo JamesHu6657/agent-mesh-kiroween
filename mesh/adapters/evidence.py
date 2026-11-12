@@ -196,7 +196,11 @@ def load_evidence(adapter_id: str, testing_mode: bool, probed_version: Optional[
         if doc.get("version") != ev.results_version:
             errors.append(f"doc version {doc.get('version')!r} != file name version {ev.results_version!r}")
         ev.captured_at_utc = doc.get("captured_at_utc")
-        for case in doc.get("cases") or []:
+        cases = doc.get("cases") or []
+        if not isinstance(cases, list):
+            errors.append(f"cases must be a list, got {type(cases).__name__}")
+            cases = []
+        for case in cases:
             if isinstance(case, dict) and isinstance(case.get("id"), str):
                 ev.cases[case["id"]] = case
     if not probed_version:

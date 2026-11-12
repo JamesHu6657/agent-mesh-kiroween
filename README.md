@@ -174,7 +174,7 @@ general use, is in [`docs/restrictions.md`](docs/restrictions.md).
   (clone), `pipx uninstall agent-mesh` or `uv tool uninstall agent-mesh`. Your data stays
   in `~/.agent-mesh` (database, runs, workspaces) and `~/.config/agent-mesh` (tokens);
   delete them yourself if you want. A package install may also leave a small launcher in
-  `~/.cache/agent-mesh/bin`.
+  `~/.cache/agent-mesh/bin/<install-id>` (one per installation).
 
 ## Status
 

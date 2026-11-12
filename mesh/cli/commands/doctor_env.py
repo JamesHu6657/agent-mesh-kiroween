@@ -63,13 +63,18 @@ def environment_checks(home_dir: str, db_present: bool, testing_mode: bool = Fal
                          "Python 3.11 or newer is required"))
     git = shutil.which("git")
     gver = ""
+    git_ok = False
     if git:
         try:
-            gver = subprocess.run([git, "--version"], capture_output=True, text=True, timeout=5,
-                                  stdin=subprocess.DEVNULL).stdout.strip()
-        except (OSError, subprocess.SubprocessError):
-            gver = git
-    checks.append(_check("git", bool(git), gver or "not found on PATH",
+            gp = subprocess.run([git, "--version"], capture_output=True, text=True, timeout=5,
+                                stdin=subprocess.DEVNULL)
+            gver = gp.stdout.strip()
+            git_ok = gp.returncode == 0 and gver.startswith("git version")
+            if not git_ok:
+                gver = f"{git} does not work (git --version exit {gp.returncode})"
+        except (OSError, subprocess.SubprocessError) as exc:
+            gver = f"{git} does not run ({exc.__class__.__name__})"
+    checks.append(_check("git", git_ok, gver or "not found on PATH",
                          "install git; repo projects and task worktrees need it", level="warning"))
     checks.append(_check("initialized", db_present, os.path.join(home_dir, "mesh.db"),
                          "run `mesh setup` (or `mesh init`)"))

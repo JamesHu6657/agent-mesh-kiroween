@@ -37,19 +37,26 @@ The normal project loop is:
    `mesh project complete <prj> --report -`. The user is notified; the user does not
    re-confirm completion.
 
-**Launch execution works for vendors with evidence (M3-lite).** M1c built the run
-wrapper (`runwrap`), the supervisor (exit handling, timeouts, cancel, post-submit grace,
-leftover termination), and crash recovery (meshd adopts live runs after a restart and
-closes lost ones). In M3 a vendor adapter can launch only when its committed smoke
-evidence passes the evidence rule (section 10). Today that is `droid` 1.6.0 and `kiro`
-(kiro-cli 3.1.0): `adapter show` prints `launch_enabled: true` for them. Both passed the
-real end-to-end run N13 (kiro in M4, after its M3 launch hold, L11, was lifted). `agy` and `vibe`
-have no smoke results and set `launch_enabled: false` with `launch_milestone: "M3"` and
-`launch_reason: "no_smoke_evidence"`; assigning a launch task to them returns rc 13
-`ADAPTER_UNSUPPORTED`. `hermes` and `openclaw` are not installed and carry
-`launch_milestone: "M4"`. The `fake` test double launches only when meshd runs with
-`MESH_TESTING=1`. Inbox-mode execution (leases, fencing, heartbeat, submit) is available
-for any agent. `docs/adapters.md` has the per-adapter status and case results.
+**Launch execution for vendor CLIs.** M1c built the run wrapper (`runwrap`), the
+supervisor (exit handling, timeouts, cancel, post-submit grace, leftover termination), and
+crash recovery (meshd adopts live runs after a restart and closes lost ones). Whether a
+vendor adapter may launch depends on `adapter.evidence_mode` (section 10):
+
+- `warn` (the default): a vendor CLI launches even without smoke evidence that matches the
+  installed version; `adapter show`, `mesh doctor` and the assignment response carry a
+  warning with the reason (for example `no_smoke_evidence` or `evidence_stale`).
+- `strict` (opt-in, `mesh config set adapter.evidence_mode '"strict"' --user`): a vendor
+  adapter launches only when its committed smoke evidence passes the evidence rule;
+  otherwise assignment returns rc 13 `ADAPTER_UNSUPPORTED`.
+
+Committed evidence passes for two adapters. Today that is `droid` 1.6.0 and `kiro` (kiro-cli 3.1.0),
+which both passed
+the real end-to-end run N13; `agy` and `vibe` have no smoke results, so they launch with a
+warning in `warn` mode and are refused in `strict` mode. Launch holds (L11) apply in both
+modes. `hermes` and `openclaw` are stubs and never launch. The `fake` test double launches
+only when meshd runs with `MESH_TESTING=1`. Inbox-mode execution (leases, fencing,
+heartbeat, submit) is available for any agent. `docs/adapters.md` has the per-adapter
+status and case results.
 
 Commands that are scheduled for later milestones return rc 2 `NOT_IMPLEMENTED_IN_M1`
 with `details.milestone` set to the milestone that builds them.
@@ -183,7 +190,7 @@ Mesh has no magic push. The following table is the concrete delivery mechanism.
 |---|---|---|---|
 | **launch** executor (headless CLI: droid/agy/kiro/vibe; in M1 only the `fake` test double under `MESH_TESTING=1`) | Mesh starts a **new headless run for every attempt**. For rework or retry it resumes the vendor session only if that adapter's resume capability is smoke-verified and a session id was captured; otherwise it starts a fresh process with the previous deliverable and the feedback in the prompt. | The scheduler (T5) | Available for the `fake` test double (M1c); in M3 for vendor CLIs whose evidence enables launch (droid 1.6.0 and kiro-cli 3.1.0 today) |
 | **launch** lead | A lead turn: a new headless run in the lead's own directory, again resuming only if verified. | The scheduler, after pending lead messages pass the debounce | Available in M2 for the `fake` test double only (`MESH_TESTING=1`). Vendor adapters cannot be launch-mode leads until M3 evidence enables them (rc 13 `ADAPTER_UNSUPPORTED`; existing turns refused with `lead.turn_refused`); until then use a `delivery=inbox` lead for vendors |
-| **inbox** agent (an already-running process: a helper agent, an interactive CLI session the user keeps open, any agent that can run shell commands) | The agent calls **`mesh inbox wait --timeout N`**, which blocks on the Unix socket with no model tokens, or calls **`mesh inbox list`** on its own schedule. It then acknowledges with **`mesh inbox ack <msg>`**. | Only its own next `inbox wait`/`list` call | Available now |
+| **inbox** agent (an already-running process: a chat bot, an interactive CLI session the user keeps open, any agent that can run shell commands) | The agent calls **`mesh inbox wait --timeout N`**, which blocks on the Unix socket with no model tokens, or calls **`mesh inbox list`** on its own schedule. It then acknowledges with **`mesh inbox ack <msg>`**. | Only its own next `inbox wait`/`list` call | Available now |
 | **user** | The user inbox (`mesh inbox list --user`), plus copies of user-facing messages in the **origin agent's** inbox for relaying. An optional `notify.command` hook is planned for M4. | The user or the origin agent | Available now |
 
 **Mesh cannot push into an interactive TUI.** Injecting text into a running
@@ -443,6 +450,10 @@ rejection reason and previous deliverable summary, even after a rework attempt f
 or times out and is retried. Correctness never depends on resume.
 
 ## 10. Vendor evidence: probe, smoke and launch (M3)
+
+**Evidence mode.** Everything below describes `adapter.evidence_mode = "strict"`. In the
+default `warn` mode the same evaluation runs, but a failing result (other than a launch hold
+or a stub adapter) is reported as a warning instead of refusing the launch.
 
 **Evidence-driven launch.** meshd decides `launch_enabled` per vendor at runtime; nobody
 sets it by hand. It is true only if the latest probe row for the agent's binary has
