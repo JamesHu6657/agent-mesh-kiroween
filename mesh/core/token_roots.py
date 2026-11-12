@@ -37,11 +37,38 @@ def configured_roots(home: str) -> Tuple[Optional[str], List[str]]:
                     ws = os.path.abspath(val.strip())
             paths = [rp for (rp,) in conn.execute(
                 "SELECT DISTINCT repo_path FROM projects WHERE repo_path IS NOT NULL;") if rp]
-            for (wp,) in conn.execute(
-                    "SELECT DISTINCT workspace_path FROM tasks WHERE workspace_path IS NOT NULL;"):
-                if wp:
-                    # <root>/<prj>/tasks/<tsk>[.aN]/ -> <root>/<prj> (also covers lead/ dirs)
-                    paths.append(os.path.dirname(os.path.dirname(os.path.normpath(wp))))
+            # Linear round 6 P2: every workspaces.root ever configured (config.updated events
+            # are append-only), so lead-only workspaces and earlier attempts under an old root
+            # stay protected after the root changes.
+            for (pj,) in conn.execute(
+                    "SELECT payload_json FROM events WHERE type = 'config.updated';"):
+                try:
+                    pl = json.loads(pj or "{}")
+                except ValueError:
+                    continue
+                v = pl.get("value") if isinstance(pl, dict) and pl.get("key") == "workspaces.root" else None
+                if isinstance(v, str) and v.strip():
+                    paths.append(os.path.abspath(v.strip()))
+            # Every task workspace path, current and from earlier attempts (reassign/retry
+            # payloads). The full path is kept as well as its project directory: the check
+            # resolves each with realpath, so a symlinked workspace's real target is covered.
+            wps = [wp for (wp,) in conn.execute(
+                "SELECT DISTINCT workspace_path FROM tasks WHERE workspace_path IS NOT NULL;") if wp]
+            for (pj,) in conn.execute(
+                    "SELECT payload_json FROM events WHERE payload_json LIKE '%workspace_path%';"):
+                try:
+                    pl = json.loads(pj or "{}")
+                except ValueError:
+                    continue
+                if isinstance(pl, dict):
+                    if isinstance(pl.get("workspace_path"), str) and pl["workspace_path"]:
+                        wps.append(pl["workspace_path"])
+            for wp in wps:
+                paths.append(wp)
+                # <root>/<prj>/tasks/<tsk>[.aN]/ -> <root>/<prj> (also covers lead/ dirs)
+                parent = os.path.dirname(os.path.normpath(wp))
+                if os.path.basename(parent) == "tasks":
+                    paths.append(os.path.dirname(parent))
             return ws, sorted(set(paths))
         finally:
             conn.close()

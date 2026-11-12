@@ -38,6 +38,7 @@ class TestTokenDestination(_Tmp):
                      "updated_at TEXT NOT NULL, updated_by TEXT NOT NULL);")
         conn.execute("CREATE TABLE projects (id TEXT PRIMARY KEY, repo_path TEXT);")
         conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, workspace_path TEXT);")
+        conn.execute("CREATE TABLE events (seq INTEGER PRIMARY KEY, type TEXT, payload_json TEXT);")
         if ws_root:
             conn.execute("INSERT INTO settings VALUES ('workspaces.root', ?, 'now', 'test');", (json.dumps(ws_root),))
         if repo:
@@ -225,6 +226,7 @@ class TestRound5(_Tmp):
                      "updated_at TEXT NOT NULL, updated_by TEXT NOT NULL);")
         conn.execute("CREATE TABLE projects (id TEXT PRIMARY KEY, repo_path TEXT);")
         conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, workspace_path TEXT);")
+        conn.execute("CREATE TABLE events (seq INTEGER PRIMARY KEY, type TEXT, payload_json TEXT);")
         if ws_value is not None:
             conn.execute("INSERT INTO settings VALUES ('workspaces.root', ?, 'now', 'test');", (json.dumps(ws_value),))
         for i, wp in enumerate(task_paths):
@@ -269,6 +271,53 @@ class TestRound5(_Tmp):
                 mock.patch.object(smoke_schema, "validate", side_effect=PermissionError(13, "denied")):
             ev = evidence.load_evidence("droid", False, "1.6.0")
         self.assertEqual((ev.ok, ev.reason), (False, "evidence_invalid"))
+
+
+class TestRound6(TestRound5):
+    """Linear Agent chat round 6 (@a36ff84)."""
+
+    def _event(self, home, etype, payload):
+        conn = sqlite3.connect(os.path.join(home, "mesh.db"))
+        conn.execute("INSERT INTO events (type, payload_json) VALUES (?, ?);", (etype, json.dumps(payload)))
+        conn.commit()
+        conn.close()
+
+    def test_lead_only_workspace_under_earlier_root(self):
+        home, a, b = (os.path.join(self.tmp, n) for n in ("home", "rootA", "rootB"))
+        lead = os.path.join(a, "prj_1", "lead", "agt_1")
+        os.makedirs(lead)
+        self._db(home, ws_value=b)
+        self._event(home, "config.updated", {"key": "workspaces.root", "value": a})
+        self._event(home, "config.updated", {"key": "workspaces.root", "value": b})
+        with self.assertRaises(MeshError):
+            msetup._check_token_destination(home, os.path.join(lead, "lead.token"))
+
+    def test_earlier_attempt_workspace_stays_protected(self):
+        home, a = os.path.join(self.tmp, "home"), os.path.join(self.tmp, "rootA")
+        old = os.path.join(a, "p", "x", "tsk_1")
+        os.makedirs(old)
+        self._db(home, ws_value=os.path.join(self.tmp, "rootB"),
+                 task_paths=[os.path.join(self.tmp, "rootB", "prj_1", "tasks", "tsk_1.a2") + "/"])
+        self._event(home, "task.retried", {"workspace_path": old + "/"})
+        with self.assertRaises(MeshError):
+            msetup._check_token_destination(home, os.path.join(old, "lead.token"))
+
+    def test_symlinked_workspace_target_protected(self):
+        home = os.path.join(self.tmp, "home")
+        target = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(target)
+        ws = os.path.join(self.tmp, "ws")
+        os.makedirs(os.path.join(ws, "prj_1", "tasks"))
+        link = os.path.join(ws, "prj_1", "tasks", "tsk_1")
+        os.symlink(target, link)
+        self._db(home, ws_value=ws, task_paths=[link + "/"])
+        with self.assertRaises(MeshError):
+            msetup._check_token_destination(home, os.path.join(target, "lead.token"))
+
+    def test_unrelated_location_still_allowed(self):
+        home = os.path.join(self.tmp, "home")
+        self._db(home, ws_value=os.path.join(self.tmp, "ws"), task_paths=["/weird"])
+        msetup._check_token_destination(home, os.path.join(self.tmp, "cfg", "lead.token"))
 
 
 def _client_token(client, tok):
