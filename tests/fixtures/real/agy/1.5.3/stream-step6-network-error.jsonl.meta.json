@@ -1,0 +1,13 @@
+{
+  "captured_at_utc": "2026-11-07T11:51:15Z",
+  "command": [
+    "agy",
+    "-p",
+    "<prompt>",
+    "--model",
+    "gemini-3.8-flash-high",
+    "--output-format",
+    "stream-json"
+  ],
+  "sha256": "88398549d730e8e96e382b06cda8e057e8ab4fe0f45f0c260c9695b17086597d"
+}

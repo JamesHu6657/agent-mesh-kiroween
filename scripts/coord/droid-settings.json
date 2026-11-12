@@ -1,0 +1,6 @@
+{
+  "commandDenylist": [
+    "git push", "git remote", "git fetch", "git pull", "git clone", "git config --global", "git reset --hard", "git clean", "git checkout main", "git rebase", "git filter-branch", "git worktree", "git branch -D",
+    "curl", "wget", "ssh", "scp", "rsync", "nc", "ncat", "socat", "pip install", "npm install", "npx", "sudo", "su ", "rm -rf /", "rm -rf ~", "rm -rf $HOME", "chmod -R", "printenv", "env", "cat ~/.factory", "kill -9 -1", "pkill", "killall", "systemctl", "crontab"
+  ]
+}

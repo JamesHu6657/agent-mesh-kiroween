@@ -1,0 +1,20 @@
+{
+  "captured_at_utc": "2026-11-09T14:55:31Z",
+  "command": [
+    "droid",
+    "exec",
+    "--output-format",
+    "stream-json",
+    "--cwd",
+    "/tmp/mh-smoke-ff6yzomm",
+    "--model",
+    "claude-sonnet-5-5",
+    "--session-id",
+    "9e176d53-937b-458d-997f-71b470bb2b9c",
+    "--log-group-id",
+    "smoke-S-X-3-S-X-3-ve127ie7",
+    "--file",
+    "/tmp/mh-c2/out/.runs/S-X-3-ve127ie7/prompt.md"
+  ],
+  "sha256": "5b112bd6b5cafd136759a16cbb381f09e5570e0e999e1ff028ca82c71b06f22f"
+}

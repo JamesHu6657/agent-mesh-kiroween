@@ -1,0 +1,138 @@
+{
+  "adapter": "droid",
+  "case": "N26",
+  "consent_ref": "MESH_SMOKE_CONSENT=droid",
+  "fixtures": {
+    "stderr": {
+      "fixture": "tests/fixtures/real/droid/1.6.0/e2e-N26-run_a1c22d87f2h2ejkayt5nhhgojm-stderr.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "stdout": {
+      "fixture": "tests/fixtures/real/droid/1.6.0/e2e-N26-run_a1c22d87f2h2ejkayt5nhhgojm-stdout.log",
+      "sha256": "91a40a0c9842571533a2916afd5cac0b248c51df20197b5ac83e9cd0f3eadb67"
+    }
+  },
+  "main_unchanged": true,
+  "merge": {
+    "ended_at": "2026-11-09T21:18:55.546Z",
+    "merge_commit": "c95fbf35b417c39819ce90f3cc61004da247ae2b",
+    "mrg": "mrg_a1c22dab39qhfaatabeyk7htz2",
+    "noop": false,
+    "pre_head": "af1bf47d97ebb7904915ed90e0a647bb096c1205",
+    "run_id": "run_a1c22dab396wxgvhgfykhf4m6o",
+    "started_at": "2026-11-09T21:18:55.289Z",
+    "test": {
+      "duration_s": 0.204,
+      "exit_code": 0,
+      "passed": true,
+      "signal": null,
+      "timeout": false,
+      "timeout_s": 1800,
+      "wrapper": {
+        "pid": 36490,
+        "starttime": 20338924
+      }
+    },
+    "test_log": "/tmp/mh-61f21ad7/merges/mrg_a1c22dab39qhfaatabeyk7htz2/test.log",
+    "tests": "passed"
+  },
+  "model": "claude-sonnet-5-5",
+  "no_remote": true,
+  "parents": [
+    "af1bf47d97ebb7904915ed90e0a647bb096c1205",
+    "8e0e1849060f6ff98097ace4dc5305af5fae7c21"
+  ],
+  "run": {
+    "adapter": "droid",
+    "agent_id": "agt_a1c22d8661yjsnrlkriknxwccy",
+    "argv_redacted_json": "[\"/home/node/.local/bin/droid\", \"exec\", \"--output-format\", \"stream-json\", \"--cwd\", \"/tmp/mh-61f21ad7/workspaces/prj_a1c22d8713mbuimm43ogomos2m/tasks/tsk_a1c22d8797rt7s65my5elz66qw\", \"--model\", \"claude-sonnet-5-5\", \"--auto\", \"medium\", \"--log-group-id\", \"run_a1c22d87f2h2ejkayt5nhhgojm\", \"--file\", \"/tmp/mh-61f21ad7/runs/run_a1c22d87f2h2ejkayt5nhhgojm/prompt.md\"]",
+    "attempt": 1,
+    "boot_id": "boot_a1c22d821ac7gw7j2obfqgpdrl",
+    "deadline_at": "2026-11-09T21:28:46.258Z",
+    "effort": null,
+    "end_reason": "exited",
+    "ended_at": "2026-11-09T21:18:54.489Z",
+    "exit_code": 0,
+    "fence": 1,
+    "id": "run_a1c22d87f2h2ejkayt5nhhgojm",
+    "kind": "task",
+    "lead_assignment_id": null,
+    "model": "claude-sonnet-5-5",
+    "pgid": 36345,
+    "proc_starttime": 20338017,
+    "profile": "dev",
+    "project_id": "prj_a1c22d8713mbuimm43ogomos2m",
+    "result_json": "{\"exit_code\": 0, \"signal\": null, \"ended_at\": \"2026-11-09T21:18:53.893Z\"}",
+    "run_dir": "/tmp/mh-61f21ad7/runs/run_a1c22d87f2h2ejkayt5nhhgojm",
+    "session_id": "1c16b9cf-3926-4734-8e48-e826bb270733",
+    "signal": null,
+    "started_at": "2026-11-09T21:18:46.258Z",
+    "status": "exited",
+    "task_id": "tsk_a1c22d8797rt7s65my5elz66qw",
+    "wrapper_pid": 36345
+  },
+  "status": "pass",
+  "task": {
+    "assignee": "e2e-executor",
+    "assignee_agent_id": "agt_a1c22d8661yjsnrlkriknxwccy",
+    "attempt": 1,
+    "base_commit": "af1bf47d97ebb7904915ed90e0a647bb096c1205",
+    "blocked_reason": null,
+    "branch": "mesh/prj_a1c22d8713mbuimm43ogomos2m/tsk_a1c22d8797rt7s65my5elz66qw",
+    "created_at": "2026-11-09T21:18:46.167Z",
+    "created_by": "agt_a1c22d8514wgm2clwujne3arik",
+    "deliverable": {
+      "artifacts": [
+        "hello.txt"
+      ],
+      "git": {
+        "base_commit": "af1bf47d97ebb7904915ed90e0a647bb096c1205",
+        "branch": "mesh/prj_a1c22d8713mbuimm43ogomos2m/tsk_a1c22d8797rt7s65my5elz66qw",
+        "commit_count": 1,
+        "diff_stat": " hello.txt | 1 +\n 1 file changed, 1 insertion(+)",
+        "diff_stat_truncated": false,
+        "dirty": false,
+        "dirty_count": 0,
+        "dirty_files": [],
+        "dirty_files_truncated": false,
+        "head": "8e0e1849060f6ff98097ace4dc5305af5fae7c21"
+      },
+      "notes": "No test suite exists; verified file contents manually.",
+      "summary": "Created hello.txt containing MESH_DEMO_OK and committed it (8e0e184) on the task branch; not pushed.",
+      "tests": {
+        "command": "cat hello.txt",
+        "result": "not_run"
+      }
+    },
+    "depended_on_by": [],
+    "depends_on": [],
+    "effort": null,
+    "failure": null,
+    "fence_seq": 1,
+    "history": [],
+    "id": "tsk_a1c22d8797rt7s65my5elz66qw",
+    "idle_timeout_s": 0,
+    "kind": "code",
+    "last_session_id": "1c16b9cf-3926-4734-8e48-e826bb270733",
+    "max_attempts": 1,
+    "merge": null,
+    "model": "claude-sonnet-5-5",
+    "offered_at": null,
+    "priority": 0,
+    "profile": "dev",
+    "project_id": "prj_a1c22d8713mbuimm43ogomos2m",
+    "queue_position": null,
+    "queued_at": "2026-11-09T21:18:46.168Z",
+    "spec": "Create hello.txt containing MESH_DEMO_OK and commit it with git in this worktree. Do not push.",
+    "status": "submitted",
+    "submitted_at": "2026-11-09T21:18:54.489Z",
+    "submitted_by": "system",
+    "timeout_s": 600,
+    "title": "Droid e2e",
+    "updated_at": "2026-11-09T21:18:54.489Z",
+    "version": 4,
+    "workspace_path": "/tmp/mh-61f21ad7/workspaces/prj_a1c22d8713mbuimm43ogomos2m/tasks/tsk_a1c22d8797rt7s65my5elz66qw"
+  },
+  "task_author": "t <t@example.invalid>",
+  "version": "1.6.0"
+}

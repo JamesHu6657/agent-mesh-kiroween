@@ -1,0 +1,8 @@
+{"type":"runStarted","data":{"payloadSchema":"acp","acpProtocolVersion":1,"engine":"v2"}}
+{"type":"metadata","data":{"sessionId":"22638935-0d0a-4e60-98b9-3ac1d62753cc","contextUsagePercentage":3.618000030517578,"reasoning":{"support":"unavailable","effortLevels":[]}}}
+{"type":"metadata","data":{"sessionId":"22638935-0d0a-4e60-98b9-3ac1d62753cc","contextUsagePercentage":0.7236000299453735,"reasoning":{"support":"toggleable","effortLevels":["low","medium","high","xhigh","max"]}}}
+{"type":"sessionUpdate","data":{"sessionId":"22638935-0d0a-4e60-98b9-3ac1d62753cc","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"MESH_SMOK"}}}}
+{"type":"sessionUpdate","data":{"sessionId":"22638935-0d0a-4e60-98b9-3ac1d62753cc","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"E_OK"}}}}
+{"type":"metadata","data":{"sessionId":"22638935-0d0a-4e60-98b9-3ac1d62753cc","contextUsagePercentage":1.2892000675201416,"reasoning":{"support":"toggleable","effortLevels":["low","medium","high","xhigh","max"]}}}
+{"type":"metadata","data":{"sessionId":"22638935-0d0a-4e60-98b9-3ac1d62753cc","contextUsagePercentage":1.2892000675201416,"meteringUsage":[{"value":0.0019193671641791023,"unit":"credit","unitPlural":"credits"}],"turnDurationMs":948,"reasoning":{"support":"toggleable","effortLevels":["low","medium","high","xhigh","max"]}}}
+{"type":"runFinished","data":{"sessionId":"22638935-0d0a-4e60-98b9-3ac1d62753cc","status":"success","stopReason":"end_turn","finalText":"MESH_SMOKE_OK","finalTextTruncated":false}}

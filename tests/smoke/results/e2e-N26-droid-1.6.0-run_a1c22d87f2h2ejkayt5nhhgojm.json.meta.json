@@ -1,0 +1,11 @@
+{
+  "captured_at_utc": "2026-11-09T21:18:55Z",
+  "command": [
+    "python3",
+    "-m",
+    "unittest",
+    "tests.smoke.test_e2e",
+    "-v"
+  ],
+  "sha256": "6dd6890638d21db775134db44365aecf9c8c883669bde6ba571d453e04b2522e"
+}

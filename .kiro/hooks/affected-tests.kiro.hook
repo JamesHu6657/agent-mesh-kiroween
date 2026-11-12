@@ -1,0 +1,17 @@
+{
+  "enabled": true,
+  "name": "Affected unit tests",
+  "description": "When a Python file under mesh/ or tests/ is saved, run the matching tests/unit/test_<name>*.py module(s) through .kiro/hooks/scripts/affected-tests.sh (unit tier only, shims on PATH, private tripwire). Without a file argument the script uses the changed files from git status. Nothing runs when no module matches.",
+  "version": "1",
+  "when": {
+    "type": "fileEdited",
+    "patterns": [
+      "mesh/**/*.py",
+      "tests/**/*.py"
+    ]
+  },
+  "then": {
+    "type": "runCommand",
+    "command": "bash .kiro/hooks/scripts/affected-tests.sh"
+  }
+}

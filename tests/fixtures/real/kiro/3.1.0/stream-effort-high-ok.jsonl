@@ -1,0 +1,8 @@
+{"type":"runStarted","data":{"payloadSchema":"acp","acpProtocolVersion":1,"engine":"v2"}}
+{"type":"metadata","data":{"sessionId":"8ad2fa07-b863-44b9-819e-e44c18517e5e","contextUsagePercentage":3.618000030517578,"reasoning":{"support":"unavailable","effortLevels":[]}}}
+{"type":"metadata","data":{"sessionId":"8ad2fa07-b863-44b9-819e-e44c18517e5e","contextUsagePercentage":0.7236000299453735,"reasoning":{"support":"alwaysOn","effortLevels":["low","medium","high","xhigh","max"]}}}
+{"type":"metadata","data":{"sessionId":"8ad2fa07-b863-44b9-819e-e44c18517e5e","contextUsagePercentage":0.7236000299453735,"reasoning":{"support":"alwaysOn","effort":"high","effortLevels":["low","medium","high","xhigh","max"]}}}
+{"type":"sessionUpdate","data":{"sessionId":"8ad2fa07-b863-44b9-819e-e44c18517e5e","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"KIRO_OK"}}}}
+{"type":"metadata","data":{"sessionId":"8ad2fa07-b863-44b9-819e-e44c18517e5e","contextUsagePercentage":1.287999987602234,"reasoning":{"support":"alwaysOn","effort":"high","effortLevels":["low","medium","high","xhigh","max"]}}}
+{"type":"metadata","data":{"sessionId":"8ad2fa07-b863-44b9-819e-e44c18517e5e","contextUsagePercentage":1.287999987602234,"meteringUsage":[{"value":0.05458897943615256,"unit":"credit","unitPlural":"credits"}],"turnDurationMs":2617,"reasoning":{"support":"alwaysOn","effort":"high","effortLevels":["low","medium","high","xhigh","max"]}}}
+{"type":"runFinished","data":{"sessionId":"8ad2fa07-b863-44b9-819e-e44c18517e5e","status":"success","stopReason":"end_turn","finalText":"KIRO_OK","finalTextTruncated":false}}

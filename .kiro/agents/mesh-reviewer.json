@@ -1,0 +1,74 @@
+{
+  "name": "mesh-reviewer",
+  "description": "Agent Mesh v1 reviewer/planner (Kiro, on demand, invoked by the Quest coordinator): reviews agy diffs against the spec and drafts next-step plans/agy prompts. Read-only on product code.",
+  "prompt": "You are the Agent Mesh v1 REVIEWER/PLANNER in /workspace/mesh-fresh-v1, invoked on demand by the coordinator (Quest). Authoritative docs: docs/HANDOFF.md (incl. section 11), docs/requirements.md, docs/plan.md, docs/acceptance-checklist.md. You never write product code, tests or prompts/*; you only write the single output file named in your task under docs/coordination/reviews/ or docs/coordination/plans/. Never ask for trust-all; never dispatch agy; never commit.",
+  "model": "claude-opus-5.5",
+  "tools": [
+    "fs_read",
+    "fs_write",
+    "execute_bash",
+    "grep",
+    "glob"
+  ],
+  "allowedTools": [
+    "fs_read",
+    "grep",
+    "glob"
+  ],
+  "toolsSettings": {
+    "execute_bash": {
+      "allowedCommands": [
+        "bash scripts/coord/status\\.sh",
+        "python3 scripts/coord/agy-summary\\.py logs/raw/[A-Za-z0-9._-]+\\.jsonl",
+        "bash scripts/test\\.sh",
+        "python3 -m unittest [^;&|<>`$\\n\\\\]*",
+        "bin/mesh [^;&|<>`$\\n\\\\]*",
+        "git (status|log|diff|show|rev-parse|ls-files|blame)[^;&|<>`$\\n\\\\]*",
+        "(ls|cat|head|tail|wc|grep|sha256sum|stat) [^;&|<>`$\\n\\\\]*",
+        "pgrep -af [^;&|<>`$\\n\\\\]*",
+        "rm -rf /tmp/mh-[A-Za-z0-9_-]+",
+        "date[^;&|<>`$\\n\\\\]*"
+      ],
+      "deniedCommands": [
+        ".*--trust-all.*",
+        ".*git push.*",
+        ".*git remote.*",
+        ".*git (add|commit|reset|checkout|restore|stash|clean).*",
+        ".*dispatch-agy.*",
+        ".*FACTORY_API_KEY.*",
+        "sudo.*"
+      ],
+      "denyByDefault": true,
+      "autoAllowReadonly": false
+    },
+    "fs_write": {
+      "allowedPaths": [
+        "docs/coordination/reviews/**",
+        "docs/coordination/plans/**",
+        "/workspace/mesh-wt-*/docs/coordination/reviews/**",
+        "/workspace/mesh-wt-*/docs/coordination/plans/**"
+      ],
+      "deniedPaths": [
+        "docs/requirements.md",
+        "docs/plan.md",
+        "docs/acceptance-checklist.md",
+        "docs/review-*.md",
+        "docs/reviews/**",
+        "prompts/**"
+      ]
+    },
+    "fs_read": {
+      "allowedPaths": [
+        "/workspace/mesh-fresh-v1/**",
+        "/workspace/mesh-m1a-acceptance-r2.md",
+        "/workspace/mesh-m1a-independent-review.md",
+        "/tmp/**",
+        "/workspace/mesh-wt-*/**"
+      ],
+      "deniedPaths": [
+        "**/.env",
+        "**/credentials*"
+      ]
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "captured_at_utc": "2026-11-09T19:40:07Z",
+  "command": [
+    "python3",
+    "-m",
+    "tests.smoke.reevaluate",
+    "droid-1.6.0-2026-11-09-2.json"
+  ],
+  "sha256": "5978c589ce579ba421ad6eb873258210524a38dedf47bf1e3054609e15b76306"
+}

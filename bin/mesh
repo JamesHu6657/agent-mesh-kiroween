@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+
+# Resolve the real path of the install root (the parent directory of bin/)
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+INSTALL_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P)"
+
+# Capture caller's original PYTHONPATH for vendor/executor child isolation (review-r3 Finding 1)
+if [ -z "${_MESH_ORIG_PYTHONPATH+x}" ]; then
+  export _MESH_ORIG_PYTHONPATH="${PYTHONPATH:-__UNSET__}"
+fi
+
+# Set PYTHONPATH to the install root ONLY for Mesh itself per plan L70 and §7.6 mitigation 8
+export PYTHONPATH="$INSTALL_ROOT"
+
+exec python3 -P -s -m mesh "$@"

@@ -1,0 +1,75 @@
+{
+  "name": "mesh-coordinator",
+  "description": "Agent Mesh v1 coordinator: dispatch agy gemini-3.8-flash-high runs, follow up, accept per agreed gates.",
+  "prompt": "You are the Agent Mesh v1 coordinator in /workspace/mesh-fresh-v1. Your authoritative handoff is docs/HANDOFF.md; read it before acting and follow it exactly. Only use the allowed helper commands; never ask for trust-all.",
+  "model": "claude-opus-5.5",
+  "tools": [
+    "fs_read",
+    "fs_write",
+    "execute_bash",
+    "grep",
+    "glob"
+  ],
+  "allowedTools": [
+    "fs_read",
+    "grep",
+    "glob"
+  ],
+  "toolsSettings": {
+    "execute_bash": {
+      "allowedCommands": [
+        "bash scripts/coord/status\\.sh",
+        "bash scripts/coord/dispatch-agy\\.sh prompts/[A-Za-z0-9._-]+\\.md [A-Za-z0-9._-]+",
+        "bash scripts/coord/wait-pid\\.sh [0-9]+ [0-9]+",
+        "python3 scripts/coord/agy-summary\\.py logs/raw/[A-Za-z0-9._-]+\\.jsonl",
+        "bash scripts/test\\.sh",
+        "python3 -m unittest [^;&|<>`$\\n\\\\]*",
+        "bin/mesh [^;&|<>`$\\n\\\\]*",
+        "git (status|log|diff|show|branch|rev-parse|ls-files)[^;&|<>`$\\n\\\\]*",
+        "git add (docs|prompts)/[^;&|<>`$\\n\\\\]*",
+        "git commit -m \\\"[^\\\"`$\\\\\\n]*\\\"",
+        "(ls|cat|head|tail|wc|grep|sha256sum|stat) [^;&|<>`$\\n\\\\]*",
+        "ps -p [0-9]+[^;&|<>`$\\n\\\\]*",
+        "pgrep -af [^;&|<>`$\\n\\\\]*",
+        "rm -rf /tmp/mh-[A-Za-z0-9_-]+",
+        "kiro-cli whoami",
+        "date[^;&|<>`$\\n\\\\]*"
+      ],
+      "deniedCommands": [
+        ".*--trust-all.*",
+        ".*git push.*",
+        ".*git remote.*",
+        ".*FACTORY_API_KEY.*",
+        "sudo.*"
+      ],
+      "denyByDefault": true,
+      "autoAllowReadonly": false
+    },
+    "fs_write": {
+      "allowedPaths": [
+        "docs/**",
+        "prompts/*.md"
+      ],
+      "deniedPaths": [
+        "docs/requirements.md",
+        "docs/plan.md",
+        "docs/acceptance-checklist.md",
+        "docs/review-*.md",
+        "docs/reviews/**",
+        "prompts/*.json"
+      ]
+    },
+    "fs_read": {
+      "allowedPaths": [
+        "/workspace/mesh-fresh-v1/**",
+        "/workspace/mesh-m1a-acceptance-r2.md",
+        "/workspace/mesh-m1a-independent-review.md",
+        "/tmp/**"
+      ],
+      "deniedPaths": [
+        "**/.env",
+        "**/credentials*"
+      ]
+    }
+  }
+}
