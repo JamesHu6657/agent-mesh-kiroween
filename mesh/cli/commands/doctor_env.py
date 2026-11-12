@@ -67,7 +67,7 @@ def environment_checks(home_dir: str, db_present: bool, testing_mode: bool = Fal
     if git:
         try:
             gp = subprocess.run([git, "--version"], capture_output=True, text=True, timeout=5,
-                                stdin=subprocess.DEVNULL)
+                                stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace")
             gver = gp.stdout.strip()
             git_ok = gp.returncode == 0 and gver.startswith("git version")
             if not git_ok:

@@ -151,7 +151,10 @@ def validate(doc: Any, repo_root: str, fixture_root: Optional[str] = None) -> Li
             errs.append(f"{where} is not an object")
             continue
         cid = case.get("id")
-        where = f"cases[{i}] {cid}"
+        where = f"cases[{i}] {cid!r}"
+        if not isinstance(cid, str):
+            errs.append(f"{where}: case id must be a string")
+            continue
         cmissing = [k for k in CASE_KEYS if k not in case]
         cextra = sorted(set(case) - set(CASE_KEYS))
         if cmissing:

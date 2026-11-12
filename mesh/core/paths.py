@@ -41,7 +41,9 @@ def get_mesh_bin_dir() -> str:
     # sharing HOME never overwrite each other's launcher (Linear round 3 P2).
     import hashlib
 
-    ident = hashlib.sha256(f"{os.path.realpath(root)}\0{os.path.realpath(sys.executable)}".encode()).hexdigest()[:16]
+    ident = hashlib.sha256("\0".join((os.path.realpath(root), os.path.abspath(sys.executable),
+                                       os.path.realpath(sys.executable), os.path.abspath(sys.prefix))
+                                      ).encode()).hexdigest()[:16]
     bin_dir = os.path.join(cache, "agent-mesh", "bin", ident)
     os.makedirs(bin_dir, mode=0o700, exist_ok=True)
     shim = os.path.join(bin_dir, "mesh")

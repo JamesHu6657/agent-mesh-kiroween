@@ -43,8 +43,8 @@ crash recovery (meshd adopts live runs after a restart and closes lost ones). Wh
 vendor adapter may launch depends on `adapter.evidence_mode` (section 10):
 
 - `warn` (the default): a vendor CLI launches even without smoke evidence that matches the
-  installed version; `adapter show`, `mesh doctor` and the assignment response carry a
-  warning with the reason (for example `no_smoke_evidence` or `evidence_stale`).
+  installed version; `mesh adapter show <id>` reports `evidence_warning` with the reason (for
+  example `no_smoke_evidence` or `evidence_stale`), and `mesh doctor` shows the active mode.
 - `strict` (opt-in, `mesh config set adapter.evidence_mode '"strict"' --user`): a vendor
   adapter launches only when its committed smoke evidence passes the evidence rule;
   otherwise assignment returns rc 13 `ADAPTER_UNSUPPORTED`.
@@ -188,7 +188,7 @@ Mesh has no magic push. The following table is the concrete delivery mechanism.
 
 | Agent kind | How it receives work | What wakes it | Status |
 |---|---|---|---|
-| **launch** executor (headless CLI: droid/agy/kiro/vibe; in M1 only the `fake` test double under `MESH_TESTING=1`) | Mesh starts a **new headless run for every attempt**. For rework or retry it resumes the vendor session only if that adapter's resume capability is smoke-verified and a session id was captured; otherwise it starts a fresh process with the previous deliverable and the feedback in the prompt. | The scheduler (T5) | Available for the `fake` test double (M1c); in M3 for vendor CLIs whose evidence enables launch (droid 1.6.0 and kiro-cli 3.1.0 today) |
+| **launch** executor (headless CLI: droid/agy/kiro/vibe; in M1 only the `fake` test double under `MESH_TESTING=1`) | Mesh starts a **new headless run for every attempt**. For rework or retry it resumes the vendor session only if that adapter's resume capability is smoke-verified and a session id was captured; otherwise it starts a fresh process with the previous deliverable and the feedback in the prompt. | The scheduler (T5) | Available for vendor CLIs: with the default `adapter.evidence_mode = "warn"` any installed, non-held vendor adapter launches (a warning names missing or stale evidence); with `strict` only those whose committed evidence passes (droid 1.6.0 and kiro-cli 3.1.0 today). The `fake` test double needs `MESH_TESTING=1` |
 | **launch** lead | A lead turn: a new headless run in the lead's own directory, again resuming only if verified. | The scheduler, after pending lead messages pass the debounce | Available in M2 for the `fake` test double only (`MESH_TESTING=1`). Vendor adapters cannot be launch-mode leads until M3 evidence enables them (rc 13 `ADAPTER_UNSUPPORTED`; existing turns refused with `lead.turn_refused`); until then use a `delivery=inbox` lead for vendors |
 | **inbox** agent (an already-running process: a chat bot, an interactive CLI session the user keeps open, any agent that can run shell commands) | The agent calls **`mesh inbox wait --timeout N`**, which blocks on the Unix socket with no model tokens, or calls **`mesh inbox list`** on its own schedule. It then acknowledges with **`mesh inbox ack <msg>`**. | Only its own next `inbox wait`/`list` call | Available now |
 | **user** | The user inbox (`mesh inbox list --user`), plus copies of user-facing messages in the **origin agent's** inbox for relaying. An optional `notify.command` hook is planned for M4. | The user or the origin agent | Available now |

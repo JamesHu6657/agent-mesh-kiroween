@@ -137,5 +137,89 @@ class TestDoctorBrokenGit(_Tmp):
         self.assertFalse(git["ok"], git)
 
 
+class TestRound4(_Tmp):
+    """Linear Agent chat round 4 (@21f165c)."""
+
+    def _db(self, home, ws_root=None, repo=None):
+        TestTokenDestination._db(self, home, ws_root=ws_root, repo=repo)
+
+    def test_home_with_uri_characters_still_protected(self):
+        home, ws = os.path.join(self.tmp, "h?mode=memory#x"), os.path.join(self.tmp, "ws")
+        os.makedirs(ws)
+        self._db(home, ws_root=ws)
+        with self.assertRaises(MeshError):
+            msetup._check_token_destination(home, os.path.join(ws, "lead.token"))
+
+    def test_uninspectable_db_fails_closed(self):
+        from mesh.core.token_roots import configured_roots
+
+        home = os.path.join(self.tmp, "home")
+        os.makedirs(home)
+        with open(os.path.join(home, "mesh.db"), "wb") as f:
+            f.write(b"not a database" * 100)
+        with self.assertRaises(MeshError):
+            configured_roots(home)
+        with self.assertRaises(MeshError):
+            msetup._check_token_destination(home, os.path.join(self.tmp, "cfg", "lead.token"))
+
+    def test_client_refuses_token_in_configured_root_and_repo(self):
+        from mesh.client import MeshClient
+
+        home, ws, repo = (os.path.join(self.tmp, n) for n in ("home", "ws", "repo"))
+        os.makedirs(ws)
+        os.makedirs(repo)
+        self._db(home, ws_root=ws, repo=repo)
+        for d in (ws, repo):
+            tok = os.path.join(d, "a.token")
+            with open(tok, "w", encoding="utf-8") as f:
+                f.write("tok")
+            os.chmod(tok, 0o600)
+            client = MeshClient.__new__(MeshClient)
+            client.home = home
+            with self.assertRaises(MeshError) as cm:
+                _client_token(client, tok)
+            self.assertEqual(cm.exception.code, "TOKEN_FILE_INSECURE")
+
+    def test_shim_differs_for_shared_package_envs(self):
+        from mesh.core import paths
+
+        dirs = []
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": self.tmp}), \
+                mock.patch.object(paths, "get_install_root", return_value=self.tmp), \
+                mock.patch.object(os.path, "realpath", side_effect=lambda p: "/usr/bin/python3.11"
+                                  if "python" in str(p) else os.path.abspath(p)):
+            for venv in ("/opt/env-a", "/opt/env-b"):
+                with mock.patch.object(sys, "executable", venv + "/bin/python3"), \
+                        mock.patch.object(sys, "prefix", venv):
+                    dirs.append(paths.get_mesh_bin_dir())
+        self.assertNotEqual(dirs[0], dirs[1])
+
+    def test_nested_malformed_case_id(self):
+        from mesh.adapters import smoke_schema
+
+        for bad in ([], {"x": 1}, 3):
+            errs = smoke_schema.validate({"adapter": "droid", "version": "1.6.0", "cases": [{"id": bad}]}, self.tmp)
+            self.assertTrue(any("case id must be a string" in e for e in errs), errs)
+
+    def test_doctor_non_utf8_git(self):
+        from mesh.cli.commands import doctor_env
+
+        fake = os.path.join(self.tmp, "git")
+        with open(fake, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\nprintf 'git version \\377\\n'\n")
+        os.chmod(fake, stat.S_IRWXU)
+        with mock.patch.dict(os.environ, {"PATH": self.tmp + os.pathsep + os.environ.get("PATH", "")}):
+            checks = doctor_env.environment_checks(self.tmp, False)
+        self.assertTrue(any(c["name"] == "platform" for c in checks))
+        self.assertTrue(any(c["name"] == "git" for c in checks))
+
+
+def _client_token(client, tok):
+    import argparse
+
+    args = argparse.Namespace(user=False, token_file=tok, passphrase_fd=None, passphrase_file=None)
+    return client._resolve_auth_uncached(args)
+
+
 if __name__ == "__main__":
     unittest.main()

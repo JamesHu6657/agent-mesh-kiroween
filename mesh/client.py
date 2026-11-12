@@ -103,7 +103,12 @@ class MeshClient:
             return {"type": "user", "passphrase": passphrase}
 
         if token_file:
-            check_token_file_secure(token_file, home=self.home)
+            # Linear round 4 P2: also refuse tokens inside the configured workspaces.root
+            # and registered repositories, not only the default locations.
+            from mesh.core.token_roots import configured_roots
+
+            ws_root, repo_paths = configured_roots(self.home)
+            check_token_file_secure(token_file, home=self.home, workspaces_root=ws_root, repo_paths=repo_paths)
             try:
                 with open(token_file, "r", encoding="utf-8") as f:
                     token = f.read().strip()

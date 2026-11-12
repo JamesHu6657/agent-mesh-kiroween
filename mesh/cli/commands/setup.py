@@ -128,36 +128,15 @@ def token_path_for(home: str, lead: str, token_dir: Optional[str]) -> str:
 
 
 def _configured_roots(home: str) -> List[str]:
-    """The configured workspaces.root and every registered project repository, read
-    straight from the database (read-only). Empty when there is no database yet."""
-    import sqlite3
+    """The configured workspaces.root and every registered project repository (realpaths).
+    Fails closed when an existing database cannot be inspected (Linear round 4 P2)."""
+    from mesh.core.token_roots import configured_roots
 
-    db = os.path.join(home, "mesh.db")
-    roots: List[str] = []
-    if not os.path.isfile(db):
-        return roots
     try:
-        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5.0)
-    except sqlite3.Error:
-        return roots
-    try:
-        try:
-            row = conn.execute("SELECT value_json FROM settings WHERE key = 'workspaces.root';").fetchone()
-            if row and row[0]:
-                val = json.loads(row[0])
-                if isinstance(val, str) and val:
-                    roots.append(os.path.realpath(os.path.expanduser(val)))
-        except (sqlite3.Error, ValueError):
-            pass
-        try:
-            for (rp,) in conn.execute("SELECT DISTINCT repo_path FROM projects WHERE repo_path IS NOT NULL;"):
-                if rp:
-                    roots.append(os.path.realpath(rp))
-        except sqlite3.Error:
-            pass
-    finally:
-        conn.close()
-    return roots
+        ws, repos = configured_roots(home)
+    except MeshError as exc:
+        raise _usage(f"cannot check token destination: {exc.message}")
+    return [os.path.realpath(p) for p in ([ws] if ws else []) + repos]
 
 
 def _enclosing_git_worktree(directory: str) -> Optional[str]:
