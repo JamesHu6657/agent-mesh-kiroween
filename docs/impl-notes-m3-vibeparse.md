@@ -1,4 +1,4 @@
-# m3-vibeparse: real VibeAdapter.parse() for vibe 3.1.0 (Grok Bot, 2026-11-10)
+# m3-vibeparse: real VibeAdapter.parse() for vibe 3.1.0 (a helper agent, 2026-11-10)
 
 Only `mesh/adapters/vibe.py` parse() + module helpers changed; build/profiles/probe untouched.
 Worked only from `tests/fixtures/real/vibe/3.1.0/` (no vendor CLI run).

@@ -5023,6 +5023,23 @@ class TestCarbonRoP1c(unittest.TestCase):
         self.addCleanup(_cleanup)
         return ready, meta, lz_pid, lz_st
 
+    def _force_gvisor_task_listing(self, lz_pid):
+        """These tests cover the gVisor fallback (no /proc/<tgid>/task once the leader
+        thread exits). On a regular Linux kernel that directory stays listable, so the
+        fallback never runs and the injected faults are never hit (pre-public re-review
+        P2). Make the listing fail the way gVisor does so the same path runs everywhere."""
+        from unittest import mock
+
+        real_listdir = os.listdir
+        task_dir = f"/proc/{lz_pid}/task"
+
+        def listdir(path=".", *a, **kw):
+            if str(path) == task_dir:
+                raise FileNotFoundError(2, "No such file or directory", task_dir)
+            return real_listdir(path, *a, **kw)
+
+        return mock.patch("mesh.core.proc.os.listdir", listdir)
+
     def test_p2_1a_sibling_thread_status_oserror_propagates_and_marks_uncertain(self):
         import builtins
         import errno
@@ -5044,7 +5061,7 @@ class TestCarbonRoP1c(unittest.TestCase):
                 raise OSError(errno.EMFILE, "injected status EMFILE", file)
             return real_open(file, *a, **kw)
 
-        with mock.patch.object(builtins, "open", open_emfile):
+        with mock.patch.object(builtins, "open", open_emfile), self._force_gvisor_task_listing(lz_pid):
             with self.assertRaises(OSError) as cm:
                 mproc.get_proc_environ(lz_pid)
             self.assertEqual(cm.exception.errno, errno.EMFILE)
@@ -5073,7 +5090,7 @@ class TestCarbonRoP1c(unittest.TestCase):
                 return io.BytesIO(b"")
             return real_open(file, *a, **kw)
 
-        with mock.patch.object(builtins, "open", open_race):
+        with mock.patch.object(builtins, "open", open_race), self._force_gvisor_task_listing(lz_pid):
             env = mproc.get_proc_environ(lz_pid)
         self.assertIsNotNone(env)
         self.assertEqual(env.get("MESH_RUN_ID"), rid)

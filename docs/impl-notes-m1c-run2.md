@@ -6,7 +6,7 @@ Sub-steps 4–7 (watch/exit loop, read verbs, ACC tests) were not started.
 
 ## 1. Sub-step 1 — harness + gVisor probe
 
-| Probe (`tests/unit/test_proc_probe.py`) | Result on Agent37 (gVisor) |
+| Probe (`tests/unit/test_proc_probe.py`) | Result on Devbox (gVisor) |
 |---|---|
 | `/proc/<pid>/stat`: pgrp, session, starttime | PASS |
 | `/proc/<pid>/environ` of another process | PASS |

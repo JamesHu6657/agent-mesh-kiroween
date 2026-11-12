@@ -19,7 +19,7 @@ Summary of the M3 runs: historical baseline main `8602d33` (all M3 PRs #11–#22
 | m3-r7a, r7c (`29de59c`, `9d2c08f`) | Opt-in real e2e (N13) and droid `dev` code-task demo (N26); inbox lead needs `--max-concurrency 1`. | `tests/smoke/test_e2e.py` |
 | C4, C5 (`2f66528`, `50e9ae2`) | N13 and N26 pass on droid 1.6.0. | e2e records |
 | m3-parse-fixtures (`9de1d32`) | Real agy 1.5.3 and vibe 3.1.0 output promoted from coordinator logs. | `tests/fixtures/real/agy/1.5.3/`, `vibe/3.1.0/` |
-| m3-agyparse(+p3), m3-vibeparse(+p3) (`de3ed0e`, `e51a34d`, `628de39`, `db8ab40`) | Real `parse()` for agy (stream-json `result` event; no `result` → `run_error`; stderr `AGY_ERROR`) and vibe (last assistant message; export.json session/usage/outcome → `vendor_exit_meaning`). Grok Bot as parallel coder. | `mesh/adapters/agy.py`, `vibe.py` |
+| m3-agyparse(+p3), m3-vibeparse(+p3) (`de3ed0e`, `e51a34d`, `628de39`, `db8ab40`) | Real `parse()` for agy (stream-json `result` event; no `result` → `run_error`; stderr `AGY_ERROR`) and vibe (last assistant message; export.json session/usage/outcome → `vendor_exit_meaning`). a helper agent as parallel coder. | `mesh/adapters/agy.py`, `vibe.py` |
 | m3-kiro-real #12 (`fe761cc`, merge `ca11c1e`) | Real kiro `parse()`, kiro smoke cases, rc-0 vendor error = T8 `vendor_error`; launch opened by evidence `kiro-3.1.0-2026-11-10-2.json`. | `mesh/adapters/kiro.py`, `tests/smoke/` |
 | m3-smoke-agy-vibe #17 (`d9f2d25`) | Offline agy/vibe smoke cases; no real runs. | `tests/smoke/test_smoke.py`, `tests/unit/test_smoke_agy.py`, `test_smoke_vibe.py` |
 | m3-r7b redo + r7b2 (`053bf26`, `eb2834d`) | `docs/adapters.md`, `docs/usage.md` from live evidence; `tests/unit/test_docs_m3.py`. | docs |
@@ -27,7 +27,7 @@ Summary of the M3 runs: historical baseline main `8602d33` (all M3 PRs #11–#22
 | test-kdf #22 (`f4d637b`) | init/doctor hardening; cheap scrypt only in testing mode. | `mesh/core/`, doctor |
 | runtargets-race #20 (`2cefb8c`) | Two-scan rule for `run_targets`; scan→begin identity handoff; recovery handoffs. | `mesh/daemon/terminate.py`, `supervisor.py` |
 | m3-r7d PR #11 (head `d38bfed`, merge `2370129`) | Reap leaked `/tmp/mh-*` test daemons: pidfd-pinned stop, per-harness token, positional launcher argv parser, effective home. Quest final ACCEPT r7d7, Linear final ACCEPT after 4 REVISE rounds. | `scripts/coord/reap_daemons.py`, `scripts/test.sh`, `tests/helpers.py` |
-| m3-p3-cleanup PR #23 (head `0bd6e06`, merge `9c02997`) | Reap launcher no-match rows, pidfd cleanup, main guard at EOF, a1-speed notes. Coder: droid `gemini-4-carbon` on grokbot-box. | `tests/integration/test_daemon.py`, `tests/unit/test_reap_daemons.py`, `test_runtargets_race.py`, `docs/impl-notes-m3-a1-speed.md` |
+| m3-p3-cleanup PR #23 (head `0bd6e06`, merge `9c02997`) | Reap launcher no-match rows, pidfd cleanup, main guard at EOF, a1-speed notes. Coder: droid `gemini-4-carbon` on helper-box. | `tests/integration/test_daemon.py`, `tests/unit/test_reap_daemons.py`, `test_runtargets_race.py`, `docs/impl-notes-m3-a1-speed.md` |
 | m3-gatefix (gate review fixes, merge `a1f0301`) | Recovery adopt records the group members before returning (P1-1); merge test step scans before reaping the wrapper (`waitid` WNOWAIT, P1-2). | `mesh/daemon/recovery.py`, `supervisor.py`, `merge.py`, `tests/unit/test_m3_gatefix.py` |
 
 ## 2. Decisions
@@ -47,10 +47,10 @@ Summary of the M3 runs: historical baseline main `8602d33` (all M3 PRs #11–#22
 | D10 | Conservative unusable-seen rule; persisted hold, never released on timeout, never kill by pgid alone. | log 21:42, 21:50; r4e notes |
 | D11 | Droid paused for coding (08:26); real runs move to kiro (09:12); Sol work to the Quest coder (09:16). | James 2026-11-10 |
 | D12 | Review routing v2: Linear free chat is review of record per PR; merge.sh refuses without `VERDICT: ACCEPT` on record. | 2026-11-09 21:40, 21:51 |
-| D13 | Grok Bot as parallel coder for independent M3 tasks. | 2026-11-10 12:34 |
+| D13 | a helper agent as parallel coder for independent M3 tasks. | 2026-11-10 12:34 |
 | D14 | M3 gate = free Linear chat + Kiro exec checks + ClickUp Opus 5.5; no Linear Loop. | 2026-11-10 13:36, 13:45 |
 | D15 | M3 gate changed: Kiro dropped (no Kiro exec checks; kiro N13 deferred to M4); gate = Linear free chat + ClickUp Opus 5.5 + droid/Carbon (reasoning high) final review on a separate review-only host (droid 1.7.1; base stays 1.6.0). A1/A3 = coordinator suite runs on base. vibe `unverified`, N11 partial, L2, L8 accepted. | James 2026-11-11 08:11, 08:38 |
-| D16 | M3 gate order: Linear free chat → droid + Carbon (`gemini-4-carbon`, high) on grokbot-box, new Factory account (review-only; base droid 1.6.0 stays, paused) → ClickUp Brain Opus 5.5 last. | James 2026-11-11 10:07 |
+| D16 | M3 gate order: Linear free chat → droid + Carbon (`gemini-4-carbon`, high) on helper-box, new Factory account (review-only; base droid 1.6.0 stays, paused) → ClickUp Brain Opus 5.5 last. | James 2026-11-11 10:07 |
 
 ## 3. Known limitations
 

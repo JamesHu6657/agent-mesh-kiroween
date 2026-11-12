@@ -604,6 +604,10 @@ def commit_lead_turn(conn: sqlite3.Connection, home: str,
         with transaction(conn):
             if not _lease_free(conn, project_id):
                 raise sqlite3.IntegrityError("leadturn lease already held")
+            # Pre-public re-review P3: a disabled lead agent never starts a turn.
+            dis = conn.execute("SELECT disabled_at FROM principals WHERE id = ?;", (agent["id"],)).fetchone()
+            if dis is None or dis["disabled_at"] is not None:
+                raise sqlite3.IntegrityError("lead agent is disabled")
             conn.execute(
                 """INSERT INTO runs (
                     id, kind, task_id, project_id, agent_id, attempt, fence,
@@ -1431,7 +1435,9 @@ def start_lead_turns(conn: sqlite3.Connection, home: str = "",
            FROM lead_assignments la
            JOIN agents a ON la.agent_id = a.id
            JOIN projects p ON la.project_id = p.id
+           JOIN principals pr ON pr.id = a.id
            WHERE la.ended_at IS NULL AND a.delivery = 'launch' AND p.status = 'active'
+             AND pr.disabled_at IS NULL
            ORDER BY la.started_at ASC, la.project_id ASC;"""
     ).fetchall()
     candidates = {(r["project_id"], r["assignment_id"]) for r in rows}

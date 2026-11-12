@@ -81,6 +81,11 @@ async def handle_event_tail_live(server: Any, ctx: HandlerContext, reader: Any, 
         while True:
             if (reader is not None and reader.at_eof()) or writer.is_closing():
                 break
+            # Pre-public re-review P2: authority is re-checked before every batch, so a
+            # stream ends once its credential expires or is revoked, its principal is
+            # disabled, or (for a lead run token) the lead assignment is superseded.
+            if not _stream_still_authorized(ctx, project_id, task_id):
+                break
 
             query = """
             SELECT seq, id, ts, type, project_id, task_id, run_id, approval_id,
@@ -178,6 +183,34 @@ async def handle_event_tail_live(server: Any, ctx: HandlerContext, reader: Any, 
                 break
     finally:
         server.active_streams = max(0, getattr(server, "active_streams", 1) - 1)
+
+
+def _stream_still_authorized(ctx: HandlerContext, project_id: Any, task_id: Any) -> bool:
+    """Re-validate an open event.tail stream: credential, principal and authorization."""
+    from mesh.core.clock import now_iso_utc
+
+    if ctx.actor_kind == "user" and ctx.via == "direct":
+        return True
+    cred_id = ctx.principal.get("credential_id") or ctx.credential_id
+    try:
+        if cred_id:
+            row = ctx.conn.execute(
+                "SELECT expires_at, revoked_at FROM credentials WHERE id = ?;", (cred_id,)
+            ).fetchone()
+            if row is None or row["revoked_at"] is not None:
+                return False
+            if row["expires_at"] is not None and row["expires_at"] < now_iso_utc():
+                return False
+        pid = ctx.principal.get("id")
+        if pid:
+            prow = ctx.conn.execute("SELECT disabled_at FROM principals WHERE id = ?;", (pid,)).fetchone()
+            if prow is None or prow["disabled_at"] is not None:
+                return False
+        check_authz(ctx.conn, "event.tail", ctx.principal, ctx.actor_kind, ctx.via,
+                    project_id=project_id, task_id=task_id)
+    except MeshError:
+        return False
+    return True
 
 
 def _list_events(ctx: HandlerContext, op: str) -> HandlerResult:

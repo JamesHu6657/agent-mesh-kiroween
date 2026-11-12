@@ -1,4 +1,4 @@
-# m3-smoke-agy-vibe: implementation notes (Grok Bot, 2026-11-10)
+# m3-smoke-agy-vibe: implementation notes (a helper agent, 2026-11-10)
 
 Opt-in smoke cases for agy and vibe, modelled on how PR #12 (m3-kiro-real) added kiro.
 Branch `grok/m3-smoke-agy-vibe` = `review/m3-kiro-real` + the fixed `grok/m3-agyparse`
@@ -139,4 +139,4 @@ reports `false` because the stub does not echo the prompt.
 
 ## Tests
 
-`bash scripts/test.sh` (all three tiers) on grokbot-box; counts in the PR.
+`bash scripts/test.sh` (all three tiers) on helper-box; counts in the PR.

@@ -1273,6 +1273,26 @@ def handle_task_retry(ctx: HandlerContext) -> HandlerResult:
     # Check transition: T19 is from failed, escalated -> queued
     check_task_transition(task["status"], "queued")
 
+    # Pre-public re-review P2: T19 queues directly, so it must apply the T4 readiness
+    # guards itself; otherwise a prerequisite added while the task was failed is skipped.
+    unfinished = [r["depends_on_task_id"] for r in ctx.conn.execute(
+        """SELECT td.depends_on_task_id FROM task_deps td JOIN tasks d ON d.id = td.depends_on_task_id
+           WHERE td.task_id = ? AND d.status NOT IN ('accepted', 'merged') ORDER BY 1;""",
+        (task["id"],)).fetchall()]
+    unfinished_projects = [r["depends_on_project_id"] for r in ctx.conn.execute(
+        """SELECT pd.depends_on_project_id FROM project_deps pd JOIN projects d ON d.id = pd.depends_on_project_id
+           WHERE pd.project_id = ? AND d.status != 'completed' ORDER BY 1;""",
+        (project_id,)).fetchall()]
+    if unfinished or unfinished_projects:
+        raise MeshError(
+            code=c.INVALID_TRANSITION,
+            exit_code=c.EXIT_CONFLICT,
+            message=(f"Task '{task_id}' cannot be retried while prerequisites are unfinished; "
+                     "reassign it (back to assigned) to queue it once they are done"),
+            details={"task_id": task_id, "unfinished_tasks": unfinished,
+                     "unfinished_projects": unfinished_projects},
+        )
+
     # Launch evidence, as AG step 4 (ACC: N19), before any write or approval use
     _requeue_launch_guard(ctx, task["assignee_agent_id"])
 

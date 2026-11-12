@@ -1,7 +1,7 @@
 # Agent Mesh v1 — Acceptance Checklist
 
 Status: **r3**, written by the planner (Factory droid, Opus 5.5) on 2026-11-06; revised after review r1 (see `docs/review-r1-fixes.md`) and review r2 (see `docs/review-r2-fixes.md`).
-Companion to `docs/plan.md` (r3) and `docs/requirements.md`. The implementer (agy) uses it as milestone exit criteria. Grok Bot uses it for final acceptance.
+Companion to `docs/plan.md` (r3) and `docs/requirements.md`. The implementer (agy) uses it as milestone exit criteria. a helper agent uses it for final acceptance.
 
 ## 0. How to use this checklist
 
@@ -305,7 +305,7 @@ Fixture K0: a temp repo `R` with a repo-local `user.name`/`user.email`, branch `
 |---|---|---|---|---|---|
 | P1 | §9 C | header, §0 | — | `docs/plan.md` header; repo history | plan written by Factory droid (Opus 5.5); a Kiro CLI (Opus 5.5) review is recorded before implementation commits |
 | P2 | §9 C | §16 | M1–M4 | Commit messages and session logs under `logs/` | implementation work done by agy (Gemini 3.8 Flash High) |
-| P3 | §9 C | this file | final | Grok Bot runs this checklist | a pass/fail record per ID; any failure blocks acceptance of that milestone |
+| P3 | §9 C | this file | final | a helper agent runs this checklist | a pass/fail record per ID; any failure blocks acceptance of that milestone |
 
 ## Z. Coverage matrix
 

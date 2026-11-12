@@ -1,7 +1,7 @@
 # Agent Mesh v1 — Implementation Plan
 
 Status: **plan r3**, written by the planner (Factory droid, Opus 5.5) on 2026-11-06 UTC; revised after review r1 (`docs/review-r1.md`, fixes in `docs/review-r1-fixes.md`) and review r2 (`docs/review-r2.md`, fixes in `docs/review-r2-fixes.md`). Both reviews were VERDICT REVISE; every finding and the section it changed is listed in the matching fixes file.
-Next steps: review by Kiro CLI (Opus 5.5), implementation by agy (Gemini 3.8 Flash High), and final acceptance by Grok Bot.
+Next steps: review by Kiro CLI (Opus 5.5), implementation by agy (Gemini 3.8 Flash High), and final acceptance by a helper agent.
 Inputs: `docs/requirements.md` (frozen 2026-11-07 Asia/Shanghai), plus a read-only inspection of the CLIs installed on this box (`--help`, `--version`, and model-list commands only; no model sessions were started).
 
 ---
@@ -34,10 +34,10 @@ Inputs: `docs/requirements.md` (frozen 2026-11-07 Asia/Shanghai), plus a read-on
 | `sqlite3` CLI | **not installed** | tests use Python's sqlite3 |
 | git | 2.47.3; **no global `user.name`/`user.email`** | merge commits need a repo-local identity (§10.6, §19) |
 | tools | `ss`, `ps`, `jq` 1.7, `timeout`, `setsid` present; `make` absent | used by the acceptance checklist |
-| droid | `/home/box/.local/bin/droid`, **1.3.0** | help-inspected; fixtures `tests/fixtures/real/droid/1.3.0/` (§14.11) |
-| agy | `/home/box/.local/lib/antigravity-cli/agy` (on PATH), **1.5.2** | the requirements say 1.4.8; the binary was updated (mtime 2026-11-06 22:30). Versions MUST NOT be hardcoded. Fixtures `tests/fixtures/real/agy/1.5.2/` |
-| kiro-cli | `/home/box/.local/bin/kiro-cli`, **3.1.0** | help and model-list JSON inspected; fixtures `tests/fixtures/real/kiro/3.1.0/` |
-| vibe | `/home/box/.local/bin/vibe` → uv tool `mistral-vibe`, **3.1.0** | help-inspected; fixture `tests/fixtures/real/vibe/3.1.0/help.txt` |
+| droid | `$HOME/.local/bin/droid`, **1.3.0** | help-inspected; fixtures `tests/fixtures/real/droid/1.3.0/` (§14.11) |
+| agy | `$HOME/.local/lib/antigravity-cli/agy` (on PATH), **1.5.2** | the requirements say 1.4.8; the binary was updated (mtime 2026-11-06 22:30). Versions MUST NOT be hardcoded. Fixtures `tests/fixtures/real/agy/1.5.2/` |
+| kiro-cli | `$HOME/.local/bin/kiro-cli`, **3.1.0** | help and model-list JSON inspected; fixtures `tests/fixtures/real/kiro/3.1.0/` |
+| vibe | `$HOME/.local/bin/vibe` → uv tool `mistral-vibe`, **3.1.0** | help-inspected; fixture `tests/fixtures/real/vibe/3.1.0/help.txt` |
 | hermes | `command -v hermes` → not found | **not installed** (`tests/fixtures/real/hermes/not-installed.txt`) |
 | openclaw | `command -v openclaw` → not found | **not installed** (`tests/fixtures/real/openclaw/not-installed.txt`) |
 
@@ -567,7 +567,7 @@ Honest limit: Mesh cannot see whether the agent actually asked first, or whether
 - Relayed decisions carry no user MAC. They are attributable only to the relayer's credential and are labelled `trust:"relayed_unverified"`; direct decisions are `trust:"direct_verified"`. `audit verify` lists relayed decisions grouped by relayer and credential.
 
 ### 7.5 Relayed user decisions and their honest trust limits
-- A relayer is an agent the user granted `relay` (typically Grok Bot). It can:
+- A relayer is an agent the user granted `relay` (typically a helper agent). It can:
   - approve or reject approvals with `--relayed`;
   - perform user-authority project ops (`set-lead`, `pause`, `resume`, `cancel`, `update`) with `--relayed --user-statement …`.
   Both require that the category policy is `direct_or_relayed`.
@@ -590,7 +590,7 @@ Honest limit: Mesh cannot see whether the agent actually asked first, or whether
 - Run-session binding (§7.1, best effort): a process inside a launched run can use only that run's token. An executor that runs `mesh … --token-file <another agent's token>`, or tries passphrases, gets exit 4 and cannot lock the user out.
 
 **Residual risk** (stated in `mesh help auth` and `docs/usage.md`). A same-uid process that ignores the rules (a compromised or prompt-injected executor with shell or file-edit access, or any other program the user runs) can:
-- read any file the user can read, including other agents' Mesh token files (e.g. Grok Bot's relayer token), and use them from outside a run session (after `setsid` plus a double fork, or with a cleared environment), which defeats run-session binding;
+- read any file the user can read, including other agents' Mesh token files (e.g. a helper agent's relayer token), and use them from outside a run session (after `setsid` plus a double fork, or with a cleared environment), which defeats run-session binding;
 - read run tokens from other processes' environment or memory;
 - with a stolen relayer token, forge **relayed** approvals; with a stolen lead token, act as the lead (assign, accept, complete);
 - read or modify `mesh.db` directly, kill meshd, or send wrong passphrases from outside a run to trigger the lockout (denial of service);
@@ -634,7 +634,7 @@ Mesh cannot prevent these in v1. After either of the last two, neither the user 
 - **History is kept.** Tasks, events, deliverables, notes (`project note`), and all lead assignments stay. `mesh project leads <prj>` lists the full history. The handover message contains the goal, the criteria, a task table with states, the last 20 lead notes, open approvals, and the last 50 events.
 - **Lead workspace.** `$MESH_HOME/workspaces/<prj>/lead/<agent_id>/` is separate per lead, so notes and files survive changes. For repo projects it contains `repo/`, a **detached** worktree at the integration branch head, refreshed at the start of each lead turn when it is clean. It is never an executor's worktree.
 - **Lead work loop.** Lead-turn mechanics are in §12.4. Inbox-mode leads use the same commands through their own token.
-- **Completion.** `project complete --report -` with JSON `{"criteria":[{"id":"crit_…","met":true,"evidence":"…"}],"summary":"…"}` (guards P4). The user is notified. The user does not re-confirm (CONFIRMED requirement). Mesh checks the report's **structure and coverage**, not its truth. Grok Bot's final acceptance happens outside Mesh.
+- **Completion.** `project complete --report -` with JSON `{"criteria":[{"id":"crit_…","met":true,"evidence":"…"}],"summary":"…"}` (guards P4). The user is notified. The user does not re-confirm (CONFIRMED requirement). Mesh checks the report's **structure and coverage**, not its truth. a helper agent's final acceptance happens outside Mesh.
 
 ---
 
@@ -834,14 +834,14 @@ The `events` table is append-only (enforced by triggers) and hash-chained. `mesh
 
 - Insertion uses `INSERT … ON CONFLICT(dedup_key) DO NOTHING`. A replayed request or a re-run recovery step therefore never creates a second message.
 - `inbox ack` is idempotent (acking an already-acked message returns exit 0).
-- The "origin agent" is `projects.origin_principal_id`, usually Grok Bot. Messages to it marked `for_user:true` are how the user hears about completion, escalations, and approval requests through their chat agent.
+- The "origin agent" is `projects.origin_principal_id`, usually a helper agent. Messages to it marked `for_user:true` are how the user hears about completion, escalations, and approval requests through their chat agent.
 
 ### 12.3 How each kind of agent actually receives work (no magic push)
 | Agent kind | Mechanism | What wakes it | Model-quota cost while idle |
 |---|---|---|---|
 | Executor, `delivery=launch` (droid/agy/kiro/vibe headless) | Mesh starts a **new headless process** per attempt. For rework or retry, it **resumes the vendor session** (`droid exec -s`, `agy --conversation`, `kiro-cli chat --resume-id`, `vibe --resume`) **only if** that adapter's resume capability is smoke-verified and a session id was captured. Otherwise it starts a fresh process with the prior deliverable and the feedback in the prompt. | The scheduler (T5) | none |
 | Lead, `delivery=launch` | **Lead turn**: a new headless run in the lead dir (resuming the lead session when verified). It is triggered by pending lead messages after a debounce (§12.4). | The scheduler | one run per batch |
-| Already-running agent, `delivery=inbox` (Grok Bot, an interactive Kiro or droid session the user keeps open, any agent that can run shell commands) | The agent must call **`mesh inbox wait --timeout N`**. This blocks on the Unix socket with no model tokens and returns as soon as a message exists, or with exit 8 on timeout. Alternatively it calls `mesh inbox list` on its own schedule. It then acks with `mesh inbox ack <msg>`. | Only its own next `inbox wait/list` call | none while blocked; whether a vendor harness allows a long blocking tool call is vendor-specific (UNVERIFIED) |
+| Already-running agent, `delivery=inbox` (a helper agent, an interactive Kiro or droid session the user keeps open, any agent that can run shell commands) | The agent must call **`mesh inbox wait --timeout N`**. This blocks on the Unix socket with no model tokens and returns as soon as a message exists, or with exit 8 on timeout. Alternatively it calls `mesh inbox list` on its own schedule. It then acks with `mesh inbox ack <msg>`. | Only its own next `inbox wait/list` call | none while blocked; whether a vendor harness allows a long blocking tool call is vendor-specific (UNVERIFIED) |
 | User | User inbox (`mesh inbox list --user`), plus copies to the origin agent's inbox for relaying. An optional `notify.command` hook (M4) runs a user-supplied argv with the message JSON on stdin. | the user or the origin agent | none |
 
 **What is not possible in v1:** Mesh cannot inject text into a running interactive TUI session. Long-lived bidirectional sessions over ACP or JSON-RPC (`agy acp`, `kiro-cli serve`, `vibe-acp`, `droid exec --input-format stream-jsonrpc`) would allow real push. They are research for M5, not v1.
@@ -995,7 +995,7 @@ argparse usage errors MUST be converted to the JSON envelope with exit 2 (overri
   - `request_hash` covers cmd + args **including** `approval`, and excludes auth, `idempotency_key`, `dry_run`, and `format`. So: key K → exit 7 (not stored) → the same op with key K and `--approval A` executes and is stored → replaying that exact request returns the stored response → key K without `--approval` afterwards → exit 6 `IDEMPOTENCY_KEY_REUSED`.
 - **Dry run.** `--dry-run` runs auth, authz, validation, and the transition checks inside a tx, then rolls back. It returns the same exit code the real call would return. It writes no events, outbox rows, or idempotency rows, and it spawns no processes and runs no git commands. It never creates approval rows: a gated op in dry-run returns exit 7 with `approval_id: null` and the computed `op_hash`.
 
-### 13.5 End-to-end example (user and Grok Bot)
+### 13.5 End-to-end example (user and a helper agent)
 ```sh
 mesh init                                      # prompts for the passphrase on /dev/tty
 mesh daemon start
@@ -1003,15 +1003,15 @@ mesh agent create --user --name kiro-lead --adapter kiro --default-model claude-
      --allowed-model claude-opus-5.5 --allowed-model claude-sonnet-5.5 --max-concurrency 1 --can-lead
 mesh agent create --user --name agy-impl --adapter agy --default-model gemini-3.8-flash-high \
      --allowed-model gemini-3.8-flash-high --allowed-model gemini-3.8-flash-medium --max-concurrency 2
-mesh agent create --user --name grokbot --adapter none --delivery inbox --max-concurrency 1 --capability relay
-mesh agent token issue grokbot --user | jq -r .data.token > ~/.config/grokbot-mesh.token && chmod 600 ~/.config/grokbot-mesh.token
+mesh agent create --user --name helper --adapter none --delivery inbox --max-concurrency 1 --capability relay
+mesh agent token issue helper --user | jq -r .data.token > ~/.config/helper-mesh.token && chmod 600 ~/.config/helper-mesh.token
 # keep token files outside every workspace; any same-uid process can still read them (§7.6)
 mesh config set lead.default_agent '"kiro-lead"' --user
-# Grok Bot (its own token):
-mesh intake submit --token-file ~/.config/grokbot-mesh.token --title "Add CSV export" \
+# a helper agent (its own token):
+mesh intake submit --token-file ~/.config/helper-mesh.token --title "Add CSV export" \
      --goal "…" --criterion "export button produces RFC4180 CSV" --repo /path/repo \
      --base-branch main --test-command '["python3","-m","unittest"]'
-mesh inbox wait --token-file ~/.config/grokbot-mesh.token --timeout 10m   # completion / approvals for the user
+mesh inbox wait --token-file ~/.config/helper-mesh.token --timeout 10m   # completion / approvals for the user
 ```
 
 ---
@@ -1416,7 +1416,7 @@ Separate OS users for meshd and executors, ACP/JSON-RPC long-lived sessions for 
   - A14: the old lead after `set-lead` → 4 `NOT_PROJECT_LEAD`.
   - A15: consumption by a non-requester → 4.
   - A16: direct DB tampering (the test sets an approval to `approved` with a bogus `user_mac` via sqlite) → `audit verify --user` exits 12 and lists the id. This is a DB-only forgery; code tampering and passphrase capture are not testable defenses (§7.6 residual risk).
-  - A17: `approval show` distinguishes `direct` (`trust:"direct_verified"`) from `relayed (unverified; by grokbot)` (`trust:"relayed_unverified"`) and includes the statement; `approval check` returns `trust` too.
+  - A17: `approval show` distinguishes `direct` (`trust:"direct_verified"`) from `relayed (unverified; by helper)` (`trust:"relayed_unverified"`) and includes the statement; `approval check` returns `trust` too.
   - A18: fake `steal_token` inside a launched run uses grok's token file for `approval approve --relayed` and lead1's for `task accept` → each 4 `CREDENTIAL_NOT_ALLOWED_IN_RUN`; the approval stays `pending`; an `auth.credential_in_run` event exists.
   - A19: fake `bad_passphrase` with count 6 inside a run → each 4 `CREDENTIAL_NOT_ALLOWED_IN_RUN`; `auth_failures` gains no rows; the user's next direct command succeeds (no `LOCKED_OUT`).
   - A20: default policy: a relayed approve of a `permission_escalation` approval → 12 `CHANNEL_NOT_ALLOWED`; a direct approve works.
@@ -1467,7 +1467,7 @@ See §14.10. They are never part of `scripts/test.sh`.
 
 | # | Question / risk | Impact | How it will be resolved |
 |---|---|---|---|
-| Q1 | Where does Grok Bot run? Can it execute `mesh` on this box? (`/home/box/.local/bin/grok` exists, but whether it is "Grok Bot" is unknown.) | If Grok Bot is remote, v1 has no network interface, so intake would need a local bridge (out of scope). | Ask the user before M2. M1 works with any local agent. |
+| Q1 | Where does a helper agent run? Can it execute `mesh` on this box? (`$HOME/.local/bin/grok` exists, but whether it is "a helper agent" is unknown.) | If a helper agent is remote, v1 has no network interface, so intake would need a local bridge (out of scope). | Ask the user before M2. M1 works with any local agent. |
 | Q2 | Which products are "Hermes" and "OpenClaw", and will they be installed here? | The adapters stay `not_installed`. | User input. Then M4 probe and smoke. |
 | Q3 | Default relayed-approval policy per category (§18.7). r2 makes `permission_escalation` `direct_only` by default; the others stay `direct_or_relayed`. | Security vs. convenience: a stolen relayer token can forge relayed approvals (§7.6). | User decision; a setting, no code change. Recommended: `direct_only` for `spend_money`, `deploy`, `delete_external`. |
 | Q4 | Should `deliver_to_base` require user approval (§18.5)? | Policy. | User decision; a setting. |
@@ -1480,7 +1480,7 @@ See §14.10. They are never part of `scripts/test.sh`.
 | Q11 | Python cannot reliably zero secrets in memory. | The passphrase and `K_user` stay in memory transiently, where a same-uid process can read them (§7.6 residual risk). | Documented. Minimize their lifetime. |
 | Q12 | Whether vendor harnesses allow long blocking tool calls (`mesh inbox wait --timeout 10m`). | Inbox-mode latency and cost. | Per-agent recommendation in `docs/usage.md` after M3 observation; shorter waits in a loop are fine. |
 | Q13 | agy changed version between the requirements (1.4.8) and planning (1.5.2). | CLI drift. | Probe-time version recording and `stale` verification marks. |
-| Q14 | Mesh checks the structure of the completion report, not its truth. | A lead could mark criteria met falsely. | By design. Grok Bot's final acceptance is outside Mesh. |
+| Q14 | Mesh checks the structure of the completion report, not its truth. | A lead could mark criteria met falsely. | By design. a helper agent's final acceptance is outside Mesh. |
 | Q15 | Socket path limit (108 bytes) with custom `MESH_HOME` paths. | Startup failure. | A clear `SOCKET_PATH_TOO_LONG` error. |
 | Q16 | The committed fixtures (§14.11) do not record the exact command per file or separate `--version` outputs. | Weaker provenance for parse tests. | Hashes are pinned in §14.11 and checked by `test_fixture_hashes`. New M3 captures carry `.meta.json` sidecars. |
 | Q17 | Profiles that cannot be expressed narrowly: agy `dev` (semantics of `--mode auto` unknown), agy `elevated`, kiro `dev` (shell tool name unknown), kiro `elevated`, vibe `elevated`. | Those adapters refuse those profiles (exit 13). | M3 smoke (S-AGY-8, S-KIRO-8) may enable agy and kiro `dev`. `elevated` stays unsupported unless a vendor adds a middle tier. |

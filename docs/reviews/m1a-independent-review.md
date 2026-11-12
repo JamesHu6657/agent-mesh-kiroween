@@ -1,6 +1,6 @@
 # M1a independent acceptance: /workspace/mesh-fresh-v1
 
-Reviewer: Grok Bot (independent executor subagent). Time: 2026-11-07, 16:50–17:05 (UTC+8). HEAD reviewed: `207a21d`.
+Reviewer: a helper agent (independent executor subagent). Time: 2026-11-07, 16:50–17:05 (UTC+8). HEAD reviewed: `207a21d`.
 Scope: I read the code and docs and ran isolated tests only. I modified nothing in the repo, invoked no real vendor CLI (the shims stayed on PATH and the tripwire stayed empty), and did not start M1b. All my temp homes were under `/tmp/mr*`. Each was cleaned up, and no meshd processes are left running.
 
 ## Verdict: **REVISE**

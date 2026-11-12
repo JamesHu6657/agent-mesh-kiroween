@@ -11,11 +11,11 @@ Created on 2026-11-09 by the Kiro spec writer (`.kiro/agents/mesh-specwriter.jso
 ## Coordination sessions (before Quest took over on 2026-11-07 ~21:37 UTC+8)
 | Date | Feature | What | Source | Credits |
 |---|---|---|---|---|
-| 2026-11-07 19:08 UTC+8 | M1b coordination | Headless Kiro coordinator (claude-opus-5.5, effort high) took over from Grok Bot, verified M1.5 and dispatched agy m1b-step6 | log.md 19:08–19:24 | not recorded |
-| 2026-11-07 19:34–21:22 UTC+8 | Infrastructure | Kiro session in Paseo (de097bf7) coordinated the moves to jamesbar and then agent37, and resolved the agy real-path BLOCKED item | log.md 19:34–21:22 | not recorded |
-| 2026-11-07 ~20:45 and ~21:10 UTC+8 | Infrastructure | Kiro smoke checks with the mesh-coordinator profile on jamesbar and on agent37 (`KIRO_SMOKE_OK`) | log.md ~20:45, ~21:10 | not recorded |
-| 2026-11-07 20:47 UTC+8 | M1b coordination | Headless coordinator took over on jamesbar | log.md 20:47 | not recorded |
-| 2026-11-07 21:10–21:37 UTC+8 | M1b coordination | Headless coordinator on agent37: wrote BLOCKED.md, then dispatched agy m1b-step6d; stopped by Quest at ~21:37 | log.md 21:10–21:37 | not recorded |
+| 2026-11-07 19:08 UTC+8 | M1b coordination | Headless Kiro coordinator (claude-opus-5.5, effort high) took over from a helper agent, verified M1.5 and dispatched agy m1b-step6 | log.md 19:08–19:24 | not recorded |
+| 2026-11-07 19:34–21:22 UTC+8 | Infrastructure | Kiro session in Paseo (<session>) coordinated the moves to vps1 and then devbox, and resolved the agy real-path BLOCKED item | log.md 19:34–21:22 | not recorded |
+| 2026-11-07 ~20:45 and ~21:10 UTC+8 | Infrastructure | Kiro smoke checks with the mesh-coordinator profile on vps1 and on devbox (`KIRO_SMOKE_OK`) | log.md ~20:45, ~21:10 | not recorded |
+| 2026-11-07 20:47 UTC+8 | M1b coordination | Headless coordinator took over on vps1 | log.md 20:47 | not recorded |
+| 2026-11-07 21:10–21:37 UTC+8 | M1b coordination | Headless coordinator on devbox: wrote BLOCKED.md, then dispatched agy m1b-step6d; stopped by Quest at ~21:37 | log.md 21:10–21:37 | not recorded |
 
 ## Reviews, plan drafts and gate checks (Kiro as on-demand reviewer/planner, profile mesh-reviewer)
 | Date | Feature | What | Source | Credits |

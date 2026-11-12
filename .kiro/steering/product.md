@@ -13,7 +13,7 @@ Agent Mesh is a local coordinator for CLI coding agents on one Linux machine (re
 - **The user (James)** holds the only passphrase and approves important decisions: spending, deleting, deploying, major scope changes (requirements §3, plan §7.4).
 - **A lead agent per project** decomposes work, assigns executors directly (no claim market), accepts or rejects deliverables, merges, and completes the project against its acceptance criteria (requirements §1, plan §6, §8).
 - **Executors** are either launched by Mesh as headless CLI processes or notified through their inbox (requirements §2, plan §12.3).
-- **A relayer** (Grok Bot in the plan examples) may carry relayed user decisions, which Mesh labels `relayed (unverified)` (plan §7.5).
+- **A relayer** (a helper agent in the plan examples) may carry relayed user decisions, which Mesh labels `relayed (unverified)` (plan §7.5).
 
 ## Core behaviour
 - Projects, tasks, runs, leases, approvals and the outbox are state machines with one event per transition (plan §5–§6).

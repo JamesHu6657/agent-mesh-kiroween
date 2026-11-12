@@ -182,11 +182,11 @@ Current `origin/main` (`be54a3c`, includes #17) merged into the branch first: me
    `fdd550d`: 485 / 278 / 49 tests, unit 34 s + integration 441 s + recovery 43 s = 518 s,
    against main 543 s there. Main `be54a3c` (after #17) is 559 s on that box.
 
-### Full `scripts/test.sh` after the fix round (grokbot-box, idle, nothing else running)
+### Full `scripts/test.sh` after the fix round (helper-box, idle, nothing else running)
 
 Branch at the fix-round commit (main `be54a3c` merged; unit count is higher than Quest's
 485 because #17 added unit tests). These two full-suite runs (219 s and 232 s) are on
-`grokbot-box`, not `base`; the `base` number (518 s vs 543 s on `fdd550d`, and 559 s on
+`helper-box`, not `base`; the `base` number (518 s vs 543 s on `fdd550d`, and 559 s on
 `be54a3c` after #17; fix-round head not re-measured on `base`) is the one that counts for
 the A1 target (full suite `< 600 s` with rc 0 on `base`).
 
@@ -197,7 +197,7 @@ the A1 target (full suite `< 600 s` with rc 0 on `base`).
 
 ## Target
 
-On `grokbot-box` the integration tier was already under 380 s: 164.8 s (216 s total) before
+On `helper-box` the integration tier was already under 380 s: 164.8 s (216 s total) before
 merging `be54a3c`, and 167.4 to 178.9 s (219 to 232 s total) after the fix round above. On
 `base` (which counts for the `< 600 s` full-suite A1 target: 518 s total with 441 s
 integration vs 543 s on `fdd550d` and 559 s on `be54a3c`, down from an earlier 457 s

@@ -6,6 +6,11 @@ P2-5 idempotency replay: a run token scoped to project A cannot replay a cached
 P2-6 project.complete: an accepted but unmerged code task blocks completion.
 P2-7 disabled agents: queued work of a disabled launch agent is never started.
 P2-8 dep.add: an already-queued task cannot gain an unfinished prerequisite.
+
+Re-review (Linear Agent chat @dbc6a5b):
+R-1 an open event.tail stream stops once its credential is revoked/expired or the lead
+    assignment is superseded (authority re-checked before every batch).
+R-2 task.retry applies the T4 readiness guards: no retry past an unfinished prerequisite.
 """
 
 import json
@@ -103,6 +108,25 @@ class TestDepAddOnQueuedTask(_DbCase):
         self.add()
 
 
+class TestRetryRespectsDeps(_DbCase):
+    def test_retry_with_unfinished_prerequisite_rejected(self):
+        from mesh.daemon.handlers.task import handle_task_retry
+
+        x = self.conn.execute
+        x("INSERT INTO principals (id, kind, name, created_at) VALUES ('agt_i','agent','ibx','now');")
+        x("INSERT INTO agents (id, adapter, delivery, max_concurrency, created_at, updated_at) "
+          "VALUES ('agt_i','none','inbox',1,'now','now');")
+        self.conn.commit()
+        self.task("tsk_a", "general", "failed", assignee="agt_i")
+        self.task("tsk_b", "general", "created")
+        handle_dep_add(self.ctx("dep.add", {"task_id": "tsk_a", "on": "tsk_b"}))  # allowed: A is not queued
+        with self.assertRaises(MeshError) as cm:
+            handle_task_retry(self.ctx("task.retry", {"task_id": "tsk_a", "reason": "r"}))
+        self.assertEqual((cm.exception.code, cm.exception.exit_code), (c.INVALID_TRANSITION, c.EXIT_CONFLICT))
+        self.assertEqual(cm.exception.details["unfinished_tasks"], ["tsk_b"])
+        self.assertEqual(self.conn.execute("SELECT status FROM tasks WHERE id='tsk_a';").fetchone()["status"], "failed")
+
+
 class TestDisabledAgentNotLaunched(_DbCase):
     def test_disabled_launch_agent_queued_task_not_started(self):
         from mesh.daemon import supervisor
@@ -191,6 +215,57 @@ class TestRunTokenScopeOverSocket(unittest.TestCase):
                  if "raw_stdout" in r else [r])
         self.assertTrue(lines, r)
         self.assertEqual({e["project_id"] for e in lines}, {self.prj["a"]})
+
+    def _tail_proc(self, token, seconds):
+        import subprocess
+
+        path = os.path.join(self.h.fixtures_dir, f"tail-{time.monotonic_ns()}.tok")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(token)
+        os.chmod(path, 0o600)
+        return subprocess.Popen(
+            [self.h.bin_mesh, "--home", self.h.home, "--token-file", path,
+             "event", "tail", "--timeout", f"{seconds}s"],
+            env=self.h.get_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def _note_a(self, text):
+        rc, r = self.h.cli("project", "note", self.prj["a"], "--text", text, user=True)
+        self.assertEqual(rc, 0, r)
+
+    def _stream_stops_after(self, invalidate):
+        proc = self._tail_proc(self.rt["a"], 8)
+        time.sleep(1.5)
+        self._note_a("before-invalidation")
+        time.sleep(1.0)
+        invalidate()
+        time.sleep(1.0)
+        self._note_a("after-invalidation")
+        out, _err = proc.communicate(timeout=20)
+        self.assertIn("before-invalidation", out)
+        self.assertNotIn("after-invalidation", out)
+
+    def _db(self, sql, params=()):
+        conn = sqlite3.connect(os.path.join(self.h.home, "mesh.db"), timeout=10.0)
+        try:
+            conn.execute(sql, params)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_tail_stops_when_token_revoked(self):
+        self._stream_stops_after(lambda: self._db(
+            "UPDATE credentials SET revoked_at = ? WHERE kind = 'run_token' "
+            "AND json_extract(scope_json, '$.project_id') = ?;", (now_iso_utc(), self.prj["a"])))
+
+    def test_tail_stops_when_lead_superseded(self):
+        def supersede():
+            # A new assignment replaces the token's one (keeps invariant I5: one active lead).
+            self._db("UPDATE lead_assignments SET ended_at = ?, ended_reason = 'test' WHERE id = ?;",
+                     (now_iso_utc(), self.asg["a"]))
+            self._db("INSERT INTO lead_assignments (id, project_id, agent_id, assigned_by, via, started_at) "
+                     "SELECT 'asg_p2_new', project_id, agent_id, assigned_by, via, ? FROM lead_assignments WHERE id = ?;",
+                     (now_iso_utc(), self.asg["a"]))
+        self._stream_stops_after(supersede)
 
     def test_replay_does_not_cross_scope(self):
         from mesh.client import MeshClient

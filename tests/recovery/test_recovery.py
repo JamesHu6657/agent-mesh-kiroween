@@ -616,6 +616,14 @@ class TestRecoveryBranches(RecoveryBase):
         exit_path = os.path.join(run["run_dir"], "exit.json")
         self.assertTrue(self.harness.wait_for(lambda: os.path.exists(exit_path), timeout=20), "no exit.json")
         self.assertTrue(self.harness.wait_for(lambda: not _alive(run["wrapper_pid"]), timeout=10))
+        # The wrapper can die a moment before the rest of its process group (the fake agent
+        # and its children). Recovery then correctly defers the close (occupied-group gate)
+        # and the scheduler closes the run on a later tick, so under load the immediate
+        # status read below saw "running". This test covers the "exited while down" branch,
+        # whose precondition is an empty group: wait for it before restarting.
+        self.assertTrue(self.harness.wait_for(
+            lambda: not _group_members(run["pgid"]) and not _carriers(run["id"]), timeout=10),
+            "run group still occupied")
         self.harness.restart_daemon()
         self.assertEqual(self.status(task_id), "submitted")
         row = self.q1("SELECT status, exit_code FROM runs WHERE id = ?;", (run["id"],))

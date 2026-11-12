@@ -12,7 +12,7 @@ Legend: **[CONFIRMED]** = explicitly decided by the user (James). **[SUGGESTED]*
 - [SUGGESTED] No cloud repo / push / deploy is part of v1 development.
 
 ## 1. Task intake and the lead agent
-- [CONFIRMED] The user hands project work to the project's **lead agent** (主 agent) through Grok Bot or any other agent. Mesh must expose one unified task-intake entry usable by any agent.
+- [CONFIRMED] The user hands project work to the project's **lead agent** (主 agent) through a helper agent or any other agent. Mesh must expose one unified task-intake entry usable by any agent.
 - [CONFIRMED] The lead agent decomposes work and **directly assigns** executors (not a free-for-all claim market), collects deliverables, accepts / rejects (sends back for rework), and drives the project to completion, then notifies the user.
 - [CONFIRMED] Each project has a lead agent chosen by the user at creation; a configurable **global default** lead is used when none is given; the lead can be changed mid-project. Task history and context records persist across lead changes.
 - [CONFIRMED] Project completion: lead agent confirms completion against the project's acceptance criteria and then notifies the user. The user does not re-confirm completion.
@@ -49,4 +49,4 @@ Legend: **[CONFIRMED]** = explicitly decided by the user (James). **[SUGGESTED]*
 - [SUGGESTED] Non-interactive first; layered `--help` with examples; JSON output; stdin input; clear exit codes; idempotency keys; `--dry-run`; safe defaults; consistent `resource verb` structure. Logs must contain no secrets.
 
 ## 9. Pipeline for building this project
-- [CONFIRMED] Plan written by Factory droid (Opus 5.5); reviewed by Kiro CLI (Opus 5.5); implemented by agy (Gemini 3.8 Flash High); final acceptance by Grok Bot.
+- [CONFIRMED] Plan written by Factory droid (Opus 5.5); reviewed by Kiro CLI (Opus 5.5); implemented by agy (Gemini 3.8 Flash High); final acceptance by a helper agent.

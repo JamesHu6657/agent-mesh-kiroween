@@ -63,7 +63,7 @@ Test names are full dotted paths, except these short forms: `fp.` = `tests.integ
 | A5 | `m --help`; `m help env` | PASS | tests.unit.test_skeleton.TestSkeleton.test_no_forbidden_host_port_flags |
 | A7 | `grep -rnE '\.factory\|\.gemini\|\.kiro\|\.vibe' mesh` | PASS | tests.unit.test_skeleton.TestSkeleton.test_no_vendor_credential_paths |
 | A8 | `m doctor --check-invariants` on a fresh home and after every integration test (harness teardown) | PASS | tests.unit.test_doctor.TestDoctorCLI.test_doctor_check_invariants_fresh_home / _initialized_clean_db / _corrupted_db; tests.integration.test_execution_inbox.TestExecutionInbox.test_a8_doctor_check_invariants_while_running; tests.integration.test_execution_termination.TestTermination.test_h2_cancel_ignore_sigterm, test_h16_cancel_during_post_submit_grace + test_f8_accept_blocked_until_post_submit_grace_kill; tests.integration.test_execution_acc_run2.TestRun2Execution.test_d15_lowered_limit_no_kill; harness teardown |
-| A10 | `test_invariants_valid_states` | PASS | tests.unit.test_invariants.TestInvariants.test_invariants_valid_states, test_corrupted_i1…i6, test_corrupted_i8_cancelling_task_without_lease |
+| A10 | `test_invariants_valid_states` | PASS | tests.unit.test_invariants.TestInvariants.test_invariants_valid_states, test_corrupted_i1_lease_on_accepted_task … test_corrupted_i6_consumed_approval, test_corrupted_i8_cancelling_task_without_lease |
 | B1 | `m --help`; `m <resource> --help` for every resource; `m task create --help`; `m help … | PASS | tests.unit.test_skeleton.TestSkeleton.test_help_layers_and_examples |
 | B2 | `m agent show no-such-agent [U]`; `m task create --bogus [@lead1]` | PASS | tests.unit.test_skeleton.TestSkeleton.test_argparse_errors_envelope; tests.integration.test_agents.TestAgentsIntegration.test_agent_show_not_found |
 | B7 | Same failing command with `--format text` and with no format flag | PASS | tests.unit.test_skeleton.TestSkeleton.test_format_flag_identical_rc |
@@ -163,7 +163,7 @@ Test names are full dotted paths, except these short forms: `fp.` = `tests.integ
 | A9 | `git log --oneline`; check out, in a scratch clone, the first M1 commit, the middle one (index ⌊n/2⌋ of … | coordinator-verified | commit list in §5; checkouts by the coordinator in scratch clones |
 | C7 | F1 task on `fx` with `FAKE {"print_secrets":{}}`, meshd env has … | PASS | run2.TestRun2Secrets.test_c7_no_secret_in_home_or_outputs |
 | C8 | While a fake run sleeps: `tr '\0' ' ' </proc/<pid>/cmdline` for the wrapper and the child; `cat … | PASS | run2.TestRun2Execution.test_c8_no_token_in_argv_spec_or_run_show |
-| C15 | `test_python_isolation_flags`: task on `fx` with `FAKE … | PASS | term.TestTermination.test_c15_python_isolation_flags |
+| C15 | `test_c15_python_isolation_flags`: task on `fx` with `FAKE … | PASS | term.TestTermination.test_c15_python_isolation_flags |
 | D4 | Task on `fx` with no `--model`; then one with `--model m-b`; inspect `m run show` | PASS | run2.TestRun2Execution.test_d4_model_default_and_explicit |
 | D6 | Fill both `fx` slots with sleeping tasks; queue a task with `--model m-b`; then `m agent update fx … | PASS | run2.TestRun2Execution.test_d6_queued_model_removed_from_allow_list |
 | D11 | `fx` max 2; create 5 tasks with `FAKE … | PASS | run2.TestRun2Execution.test_d11_concurrency_limit_two |
@@ -291,15 +291,15 @@ Tags: the step each commit belongs to (from the run/branch it was made in), not 
 | 37 | `0637e78` | coord | chore(coord): migration aborts unless Paseo ACP auto-accept is verifiably off |
 | 38 | `0b69d98` | coord | docs(coord): M1.5 verified; agy M1.6 prompt |
 | 39 | `75c8492` | coord | docs(coord): coordination moved to Paseo session de097bf7 |
-| 40 | `73e3b34` | coord | chore(coord): move project to VPS jamesbar; agy via local WARP proxy; M1.6 resume prompt |
+| 40 | `73e3b34` | coord | chore(coord): move project to VPS vps1; agy via local WARP proxy; M1.6 resume prompt |
 | 41 | `0bf73ba` | coord | docs(coord): VPS coordinator takeover; review M1.7 prompt |
 | 42 | `7ca8231` | M1.6 | feat(m1b): state machine definitions and exhaustive transition tests |
-| 43 | `428943a` | coord | chore(coord): move project to Agent37 instance <instance> (HANDOFF §10 migration checklist); M1.6 resume prompt step6c |
-| 44 | `3098748` | coord | docs(coord): agent37 takeover; m1b-step6c write-denied (symlink path); BLOCKED on agy settings path |
-| 45 | `52fc5c9` | coord | chore(coord): agy settings allow the real path of the repo on agent37 (symlinked /workspace) |
+| 43 | `428943a` | coord | chore(coord): move project to Devbox instance <instance> (HANDOFF §10 migration checklist); M1.6 resume prompt step6c |
+| 44 | `3098748` | coord | docs(coord): devbox takeover; m1b-step6c write-denied (symlink path); BLOCKED on agy settings path |
+| 45 | `52fc5c9` | coord | chore(coord): agy settings allow the real path of the repo on devbox (symlinked /workspace) |
 | 46 | `0c3cc31` | coord | docs(coord): resolve BLOCKED (agy real-path permission fixed in 52fc5c9); restart coordinator |
-| 47 | `08eef08` | coord | docs: handoff to Quest (supervision of the agent37 run) |
-| 48 | `98ced1c` | coord | docs: jamesbar repo copy deleted at James's request |
+| 47 | `08eef08` | coord | docs: handoff to Quest (supervision of the devbox run) |
+| 48 | `98ced1c` | coord | docs: vps1 repo copy deleted at James's request |
 | 49 | `8761ec6` | M1.6 | feat(m1b): task create, show, list, cancel and task/project deps |
 | 50 | `27a3949` | M1.6 | feat(m1b): scheduler promotion and queue ordering |
 | 51 | `657cf79` | coord | docs(coord): Quest coordinates; Kiro becomes on-demand reviewer/planner (HANDOFF §11, mesh-reviewer profile, kiro-review/plan wrappers) |
@@ -447,7 +447,7 @@ Tags: the step each commit belongs to (from the run/branch it was made in), not 
 5. Tick order: sweeps → watch → T6 → promote → T6 → start. exit.json is the source of truth for run outcome.
 6. **E17:** the no_response clock is reset while the task is blocked (project paused, or agent at its concurrency limit) and restarts when it unblocks; `offered_at` is the start of the acknowledgement window.
 7. Project cancel without `--cancel-running` still cancels running tasks, through `cancelling`.
-8. H17 escapee uses `ignore_sigterm` and `kill.grace_s = 2` so the `RUN_STILL_ACTIVE` window is observable. C15 spec adds a 2 s sleep so the wrapper cmdline can be read; the test is named `test_c15_python_isolation_flags` (checklist: `test_python_isolation_flags`).
+8. H17 escapee uses `ignore_sigterm` and `kill.grace_s = 2` so the `RUN_STILL_ACTIVE` window is observable. C15 spec adds a 2 s sleep so the wrapper cmdline can be read; the test is named `test_c15_python_isolation_flags` (the checklist row calls it "python isolation flags").
 9. After `task fail` (pending failure) the agent may run until its deadline; the plan gives no grace for this case.
 10. `spawn_failed` deletes the lease without a target scan (Popen raised, so no child exists).
 11. Recovery runs on every boot; lost runs are never signalled; `lost_before_spawn` never respawns. A lost run with a pending `task fail` closes as `lost_on_restart`; the reported message is not carried over.

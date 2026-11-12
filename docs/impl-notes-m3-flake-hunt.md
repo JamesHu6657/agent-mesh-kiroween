@@ -1,4 +1,4 @@
-# m3-flake-hunt: implementation notes (Grok Bot, 2026-11-10)
+# m3-flake-hunt: implementation notes (a helper agent, 2026-11-10)
 
 Test-only fix for two load-sensitive unit modules. Branch `grok/m3-flake-hunt` from
 `origin/main` (256bc6e). Changed: `tests/unit/test_termination_units.py`,
@@ -7,7 +7,7 @@ touched. No assertion was loosened and no retries were added.
 
 ## How it was measured
 
-Each module was run as `python3 -m unittest tests.unit.<module>` in a loop on grokbot-box
+Each module was run as `python3 -m unittest tests.unit.<module>` in a loop on helper-box
 (8 vCPU, gVisor), 30 runs per row:
 
 * **solo**: nothing else running.
@@ -97,4 +97,4 @@ product code; flagging it in case it matters for escapee detection.
 
 ## Tests
 
-`bash scripts/test.sh` (all three tiers) on grokbot-box; counts in the PR.
+`bash scripts/test.sh` (all three tiers) on helper-box; counts in the PR.

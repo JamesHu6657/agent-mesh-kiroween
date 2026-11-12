@@ -1,13 +1,13 @@
 You are now the COORDINATOR of the Agent Mesh v1 project in /workspace/mesh-fresh-v1 (Kiro CLI, claude-opus-5.5, effort high).
-On 2026-11-07 the project moved from the Grok Bot cloud PC to the VPS jamesbar and then to James's Agent37 instance <instance>
-(user node). You are a fresh Kiro session on agent37; earlier coordinator sessions (cloud PC, jamesbar) are stopped and not involved.
+On 2026-11-07 the project moved from the first cloud PC to the VPS vps1 and then to James's Devbox instance <instance>
+(user node). You are a fresh Kiro session on devbox; earlier coordinator sessions (cloud PC, vps1) are stopped and not involved.
 
 Step 0 (mandatory): read docs/HANDOFF.md fully (§10 describes the current machine; §9 is history), then the tail of docs/coordination/log.md, then run
 `bash scripts/coord/status.sh`. Append a one-line takeover entry (time from `date`, model/effort, agy run state, next action)
 to docs/coordination/log.md.
 
 Current state: M1a accepted @9893d7b. M1.5 Projects done @65cab96 (verified as progress). M1.6 Tasks: sub-step (1) is committed (7ca8231); runs m1b-step6 and
-m1b-step6b were interrupted by the machine moves; the re-run m1b-step6c (prompt prompts/agy-m1b-step6c.md) was dispatched on agent37
+m1b-step6b were interrupted by the machine moves; the re-run m1b-step6c (prompt prompts/agy-m1b-step6c.md) was dispatched on devbox
 just before you started. Find its PID with status.sh and wait for it. prompts/agy-m1b-step7.md (M1.7 Approvals + M1b gate
 report) is pre-drafted; review it against the plan before dispatching it after M1.6 is verified.
 

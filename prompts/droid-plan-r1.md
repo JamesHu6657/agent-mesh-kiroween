@@ -1,5 +1,5 @@
 You are the PLANNER for a brand-new project "Agent Mesh v1" in the current directory (a fresh git repo).
-Read docs/requirements.md carefully. Also inspect the real CLIs installed on this Linux box (read-only: run their --help / version / model-list commands only; do NOT start model sessions, log in, or change config): `droid exec --help`, `agy --help`, `agy models`, `/home/box/.local/bin/kiro-cli chat --help`, `kiro-cli chat --list-models -f json`, `vibe --help`, and check whether `hermes` / `openclaw` exist. Do not read any credential/token/cookie files.
+Read docs/requirements.md carefully. Also inspect the real CLIs installed on this Linux box (read-only: run their --help / version / model-list commands only; do NOT start model sessions, log in, or change config): `droid exec --help`, `agy --help`, `agy models`, `$HOME/.local/bin/kiro-cli chat --help`, `kiro-cli chat --list-models -f json`, `vibe --help`, and check whether `hermes` / `openclaw` exist. Do not read any credential/token/cookie files.
 
 Write exactly two files (and nothing else, no code):
 1. docs/plan.md — an implementation plan detailed enough that a separate implementer agent can build v1 without guessing. Must cover:
