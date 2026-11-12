@@ -4,7 +4,7 @@ import asyncio
 import json
 import sqlite3
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import mesh.constants as c
 from mesh.core.authz import check_authz, get_agent_capabilities, lead_run_token_scope
@@ -84,8 +84,18 @@ async def handle_event_tail_live(server: Any, ctx: HandlerContext, reader: Any, 
             # Pre-public re-review P2: authority is re-checked before every batch, so a
             # stream ends once its credential expires or is revoked, its principal is
             # disabled, or (for a lead run token) the lead assignment is superseded.
-            if not _stream_still_authorized(ctx, project_id, task_id):
+            fresh_caps = _stream_still_authorized(ctx, project_id, task_id)
+            if fresh_caps is None:
                 break
+            # Re-review P2: capabilities can change while the stream is open (e.g. relay
+            # removed), so the own-events filter is recomputed from the current set.
+            apply_own_filter = (
+                scope_project is None
+                and ctx.actor_kind != "user"
+                and "relay" not in fresh_caps
+                and not project_id
+                and not task_id
+            )
 
             query = """
             SELECT seq, id, ts, type, project_id, task_id, run_id, approval_id,
@@ -185,12 +195,13 @@ async def handle_event_tail_live(server: Any, ctx: HandlerContext, reader: Any, 
         server.active_streams = max(0, getattr(server, "active_streams", 1) - 1)
 
 
-def _stream_still_authorized(ctx: HandlerContext, project_id: Any, task_id: Any) -> bool:
-    """Re-validate an open event.tail stream: credential, principal and authorization."""
+def _stream_still_authorized(ctx: HandlerContext, project_id: Any, task_id: Any) -> Optional[List[str]]:
+    """Re-validate an open event.tail stream: credential, principal, current capabilities
+    and authorization. Returns the principal's current capabilities, or None to end it."""
     from mesh.core.clock import now_iso_utc
 
     if ctx.actor_kind == "user" and ctx.via == "direct":
-        return True
+        return list(ctx.principal.get("capabilities") or [])
     cred_id = ctx.principal.get("credential_id") or ctx.credential_id
     try:
         if cred_id:
@@ -198,19 +209,26 @@ def _stream_still_authorized(ctx: HandlerContext, project_id: Any, task_id: Any)
                 "SELECT expires_at, revoked_at FROM credentials WHERE id = ?;", (cred_id,)
             ).fetchone()
             if row is None or row["revoked_at"] is not None:
-                return False
+                return None
             if row["expires_at"] is not None and row["expires_at"] < now_iso_utc():
-                return False
+                return None
         pid = ctx.principal.get("id")
         if pid:
             prow = ctx.conn.execute("SELECT disabled_at FROM principals WHERE id = ?;", (pid,)).fetchone()
             if prow is None or prow["disabled_at"] is not None:
-                return False
-        check_authz(ctx.conn, "event.tail", ctx.principal, ctx.actor_kind, ctx.via,
+                return None
+        principal = dict(ctx.principal)
+        caps = list(principal.get("capabilities") or [])
+        if pid and ctx.actor_kind != "user":
+            caps = list(get_agent_capabilities(ctx.conn, pid) or [])
+            principal["capabilities"] = caps
+            if ctx.via == "relayed" and "relay" not in caps:
+                return None
+        check_authz(ctx.conn, "event.tail", principal, ctx.actor_kind, ctx.via,
                     project_id=project_id, task_id=task_id)
     except MeshError:
-        return False
-    return True
+        return None
+    return caps
 
 
 def _list_events(ctx: HandlerContext, op: str) -> HandlerResult:

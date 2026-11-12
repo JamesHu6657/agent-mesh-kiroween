@@ -10,6 +10,7 @@ P2-8 dep.add: an already-queued task cannot gain an unfinished prerequisite.
 Re-review (Linear Agent chat @dbc6a5b):
 R-1 an open event.tail stream stops once its credential is revoked/expired or the lead
     assignment is superseded (authority re-checked before every batch).
+R-3 an open event.tail stream re-reads the agent's capabilities each batch (relay removal).
 R-2 task.retry applies the T4 readiness guards: no retry past an unfinished prerequisite.
 """
 
@@ -266,6 +267,28 @@ class TestRunTokenScopeOverSocket(unittest.TestCase):
                      "SELECT 'asg_p2_new', project_id, agent_id, assigned_by, via, ? FROM lead_assignments WHERE id = ?;",
                      (now_iso_utc(), self.asg["a"]))
         self._stream_stops_after(supersede)
+
+    def test_tail_stops_seeing_others_when_relay_removed(self):
+        rc, r = self.h.setup_cli("agent", "create", "--name", "ag-relay", "--adapter", "none", "--delivery", "inbox",
+                                 "--max-concurrency", "1", "--capability", "relay", user=True)
+        self.assertEqual(rc, 0, r)
+        relay_id = r["data"]["id"]
+        rc, r = self.h.cli("agent", "token", "issue", "ag-relay", user=True)
+        self.assertEqual(rc, 0, r)
+
+        def drop_relay():
+            self._db("UPDATE agents SET capabilities_json = '[]' WHERE id = ?;", (relay_id,))
+
+        proc = self._tail_proc(r["data"]["token"], 8)
+        time.sleep(1.5)
+        self._note_a("before-invalidation")
+        time.sleep(1.0)
+        drop_relay()
+        time.sleep(1.0)
+        self._note_a("after-invalidation")
+        out, _err = proc.communicate(timeout=20)
+        self.assertIn("before-invalidation", out)
+        self.assertNotIn("after-invalidation", out)
 
     def test_replay_does_not_cross_scope(self):
         from mesh.client import MeshClient
