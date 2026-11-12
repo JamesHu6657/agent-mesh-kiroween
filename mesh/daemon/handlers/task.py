@@ -632,7 +632,8 @@ def handle_task_create(ctx: HandlerContext) -> HandlerResult:
 
     now = now_iso_utc()
     task_id = generate_id("tsk")
-    workspace_path = os.path.join(ctx.home, "workspaces", project_id, "tasks", task_id)
+    # Linear round 5 P2: honour the configured workspaces.root (was always $home/workspaces).
+    workspace_path = os.path.join(get_workspaces_root(ctx.conn, ctx.home), project_id, "tasks", task_id)
 
     ctx.conn.execute(
         """INSERT INTO tasks (

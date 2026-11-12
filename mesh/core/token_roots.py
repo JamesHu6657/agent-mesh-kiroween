@@ -13,7 +13,12 @@ from mesh.errors import MeshError
 
 
 def configured_roots(home: str) -> Tuple[Optional[str], List[str]]:
-    """(workspaces.root or None, registered repo paths) read from ``<home>/mesh.db``.
+    """(workspaces.root or None, protected paths) read from ``<home>/mesh.db``.
+
+    workspaces.root is normalised exactly as at runtime (``get_workspaces_root``: strip,
+    abspath). Protected paths are the registered repositories plus the project directory
+    of every persisted task workspace, so a workspace created under an earlier root stays
+    protected after the root changes (Linear round 5 P2).
 
     No database yet -> (None, []). A database that exists but cannot be inspected
     fails closed with TOKEN_FILE_INSECURE rather than silently protecting nothing.
@@ -28,11 +33,16 @@ def configured_roots(home: str) -> Tuple[Optional[str], List[str]]:
             row = conn.execute("SELECT value_json FROM settings WHERE key = 'workspaces.root';").fetchone()
             if row and row[0]:
                 val = json.loads(row[0])
-                if isinstance(val, str) and val:
-                    ws = os.path.expanduser(val)
-            repos = [rp for (rp,) in conn.execute(
+                if isinstance(val, str) and val.strip():
+                    ws = os.path.abspath(val.strip())
+            paths = [rp for (rp,) in conn.execute(
                 "SELECT DISTINCT repo_path FROM projects WHERE repo_path IS NOT NULL;") if rp]
-            return ws, repos
+            for (wp,) in conn.execute(
+                    "SELECT DISTINCT workspace_path FROM tasks WHERE workspace_path IS NOT NULL;"):
+                if wp:
+                    # <root>/<prj>/tasks/<tsk>[.aN]/ -> <root>/<prj> (also covers lead/ dirs)
+                    paths.append(os.path.dirname(os.path.dirname(os.path.normpath(wp))))
+            return ws, sorted(set(paths))
         finally:
             conn.close()
     except (sqlite3.Error, ValueError, OSError) as exc:

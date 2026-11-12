@@ -171,7 +171,12 @@ def load_evidence(adapter_id: str, testing_mode: bool, probed_version: Optional[
     """Judge the latest results file for ``adapter_id`` against ``probed_version``."""
     ev = Evidence(ok=False, probed_version=probed_version)
     rdir = results_dir(testing_mode, env)
-    path = smoke_schema.load_latest(str(rdir), adapter_id) if rdir else None
+    try:
+        path = smoke_schema.load_latest(str(rdir), adapter_id) if rdir else None
+    except OSError as exc:
+        # Linear round 5 P3: unreadable evidence is an evidence failure, not an internal error.
+        ev.reason, ev.errors = "evidence_invalid", [f"cannot list smoke results: {exc}"]
+        return ev
     if not path:
         ev.reason = "no_smoke_evidence"
         return ev
@@ -186,8 +191,12 @@ def load_evidence(adapter_id: str, testing_mode: bool, probed_version: Optional[
         return ev
     froot = fixture_root(testing_mode, env)
     root = REPO_ROOT if testing_mode else evidence_root(env)
-    errors = smoke_schema.validate(doc, str(root), fixture_root=str(froot) if froot else None)
-    side = smoke_schema._check_sidecar(path)
+    try:
+        errors = smoke_schema.validate(doc, str(root), fixture_root=str(froot) if froot else None)
+        side = smoke_schema._check_sidecar(path)
+    except OSError as exc:
+        ev.reason, ev.errors = "evidence_invalid", [f"cannot read smoke evidence: {exc}"]
+        return ev
     if side:
         errors.append(f"results file: {side}")
     if isinstance(doc, dict):

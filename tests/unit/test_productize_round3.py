@@ -37,6 +37,7 @@ class TestTokenDestination(_Tmp):
         conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, "
                      "updated_at TEXT NOT NULL, updated_by TEXT NOT NULL);")
         conn.execute("CREATE TABLE projects (id TEXT PRIMARY KEY, repo_path TEXT);")
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, workspace_path TEXT);")
         if ws_root:
             conn.execute("INSERT INTO settings VALUES ('workspaces.root', ?, 'now', 'test');", (json.dumps(ws_root),))
         if repo:
@@ -212,6 +213,62 @@ class TestRound4(_Tmp):
             checks = doctor_env.environment_checks(self.tmp, False)
         self.assertTrue(any(c["name"] == "platform" for c in checks))
         self.assertTrue(any(c["name"] == "git" for c in checks))
+
+
+class TestRound5(_Tmp):
+    """Linear Agent chat round 5 (@60604b0)."""
+
+    def _db(self, home, ws_value=None, task_paths=()):
+        os.makedirs(home, exist_ok=True)
+        conn = sqlite3.connect(os.path.join(home, "mesh.db"))
+        conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, "
+                     "updated_at TEXT NOT NULL, updated_by TEXT NOT NULL);")
+        conn.execute("CREATE TABLE projects (id TEXT PRIMARY KEY, repo_path TEXT);")
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, workspace_path TEXT);")
+        if ws_value is not None:
+            conn.execute("INSERT INTO settings VALUES ('workspaces.root', ?, 'now', 'test');", (json.dumps(ws_value),))
+        for i, wp in enumerate(task_paths):
+            conn.execute("INSERT INTO tasks VALUES (?, ?);", (f"tsk_{i}", wp))
+        conn.commit()
+        conn.close()
+
+    def test_root_normalised_like_runtime(self):
+        from mesh.core.token_roots import configured_roots
+
+        home, ws = os.path.join(self.tmp, "home"), os.path.join(self.tmp, "custom-ws")
+        os.makedirs(ws)
+        self._db(home, ws_value=ws + " ")
+        root, _paths = configured_roots(home)
+        self.assertEqual(root, ws)
+        with self.assertRaises(MeshError):
+            msetup._check_token_destination(home, os.path.join(ws, "prj_1", "tasks", "tsk_1", "lead.token"))
+
+    def test_workspaces_under_an_earlier_root_stay_protected(self):
+        old = os.path.join(self.tmp, "rootA")
+        wp = os.path.join(old, "prj_1", "tasks", "tsk_1") + "/"
+        os.makedirs(wp)
+        home = os.path.join(self.tmp, "home")
+        self._db(home, ws_value=os.path.join(self.tmp, "rootB"), task_paths=[wp])
+        with self.assertRaises(MeshError):
+            msetup._check_token_destination(home, os.path.join(wp, "lead.token"))
+        with self.assertRaises(MeshError):
+            msetup._check_token_destination(home, os.path.join(old, "prj_1", "lead", "agt", "lead.token"))
+
+    def test_unreadable_evidence_is_evidence_invalid(self):
+        from mesh.adapters import evidence, smoke_schema
+
+        with mock.patch.object(evidence, "results_dir", return_value=self.tmp), \
+                mock.patch.object(smoke_schema, "load_latest", side_effect=PermissionError(13, "denied")):
+            ev = evidence.load_evidence("droid", False, "1.6.0")
+        self.assertEqual((ev.ok, ev.reason), (False, "evidence_invalid"))
+        path = os.path.join(self.tmp, "droid-1.6.0.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"adapter": "droid", "version": "1.6.0", "cases": []}, f)
+        with mock.patch.object(evidence, "results_dir", return_value=self.tmp), \
+                mock.patch.object(smoke_schema, "load_latest", return_value=path), \
+                mock.patch.object(smoke_schema, "validate", side_effect=PermissionError(13, "denied")):
+            ev = evidence.load_evidence("droid", False, "1.6.0")
+        self.assertEqual((ev.ok, ev.reason), (False, "evidence_invalid"))
 
 
 def _client_token(client, tok):

@@ -290,6 +290,22 @@ class TestRunTokenScopeOverSocket(unittest.TestCase):
         self.assertIn("before-invalidation", out)
         self.assertNotIn("after-invalidation", out)
 
+    def test_task_create_uses_configured_workspaces_root(self):
+        """Linear round 5 P2: task creation honoured only $home/workspaces."""
+        root = os.path.join(self.h.fixtures_dir, "custom-ws")
+        os.makedirs(root, mode=0o700)
+        self._db("INSERT OR REPLACE INTO settings (key, value_json, updated_at, updated_by) "
+                 "VALUES ('workspaces.root', ?, ?, 'test');", (json.dumps(root + " "), now_iso_utc()))
+        rc, r = self.h.cli("task", "create", "--project", self.prj["a"], "--title", "t", "--spec", "s", user=True)
+        self.assertEqual(rc, 0, r)
+        conn = sqlite3.connect(os.path.join(self.h.home, "mesh.db"), timeout=10.0)
+        try:
+            wp = conn.execute("SELECT workspace_path FROM tasks WHERE id = ?;", (r["data"]["id"],)).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertTrue(wp.startswith(root + os.sep), wp)
+        self._db("DELETE FROM settings WHERE key = 'workspaces.root';")
+
     def test_replay_does_not_cross_scope(self):
         from mesh.client import MeshClient
 
