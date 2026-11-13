@@ -15,6 +15,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import mesh.constants as c
 from tests.integration import test_merge as tm
+from tests.integration.test_lead_actions import LeadActionCase, _fake_goal
+from tests.integration.test_lead_turns import create_agent
 
 GATE_SCRIPT = ("import os, sys, time\n"
                "g = sys.argv[1]\n"
@@ -186,6 +188,66 @@ class TestP27DeliverPruneMergeLease(MergeGateCase):
         self.assertEqual([(s["task_id"], s["reason"]) for s in resp["data"]["skipped"]],
                          [(tsk_o, "merge_in_progress")], resp)
         self.finish_merge(th, box, gate)
+
+
+class TestP26SerialLeadMerges(LeadActionCase):
+    """P2-6: two `task.merge` actions of one project in one lead turn run one after the other."""
+
+    needs_git = True
+
+    def _submitted_code_task(self, project_id: str, tok_ibx: str, name: str) -> str:
+        rc, resp = self.harness.cli("task", "create", "--project", project_id, "--title", name,
+                                    "--spec", "edit", "--assignee", "ibx", "--kind", "code", user=True)
+        self.assertEqual(rc, 0, resp)
+        task_id = resp["data"]["id"]
+        self.assertTrue(self.harness.wait_for(lambda: self._task_status(task_id) == "queued",
+                                              timeout=15.0, step=0.1))
+        rc, st = self.harness.cli("task", "start", task_id, token=tok_ibx)
+        self.assertEqual(rc, 0, st)
+        ws = st["data"]["workspace"]
+        with open(os.path.join(ws, f"{name}.txt"), "w", encoding="utf-8") as f:
+            f.write(f"{name}\n")
+        self.fixture.git(ws, "add", f"{name}.txt")
+        self.fixture.git(ws, "commit", "-m", name, identity=True)
+        rc, resp = self.harness.cli("task", "submit", task_id, "--run", st["data"]["run_id"],
+                                    "--fence", str(st["data"]["fence"]), "--summary", "done", token=tok_ibx)
+        self.assertEqual(rc, 0, resp)
+        return task_id
+
+    def test_two_merges_of_one_project_in_one_round_do_not_collide(self) -> None:
+        assert self.fixture is not None
+        tok_ibx = create_agent(self.harness, "ibx", adapter="none", delivery="inbox")
+        repo = self.fixture.make_k0("SER")
+        slow = json.dumps(["python3", "-c", "import time; time.sleep(1.5)"])  # holds the merge lease
+        rc, resp = self.harness.cli("intake", "submit", "--title", "Serial merges", "--goal", "g",
+                                    "--criterion", "C1", "--lead", "flead", "--repo", repo,
+                                    "--base-branch", "main", "--test-command", slow, token=self.tok_grok)
+        self.assertEqual(rc, 0, resp)
+        project_id = resp["data"]["id"]
+        a = self._submitted_code_task(project_id, tok_ibx, "alpha")
+        b = self._submitted_code_task(project_id, tok_ibx, "beta")
+        self._set_actions(project_id, [
+            {"cmd": "task.accept", "args": {"task": a}},
+            {"cmd": "task.accept", "args": {"task": b}},
+            {"cmd": "task.merge", "args": {"task": a}},
+            {"cmd": "task.merge", "args": {"task": b}},
+        ], "merge both")
+        self.assertTrue(self.harness.wait_for(
+            lambda: self._task_status(a) == "merged" and self._task_status(b) == "merged",
+            timeout=90.0, step=0.2), f"statuses: {self._task_status(a)}, {self._task_status(b)}")
+        run_id = self._project_action_results(project_id, "task.merge")[0]["run_id"]
+        results = self._action_results(run_id)
+        # No `merge_start` failure (a second merge colliding with the first one's lease).
+        self.assertEqual([(r["index"], r["cmd"], r["ok"]) for r in results],
+                         [(0, "task.accept", True), (1, "task.accept", True),
+                          (2, "task.merge", True), (3, "task.merge", True)], results)
+        self.assertEqual(self._rows("SELECT 1 FROM outbox WHERE type = 'lead.action_failed';"), [])
+        merging = self._rows("SELECT task_id, seq FROM events WHERE type = 'task.merging' ORDER BY seq;")
+        merged = {r["task_id"]: r["seq"] for r in
+                  self._rows("SELECT task_id, seq FROM events WHERE type = 'task.merged';")}
+        self.assertEqual([r["task_id"] for r in merging], [a, b])
+        # strictly serial: the second merge starts only after the first one was recorded
+        self.assertGreater(merging[1]["seq"], merged[a])
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 """Asynchronous Unix-socket server, dispatch, auth, and single-instance daemon (meshd)."""
 
 import asyncio
+import collections
 import ctypes
 import fcntl
 import hashlib
@@ -369,6 +370,8 @@ class DaemonServer:
         self._last_reap = 0.0
         self._notify_cond: Optional[asyncio.Condition] = None
         self._lead_merge_tasks: Set[asyncio.Future] = set()
+        # Carbon P2-6: queued lead merges of one project run one at a time, in queue order.
+        self._lead_merge_queues: Dict[str, "collections.deque[Dict[str, Any]]"] = {}
 
     @property
     def notify_cond(self) -> asyncio.Condition:
@@ -1076,9 +1079,49 @@ class DaemonServer:
             if not committed:
                 self.log_error(f"Queued lead merge of run {item['run_id']} dropped: its turn did not commit")
                 continue
-            task = asyncio.ensure_future(self._run_lead_merge(item))
-            self._lead_merge_tasks.add(task)
-            task.add_done_callback(self._lead_merge_tasks.discard)
+            self._enqueue_lead_merge(item)
+
+    def _lead_merge_chain_key(self, item: Dict[str, Any]) -> str:
+        """The serialisation key of a queued lead merge: its project (unknown: its own request)."""
+        try:
+            row = self.db_conn.execute("SELECT project_id FROM tasks WHERE id = ?;",
+                                       (item["args"].get("task_id"),)).fetchone()
+        except Exception:  # noqa: BLE001 - an unreadable task simply gets its own chain
+            row = None
+        return row["project_id"] if row is not None else f"request:{item['request_id']}"
+
+    def _enqueue_lead_merge(self, item: Dict[str, Any]) -> None:
+        """Carbon P2-6: serialise the queued merges of one project.
+
+        `_queue_internal_merge` checks each `task.merge` in a rolled-back savepoint, so two
+        merges of the same project queued by one lead turn both look startable. Starting
+        them concurrently made the second one collide with the first one's `merge:<prj>`
+        lease (rc 11) and fail. They now run one after another through a per-project
+        drain task; merges of different projects stay concurrent.
+        """
+        key = self._lead_merge_chain_key(item)
+        queue = self._lead_merge_queues.get(key)
+        if queue is not None:
+            queue.append(item)  # the running drain task picks it up in order
+            return
+        self._lead_merge_queues[key] = collections.deque([item])
+        task = asyncio.ensure_future(self._drain_lead_merges(key))
+        self._lead_merge_tasks.add(task)
+        task.add_done_callback(self._lead_merge_tasks.discard)
+
+    async def _drain_lead_merges(self, key: str) -> None:
+        queue = self._lead_merge_queues[key]
+        try:
+            while queue:
+                item = queue.popleft()
+                try:
+                    await self._run_lead_merge(item)
+                except Exception as e:  # noqa: BLE001 - one failing merge must not strand the rest
+                    self.log_error(f"Lead merge of {item['args'].get('task_id')} raised: {type(e).__name__}: {e}")
+        finally:
+            # No await between the last empty check and this pop: a merge queued meanwhile
+            # either was seen by the loop above or finds no queue and starts a new drain.
+            self._lead_merge_queues.pop(key, None)
 
     async def _run_lead_merge(self, item: Dict[str, Any]) -> None:
         """One queued lead merge, through the socket's entry point (`handle_task_merge`).
