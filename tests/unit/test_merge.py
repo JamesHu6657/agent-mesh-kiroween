@@ -492,8 +492,11 @@ class PipelineTagShadowTest(TaskBranchCase):
     def test_k10_tag_named_like_the_task_branch(self) -> None:
         """ACC: K10, K5 - a tag named like the task branch (at main) does not turn the merge into a no-op; the branch tip is merged."""
         self.fixture.git(self.repo, "tag", self.BRANCH, self.base)
+        run_dir = tempfile.mkdtemp(prefix="mh-mrg-")  # the pipeline writes merge_intent.json there (P1-3)
+        self.addCleanup(shutil.rmtree, run_dir, True)
         plan = {"task_id": self.TASK, "title": "t", "integration": self.repo, "worktree": self.repo,
-                "branch": self.BRANCH, "pre_head": None}
+                "branch": self.BRANCH, "pre_head": None, "run_dir": run_dir, "merge_id": "mrg_t",
+                "run_id": "run_t"}
         out = merge.run_merge_pipeline(plan)
         self.assertEqual(out["outcome"], "merged", out)
         self.assertIs(out["noop"], False)

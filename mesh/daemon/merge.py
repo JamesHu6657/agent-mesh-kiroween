@@ -33,6 +33,7 @@ import asyncio
 import errno
 import json
 import os
+import re
 import signal
 import sqlite3
 import subprocess
@@ -760,6 +761,69 @@ def run_merge_pipeline(plan: Mapping[str, Any]) -> Dict[str, Any]:
     return out
 
 
+INTENT_NAME = "merge_intent.json"
+_SHA40 = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
+
+
+def merge_intent_path(run_dir: str) -> str:
+    return os.path.join(run_dir, INTENT_NAME)
+
+
+def write_merge_intent(run_dir: str, intent: Mapping[str, Any]) -> None:
+    """Carbon P1-3: durably record ``(pre_head, tip)`` before the merge commit is made.
+
+    Written to a temp file, fsynced, renamed into place and the directory fsynced, so that a
+    crash right after ``git commit`` finds it. Raises OSError when it cannot be made durable
+    (the caller then does not commit)."""
+    os.makedirs(run_dir, mode=0o700, exist_ok=True)
+    path = merge_intent_path(run_dir)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, (json.dumps(dict(intent), sort_keys=True) + "\n").encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    dfd = os.open(run_dir, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def read_merge_intent(run_dir: Optional[str]) -> Optional[Dict[str, Any]]:
+    """The intent of a merge run, or None when absent or malformed (legacy runs, a crash
+    before the intent was written)."""
+    if not run_dir:
+        return None
+    data = _read_json(merge_intent_path(run_dir))
+    if not data:
+        return None
+    if not (isinstance(data.get("task_id"), str) and isinstance(data.get("pre_head"), str)
+            and isinstance(data.get("tip"), str)):
+        return None
+    if not (_SHA40.match(data["pre_head"]) and _SHA40.match(data["tip"])):
+        return None
+    return data
+
+
+def _find_intended_merge(integ: str, intent: Mapping[str, Any]) -> Optional[str]:
+    """The commit in integration's first-parent history above ``pre_head`` whose parents are
+    exactly ``[pre_head, tip]`` (Carbon P1-3): the merge commit this task's merge made,
+    matched by its parents, never by its message, and independent of where the task branch
+    is now. None when there is none (or ``pre_head`` is not in this repo)."""
+    pre, tip = intent["pre_head"], intent["tip"]
+    cp = _git("find merge commit", ["log", "--first-parent", "--format=%H %P", f"{pre}..HEAD"], integ)
+    if cp.returncode != 0:
+        return None
+    for line in (cp.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[1] == pre and parts[2] == tip:
+            return parts[0]
+    return None
+
+
 def _integrating_commit(integ: str, tip: str) -> str:
     """The commit of ``integ``'s first-parent history that brought ``tip`` in (Carbon P2-5).
 
@@ -862,6 +926,17 @@ def _run_merge_pipeline(plan: Mapping[str, Any]) -> Dict[str, Any]:
                 return {"outcome": "failed", "reason": "tests_failed", "pre_head": pre_head,
                         "details": _test_failure_details(test, verify), **tests}
 
+        try:
+            write_merge_intent(plan["run_dir"], {"v": 1, "task_id": plan["task_id"], "merge_id": plan["merge_id"],
+                                                 "run_id": plan["run_id"], "pre_head": pre_head, "tip": tip})
+        except OSError as exc:
+            # Never commit without a durable intent: a crash after the commit could not be
+            # recognised. The merge is aborted and reported as a failed git step.
+            verify = _abort_and_verify(integ, pre_head)
+            details = {"step": "write merge_intent", "error": f"{type(exc).__name__}: {exc}"}
+            details.update(verify)
+            return {"outcome": "failed", "reason": "git_failed", "pre_head": pre_head, "details": details,
+                    **tests}
         msg = f"Merge mesh task {plan['task_id']}: {plan['title']}"
         cp = _git("commit", ["commit", "--no-edit", "-m", msg], integ, GIT_MERGE_TIMEOUT_S)
         if cp.returncode != 0:
@@ -1170,12 +1245,18 @@ def _branch_tip(integ: str, branch: Optional[str]) -> Optional[str]:
     return (cp.stdout or "").strip() or None
 
 
-def decide_recovery(integ: str, task_id: str, branch: Optional[str], pre_head: Optional[str]) -> Dict[str, Any]:
+def decide_recovery(integ: str, task_id: str, branch: Optional[str], pre_head: Optional[str],
+                    intent: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """§11.7 step 5 git decision for a task left in ``merging``.
 
     - ``MERGE_HEAD`` exists → ``merge --abort`` (then verify) → ``interrupted``;
-    - HEAD is a merge commit whose second parent is the task branch tip
-      and whose message contains the task id → reconcile ``merged``;
+    - a merge commit above the intent's ``pre_head`` whose parents are exactly
+      ``[pre_head, tip]`` of the durable ``merge_intent`` written before the commit
+      (Carbon P1-3: matched by parents, not by message, and independent of where the task
+      branch is now) → reconcile ``merged``. Only when there is no intent (a run made before
+      intents existed, or a crash before it was written) the old rule applies: HEAD is a
+      merge commit whose second parent is the current task branch tip and whose message
+      contains the task id;
     - otherwise → ``interrupted``.
 
     ``pre_head`` is the probe stored by TX1, read before the merge lease was held, so it can
@@ -1202,9 +1283,15 @@ def decide_recovery(integ: str, task_id: str, branch: Optional[str], pre_head: O
         current_pre = head
         parents, body = _inspect_head(integ, head)
         tip = _branch_tip(integ, branch)
-        if len(parents) >= 2 and tip is not None and parents[1] == tip and task_id in body:
+        if intent is not None and intent.get("task_id") == task_id:
+            found = _find_intended_merge(integ, intent)
+            if found is not None:
+                return {"outcome": "merged", "noop": False, "pre_head": intent["pre_head"],
+                        "merge_commit": found, "matched_by": "merge_intent",
+                        **({"recorded_pre_head": pre_head} if pre_head and pre_head != intent["pre_head"] else {})}
+        elif len(parents) >= 2 and tip is not None and parents[1] == tip and task_id in body:
             return {"outcome": "merged", "noop": False, "pre_head": parents[0],
-                    "merge_commit": head,
+                    "merge_commit": head, "matched_by": "message",
                     **({"recorded_pre_head": pre_head} if pre_head and pre_head != parents[0] else {})}
         true_pre = head
         if parents and (task_id in body or (tip is not None and tip in parents[1:])):
@@ -1257,7 +1344,8 @@ def recover_merging_task(conn: sqlite3.Connection, home: str, task: Mapping[str,
     integ = integration_worktree_path(get_workspaces_root(conn, home), task["project_id"])
     pre_head = mj.get("pre_head")
     if os.path.isdir(integ):
-        result = decide_recovery(integ, task["id"], task["branch"], pre_head)
+        intent = read_merge_intent(os.path.join(home, "merges", mj["mrg"])) if mj.get("mrg") else None
+        result = decide_recovery(integ, task["id"], task["branch"], pre_head, intent)
     else:
         result = {"outcome": "failed", "reason": "interrupted", "pre_head": pre_head,
                   "details": {"integration_missing": True, "restored": None}}
@@ -1283,6 +1371,8 @@ def recover_merging_task(conn: sqlite3.Connection, home: str, task: Mapping[str,
     extra: Dict[str, Any] = {"recovered": True, "reconciled": reconciled}
     if reconciled and result.get("recorded_pre_head"):
         extra["recorded_pre_head"] = result["recorded_pre_head"]
+    if reconciled and result.get("matched_by"):
+        extra["matched_by"] = result["matched_by"]
     if reconciled and run_termination.get("kill_failed"):
         extra["kill_failed"] = True
         extra["kill_failed_pids"] = run_termination.get("pids") or []

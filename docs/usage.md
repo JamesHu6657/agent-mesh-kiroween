@@ -411,7 +411,16 @@ and a log tail. A successful merge records its commit and `tests:"passed"` or
 make it `merge_failed`) and records the commit that really merged it as `merge_commit`
 (never the task's tip). Failures notify
 the lead. A client disconnect does not cancel a merge. Boot recovery aborts an
-unfinished merge or reconciles an already-created matching merge commit.
+unfinished merge or reconciles an already-created matching merge commit. Before the
+merge commit is made, `(pre_head, tip)` is written to `$MESH_HOME/merges/<mrg>/merge_intent.json`
+and fsynced (no intent, no commit); recovery recognises the merge commit by those
+parents (a commit above `pre_head` with parents exactly `[pre_head, tip]`), not by its
+message, so a `commit-msg` hook or a task branch that moved on cannot hide it. A run
+without an intent file (made before intents existed) falls back to the old rule: a merge
+commit on HEAD whose second parent is the current branch tip and whose message names the
+task. `doctor --check-invariants` (I9) also reports the reverse case: a task that is not
+`merged` (for example cancelled after an unrecognised merge) whose work is already in the
+integration branch, because `project deliver` would hand it to the base branch.
 `project cancel` during a merge is rc 6 with reason `merge_in_progress`.
 
 Test commands must leave no untracked, non-ignored artifacts in the integration

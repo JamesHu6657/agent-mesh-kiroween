@@ -19,6 +19,7 @@ import mesh.constants as c
 from tests.integration import test_merge as tm
 from tests.integration.test_lead_actions import LeadActionCase, _fake_goal
 from tests.integration.test_lead_turns import create_agent
+from tests.recovery.test_recovery_merge import TestRecoveryMerge
 
 GATE_SCRIPT = ("import os, sys, time\n"
                "g = sys.argv[1]\n"
@@ -456,6 +457,112 @@ class TestP25NoopMergeRunsTests(MergeGateCase):
         rc, resp = self.merge(tsk)
         self.assertEqual(rc, 0, resp)
         self.assertEqual((resp["data"]["noop"], resp["data"]["tests"]), (True, "none"), resp)
+
+
+class TestP13IntentAndRecoveryByParents(MergeGateCase):
+    """P1-3: (pre_head, tip) is made durable before the merge commit, and crash recovery matches
+    the merge commit by those parents, not by its message or the current task branch tip."""
+
+    merge_json = TestRecoveryMerge.merge_json
+    merge_events = TestRecoveryMerge.merge_events
+    recovered_events = TestRecoveryMerge.recovered_events
+
+    def install_message_rewriting_hook(self, repo: str) -> None:
+        hook = os.path.join(repo, ".git", "hooks", "commit-msg")
+        with open(hook, "w", encoding="utf-8") as f:
+            f.write('#!/bin/sh\necho "chore: merge branch" > "$1"\n')
+        os.chmod(hook, 0o755)
+
+    def crash_after_merge_commit(self, tsk: str) -> None:
+        self.harness.kill9_daemon()
+        self.harness.restart_daemon(extra_env={"MESH_TEST_CRASH_AT": "after_merge_commit"})
+        rc, resp = self.merge(tsk)
+        self.assertNotEqual(rc, 0, resp)
+        self.harness.wait_daemon_exit(timeout=30.0)
+        self.assertEqual(self.q("SELECT status FROM tasks WHERE id = ?;", (tsk,))[0]["status"], "merging")
+
+    def crashed_project(self, name: str) -> Tuple[str, str, str, str, str]:
+        repo, prj = self.make_project(name, test_command='["python3","-c","pass"]')
+        self.repo = repo
+        self.remote_before = self.fixture.remote_refs(repo)
+        tsk, ws = self.accepted_task(prj, "Commit then crash", "crash.txt", "crash\n")
+        return repo, prj, tsk, ws, self.fixture.head(repo, f"mesh/{prj}/{tsk}")
+
+    def test_intent_is_durable_and_names_pre_head_and_tip(self) -> None:
+        repo, prj, tsk, _ws, tip = self.crashed_project("I1")
+        pre_head = self.fixture.head(repo, self.integ_branch(prj))
+        rc, resp = self.merge(tsk)
+        self.assertEqual(rc, 0, resp)
+        mrg = self.show(tsk)["merge"]["mrg"]
+        path = os.path.join(self.harness.home, "merges", mrg, "merge_intent.json")
+        with open(path, encoding="utf-8") as f:
+            intent = json.load(f)
+        self.assertEqual((intent["task_id"], intent["pre_head"], intent["tip"]), (tsk, pre_head, tip))
+        self.assertEqual(oct(os.stat(path).st_mode & 0o777), oct(0o600))
+        self.doctor_ok()
+
+    def test_commit_msg_hook_that_rewrites_the_message_is_still_reconciled(self) -> None:
+        repo, prj, tsk, _ws, tip = self.crashed_project("I2")
+        self.install_message_rewriting_hook(repo)
+        pre_head = self.fixture.head(repo, self.integ_branch(prj))
+        self.crash_after_merge_commit(tsk)
+        head = self.fixture.head(repo, self.integ_branch(prj))
+        self.assertNotEqual(head, pre_head)
+        self.assertEqual(self.fixture.git(repo, "log", "-1", "--format=%s", head).stdout.strip(),
+                         "chore: merge branch")  # the task id is not in the message any more
+        self.harness.restart_daemon()
+        d = self.show(tsk)
+        self.assertEqual(d["status"], "merged", d)
+        mj = self.merge_json(tsk)
+        self.assertEqual((mj["merge_commit"], mj["pre_head"], mj["reconciled"]), (head, pre_head, True), mj)
+        self.assertEqual(mj["matched_by"], "merge_intent")
+        parents = self.fixture.git(repo, "rev-list", "--parents", "-n", "1", head).stdout.split()
+        self.assertEqual(parents[1:], [pre_head, tip])
+        self.assertEqual(self.merge_events(tsk, "merge.failed"), [])
+        self.assert_no_merge_lease(prj)
+        self.doctor_ok()
+
+    def test_task_branch_advanced_after_the_tip_was_resolved_is_still_reconciled(self) -> None:
+        repo, prj, tsk, ws, tip = self.crashed_project("I3")
+        pre_head = self.fixture.head(repo, self.integ_branch(prj))
+        self.crash_after_merge_commit(tsk)
+        head = self.fixture.head(repo, self.integ_branch(prj))
+        # an inbox executor keeps working on its branch while meshd is down
+        self.commit_file(ws, "more.txt", "more\n", "more work after the merge")
+        self.assertNotEqual(self.fixture.head(repo, f"mesh/{prj}/{tsk}"), tip)
+        self.harness.restart_daemon()
+        d = self.show(tsk)
+        self.assertEqual(d["status"], "merged", d)
+        mj = self.merge_json(tsk)
+        self.assertEqual((mj["merge_commit"], mj["pre_head"], mj["reconciled"]), (head, pre_head, True), mj)
+        self.assertEqual(self.merge_events(tsk, "merge.failed"), [])
+        self.doctor_ok()
+
+    def test_without_intent_and_with_rewritten_message_doctor_flags_the_cancelled_task(self) -> None:
+        """The report's scenario when no intent is available (a run from before intents): recovery
+        cannot prove the merge, the task ends merge_failed and, once cancelled, `doctor
+        --check-invariants` reports that its work is already in integration."""
+        repo, prj, tsk, _ws, tip = self.crashed_project("I4")
+        self.install_message_rewriting_hook(repo)
+        self.crash_after_merge_commit(tsk)
+        mrg = json.loads(self.q("SELECT merge_json FROM tasks WHERE id = ?;", (tsk,))[0]["merge_json"])["mrg"]
+        os.unlink(os.path.join(self.harness.home, "merges", mrg, "merge_intent.json"))
+        self.harness.restart_daemon()
+        self.assertEqual(self.show(tsk)["status"], "merge_failed")
+        self.assertEqual(self.merge_json(tsk)["reason"], "interrupted")
+        rc, resp = self.harness.cli("doctor", "--check-invariants", user=True, timeout=60.0)
+        self.assertEqual(rc, 1, resp)  # already: merge_failed but integrated
+        rc, resp = self.harness.cli("task", "cancel", tsk, "--reason", "abandon", token=self.tok_lead1)
+        self.assertEqual(rc, 0, resp)
+        rc, resp = self.harness.cli("doctor", "--check-invariants", user=True, timeout=60.0)
+        self.assertEqual(rc, 1, resp)
+        viol = resp["error"]["details"]["violations"]
+        self.assertEqual([(v["invariant"], v["details"]["task_id"], v["details"]["reason"]) for v in viol],
+                         [("I9", tsk, "integrated_but_not_merged")], viol)
+        self.assertEqual(viol[0]["details"]["status"], "cancelled")
+        head = self.fixture.head(repo, self.integ_branch(prj))
+        self.assertEqual(self.fixture.git(repo, "rev-list", "--parents", "-n", "1", head).stdout.split()[2], tip)
+        self.harness.check_invariants_on_teardown = False  # the violation is the point of this test
 
 
 if __name__ == "__main__":
