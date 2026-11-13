@@ -407,7 +407,9 @@ The pipeline prepares a non-fast-forward merge, runs the project's tests in the
 integration worktree under supervision, then commits. Tests failing or timing out
 give rc 14 `TESTS_FAILED`, a redacted log at `$MESH_HOME/merges/<mrg>/test.log`,
 and a log tail. A successful merge records its commit and `tests:"passed"` or
-`"none"`; a branch already integrated is a no-op and skips tests. Failures notify
+`"none"`; a branch already integrated is a no-op that still runs the tests (failing tests
+make it `merge_failed`) and records the commit that really merged it as `merge_commit`
+(never the task's tip). Failures notify
 the lead. A client disconnect does not cancel a merge. Boot recovery aborts an
 unfinished merge or reconciles an already-created matching merge commit.
 `project cancel` during a merge is rc 6 with reason `merge_in_progress`.

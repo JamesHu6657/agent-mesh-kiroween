@@ -397,5 +397,66 @@ class TestP28ForceMergeHeld(MergeGateCase):
         self.assertEqual(rc, 0, resp)
 
 
+class TestP25NoopMergeRunsTests(MergeGateCase):
+    """P2-5: a task whose tip is already in integration still runs test_command, and its
+    merge_commit is the commit that really merged it, not the tip."""
+
+    def test_zero_commit_task_with_failing_tests_is_not_merged(self) -> None:
+        repo, prj = self.make_project("N1", test_command='["false"]')
+        self.repo = repo
+        self.remote_before = self.fixture.remote_refs(repo)
+        tsk, _ = self.accepted_task(prj, "Nothing", None)  # submitted without a commit
+        pre_head = self.fixture.head(repo, self.integ_branch(prj))
+        rc, resp = self.merge(tsk)
+        self.assertEqual(rc, c.EXIT_MERGE_FAILED, resp)
+        self.assertEqual(resp["error"]["code"], c.TESTS_FAILED, resp)
+        det = resp["error"]["details"]
+        self.assertEqual(det["reason"], "tests_failed")
+        self.assertNotEqual(det["exit_code"], 0)
+        self.assertTrue(os.path.isfile(det["log_path"]))
+        self.assertEqual(self.show(tsk)["status"], "merge_failed")
+        self.assertEqual(self.show(tsk)["merge"]["tests"], "failed")
+        self.assert_integration_restored(repo, prj, pre_head)
+        self.assert_no_merge_lease(prj)
+        self.assertEqual(self.merge_runs(tsk)[0]["end_reason"], "tests_failed")
+        self.doctor_ok()
+
+    def test_noop_merge_runs_passing_tests_and_records_the_merging_commit(self) -> None:
+        repo, prj = self.make_project("N2", test_command='["true"]')
+        self.repo = repo
+        self.remote_before = self.fixture.remote_refs(repo)
+        tsk, _ = self.accepted_task(prj, "Feature", "f.txt", "f\n")
+        branch = f"mesh/{prj}/{tsk}"
+        tip = self.fixture.head(repo, branch)
+        # The branch is merged into integration behind Mesh's back (the P1-3 crash window leaves
+        # exactly this: a merge commit in git, the task not `merged`), then more history on top.
+        wt = self.integ_wt(prj)
+        self.fixture.git(wt, "merge", "--no-ff", branch, "-m", "outside merge", identity=True)
+        merge_commit = self.fixture.head(wt)
+        self.assertNotEqual(merge_commit, tip)
+        with open(os.path.join(wt, "later.txt"), "w", encoding="utf-8") as f:
+            f.write("later\n")
+        self.fixture.git(wt, "add", "later.txt")
+        self.fixture.git(wt, "commit", "-m", "later work", identity=True)
+        head = self.fixture.head(wt)
+        rc, resp = self.merge(tsk)
+        self.assertEqual(rc, 0, resp)
+        data = resp["data"]
+        self.assertIs(data["noop"], True, data)
+        self.assertEqual(data["tests"], "passed", data)  # not "none": the tests ran
+        self.assertEqual(data["merge_commit"], merge_commit, data)  # the commit that merged it, not the tip
+        self.assertNotEqual(data["merge_commit"], tip)
+        self.assertEqual(self.fixture.head(wt), head)  # nothing was committed
+        self.assertEqual(self.show(tsk)["merge"]["merge_commit"], merge_commit)
+        self.assertTrue(os.path.isfile(data["test_log"]))
+        self.doctor_ok()  # I9: merge_commit is an ancestor of integration
+
+    def test_noop_merge_without_tests_keeps_tests_none(self) -> None:
+        tsk, _ = self.accepted_task(self.prj, "Nothing", None)
+        rc, resp = self.merge(tsk)
+        self.assertEqual(rc, 0, resp)
+        self.assertEqual((resp["data"]["noop"], resp["data"]["tests"]), (True, "none"), resp)
+
+
 if __name__ == "__main__":
     unittest.main()

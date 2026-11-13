@@ -357,11 +357,13 @@ def probe_integration_head(integration: str) -> Optional[str]:
         return None
 
 
-def _abort_and_verify(integ: str, pre_head: str) -> Dict[str, Any]:
-    """`merge --abort`, then HEAD == pre_head, clean tree, no MERGE_HEAD (§10.5 step 2)."""
+def _abort_and_verify(integ: str, pre_head: str, abort: bool = True) -> Dict[str, Any]:
+    """`merge --abort`, then HEAD == pre_head, clean tree, no MERGE_HEAD (§10.5 step 2).
+
+    ``abort=False`` (a noop merge, nothing in progress) only verifies."""
     out: Dict[str, Any] = {}
-    cp = _git("merge --abort", ["merge", "--abort"], integ)
-    if cp.returncode != 0:
+    cp = _git("merge --abort", ["merge", "--abort"], integ) if abort else None
+    if cp is not None and cp.returncode != 0:
         out["abort_stderr"] = _clip(cp.stderr)
     try:
         head = _head(integ, "verify HEAD")
@@ -758,6 +760,52 @@ def run_merge_pipeline(plan: Mapping[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _integrating_commit(integ: str, tip: str) -> str:
+    """The commit of ``integ``'s first-parent history that brought ``tip`` in (Carbon P2-5).
+
+    The oldest first-parent commit of HEAD that has ``tip`` as an ancestor: the merge commit
+    that merged the task earlier, or the first commit on top of a branch that is simply
+    contained in integration. ``tip`` itself when nothing sits on top of it (HEAD is ``tip``)."""
+    cp = _git("log integrating commit",
+              ["log", "--first-parent", "--ancestry-path", "--format=%H", f"{tip}..HEAD"], integ)
+    if cp.returncode != 0:
+        raise _GitFailed("log integrating commit", cp)
+    shas = [ln.strip() for ln in (cp.stdout or "").splitlines() if ln.strip()]
+    return shas[-1] if shas else tip
+
+
+def _run_noop_merge(plan: Mapping[str, Any], integ: str, tip: str, pre_head: str) -> Dict[str, Any]:
+    """Carbon P2-5: the task branch is already contained in integration (a zero-commit task,
+    or a merge commit that exists but was never recorded). Nothing is merged, but the gate
+    is not skipped: ``test_command`` still runs on the integration tree, and the recorded
+    ``merge_commit`` is the commit that really carries the task, never the task's tip."""
+    tests: Dict[str, Any] = {"tests": "none", "test_log": None}
+    if plan.get("test_argv"):
+        test = run_test_step(plan)
+        tests = {"tests": "passed" if test["passed"] else "failed", "test_log": test["log_path"],
+                 "test": {k: v for k, v in test.items() if k != "log_path"}}
+        if not test["passed"]:
+            verify = _abort_and_verify(integ, pre_head, abort=False)
+            return {"outcome": "failed", "reason": "tests_failed", "pre_head": pre_head,
+                    "details": _test_failure_details(test, verify), **tests}
+    return {"outcome": "merged", "noop": True, "pre_head": pre_head,
+            "merge_commit": _integrating_commit(integ, tip), **tests}
+
+
+def _test_failure_details(test: Mapping[str, Any], verify: Mapping[str, Any]) -> Dict[str, Any]:
+    tail, tail_cut = log_tail_capped(test["log_path"])
+    details = {"log_path": test["log_path"], "log_tail": tail, "log_tail_truncated": tail_cut,
+               "timeout": test["timeout"], "timeout_s": test["timeout_s"],
+               "exit_code": test["exit_code"], "signal": test["signal"]}
+    for k in ("error", "termination", "leftovers", "leftover_scan_uncertain"):
+        if k in test:
+            details[k] = test[k]
+    if (test.get("termination") or {}).get("kill_failed"):
+        details["kill_failed"] = True
+    details.update(verify)
+    return details
+
+
 def _run_merge_pipeline(plan: Mapping[str, Any]) -> Dict[str, Any]:
     integ = plan["integration"]
     wt = plan["worktree"]
@@ -781,10 +829,10 @@ def _run_merge_pipeline(plan: Mapping[str, Any]) -> Dict[str, Any]:
             raise _GitFailed("rev-parse branch", cp)
         tip = (cp.stdout or "").strip()
         cp = _git("merge-base --is-ancestor", ["merge-base", "--is-ancestor", tip, "HEAD"], integ)
-        if cp.returncode == 0:
-            return {"outcome": "merged", "noop": True, "pre_head": pre_head, "merge_commit": tip}
-        if cp.returncode != 1:
+        if cp.returncode not in (0, 1):
             raise _GitFailed("merge-base --is-ancestor", cp)
+        if cp.returncode == 0:
+            return _run_noop_merge(plan, integ, tip, pre_head)
 
         cp = _git("merge", ["merge", "--no-ff", "--no-commit", tip], integ, GIT_MERGE_TIMEOUT_S)
         if cp.returncode != 0:
@@ -811,18 +859,8 @@ def _run_merge_pipeline(plan: Mapping[str, Any]) -> Dict[str, Any]:
                      "test": {k: v for k, v in test.items() if k != "log_path"}}
             if not test["passed"]:
                 verify = _abort_and_verify(integ, pre_head)
-                tail, tail_cut = log_tail_capped(test["log_path"])
-                details = {"log_path": test["log_path"], "log_tail": tail, "log_tail_truncated": tail_cut,
-                           "timeout": test["timeout"], "timeout_s": test["timeout_s"],
-                           "exit_code": test["exit_code"], "signal": test["signal"]}
-                for k in ("error", "termination", "leftovers", "leftover_scan_uncertain"):
-                    if k in test:
-                        details[k] = test[k]
-                if (test.get("termination") or {}).get("kill_failed"):
-                    details["kill_failed"] = True
-                details.update(verify)
                 return {"outcome": "failed", "reason": "tests_failed", "pre_head": pre_head,
-                        "details": details, **tests}
+                        "details": _test_failure_details(test, verify), **tests}
 
         msg = f"Merge mesh task {plan['task_id']}: {plan['title']}"
         cp = _git("commit", ["commit", "--no-edit", "-m", msg], integ, GIT_MERGE_TIMEOUT_S)
