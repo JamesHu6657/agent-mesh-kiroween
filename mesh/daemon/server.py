@@ -1021,6 +1021,19 @@ class DaemonServer:
                         self.log_error(f"Lead repo/ worktree not created: {e}")
             elif eff.kind == "terminate_lead_turn":
                 self._terminate_lead_turn(eff.params["run_id"], eff.params.get("end_reason", "lead_superseded"))
+            elif eff.kind == "reconcile_merging_task":
+                # Carbon P2-8: after the commit of `run release --force-merge-held`, decide the
+                # task the way boot recovery would (its merge run is closed, the lease gone).
+                from mesh.daemon import merge
+
+                try:
+                    task = self.db_conn.execute("SELECT * FROM tasks WHERE id = ? AND status = 'merging';",
+                                                (eff.params["task_id"],)).fetchone()
+                    if task is not None:
+                        merge.recover_merging_task(self.db_conn, self.home, task)
+                except Exception as e:  # noqa: BLE001 - the next boot decides it
+                    self.log_error(f"Task {eff.params.get('task_id')} not reconciled after a forced "
+                                   f"merge release: {type(e).__name__}: {e}")
             elif eff.kind == "seen_release_forced":
                 # r4e: after the commit of `run release --force-seen-unusable` only.
                 from mesh.daemon import supervisor

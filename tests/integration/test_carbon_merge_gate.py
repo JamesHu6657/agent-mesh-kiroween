@@ -8,6 +8,8 @@ lease and the `merging` state are held while the test drives the other commands.
 import json
 import os
 import shutil
+import sqlite3
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -248,6 +250,151 @@ class TestP26SerialLeadMerges(LeadActionCase):
         self.assertEqual([r["task_id"] for r in merging], [a, b])
         # strictly serial: the second merge starts only after the first one was recorded
         self.assertGreater(merging[1]["seq"], merged[a])
+
+
+class TestP28ForceMergeHeld(MergeGateCase):
+    """P2-8: `run release <run> --force-merge-held --user` for a held merge_test run."""
+
+    def write_db(self, sql: str, params: tuple = ()) -> None:
+        conn = sqlite3.connect(os.path.join(self.harness.home, "mesh.db"), timeout=10)
+        try:
+            conn.execute(sql, params)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def held_merge(self) -> Tuple[str, str, str]:
+        """A task stuck `merging` with an open merge_test run and the merge:<prj> lease: the state
+        MergeRunHeld leaves behind. Returns (project, task, run)."""
+        tsk, _ = self.accepted_task(self.prj, "Held", "held.txt", "h\n")
+        pre_head = self.fixture.head(self.repo, self.integ_branch(self.prj))
+        run_id, mrg = "run_heldmerge0001", "mrg_heldmerge0001"
+        run_dir = os.path.join(self.harness.home, "merges", mrg)
+        os.makedirs(run_dir, exist_ok=True)
+        conn = sqlite3.connect(os.path.join(self.harness.home, "mesh.db"), timeout=10)
+        try:
+            row = conn.execute("SELECT attempt, fence_seq FROM tasks WHERE id = ?;", (tsk,)).fetchone()
+            boot = conn.execute("SELECT value FROM meta WHERE key = 'boot_id';").fetchone()
+            boot_id = boot[0] if boot else "boot_test"
+            conn.execute(
+                "INSERT INTO runs (id, kind, task_id, project_id, agent_id, attempt, fence, adapter, status, "
+                "boot_id, run_dir, argv_redacted_json, started_at) "
+                "VALUES (?, 'merge_test', ?, ?, NULL, ?, ?, 'mesh', 'running', ?, ?, '[]', "
+                "'2026-01-01T00:00:00Z');", (run_id, tsk, self.prj, row[0], row[1], boot_id, run_dir))
+            conn.execute(
+                "INSERT INTO leases (key, run_id, holder_kind, holder, agent_id, fence, acquired_at, expires_at, "
+                "heartbeat_at) VALUES (?, ?, 'meshd', ?, NULL, ?, '2026-01-01T00:00:00Z', "
+                "'2099-01-01T00:00:00Z', '2026-01-01T00:00:00Z');", (f"merge:{self.prj}", run_id, boot_id, row[1]))
+            conn.execute("UPDATE tasks SET status = 'merging', merge_json = ? WHERE id = ?;",
+                         (json.dumps({"mrg": mrg, "pre_head": pre_head, "started_at": "2026-01-01T00:00:00Z",
+                                      "run_id": run_id}), tsk))
+            conn.commit()
+        finally:
+            conn.close()
+        return self.prj, tsk, run_id
+
+    def release(self, run_id: str, *flags: str, token: Optional[str] = None) -> Tuple[int, Dict[str, Any]]:
+        argv = ["run", "release", run_id, *flags]
+        if token is None:
+            return self.harness.cli(*argv, user=True, timeout=60.0)
+        return self.harness.cli(*argv, token=token, timeout=60.0)
+
+    def test_release_closes_run_frees_lease_audits_and_unsticks_the_task(self) -> None:
+        prj, tsk, run_id = self.held_merge()
+        # the merge channel is blocked: both the lease and the `merging` state
+        rc, resp = self.merge(tsk)
+        self.assertEqual(rc, c.EXIT_CONFLICT, resp)
+        rc, resp = self.release(run_id, "--force-merge-held")
+        self.assertEqual(rc, 0, resp)
+        self.assertEqual((resp["data"]["released"], resp["data"]["status"], resp["data"]["task_id"]),
+                         (True, "lost", tsk), resp)
+        run = self.q("SELECT status, end_reason, ended_at FROM runs WHERE id = ?;", (run_id,))[0]
+        self.assertEqual((run["status"], run["end_reason"]), ("lost", "merge_release_forced"))
+        self.assertIsNotNone(run["ended_at"])
+        self.assert_no_merge_lease(prj)
+        ev = self.q("SELECT actor_kind, via, payload_json FROM events WHERE type = 'run.merge_release_forced' "
+                    "AND run_id = ?;", (run_id,))
+        self.assertEqual(len(ev), 1)
+        self.assertEqual((ev[0]["actor_kind"], ev[0]["via"]), ("user", "direct"))
+        payload = json.loads(ev[0]["payload_json"])
+        self.assertEqual((payload["run_id"], payload["task_id"], payload["lease"], payload["lease_released"]),
+                         (run_id, tsk, f"merge:{prj}", True))
+        # the task was decided like boot recovery would (nothing merged: merge_failed/interrupted) ...
+        self.assertTrue(self.harness.wait_for(lambda: self.show(tsk)["status"] == "merge_failed", timeout=15))
+        self.assertEqual(self.show(tsk)["merge"]["reason"], "interrupted")
+        # ... so the project's merge channel works again, without a restart
+        rc, resp = self.merge(tsk)
+        self.assertEqual(rc, 0, resp)
+        self.assertEqual(resp["data"]["status"], "merged")
+        # a second release: the run is closed
+        rc, resp = self.release(run_id, "--force-merge-held")
+        self.assertEqual(rc, c.EXIT_CONFLICT, resp)
+        self.assertEqual(resp["error"]["details"]["reason"], "run_not_open")
+        self.doctor_ok()
+
+    def test_refused_while_wrapper_alive(self) -> None:
+        prj, tsk, run_id = self.held_merge()
+        proc = subprocess.Popen(["sleep", "300"], start_new_session=True)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        with open(f"/proc/{proc.pid}/stat", "rb") as f:
+            starttime = int(f.read().rsplit(b")", 1)[1].split()[19])
+        self.write_db("UPDATE runs SET wrapper_pid = ?, pgid = ?, proc_starttime = ? WHERE id = ?;",
+                      (proc.pid, proc.pid, starttime, run_id))
+        rc, resp = self.release(run_id, "--force-merge-held")
+        self.assertEqual(rc, c.EXIT_CONFLICT, resp)
+        self.assertEqual(resp["error"]["code"], c.RUN_STILL_ACTIVE, resp)
+        self.assertEqual(resp["error"]["details"]["reason"], "wrapper_alive")
+        self.assertEqual(self.q("SELECT status FROM runs WHERE id = ?;", (run_id,))[0]["status"], "running")
+        self.assertEqual(len(self.q("SELECT 1 FROM leases WHERE key = ?;", (f"merge:{prj}",))), 1)
+        self.assertEqual(self.q("SELECT 1 FROM events WHERE type = 'run.merge_release_forced';"), [])
+        # the wrapper exits: the release is allowed (a pid reused by another process would not count)
+        proc.kill()
+        proc.wait()
+        rc, resp = self.release(run_id, "--force-merge-held")
+        self.assertEqual(rc, 0, resp)
+        self.assert_no_merge_lease(prj)
+
+    def test_reused_pid_is_not_the_wrapper(self) -> None:
+        prj, tsk, run_id = self.held_merge()
+        # a live pid with a different starttime than the recorded one: another process now
+        other = subprocess.Popen(["sleep", "300"], start_new_session=True)
+        self.addCleanup(other.wait)
+        self.addCleanup(other.kill)
+        self.write_db("UPDATE runs SET wrapper_pid = ?, pgid = ?, proc_starttime = 1 WHERE id = ?;",
+                      (other.pid, other.pid, run_id))
+        rc, resp = self.release(run_id, "--force-merge-held")
+        self.assertEqual(rc, 0, resp)
+
+    def test_only_the_user_open_merge_test_runs_and_exact_flags(self) -> None:
+        prj, tsk, run_id = self.held_merge()
+        # an agent (even the lead) is forbidden; nothing changes
+        rc, resp = self.release(run_id, "--force-merge-held", token=self.tok_lead1)
+        self.assertEqual(rc, 4, resp)
+        self.assertEqual(self.q("SELECT status FROM runs WHERE id = ?;", (run_id,))[0]["status"], "running")
+        # no flag / both flags are usage errors, and the old flag still refuses a merge_test run
+        rc, resp = self.release(run_id)
+        self.assertEqual(rc, 2, resp)
+        self.assertIn("--force-merge-held", json.dumps(resp))
+        rc, resp = self.release(run_id, "--force-merge-held", "--force-seen-unusable")
+        self.assertEqual(rc, 2, resp)
+        rc, resp = self.release(run_id, "--force-seen-unusable")
+        self.assertEqual(rc, c.EXIT_CONFLICT, resp)
+        self.assertEqual(resp["error"]["details"]["reason"], "not_seen_held")
+        # a run that is not a merge_test run is refused
+        self.write_db("UPDATE runs SET kind = 'external' WHERE id = ?;", (run_id,))
+        rc, resp = self.release(run_id, "--force-merge-held")
+        self.assertEqual(rc, c.EXIT_CONFLICT, resp)
+        self.assertEqual(resp["error"]["details"]["reason"], "not_merge_test")
+        self.write_db("UPDATE runs SET kind = 'merge_test' WHERE id = ?;", (run_id,))
+        # a dry run changes nothing
+        rc, resp = self.harness.cli("run", "release", run_id, "--force-merge-held", "--dry-run", user=True)
+        self.assertEqual(rc, 0, resp)
+        self.assertEqual(self.q("SELECT status FROM runs WHERE id = ?;", (run_id,))[0]["status"], "running")
+        self.assertEqual(len(self.q("SELECT 1 FROM leases WHERE key = ?;", (f"merge:{prj}",))), 1)
+        # finally release for a clean doctor
+        rc, resp = self.release(run_id, "--force-merge-held")
+        self.assertEqual(rc, 0, resp)
 
 
 if __name__ == "__main__":

@@ -334,6 +334,16 @@ passphrase.** It cannot detect either.
   `mesh run release <run-id> --force-seen-unusable --user` closes the run as `lost` and
   releases its lease without signalling any process (event `run.seen_release_forced`).
   It is user-only and refuses runs that are not held this way.
+- A `merge_test` run that the merge close gate keeps open (its group is still occupied
+  after the test step) holds `merge:<prj>` and leaves the task `merging` until the next
+  boot. Once you have checked the leftover processes yourself,
+  `mesh run release <run-id> --force-merge-held --user` closes that run as `lost`,
+  releases `merge:<prj>` and records `run.merge_release_forced`; the task is then decided
+  as boot recovery would (reconciled `merged` if its merge commit is in integration,
+  otherwise `merge_failed` with reason `interrupted`). It is user-only, only for a
+  `merge_test` run that is still open (otherwise rc 6 `not_merge_test` / `run_not_open`),
+  and refused (rc 6 `RUN_STILL_ACTIVE`, reason `wrapper_alive`) while the run's wrapper
+  process is alive. No process is signalled.
 
 ---
 
