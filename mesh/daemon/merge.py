@@ -1104,20 +1104,31 @@ def _integrating_commit(integ: str, tip: str) -> str:
 
     The oldest first-parent commit of HEAD that has ``tip`` as an ancestor: the merge commit
     that merged the task earlier, or the first commit on top of a branch that is simply
-    contained in integration. ``tip`` itself when nothing sits on top of it (HEAD is ``tip``)."""
+    contained in integration. ``tip`` itself when nothing sits on top of it (HEAD is ``tip``)
+    or when ``tip`` lies on the first-parent line (nothing merged it)."""
     cp = _git("log integrating commit",
               ["log", "--first-parent", "--ancestry-path", "--format=%H", f"{tip}..HEAD"], integ)
     if cp.returncode != 0:
         raise _GitFailed("log integrating commit", cp)
     shas = [ln.strip() for ln in (cp.stdout or "").splitlines() if ln.strip()]
-    return shas[-1] if shas else tip
+    if not shas:
+        return tip
+    # When ``tip`` is itself on the first-parent line (a zero-commit task: its tip is the base
+    # it started from), nothing merged it: the oldest commit above it is just the next
+    # integration commit (another task's merge), so the tip is recorded, as before P2-5.
+    cp = _git("log integrating parents", ["log", "-1", "--format=%P", shas[-1]], integ)
+    if cp.returncode != 0:
+        raise _GitFailed("log integrating parents", cp)
+    parents = (cp.stdout or "").split()
+    return tip if parents and parents[0] == tip else shas[-1]
 
 
 def _run_noop_merge(plan: Mapping[str, Any], integ: str, tip: str, pre_head: str) -> Dict[str, Any]:
     """Carbon P2-5: the task branch is already contained in integration (a zero-commit task,
     or a merge commit that exists but was never recorded). Nothing is merged, but the gate
     is not skipped: ``test_command`` still runs on the integration tree, and the recorded
-    ``merge_commit`` is the commit that really carries the task, never the task's tip."""
+    ``merge_commit`` is the commit that really carries the task: the merge commit that merged
+    it, or the tip itself for a zero-commit task (never an unrelated later commit)."""
     tests: Dict[str, Any] = {"tests": "none", "test_log": None}
     if plan.get("test_argv"):
         test, tests = _gated_test_step(plan, integ, pre_head)

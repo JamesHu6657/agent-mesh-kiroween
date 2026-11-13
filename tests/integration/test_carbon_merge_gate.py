@@ -452,6 +452,23 @@ class TestP25NoopMergeRunsTests(MergeGateCase):
         self.assertTrue(os.path.isfile(data["test_log"]))
         self.doctor_ok()  # I9: merge_commit is an ancestor of integration
 
+    def test_zero_commit_task_after_other_merges_records_its_tip_not_a_later_merge(self) -> None:
+        repo, prj = self.make_project("N3", test_command='["true"]')
+        self.repo = repo
+        self.remote_before = self.fixture.remote_refs(repo)
+        tsk_z, _ = self.accepted_task(prj, "Nothing", None)  # its tip is the base it started from
+        tip = self.fixture.head(repo, f"mesh/{prj}/{tsk_z}")
+        tsk_o, _ = self.accepted_task(prj, "Other", "o.txt", "o\n")
+        rc, resp = self.merge(tsk_o)
+        self.assertEqual(rc, 0, resp)
+        other_merge = resp["data"]["merge_commit"]
+        rc, resp = self.merge(tsk_z)
+        self.assertEqual(rc, 0, resp)
+        self.assertIs(resp["data"]["noop"], True, resp)
+        self.assertEqual(resp["data"]["merge_commit"], tip, resp)  # not the other task's merge
+        self.assertNotEqual(resp["data"]["merge_commit"], other_merge)
+        self.doctor_ok()
+
     def test_noop_merge_without_tests_keeps_tests_none(self) -> None:
         tsk, _ = self.accepted_task(self.prj, "Nothing", None)
         rc, resp = self.merge(tsk)
