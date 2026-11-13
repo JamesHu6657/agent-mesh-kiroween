@@ -53,6 +53,25 @@ def _setting(db_path: str, key: str) -> Any:
         return None
 
 
+def _scheduler_errors_check(home_dir: str) -> Dict[str, Any]:
+    """Errors the running meshd's scheduler hit since it started ($home/run/scheduler_errors.json)."""
+    path = os.path.join(home_dir, "run", "scheduler_errors.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        count = int(data.get("count") or 0)
+        last = data.get("last") or {}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return _check("scheduler_errors", True, "none since meshd started")
+    if count <= 0:
+        return _check("scheduler_errors", True, "none since meshd started")
+    item = f" on {last.get('item')}" if last.get("item") else ""
+    return _check("scheduler_errors", False,
+                  f"{count} since meshd started; last: {last.get('step')}{item}: {last.get('error')} at {last.get('at')}",
+                  "see the traceback in $MESH_HOME/logs/meshd.log; `mesh daemon status` shows the counts per step",
+                  level="warning")
+
+
 def environment_checks(home_dir: str, db_present: bool, testing_mode: bool = False) -> List[Dict[str, Any]]:
     checks: List[Dict[str, Any]] = []
     plat = platform.system()
@@ -81,6 +100,7 @@ def environment_checks(home_dir: str, db_present: bool, testing_mode: bool = Fal
     running = _daemon_running(home_dir) if db_present else False
     checks.append(_check("daemon", bool(running), "running" if running else "not running",
                          "start it with `mesh daemon start`", level="warning"))
+    checks.append(_scheduler_errors_check(home_dir))
 
     mode = None
     if db_present:

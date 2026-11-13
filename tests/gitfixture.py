@@ -3,7 +3,7 @@
 Safety rule (hard, enforced by assertions in this module):
 
 - Never point any helper at the Mesh checkout (`/workspace/mesh-fresh-v1`,
-  `/home/node/workspace/mesh-fresh-v1`, any `mesh-wt-*`) or at any directory outside
+  `/home/user/workspace/mesh-fresh-v1`, any `mesh-wt-*`) or at any directory outside
   `/tmp/mh-*`. Every git call made here has an explicit `cwd` under the fixture base
   directory. Before a process starts, `git()` also refuses the repository-selecting
   options `-C`, `--git-dir`/`--git-dir=*`, `--work-tree`/`--work-tree=*` and any

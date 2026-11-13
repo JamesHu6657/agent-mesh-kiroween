@@ -25,7 +25,14 @@ from mesh.core.proc import get_proc_environ, get_proc_stat
 from mesh.daemon import merge, recovery, server, supervisor, terminate
 from tests.unit.test_proc_probe import _read_line_or_fail
 
-RUN = "run_race"
+# Unique per test process: run ids carried as a real MESH_RUN_ID must not collide
+# with another tier run on the same host (dogfood concurrency).
+_RUN_SFX = f"_{os.getpid()}"
+
+# Real /proc scans: hold the runner's host-wide /proc lock shared (tests/run_tier.py).
+MESH_PROC_LOCK = "shared"
+
+RUN = f"run_race{_RUN_SFX}"
 
 
 def _spawn(run_id=None, extra_env=None, args=None):
@@ -165,7 +172,7 @@ class TestClearCheck(unittest.TestCase):
         self.assertFalse(hasattr(terminate, "confirmed_clear"))
 
     def test_step_done_needs_two_empty_scans_a_poll_apart(self):
-        t = terminate.Termination(run_id="run_empty", pgid=None, wrapper_pid=None,
+        t = terminate.Termination(run_id=f"run_empty{_RUN_SFX}", pgid=None, wrapper_pid=None,
                                   end_reason="timeout", grace_s=1.0)
         with mock.patch.object(terminate, "run_targets", return_value={}):
             self.assertEqual(terminate.step(t), "pending")
@@ -175,7 +182,7 @@ class TestClearCheck(unittest.TestCase):
 
     def test_step_hit_between_empty_scans_resets(self):
         """Review #20b M15: empty, hit, empty a poll after the first is not "done"."""
-        t = terminate.Termination(run_id="run_hit", pgid=None, wrapper_pid=None,
+        t = terminate.Termination(run_id=f"run_hit{_RUN_SFX}", pgid=None, wrapper_pid=None,
                                   end_reason="timeout", grace_s=100.0)
         t.deadline = 1e9
         scans = iter([{}, {4242: 7}, {}, {}])
@@ -360,20 +367,20 @@ class TestFullLoopRealProcesses(RealProcBase):
     def test_readable_without_run_id_not_targeted(self):
         stranger = self.spawn(None)
         other = self.spawn("someone-else")
-        ours = self.spawn("run_safe")
+        ours = self.spawn(f"run_safe{_RUN_SFX}")
         self.assertTrue(get_proc_environ(stranger.pid))
-        found = terminate.run_targets("run_safe", ours.pid, ours.pid,
+        found = terminate.run_targets(f"run_safe{_RUN_SFX}", ours.pid, ours.pid,
                                       int(get_proc_stat(ours.pid)["starttime"]))
         self.assertIn(ours.pid, found)
         self.assertNotIn(stranger.pid, found)
         self.assertNotIn(other.pid, found)
-        env_only = terminate.run_targets("run_safe", None, None)
+        env_only = terminate.run_targets(f"run_safe{_RUN_SFX}", None, None)
         self.assertIn(ours.pid, env_only)
         self.assertNotIn(stranger.pid, env_only)
         self.assertNotIn(other.pid, env_only)
 
     def test_real_zombie_never_targeted(self):
-        z = _spawn("run_z", args=[sys.executable, "-c", "pass"])
+        z = _spawn(f"run_z{_RUN_SFX}", args=[sys.executable, "-c", "pass"])
         self._procs.append(z)
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
@@ -382,18 +389,18 @@ class TestFullLoopRealProcesses(RealProcBase):
                 break
             time.sleep(0.02)
         self.assertEqual(get_proc_stat(z.pid)["state"], "Z")
-        self.assertNotIn(z.pid, terminate.run_targets("run_z", z.pid, None))
+        self.assertNotIn(z.pid, terminate.run_targets(f"run_z{_RUN_SFX}", z.pid, None))
         z.wait()
 
     def test_recovery_env_only_after_empty_first_read(self):
-        proc = self.spawn("run_rec")
+        proc = self.spawn(f"run_rec{_RUN_SFX}")
         fake, _ = _empty_first(proc.pid, 1)
         with mock.patch.object(terminate, "get_proc_environ", side_effect=fake), \
                 mock.patch.object(terminate, "POLL_S", 0.02), \
                 mock.patch.object(supervisor, "_setting_int", return_value=1.0):
-            self.assertIn(proc.pid, recovery._env_carriers("run_rec"))
-            recovery._terminate_carriers(mock.Mock(), "/tmp", {"id": "run_rec"}, "lost_before_spawn")
-        t = terminate.get("run_rec")
+            self.assertIn(proc.pid, recovery._env_carriers(f"run_rec{_RUN_SFX}"))
+            recovery._terminate_carriers(mock.Mock(), "/tmp", {"id": f"run_rec{_RUN_SFX}"}, "lost_before_spawn")
+        t = terminate.get(f"run_rec{_RUN_SFX}")
         self.assertIsNotNone(t)
         self.assertIn(proc.pid, t.initial_pids)
 
@@ -414,7 +421,7 @@ class TestWatchTickPath(unittest.TestCase):
 
     def setUp(self):
         supervisor._CLEAR.clear()
-        self.run = {"id": "run_w", "task_id": "tsk_w", "pgid": 777, "wrapper_pid": 777,
+        self.run = {"id": f"run_w{_RUN_SFX}", "task_id": "tsk_w", "pgid": 777, "wrapper_pid": 777,
                     "proc_starttime": 1, "run_dir": "/nonexistent", "kind": "task", "adapter": "fake"}
         self.changed = [False]
         self.targets = [{}]
@@ -480,7 +487,7 @@ class TestWatchTickPath(unittest.TestCase):
         self.targets[0] = {4242: 1}
         with mock.patch.object(supervisor, "_begin_termination", side_effect=_Closing()):
             self.assertEqual(self._tick(), "closing")
-        self.assertNotIn("run_w", supervisor._CLEAR)
+        self.assertNotIn(f"run_w{_RUN_SFX}", supervisor._CLEAR)
 
     def test_run_eventually_closes(self):
         """Q1 regression: empty scans a poll apart close the run within a few ticks."""
@@ -500,7 +507,7 @@ class TestWatchTickPath(unittest.TestCase):
             self.assertEqual(supervisor.confirm_pending_exits(self.conn, "/tmp"), [])
             w.assert_not_called()  # not due yet
             time.sleep(terminate.POLL_S)
-            self.assertEqual(supervisor.confirm_pending_exits(self.conn, "/tmp"), ["run_w"])
+            self.assertEqual(supervisor.confirm_pending_exits(self.conn, "/tmp"), [f"run_w{_RUN_SFX}"])
 
 
 # --- review #20b: scan -> begin() handoff window (Linear MAJOR L1) -------------------
@@ -604,7 +611,7 @@ class TestHandoffWindow(unittest.TestCase):
         self.assertIn(c, t.signalled_term)
 
     def test_lead_turn_leftovers_handoff(self):
-        run_id = "run_hl"
+        run_id = f"run_hl{_RUN_SFX}"
         p, c = self._spawn_p(run_id)
         race = _HandoffRace(self, run_id)
         with contextlib.ExitStack() as stack:
@@ -616,7 +623,7 @@ class TestHandoffWindow(unittest.TestCase):
         self._assert_c_taken(run_id, c)
 
     def test_task_leftovers_handoff(self):
-        run_id = "run_ht"
+        run_id = f"run_ht{_RUN_SFX}"
         p, c = self._spawn_p(run_id)
         race = _HandoffRace(self, run_id)
         conn = mock.Mock()
@@ -668,7 +675,7 @@ class TestLeadTurnTwoScanGate(unittest.TestCase):
 
     def test_lead_turn_needs_two_empty_scans(self):
         from mesh.daemon import lead_turns
-        run = {"id": "run_lt", "pgid": 9, "wrapper_pid": 9, "proc_starttime": 1,
+        run = {"id": f"run_lt{_RUN_SFX}", "pgid": 9, "wrapper_pid": 9, "proc_starttime": 1,
                "run_dir": "/nonexistent", "kind": "lead_turn", "project_id": "prj"}
         clock = [100.0]
         with mock.patch.object(supervisor, "wrapper_alive", return_value=False), \
@@ -720,7 +727,7 @@ class TestRecoveryConfirmingScan(unittest.TestCase):
                 mock.patch.object(recovery, "_identity_alive", return_value=False), \
                 mock.patch.object(supervisor, "_watch_one", side_effect=watch), \
                 mock.patch.object(terminate, "POLL_S", 0.02):
-            out = recovery._recover_run(conn, "/tmp", {"id": "run_rc", "lease_holder": "old"}, "boot")
+            out = recovery._recover_run(conn, "/tmp", {"id": f"run_rc{_RUN_SFX}", "lease_holder": "old"}, "boot")
         self.assertEqual(out, "exited")
         self.assertEqual(state["watches"], 2)
         self.assertEqual(state["status"], "succeeded")
@@ -732,7 +739,7 @@ class TestTerminationLoopPendingExits(unittest.TestCase):
     def test_loop_advances_pending_exit_check(self):
         supervisor._CLEAR.clear()
         self.addCleanup(supervisor._CLEAR.clear)
-        supervisor._CLEAR["run_lp"] = terminate.ClearCheck(first_empty_at=1.0)
+        supervisor._CLEAR[f"run_lp{_RUN_SFX}"] = terminate.ClearCheck(first_empty_at=1.0)
         self.assertEqual(terminate.active(), {})
         calls = []
 
@@ -749,7 +756,7 @@ class TestTerminationLoopPendingExits(unittest.TestCase):
             def adv(conn, home):
                 calls.append(1)
                 stop.set()
-                return ["run_lp"]
+                return [f"run_lp{_RUN_SFX}"]
 
             with mock.patch.object(supervisor, "advance_terminations", adv), \
                     mock.patch.object(terminate, "POLL_S", 0.01):
@@ -849,7 +856,7 @@ class TestGitCollectedOnce(unittest.TestCase):
         self.addCleanup(supervisor._GIT_INFO.clear)
 
     def test_one_collection_per_clean_exit(self):
-        run = {"id": "run_g1", "task_id": "tsk_g1", "project_id": "prj", "pgid": 778, "wrapper_pid": 778,
+        run = {"id": f"run_g1{_RUN_SFX}", "task_id": "tsk_g1", "project_id": "prj", "pgid": 778, "wrapper_pid": 778,
                "proc_starttime": 1, "run_dir": "/nonexistent", "kind": "task", "adapter": "fake",
                "status": "running"}
         task = {"id": "tsk_g1", "status": "running", "kind": "code", "workspace_path": "/nonexistent",
@@ -880,7 +887,7 @@ class TestGitCollectedOnce(unittest.TestCase):
                                   lambda c, r, e, git=None: finished.append(git) or "succeeded"):
             self.assertIsNone(supervisor._watch_one(conn, "/tmp", run))  # starts the worker
             deadline = time.monotonic() + 5
-            while not supervisor._GIT_INFO["run_g1"]["done"] and time.monotonic() < deadline:
+            while not supervisor._GIT_INFO[f"run_g1{_RUN_SFX}"]["done"] and time.monotonic() < deadline:
                 time.sleep(0.02)
             self.assertIsNone(supervisor._watch_one(conn, "/tmp", run))  # first empty scan
             self.assertTrue(supervisor.pending_exit_checks())
@@ -891,10 +898,10 @@ class TestGitCollectedOnce(unittest.TestCase):
         self.assertLessEqual(iters, 8)  # 1.0 s at a 200 ms beat, never the 5 ms floor
 
     def test_entry_evicted_when_run_inactive(self):
-        supervisor._GIT_INFO["run_g2"] = {"done": True, "git": {}}
-        supervisor._GIT_INFO["run_g3"] = {"done": True, "git": {}}
-        supervisor._evict_git_info({"run_g3"})
-        self.assertEqual(sorted(supervisor._GIT_INFO), ["run_g3"])
+        supervisor._GIT_INFO[f"run_g2{_RUN_SFX}"] = {"done": True, "git": {}}
+        supervisor._GIT_INFO[f"run_g3{_RUN_SFX}"] = {"done": True, "git": {}}
+        supervisor._evict_git_info({f"run_g3{_RUN_SFX}"})
+        self.assertEqual(sorted(supervisor._GIT_INFO), [f"run_g3{_RUN_SFX}"])
 
 
 class TestLoopBackoff(unittest.TestCase):
@@ -903,9 +910,9 @@ class TestLoopBackoff(unittest.TestCase):
     def setUp(self):
         supervisor._CLEAR.clear()
         self.addCleanup(supervisor._CLEAR.clear)
-        supervisor._CLEAR["run_bo"] = terminate.ClearCheck(first_empty_at=time.monotonic() - 1.0)
+        supervisor._CLEAR[f"run_bo{_RUN_SFX}"] = terminate.ClearCheck(first_empty_at=time.monotonic() - 1.0)
         self.conn = mock.Mock()
-        self.conn.execute.return_value.fetchone.return_value = {"id": "run_bo", "status": "running",
+        self.conn.execute.return_value.fetchone.return_value = {"id": f"run_bo{_RUN_SFX}", "status": "running",
                                                                 "kind": "task"}
 
     def _count(self, watch):
@@ -953,7 +960,7 @@ class TestBeginStarttimeCheck(unittest.TestCase):
         p = _spawn()
         self.addCleanup(lambda: (_kill_quiet(p.pid), p.wait()))
         st = int(get_proc_stat(p.pid)["starttime"])
-        run_id = "run_bst"
+        run_id = f"run_bst{_RUN_SFX}"
         self.addCleanup(terminate.forget, run_id)
         with mock.patch.object(terminate, "signal_if_same", return_value=True) as sig:
             t = terminate.begin(run_id, None, None, "test", 1, seen={p.pid: st + 1})

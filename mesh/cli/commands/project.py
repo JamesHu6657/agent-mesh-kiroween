@@ -33,7 +33,7 @@ def register_project_commands(subparsers: argparse._SubParsersAction, parent_par
     create_parser.add_argument("--goal", required=True, help="Project goal description")
     create_parser.add_argument("--criterion", action="append", default=[], help="Acceptance criterion (repeatable)")
     create_parser.add_argument("--lead", help="Designated lead agent identifier")
-    create_parser.add_argument("--repo", help="Git repository root path (repo project, plan §10.2)")
+    create_parser.add_argument("--repo", help="Git repository root path; makes this a repo project whose code tasks get their own git worktree and branch")
     create_parser.add_argument("--base-branch", help="Base git branch")
     create_parser.add_argument("--test-command", help="Test command JSON or 'none'")
     create_parser.add_argument("--depends-on-project", action="append", default=[], help="Project dependency ID")
@@ -117,7 +117,7 @@ def register_project_commands(subparsers: argparse._SubParsersAction, parent_par
         epilog="Examples:\n  mesh project cancel prj_123\n  mesh project cancel prj_123 --cancel-running --user\n",
     )
     cancel_parser.add_argument("project_id", help="Project identifier")
-    cancel_parser.add_argument("--cancel-running", action="store_true", default=False, help="Accepted for compatibility (plan §13); running tasks are always cancelled through cancelling (P5)")
+    cancel_parser.add_argument("--cancel-running", action="store_true", default=False, help="Accepted for compatibility; running tasks are always stopped (they pass through 'cancelling')")
     cancel_parser.set_defaults(func=handle_project_cancel)
 
     # set-lead
@@ -302,7 +302,8 @@ def handle_project_set_lead(args: argparse.Namespace) -> Dict[str, Any]:
 def handle_project_complete(args: argparse.Namespace) -> Dict[str, Any]:
     report_arg = getattr(args, "report", "")
     if report_arg == "-":
-        report_raw = sys.stdin.read()
+        from mesh.cli.stdin import read_stdin
+        report_raw = read_stdin("--report")
     else:
         try:
             with open(report_arg, "r", encoding="utf-8") as f:

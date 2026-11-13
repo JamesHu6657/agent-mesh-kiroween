@@ -49,8 +49,8 @@ were not edited. **N1 is not changed in M2.**
 ## 2. Commands, counts and regression evidence
 
 Historical r12/r12b/r12c commands ran from
-`/home/node/workspace/mesh-wt-m2-r12` ([run notes](impl-notes-m2-r12.md)).
-Kiro's gate commands ran from `/home/node/workspace/mesh-fresh-v1`
+`/home/user/workspace/mesh-wt-m2-r12` ([run notes](impl-notes-m2-r12.md)).
+Kiro's gate commands ran from `/home/user/workspace/mesh-fresh-v1`
 ([execution record](coordination/reviews/m2-gate-kiro.md)).
 
 | Check | Command | Exit/result |

@@ -2,7 +2,9 @@
 
 import mesh.constants as c
 
-TOP_HELP_EPILOG = """Authentication Summary:
+TOP_HELP_EPILOG = """New here? Run `mesh help quickstart` for a short walkthrough.
+
+Authentication Summary:
   User authentication:
     --user --passphrase-fd <fd>   Provide passphrase via file descriptor (or prompt on /dev/tty).
   Agent authentication:
@@ -24,6 +26,50 @@ Examples:
 """
 
 HELP_TOPICS = {
+    "quickstart": """Agent Mesh Quickstart
+
+One machine, one Unix user. The daemon (meshd) schedules tasks; agents talk to it
+with the `mesh` CLI. Commands marked --user ask for your passphrase.
+
+  1. Set up (init the home, start the daemon, create an inbox lead with a token file):
+     mesh setup
+
+  2. Create an inbox worker agent, its 0600 token file and a cheat-sheet in one step:
+     mesh agent onboard worker1 --out ~/.config/agent-mesh/worker1.token --user
+     (email-driven or slow agents: add --ack-timeout 2h; the default window is 10 min)
+
+  3. Submit a project for a git repository (the lead plans it). A repo project needs
+     its base branch and the merge-gate test command (a JSON argv, or none):
+     mesh intake submit --title "Add CSV export" --goal "Export reports as CSV" \
+         --criterion "Tests pass" --repo ~/src/myapp --base-branch main \
+         --test-command '["python3", "-m", "pytest", "-q"]' \
+         --token-file ~/.config/agent-mesh/lead.token
+
+  4. The lead creates a task for the worker ('-' reads the spec from stdin):
+     mesh task create --project prj_123 --title "CSV export" --assignee worker1 --spec - \
+         --token-file ~/.config/agent-mesh/lead.token < spec.md
+
+  5. The worker picks it up, keeps its lease alive, and submits:
+     W=~/.config/agent-mesh/worker1.token
+     mesh inbox list --token-file $W
+     mesh task start tsk_456 --token-file $W        # prints run id, fence, workspace, lease, session
+     export MESH_SESSION=ses_0123456789abcdef       # the session it printed (run writes must send it)
+     mesh task keepalive tsk_456 --run run_789 --fence 1 --token-file $W > keepalive.log 2>&1 &
+     mesh task submit tsk_456 --run run_789 --fence 1 --summary "Done" \
+         --deliverable '{"tests": "pass"}' --token-file $W
+
+  6. The lead reviews, accepts (or rejects with feedback) and merges:
+     mesh task accept tsk_456 --token-file ~/.config/agent-mesh/lead.token
+     mesh task merge tsk_456 --token-file ~/.config/agent-mesh/lead.token
+
+  7. Deliver the integration branch to the base branch:
+     mesh project deliver prj_123 --user
+
+Examples:
+  mesh help quickstart
+  mesh help workflow
+  mesh doctor
+""",
     "auth": f"""Agent Mesh Authentication & Threat Model
 
 Authentication Mechanisms:
@@ -79,7 +125,7 @@ Examples:
   # Delegated mode: the lead approves on the human's quoted reply:
   mesh approval approve apr_12345 --op-hash sha256:... --human-confirmed "Alice 09:12: yes, deploy" --token-file lead.tok
 """,
-    "exit-codes": f"""Exit Codes Table (plan §13.2 verbatim):
+    "exit-codes": f"""Exit Codes:
 
 {c.EXIT_CODES_TABLE_MD}
 
@@ -135,12 +181,15 @@ Examples:
     "adapters": """Agent Mesh Adapters
 
 Supported CLI Adapters:
-  - droid: Factory droid CLI (partially_verified in M1; launch enabled in M3)
-  - agy: Antigravity CLI (partially_verified in M1; launch enabled in M3)
-  - kiro: Kiro CLI (partially_verified in M1; launch enabled in M3)
-  - vibe: Mistral vibe CLI (partially_verified in M1; launch enabled in M3)
-  - hermes: Hermes agent (not_installed)
-  - openclaw: OpenClaw agent (not_installed)
+  - droid: Factory droid CLI
+  - agy: Antigravity CLI
+  - kiro: Kiro CLI
+  - vibe: Mistral vibe CLI
+  - hermes: Hermes agent (no launch support yet; use an inbox agent)
+  - openclaw: OpenClaw agent (no launch support yet; use an inbox agent)
+  Whether a vendor adapter may launch depends on its probe and smoke evidence and
+  the adapter.evidence_mode setting; `mesh adapter list` shows launch_enabled and,
+  when it is off, launch_reason.
   - none: Inbox-only agent delivery (no CLI launch)
   - fake: In-memory test double (enabled only when MESH_TESTING=1)
 

@@ -321,11 +321,19 @@ class TestCodeTasks(unittest.TestCase):
         """ACC: D12, K3 (review m2-r4 finding 2) - fx1 full; a priority-5 code task starts before a priority-0 general task."""
         create_agent(self.harness, "fx1", adapter="fake", delivery="launch",
                      allowed_models=["m-a"], default_model="m-a", max_concurrency=1)
-        busy = self.create_task('FAKE {"sleep": {"seconds": 3}}', "fx1", "--kind", "general", title="busy")
+        # `busy` holds fx1's only slot until both other tasks are queued (load-independent:
+        # a fixed sleep could end before `code` exists on a loaded host, letting `g` start first).
+        release = os.path.join(self.stubs_dir, "busy.release")
+        busy = self.create_task('FAKE {"wait_release": {"path": "%s"}}' % release, "fx1", "--kind", "general",
+                                title="busy")
         self.wait_status(busy, "running", timeout=30.0)
         g = self.create_task('FAKE {"sleep": {"seconds": 1}}', "fx1", "--kind", "general", "--priority", "0",
                              title="general")
         code = self.create_task(_commit_spec("c.txt", "c\n", "c"), "fx1", "--priority", "5", title="code")
+        self.wait_status(g, "queued", timeout=30.0)
+        self.wait_status(code, "queued", timeout=30.0)
+        self.assertEqual(self.show(busy)["status"], "running")
+        open(release, "w").close()
         self.wait_status(code, "submitted", timeout=60.0)
         self.wait_status(g, "submitted", timeout=60.0)
         conn = self.harness.db()

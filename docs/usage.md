@@ -1,8 +1,8 @@
 # Agent Mesh v1 — Usage Guide
 
-Status: updated for gate M2 (plan §16). It describes what Mesh does **today**
-on this branch, including what is left for later milestones. Where this guide and the code
-disagree, the code and `mesh help <topic>` are authoritative.
+This guide describes the current implementation and its limits. Where this guide and the code
+disagree, the code and `mesh help <topic>` are authoritative. For a short end-to-end
+walkthrough run `mesh help quickstart`.
 
 Agent Mesh runs on a single Linux machine under one Unix user. It is a local scheduler:
 a daemon (`meshd`) owns one SQLite database, and the `mesh` CLI talks to it over a Unix
@@ -15,7 +15,8 @@ and no remote endpoint.
 
 The normal project loop is:
 
-1. **Init and start.** `mesh init` (passphrase on `/dev/tty`), then `mesh daemon start`.
+1. **Set up.** `mesh setup` initializes the home, starts the daemon and creates an inbox
+   lead. For the separate steps use `mesh init` followed by `mesh daemon start`.
 2. **Agents.** The user creates agents with `mesh agent create --user`. An agent is
    either `delivery=launch` (Mesh starts a headless CLI process per attempt) or
    `delivery=inbox` (an already-running process polls for work).
@@ -28,7 +29,8 @@ The normal project loop is:
    project state, priority, and per-agent plus global concurrency limits.
 6. **Execution.** A launch executor runs in its own per-task directory under a wrapper
    that meshd supervises (timeout, cancel, crash recovery); an inbox
-   executor calls `mesh task start`, then `mesh task heartbeat`/`progress`, then
+   executor calls `mesh task start`, keeps the lease alive with `mesh task keepalive`
+   (or its own `mesh task heartbeat` calls), reports `progress`, then
    `mesh task submit` (or `mesh task fail`).
 7. **Review.** The lead accepts (`mesh task accept`) or rejects with a reason
    (`mesh task reject --reason …`). Rejection returns the task to `rework` and then
@@ -37,10 +39,10 @@ The normal project loop is:
    `mesh project complete <prj> --report -`. The user is notified; the user does not
    re-confirm completion.
 
-**Launch execution for vendor CLIs.** M1c built the run wrapper (`runwrap`), the
+**Launch execution for vendor CLIs.** The run wrapper (`runwrap`), the
 supervisor (exit handling, timeouts, cancel, post-submit grace, leftover termination), and
-crash recovery (meshd adopts live runs after a restart and closes lost ones). Whether a
-vendor adapter may launch depends on `adapter.evidence_mode` (section 10):
+crash recovery (meshd adopts live runs after a restart and closes lost ones) supervise
+each launched attempt. Whether a vendor adapter may launch depends on `adapter.evidence_mode` (section 10):
 
 - `warn` (the default): a vendor CLI launches even without smoke evidence that matches the
   installed version; `mesh adapter show <id>` reports `evidence_warning` with the reason (for
@@ -51,17 +53,49 @@ vendor adapter may launch depends on `adapter.evidence_mode` (section 10):
 
 Committed evidence passes for two adapters. Today that is `droid` 1.6.0 and `kiro` (kiro-cli 3.1.0),
 which both passed
-the real end-to-end run N13; `agy` and `vibe` have no smoke results, so they launch with a
-warning in `warn` mode and are refused in `strict` mode. Launch holds (L11) apply in both
+real end-to-end readonly tasks; `agy` and `vibe` have no smoke results, so they launch with a
+warning in `warn` mode and are refused in `strict` mode. Explicit launch holds apply in both
 modes. `hermes` and `openclaw` are stubs and never launch. The `fake` test double launches
 only when meshd runs with `MESH_TESTING=1`. Inbox-mode execution (leases, fencing,
 heartbeat, submit) is available for any agent. `docs/adapters.md` has the per-adapter
 status and case results.
 
-Commands that are scheduled for later milestones return rc 2 `NOT_IMPLEMENTED_IN_M1`
-with `details.milestone` set to the milestone that builds them.
+Unimplemented commands return rc 2 with the legacy error code
+`NOT_IMPLEMENTED_IN_M1`; this means the operation is unavailable, not that an earlier
+release must be installed. Internal milestone fields are diagnostic metadata.
 
 ---
+
+### Reading and trying the examples
+
+Commands with `$PROJECT_ID`, `$TASK_ID`, `$RUN_ID`, `$FENCE`, `$APPROVAL_ID` or
+`$OP_HASH` require values returned by the preceding operation. Replace symbolic
+paths and model ids before running them. Angle brackets in prose are placeholders,
+not shell syntax. The human uses `--user`; an agent appends its own
+`--token-file "$TOKEN_FILE"`. Never substitute another agent's credential.
+
+Use a throwaway home to try administrative examples without changing a working Mesh:
+
+```sh
+DEMO_ROOT=$(mktemp -d /tmp/mh-demo-XXXXXX)
+export MESH_HOME="$DEMO_ROOT/mesh"
+mkdir -m 700 "$DEMO_ROOT/tokens"
+(umask 077; printf '%s\n' 'documentation-only-passphrase' > "$DEMO_ROOT/passphrase")
+export MESH_PASSPHRASE_FILE="$DEMO_ROOT/passphrase"
+mesh --home "$MESH_HOME" setup --token-dir "$DEMO_ROOT/tokens" \
+  --passphrase-file "$MESH_PASSPHRASE_FILE"
+# Use the token_file in this response; a custom home adds a filename suffix.
+```
+
+The daemon's Unix socket, database, runs and workspaces live under this temporary
+home; no TCP port is opened. Do not point a demo project at your Mesh installation
+or real repository. After the demo, stop only this daemon and remove its fixtures:
+
+```sh
+mesh --home "$MESH_HOME" daemon stop --user
+rm -rf -- "$DEMO_ROOT"
+unset MESH_HOME MESH_PASSPHRASE_FILE DEMO_ROOT
+```
 
 ## 2. Authentication
 
@@ -84,7 +118,7 @@ After five failures within five minutes from peers outside a run session, user a
 locked for five minutes (`LOCKED_OUT`). Failures are recorded as `auth.failed` events
 that contain no secret.
 
-Testing homes (m3-test-kdf): `mesh init` with `MESH_TESTING=1` on a home other than
+Testing homes: `mesh init` with `MESH_TESTING=1` on a home other than
 `~/.agent-mesh` stores a cheap verifier (`N=2**10`) marked `"testing": true`, so the
 offline test suite does not spend minutes in scrypt. `mesh init`, meshd and `mesh doctor` refuse
 testing mode on the default home, including any second path to it they can see (symlink,
@@ -102,7 +136,10 @@ passphrase credential gives `DB_INTEGRITY_FAILED` (rc 1). Home paths may contain
 
 ### 2.2 Agent tokens
 
-`mesh agent token issue <name> --user` prints `mesh_at_<lookup>_<secret>` **once**. The
+`mesh agent token issue <name> --user` prints `mesh_at_<lookup>_<secret>` **once**.
+`mesh agent token issue <name> --out FILE --user` writes it to a new mode 0600 file
+instead (refused if FILE exists unless `--force`, or if it is in a place the token-file
+checks below reject) and leaves it out of the output. The
 database stores only the lookup id and `sha256(token)`. An agent presents the token with
 `--token-file PATH` (mode 0600 required) or in `MESH_TOKEN`. A token never appears in
 argv, prompts, run directories, or child environments.
@@ -153,7 +190,9 @@ Mesh gates the operations it controls:
 
 1. An agent runs a gated op. meshd creates (or reuses) a `pending` approval bound to
    the op's canonical `op_hash` and returns rc 7 `APPROVAL_REQUIRED` with the approval
-   id, hash, category, and expiry.
+   id, hash, category, and expiry. An open approval is reused only while it is within
+   its TTL; one past `expires_at` (not yet swept) is marked `expired` (event
+   `approval.expired`, `expired_on: new_request`) and a fresh approval is created.
 2. The requester re-runs the **identical** op with `--approval <apr>`. Any change in the
    operation, caller, or parameters changes `op_hash` and yields rc 12
    `OP_HASH_MISMATCH` with no state change.
@@ -192,12 +231,17 @@ Then:
    or `user_only` when only you can decide it) and ready approve/reject commands with
    the caller's `--token-file`/`--home`.
 3. The lead asks you through whatever channel it uses with you (chat, email, Telegram).
-4. With your answer, the lead decides with its own agent token and quotes you:
+4. With your actual answer, the lead sets `HUMAN_REPLY` to your words and decides
+   with its own token. Set `APPROVAL_ID` and `OP_HASH` from the pending response,
+   and `LEAD_TOKEN` to that lead's token path. Optional evidence is supplied with
+   `--evidence-ref "$MESSAGE_ID"`; square-bracket syntax is not a CLI argument:
 
    ```sh
-   mesh approval approve apr_123 --op-hash sha256:... \
-     --human-confirmed "James 08:03: yes, deploy it" [--evidence-ref msg-id] --token-file lead.tok
-   mesh approval reject  apr_123 --op-hash sha256:... --human-confirmed "James: no" --token-file lead.tok
+   mesh approval approve "$APPROVAL_ID" --op-hash "$OP_HASH" \
+     --human-confirmed "$HUMAN_REPLY" --token-file "$LEAD_TOKEN"
+   # Alternative decision, not a second command to run for the same approval:
+   mesh approval reject "$APPROVAL_ID" --op-hash "$OP_HASH" \
+     --human-confirmed "$HUMAN_REPLY" --token-file "$LEAD_TOKEN"
    ```
 
 What Mesh enforces: only the **current lead of the approval's project** can do this, with
@@ -235,13 +279,90 @@ Mesh has no magic push. The following table is the concrete delivery mechanism.
 
 | Agent kind | How it receives work | What wakes it | Status |
 |---|---|---|---|
-| **launch** executor (headless CLI: droid/agy/kiro/vibe; in M1 only the `fake` test double under `MESH_TESTING=1`) | Mesh starts a **new headless run for every attempt**. For rework or retry it resumes the vendor session only if that adapter's resume capability is smoke-verified and a session id was captured; otherwise it starts a fresh process with the previous deliverable and the feedback in the prompt. | The scheduler (T5) | Available for vendor CLIs: with the default `adapter.evidence_mode = "warn"` any installed, non-held vendor adapter launches (a warning names missing or stale evidence); with `strict` only those whose committed evidence passes (droid 1.6.0 and kiro-cli 3.1.0 today). The `fake` test double needs `MESH_TESTING=1` |
-| **launch** lead | A lead turn: a new headless run in the lead's own directory, again resuming only if verified. | The scheduler, after pending lead messages pass the debounce | Available in M2 for the `fake` test double only (`MESH_TESTING=1`). Vendor adapters cannot be launch-mode leads until M3 evidence enables them (rc 13 `ADAPTER_UNSUPPORTED`; existing turns refused with `lead.turn_refused`); until then use a `delivery=inbox` lead for vendors |
+| **launch** executor (headless CLI: droid/agy/kiro/vibe) | Mesh starts a **new headless run for every attempt**. For rework or retry it resumes the vendor session only if that adapter's resume capability is smoke-verified and a session id was captured; otherwise it starts a fresh process with the previous deliverable and the feedback in the prompt. | The scheduler | Available for vendor CLIs: with the default `adapter.evidence_mode = "warn"` any installed, non-held vendor adapter launches (a warning names missing or stale evidence); with `strict` only those whose committed evidence passes (droid 1.6.0 and kiro-cli 3.1.0 today). The `fake` test double needs `MESH_TESTING=1` |
+| **launch** lead | A lead turn: a new headless run in the lead's own directory, again resuming only if verified. | The scheduler, after pending lead messages pass the debounce | Available only for the `fake` test double (`MESH_TESTING=1`). Vendor launch leads are refused (rc 13 `ADAPTER_UNSUPPORTED`; existing turns emit `lead.turn_refused`); use an inbox lead for vendors |
 | **inbox** agent (an already-running process: a chat bot, an interactive CLI session the user keeps open, any agent that can run shell commands) | The agent calls **`mesh inbox wait --timeout N`**, which blocks on the Unix socket with no model tokens, or calls **`mesh inbox list`** on its own schedule. It then acknowledges with **`mesh inbox ack <msg>`**. | Only its own next `inbox wait`/`list` call | Available now |
-| **user** | The user inbox (`mesh inbox list --user`), plus copies of user-facing messages in the **origin agent's** inbox for relaying. An optional `notify.command` hook is planned for M4. | The user or the origin agent | Available now |
+| **user** | The user inbox (`mesh inbox list --user`), plus copies of user-facing messages in the **origin agent's** inbox for relaying. No external notification hook is implemented. | The user or the origin agent | Available now |
+
+### 4.1 Running an inbox worker
+
+- **Onboarding.** `mesh agent onboard NAME --out FILE --user` creates an inbox agent
+  (adapter `none`, max concurrency 1, which is also `agent create`'s default), writes its token to a new 0600 file and prints a
+  cheat-sheet with the exact commands for that token. It is the same as
+  `agent create --delivery inbox` + `agent token issue --out`.
+- **Ack window.** An offered task must be started within the ack window or it fails
+  `no_response` (T6). The window is `inbox.ack_timeout_s` (default 600 s) for every
+  inbox agent, or the agent's own value: `mesh agent create/update NAME --ack-timeout 2h`
+  (`--ack-timeout default` goes back to the global setting; `agent show` prints
+  `ack_timeout_s` and where it comes from). Use it for email-driven or other slow
+  agents. The failure details and the lead's `task.failed` notification name the
+  window, the setting that set it, and the retry / update commands.
+  The window is fixed when the task is offered (recorded as `ack_timeout_s` in the
+  `task.offered` message). Lowering `inbox.ack_timeout_s` or `--ack-timeout` applies to
+  new offers only; raising it also extends offers already out. `config set` and
+  `agent update` list (`offers_keeping_window` + a warning) the offers that keep
+  their longer window. Offers made before this was recorded use the current value;
+  the warning names those too.
+- **Watching an inbox.** `mesh inbox list` marks pending messages `delivered`.
+  A watcher or cron job that only checks for work should use `mesh inbox list --peek`
+  (read-only), so the worker's own `inbox list`/`inbox wait` still sees them pending.
+- **Rework.** After `task reject --reason`, `task show` (assignee and lead) has
+  `last_rejection` {reason, rejected_by, rejected_at, attempt}. An inbox assignee also
+  gets a `task.rejected` message with the reason, and the next `task.offered`
+  message carries `last_rejection`.
+- **Lease.** `task start` prints `lease_ttl_s`, `lease_expires_at`,
+  `heartbeat_every_s` (a third of the TTL), `timeout_s` and `deadline_at`; the
+  assignee sees the same under `live_run` in `task show`. An inbox run has no
+  meshd-enforced deadline (`deadline_at` is null, `deadline_enforced` false): it ends
+  when the worker submits or fails it, or when no heartbeat arrives within
+  `lease.ttl_s` (the task fails `lease_expired`). `timeout_s` is the task's budget.
+  Every lease the sweep expires records a `task.lease_expired` event (run, fence,
+  holder, task status) shown in `task show` history; the lead is told by the
+  `task.failed` message, or by `task.lease_expired` itself when the task was no
+  longer running and so did not fail.
+- **One session per run (on by default).** Several worker processes may share an
+  agent token. `task start` records a client session on the run: `MESH_SESSION` if set
+  (any short id), otherwise a generated `ses_...` id. The response carries `session`,
+  an `export MESH_SESSION=...` line (printed in text mode) and a `keepalive` command that
+  already includes it. Heartbeat / keepalive / progress / submit / fail of that run
+  from a different session is refused (exit 9 `FENCE_MISMATCH`, `details.reason:
+  "session_mismatch"`), and so is one naming no session (`"session_missing"`; the error
+  says which `export` to run). Runs started without a session (older clients, launch
+  runs) are not checked.
+  A submit or heartbeat for a run that was already submitted says when, by whom,
+  with which request (and session), so a second session sees what happened.
+- **Lists and batches.** `mesh task list --status submitted,accepted` takes a comma
+  list; its text form shows id, status, assignee, age, time in the current status,
+  attempt and title. `mesh task merge --all-accepted --project P` (lead) merges the
+  project's accepted code tasks one at a time in creation order, each an ordinary
+  `task merge` with its full gate, stops at the first failure and reports merged /
+  failed / not attempted.
+- **Scheduler errors.** A failing scheduler step is logged with its traceback in
+  `logs/meshd.log`, counted, and does not stop the other steps; `mesh daemon status`
+  (`scheduler.sweep_errors`, `last_sweep_error`, per step) and `mesh doctor`
+  (`scheduler_errors` warning) show them since meshd started.
+- **Keepalive.** `mesh task keepalive TSK --run R --fence F [--every N]` heartbeats in a
+  loop (default every `heartbeat_every_s`) and logs each beat to stderr. Run it in the
+  background after `task start`. It exits 0 with the final task state when the run
+  ends normally (submit, fail, cancel) and 9 when the lease was lost (`LEASE_EXPIRED`)
+  or the task was restarted with a newer fence (`FENCE_MISMATCH`). SIGINT/SIGTERM stop
+  it (exit 0); the lease then runs out after `lease.ttl_s`.
+- **Roster for leads.** `mesh agent list` / `mesh agent show NAME` work with an agent
+  token for an enabled agent with `can_lead` or the current lead of an active project.
+  Leads get the roster view: id, name, adapter, delivery, can_lead, max concurrency,
+  disabled, models and efforts, ack window. No credentials, adapter options or binary
+  paths. Every other agent keeps the user-only rule, and all agent changes stay user-only.
+- **Capabilities.** An agent gets `["intake"]` when `agent create` names no
+  `--capability`. Each `--capability` replaces that default (a warning says so when
+  intake is dropped); `--no-intake` drops it on purpose.
+- **Ack window warning.** `agent create`/`onboard` of an inbox agent without
+  `--ack-timeout` warns when the global `inbox.ack_timeout_s` is under 1 h.
+- **Deliverables.** `task submit --deliverable` takes a file path, `-` for stdin, or
+  inline JSON. A value that is neither an existing file nor JSON is reported as
+  `file not found: PATH (and not valid inline JSON)`.
 
 **Mesh cannot push into an interactive TUI.** Injecting text into a running
-interactive session (ACP or JSON-RPC push) is research for a later milestone, not v1.
+interactive session (ACP or JSON-RPC push) is not implemented.
 
 ---
 
@@ -258,6 +379,9 @@ Without OS-level separation, which v1 does not use, Mesh cannot isolate agents f
 other or from itself. Vendor cwd/workdir flags are conventions, not jails: a CLI
 launched with edit or shell permission can write outside its workspace, and vendor
 sandbox flags are vendor features that Mesh does not guarantee.
+
+For real work: Never keep the passphrase in a file and keep token files outside every workspace.
+The throwaway examples above use only a disposable dummy passphrase, not a real account credential.
 
 **Same-uid limits.** These are properties of the operating system, not bugs:
 
@@ -304,7 +428,7 @@ passphrase.** It cannot detect either.
 
 **Recommendations:**
 
-- **Never keep the passphrase in a file and keep token files outside every workspace.**
+- **Keep token files outside every workspace; prefer the terminal prompt for real approvals.**
   The checklist's passphrase file `P` is a test fixture only. Real users type the
   passphrase on `/dev/tty`; use mode 0600 token files under `~/.config/mesh/`.
 - **Mesh recommends a read-only install outside every workspace**
@@ -322,6 +446,11 @@ passphrase.** It cannot detect either.
   unavailable, 11 busy, 12 approval invalid, 13 adapter unavailable, 14 merge failed.
   `mesh help exit-codes` prints the full table.
 - Default output is one JSON envelope. Use `--format text` for tables.
+- `mesh config set KEY VALUE` takes VALUE as JSON (`600`, `null`, `'"text"'`,
+  `'["a"]'`). String settings (`lead.default_agent`, `lead.profile`, `workspaces.root`,
+  `adapter.evidence_mode`, `approval.mode`, `approval.policy.*`) also take a bare word
+  (`config set lead.default_agent lead1`); for other settings a value that is not JSON
+  is refused with the quoted form to use.
 - Every mutating command accepts `--idempotency-key` and `--dry-run`.
 - Use `mesh help auth`, `mesh help approvals`, `mesh help workflow`, and
   `mesh help adapters` for the CLI's own topic text.
@@ -337,14 +466,21 @@ passphrase.** It cannot detect either.
 
 ---
 
+Inbox workers should send a heartbeat while the model or tests are working, not only
+once before submission. `task start` returns `lease_ttl_s`; use an interval well
+inside it (at most 40 seconds for the default 120-second lease). Every write uses
+the exact `run_id` and `fence` from that start. Stop heartbeats after submit/fail or
+a stale/terminal response. See [inbox-agent.sh](examples/inbox-agent.sh).
+
 ## 7. Repo projects and code tasks
 
 Both `intake submit` and `project create` accept `--repo PATH --base-branch B
 --test-command JSON_OR_NONE`. PATH must name the repo's top-level directory, and B
-must be a local branch. For example (append your normal agent or user authentication):
+must be a local branch. Set `REPO` to a separate, clean test repository and use
+`lead` only if that is your configured inbox lead. For example:
 
 ```sh
-mesh intake submit --title "Calculator" --goal "Fix addition" --criterion "Tests pass" --lead lead1 --repo /absolute/path/to/repo --base-branch main --test-command '["python3","-m","unittest"]'
+mesh intake submit --title "Calculator" --goal "Fix addition" --criterion "Tests pass" --lead lead --repo "$REPO" --base-branch main --test-command '["python3","-m","unittest"]' --token-file "$LEAD_TOKEN"
 ```
 
 `--test-command` is required. Use the literal `none` to explicitly record
@@ -377,16 +513,22 @@ are bounded and marked as truncated.
 ## 8. Merge, deliver and cleanup
 
 ```sh
-mesh task accept <tsk>
-mesh task merge <tsk>
-mesh project deliver <prj>
-mesh workspace prune --project <prj> --dry-run
-mesh workspace prune --project <prj>
-mesh workspace delete <tsk>
+mesh task accept "$TASK_ID" --token-file "$LEAD_TOKEN"
+mesh task merge "$TASK_ID" --token-file "$LEAD_TOKEN"
+mesh project deliver "$PROJECT_ID" --token-file "$LEAD_TOKEN"
+mesh workspace prune --project "$PROJECT_ID" --dry-run --token-file "$LEAD_TOKEN"
+mesh workspace prune --project "$PROJECT_ID" --token-file "$LEAD_TOKEN"
+# Accepted work that landed through another task's merge: close it as superseded.
+mesh task close "$TASK_ID" --superseded-by "$OTHER_TASK_ID" --reason "landed in $OTHER_TASK_ID" --token-file "$LEAD_TOKEN"
+# Alternative to prune: delete one inactive workspace, retaining its branch.
+# Agents must first obtain the delete approval, then add --approval "$APPROVAL_ID".
+mesh workspace delete "$TASK_ID" --token-file "$LEAD_TOKEN" --approval "$APPROVAL_ID"
 ```
 
-These examples require the current lead's credential or user authentication.
-`task merge` accepts an accepted code task, or retries `merge_failed` (T17), with no
+These are lead operations, not worker instructions. `project deliver` changes the
+local base branch; run it only when authorized, never merely to inspect a task.
+Prune and delete remove workspaces; use throwaway fixtures when trying them.
+`task merge` accepts an accepted code task, or retries `merge_failed`, with no
 task lease. A `merge:<prj>` lease serializes merges; another merge is rc 11
 `CONCURRENCY_LIMIT`. A submitted task is rc 6 `INVALID_TRANSITION`.
 Dirty task/integration worktrees are refused (rc 14 `WORKTREE_DIRTY` /
@@ -396,11 +538,26 @@ verifies restoration rather than overwriting conflict content.
 The pipeline prepares a non-fast-forward merge, runs the project's tests in the
 integration worktree under supervision, then commits. Tests failing or timing out
 give rc 14 `TESTS_FAILED`, a redacted log at `$MESH_HOME/merges/<mrg>/test.log`,
-and a log tail. A successful merge records its commit and `tests:"passed"` or
+and a log tail. The message and details (`failing_tests`, `failing_tests_total`,
+`failing_tests_truncated`, `log_path`) list up to 20 failing test ids, parsed from
+unittest `FAIL:`/`ERROR:` and pytest `FAILED` lines. `task merge` waits for the tests;
+in `--format text` it prints `mesh: merging TSK: running the project's tests if any
+(log: PATH)...` to stderr once the merge has started. (`--no-wait` was left out: the
+merge result, idempotency record and lead notification are tied to the request; a
+second terminal can follow `task show` (status `merging`, `merge.mrg`) and the log.) A successful merge records its commit and `tests:"passed"` or
 `"none"`; a branch already integrated is a no-op and skips tests. Failures notify
 the lead. A client disconnect does not cancel a merge. Boot recovery aborts an
 unfinished merge or reconciles an already-created matching merge commit.
 `project cancel` during a merge is rc 6 with reason `merge_in_progress`.
+
+`task close TSK --superseded-by TSK2` (lead or user) is for an `accepted` or
+`merge_failed` code task whose work reached integration through TSK2's merge. TSK2
+must be `merged` and in the same project, and TSK must have no open dependents
+(re-point them with `dep remove`/`dep add`). TSK ends in the terminal `cancelled`
+state with a `task.closed` event (`superseded_by`, `from_state`, optional `--reason`);
+`task show` prints `superseded_by`. The branch and worktree are kept. No new task
+state is added, so project completion, deliver, doctor and prune treat it like any
+cancelled task.
 
 Test commands must leave no untracked, non-ignored artifacts in the integration
 worktree, or later merges report `INTEGRATION_DIRTY`. Mesh does not clean those
@@ -422,18 +579,15 @@ Agents must name `--project` and lead that project; only the user may prune unsc
 `workspace delete` requires the `delete` approval for agents (rc 7), or direct user
 authentication. A live task lease blocks it. After checking containment under
 `workspaces.root`, it removes the directory and prunes git's worktree metadata,
-but **keeps the branch, including unmerged commits** (Q7).
+but **keeps the branch, including unmerged commits**.
 
 ## 9. Launch-mode lead turns
 
-M2 exercises this path only with `fake` in testing mode, not real inference.
-Vendor launch leads remain disabled until M3 evidence enables them. Creation or
-set-lead refuses them with rc 13; the scheduler refuses an existing disabled
-launch lead once per assignment (`lead.turn_refused`), leaving messages pending.
-**In M3-lite every vendor launch lead is refused, even with launch evidence**
-(decision D4): no vendor lead turn starts, its messages stay pending, and meshd logs
-`lead.turn_refused` with reason `vendor_lead_m3_lite` once per assignment. droid and
-kiro can be launch executors but not launch leads; use a `delivery=inbox` lead.
+Only the `fake` test double can be a launch-mode lead, and only in testing mode.
+All vendor launch leads are refused, even with executor launch evidence. Creation or
+set-lead returns rc 13; an existing disabled launch lead keeps its messages pending
+and emits `lead.turn_refused` with legacy reason `vendor_lead_m3_lite` once per
+assignment. Use `delivery=inbox` for a real lead. No vendor lead inference starts.
 
 For an active project, pending `lead_wake` messages trigger a turn after
 `lead.wake_debounce_s` (default 5 s), or when at least 20 are pending. The
@@ -490,29 +644,31 @@ a turn by themselves, avoiding an automatic failure loop.
 
 Session ids are captured for executor runs and lead assignments. Resume is used
 only when an id exists and the adapter reports a supported, smoke-verified resume
-capability. M2 tests this only with the fake's `resume_verified=true` option, never
-as evidence for a vendor. Without verification the next run is fresh. Every run
+capability. Tests exercise this with the fake's `resume_verified=true` option; that is not
+evidence for a vendor. Without verification the next run is fresh. Every run
 still gets the full prompt. After rejection, subsequent attempts include the latest
 rejection reason and previous deliverable summary, even after a rework attempt fails
 or times out and is retried. Correctness never depends on resume.
 
-## 10. Vendor evidence: probe, smoke and launch (M3)
+## 10. Vendor evidence: probe, smoke and launch
 
 **Evidence mode.** Everything below describes `adapter.evidence_mode = "strict"`. In the
 default `warn` mode the same evaluation runs, but a failing result (other than a launch hold
 or a stub adapter) is reported as a warning instead of refusing the launch.
 
-**Evidence-driven launch.** meshd decides `launch_enabled` per vendor at runtime; nobody
+**Evidence-driven launch.** For leads, every vendor launch lead is refused, even with launch evidence;
+its legacy machine reason remains `vendor_lead_m3_lite`.
+
+**Strict executor evidence.** meshd decides `launch_enabled` per vendor at runtime; nobody
 sets it by hand. It is true only if the latest probe row for the agent's binary has
 version V, the latest results file for the adapter in `tests/smoke/results/` has version
 V, that file validates, and its S-X-1 and S-X-6 cases pass. Otherwise launch commands
 return rc 13 `ADAPTER_UNSUPPORTED` with `details.reason` (`no_probe_version`,
 `no_smoke_evidence`, `evidence_stale`, `evidence_invalid`, `launch_cases_failed`, or
-`launch_held` for an adapter held back by milestone; none is held today, kiro was held
-during M3, L11).
+`launch_held` for an adapter on an explicit hold).
 meshd reads this evidence from the checkout's `tests/` tree at runtime (`tests/smoke/results/`,
-and it hashes `tests/fixtures/real/`); this is an accepted deviation for a local v1
-(D5). Upgrading a vendor CLI makes its evidence `evidence_stale` until new results for
+and it hashes `tests/fixtures/real/`); package installs therefore need `MESH_EVIDENCE_ROOT` pointing at a checkout for
+strict evidence checking. Upgrading a vendor CLI makes its evidence `evidence_stale` until new results for
 the new version are promoted. `mesh adapter show <id>` prints the status,
 `launch_enabled`, `launch_milestone`, `launch_reason`, `results_file`, and per-capability
 `verification`, `verified_at` and `verified_version`.
@@ -545,13 +701,13 @@ results file offline into a new staging directory.
 
 - Mesh does not sandbox external CLIs. A passing smoke case is evidence about a readonly
   run, not a permission guarantee.
-- Vendor launch leads stay refused in M3-lite (D4, section 9).
+- Vendor launch leads are refused (section 9).
 - The idle timeout stays off: `run.idle_timeout_s` defaults to `0`, and it is not
   validated against vendor output.
 - Resume is used only for a resume capability that is `supported: "yes"` and smoke
   verified; every vendor still reports `supported: "unknown"`, so vendor runs start
   fresh with the full prompt.
-- **droid `dev` is the profile that commits locally.** In the N26 demo, droid `dev`
+- **droid `dev` is the profile that commits locally.** In the recorded code-task demo, droid `dev`
   (`--auto medium`) edited and committed in its own task worktree; Mesh never
   auto-commits, then merged the task branch into integration with a two-parent merge
   commit, with no remote and nothing pushed. kiro and agy `dev` stay

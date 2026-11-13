@@ -62,12 +62,15 @@ if "Count from 1" in prompt:
             time.sleep(0.2)
             os.abort()
         signal.signal(signal.SIGTERM, on_term)
+    termed = []
     if mode == "term_run_error":
-        def on_term(signo, frame):
+        # Only set a flag here: printing from the handler could interrupt a print in the
+        # loop (reentrant BufferedWriter -> RuntimeError, rc 1 under load).
+        signal.signal(signal.SIGTERM, lambda signo, frame: termed.append(signo))
+    for i in range(1, 100000):
+        if termed:
             emit("runError", {"sessionId": sid, "stage": "prompt", "message": "Internal error: the response stream was closed."})
             sys.exit(0)
-        signal.signal(signal.SIGTERM, on_term)
-    for i in range(1, 100000):
         chunk(str(i) + "\n")
         time.sleep(0.01)
     sys.exit(0)

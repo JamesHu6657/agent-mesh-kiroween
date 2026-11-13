@@ -28,7 +28,7 @@ def register_intake_commands(subparsers: argparse._SubParsersAction, parent_pars
     submit_parser.add_argument("--goal", help="Project goal description")
     submit_parser.add_argument("--criterion", action="append", default=[], help="Acceptance criterion (repeatable)")
     submit_parser.add_argument("--lead", help="Designated lead agent identifier")
-    submit_parser.add_argument("--repo", help="Git repository root path (repo project, plan §10.2)")
+    submit_parser.add_argument("--repo", help="Git repository root path; makes this a repo project whose code tasks get their own git worktree and branch")
     submit_parser.add_argument("--base-branch", help="Base git branch for integration")
     submit_parser.add_argument("--test-command", help="Test command JSON array or 'none'")
     submit_parser.add_argument("--depends-on-project", action="append", default=[], help="Project dependency ID (repeatable)")

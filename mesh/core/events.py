@@ -249,6 +249,20 @@ def fan_out_event(conn: sqlite3.Connection, event: Dict[str, Any]) -> None:
             dedup = f"offered:{task_id}:{fence}:v{tver}"
             _insert_outbox_msg(conn, event_seq, assignee_id, "inbox", dedup, project_id, etype, payload_raw, now)
 
+    # 3b. task.rejected -> inbox assignee (the reason travels with it; launch agents get
+    #     it in the next attempt's prompt instead)
+    elif etype == "task.rejected" and task_id:
+        cur_t = conn.execute(
+            "SELECT t.assignee_agent_id, a.delivery FROM tasks t "
+            "LEFT JOIN agents a ON a.id = t.assignee_agent_id WHERE t.id = ?;",
+            (task_id,),
+        )
+        trow = cur_t.fetchone()
+        if trow and trow["assignee_agent_id"] and trow["delivery"] == "inbox":
+            dedup = f"rejected:{task_id}:{event_id}"
+            _insert_outbox_msg(conn, event_seq, trow["assignee_agent_id"], "inbox", dedup, project_id, etype,
+                               payload_raw, now)
+
     # 4. task.submitted, task.failed -> lead
     elif etype in ("task.submitted", "task.failed") and project_id:
         lead = _get_project_lead_info(conn, project_id)
@@ -262,6 +276,15 @@ def fan_out_event(conn: sqlite3.Connection, event: Dict[str, Any]) -> None:
                 dedup = f"{etype}:{task_id}:{fence}:{lead['assignment_id']}:v{tver}"
             else:
                 dedup = f"{etype}:{task_id}:{fence}:{lead['assignment_id']}"
+            _insert_outbox_msg(conn, event_seq, lead["agent_id"], channel, dedup, project_id, etype, payload_raw, now)
+
+    # 4b. task.lease_expired -> lead, only when the task did not fail with it (a failed
+    #     task already notifies the lead with task.failed reason lease_expired)
+    elif etype == "task.lease_expired" and project_id and not payload.get("task_failed"):
+        lead = _get_project_lead_info(conn, project_id)
+        if lead:
+            channel = "lead_wake" if lead["delivery"] == "launch" else "inbox"
+            dedup = f"{etype}:{task_id}:{run_id}:{lead['assignment_id']}"
             _insert_outbox_msg(conn, event_seq, lead["agent_id"], channel, dedup, project_id, etype, payload_raw, now)
 
     # 5. task.blocked, task.merged, merge.failed -> lead
@@ -400,3 +423,34 @@ def verify_event_chain(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
 
 
 insert_event = record_event
+
+
+def last_rejection(conn: sqlite3.Connection, task_id: str) -> Optional[Dict[str, Any]]:
+    """The latest `task reject` of a task: reason, who, when, attempt. None if never rejected.
+
+    Shown to the assignee and the lead in `task show` and carried in the rework offer, so
+    a worker picking a task up again knows what to change.
+    """
+    row = conn.execute(
+        """SELECT e.ts, e.reason, e.payload_json, e.actor_id, e.actor_kind, e.via, p.name AS actor_name
+           FROM events e LEFT JOIN principals p ON p.id = e.actor_id
+           WHERE e.task_id = ? AND e.type = 'task.rejected'
+           ORDER BY e.seq DESC LIMIT 1;""",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload_json"] or "{}")
+    except (ValueError, TypeError):
+        payload = {}
+    by = row["actor_name"] or row["actor_id"]
+    if row["actor_kind"] == "user":
+        by = "user"
+    return {
+        "reason": row["reason"] or payload.get("reason") or "",
+        "rejected_by": by,
+        "via": row["via"],
+        "rejected_at": row["ts"],
+        "attempt": payload.get("attempt"),
+    }

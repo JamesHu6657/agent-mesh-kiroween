@@ -14,6 +14,8 @@ count is bounded only by the CPU count (gate item A1: keep the suite under 10 mi
 """
 
 import concurrent.futures
+import fcntl
+import tempfile
 import json
 import hashlib
 import os
@@ -65,7 +67,79 @@ def is_idle_bound_test(test: unittest.TestCase) -> bool:
 IDLE_POOL_MAX = 4
 
 
+# Host-wide /proc lock (dogfood: N concurrent tier runs on one host). Tests that scan
+# the real /proc see every same-uid process on the host, including another runner's
+# non-dumpable escapees (EACCES environ -> scan "uncertain"). mesh_serial only orders
+# tests inside one runner, so these tests also take an flock shared by all runners of
+# this uid: tests that spawn non-dumpable escapees hold it EXCLUSIVE, tests that scan
+# the real /proc hold it SHARED. Scanners still run concurrently with each other; no
+# scanner runs while any runner has a non-dumpable escapee alive. Production scan
+# semantics are untouched. Marking: ``mesh_proc_lock = "exclusive" | "shared"`` on a
+# test method or class, or ``MESH_PROC_LOCK = ...`` at module level.
+#
+# Integration and recovery tiers default to SHARED (batch 6 audit): every test there runs
+# a real meshd whose run closure / termination / merge leftover scans read the real
+# /proc, so another runner's EXCLUSIVE escapee test could make them "uncertain"
+# (test_kill_failed_retry_then_dead, merge leftover_scan_uncertain under load).
+#
+# Writer preference: shared holders are many and overlap across runners, so a plain
+# flock could starve an EXCLUSIVE test. Every acquirer first takes a turnstile lock
+# (EX) for the moment of its own acquisition; an exclusive waiter holds the turnstile
+# while it waits, so new shared holders queue behind it and the current ones drain.
+PROC_LOCK_PATH = os.environ.get("MESH_TEST_PROC_LOCK") or os.path.join(
+    tempfile.gettempdir(), f"agent-mesh-proc-tests-{os.getuid()}.lock")
+PROC_TURNSTILE_PATH = PROC_LOCK_PATH + ".turnstile"
+SHARED_BY_DEFAULT_TIERS = ("integration", "recovery")
+DEFAULT_PROC_LOCK: Optional[str] = None
+
+
+def proc_lock_mode(test: unittest.TestCase) -> Optional[str]:
+    """``"exclusive"``, ``"shared"`` or ``None`` for a test (method > class > module)."""
+    method = getattr(test, getattr(test, "_testMethodName", "") or "", None)
+    for holder in (method, test.__class__):
+        mode = getattr(holder, "mesh_proc_lock", None) if holder is not None else None
+        if mode:
+            return mode
+    module = sys.modules.get(test.__class__.__module__)
+    mode = getattr(module, "MESH_PROC_LOCK", None) if module is not None else None
+    return mode or DEFAULT_PROC_LOCK
+
+
+class _ProcLock:
+    def __init__(self, mode: Optional[str]) -> None:
+        self.mode = mode
+        self.fd: Optional[int] = None
+
+    def __enter__(self) -> "_ProcLock":
+        if self.mode in ("exclusive", "shared"):
+            self.fd = os.open(PROC_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600)
+            turn = os.open(PROC_TURNSTILE_PATH, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(turn, fcntl.LOCK_EX)
+                fcntl.flock(self.fd, fcntl.LOCK_EX if self.mode == "exclusive" else fcntl.LOCK_SH)
+            finally:
+                os.close(turn)  # releases the turnstile
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        if self.fd is not None:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self.fd)
+                self.fd = None
+
+
+PROC_LOCK_MODES: Dict[str, Optional[str]] = {}
+
+
 def run_single_test(test_id: str, timeout_s: int) -> Tuple[str, str, float, str]:
+    """Run a single test ID as an isolated subprocess (under its host-wide /proc lock)."""
+    with _ProcLock(PROC_LOCK_MODES.get(test_id)):
+        return _run_single_test(test_id, timeout_s)
+
+
+def _run_single_test(test_id: str, timeout_s: int) -> Tuple[str, str, float, str]:
     """Run a single test ID as an isolated subprocess.
 
     Returns:
@@ -136,6 +210,9 @@ def main() -> int:
         return 1
 
     test_dir = sys.argv[1]
+    global DEFAULT_PROC_LOCK
+    if os.path.basename(os.path.normpath(test_dir)) in SHARED_BY_DEFAULT_TIERS:
+        DEFAULT_PROC_LOCK = "shared"
     timeout_s = int(os.environ.get("MESH_TEST_TIMEOUT_S", "600"))
 
     # Discover tests
@@ -153,6 +230,7 @@ def main() -> int:
 
     for case in all_cases:
         t_id = case.id()
+        PROC_LOCK_MODES[t_id] = proc_lock_mode(case)
         if is_serial_test(case):
             serial_ids.append(t_id)
         elif is_idle_bound_test(case):

@@ -1,6 +1,6 @@
 # Implementation notes — m4-p3-cleanup
 
-Run by a Quest coder (a helper agent declined the batch, 2026-11-12 21:06). Scope: the five
+Run by a Quest coder (Worker 2 declined the batch, 2026-11-12 21:06). Scope: the five
 P3 items carried from the M3 gate into M4 polish. No new features.
 
 1. **kiro/agy prompt position (Carbon r10 P3).** Neither real help fixture documents `--`

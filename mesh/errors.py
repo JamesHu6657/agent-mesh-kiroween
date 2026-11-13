@@ -53,7 +53,7 @@ class NotImplementedInM1Error(MeshError):
         super().__init__(
             code=c.NOT_IMPLEMENTED_IN_M1,
             exit_code=c.EXIT_USAGE,
-            message=f"Verb '{verb}' is not implemented in M1",
+            message=f"'{verb}' is not available in this version of Agent Mesh",
             details=details,
         )
 

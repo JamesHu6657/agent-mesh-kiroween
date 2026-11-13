@@ -291,6 +291,60 @@ def _same_uid(pid: int) -> bool:
         return False
 
 
+def _comm(pid: int) -> str:
+    """/proc/<pid>/comm (readable even for non-dumpable processes); '' when unreadable."""
+    if pid <= 0:
+        return ""
+    try:
+        with open(f"/proc/{pid}/comm", "r", encoding="utf-8", errors="replace") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _foreign_spawned_bystander(info: Dict[str, int], eacces_from: Optional[int],
+                               pid: Optional[int] = None) -> bool:
+    """True for a young non-dumpable same-uid process a *pre-existing other-user daemon*
+    created, e.g. ``sshd-session: user@notty`` (parent: root ``sshd-session [priv]``,
+    grandparent: the old root ``sshd`` listener).
+
+    Dogfood merge failure: every SSH login during a long merge test made the run's
+    termination scan uncertain (EACCES on the session's environ), so the merge could
+    not close (INTERNAL_ERROR, task stuck in 'merging') and the unit tests that scan
+    /proc failed whenever someone logged in. Such a process cannot carry this run's
+    MESH_RUN_ID: an unprivileged run cannot make another user's process its parent,
+    and a daemon that was running before the run (the grandparent) builds the child's
+    environment itself. A parent of our own uid, pid 1 (reparented escapee), a
+    grandparent started at/after the run, or any read error keeps it uncertain.
+    """
+    if eacces_from is None:
+        return False
+    try:
+        ppid = int(info["ppid"])
+        if ppid <= 1:
+            return False
+        # PR #37 review #1: only sshd's own session processes. Any other foreign parent
+        # (e.g. a root subreaper that adopted an escaped run process) stays uncertain.
+        if not _comm(ppid).startswith("sshd"):
+            return False
+        if pid is not None and not _comm(pid).startswith("sshd"):
+            return False
+        pinfo = get_proc_stat(ppid)
+        if pinfo is None or os.stat(f"/proc/{ppid}").st_uid == os.geteuid():
+            return False
+        gpid = int(pinfo["ppid"])
+        if gpid < 1:
+            return False
+        ginfo = get_proc_stat(gpid)
+        if ginfo is None or int(ginfo["starttime"]) >= int(eacces_from):
+            return False
+        # Re-check the parent is still the same process (pid reuse between reads).
+        again = get_proc_stat(ppid)
+        return bool(again and int(again["starttime"]) == int(pinfo["starttime"]))
+    except (OSError, KeyError, ValueError, TypeError):
+        return False
+
+
 def _environ_unknown(env: Optional[Dict[str, str]], pid: int, info: Dict[str, int],
                      young_from: Optional[int]) -> bool:
     """True when an empty/unreadable environ may just not be visible yet (UNKNOWN).
@@ -479,7 +533,8 @@ def _run_targets_inner(
                 # whereas pre-existing host bystanders (e.g. ssh-agent started before the run)
                 # have st < eacces_from and do not wedge scans.
                 if _same_uid(pid) and not _is_kthread(pid, info):
-                    if (eacces_from is None or st >= eacces_from) and not _exiting_or_gone(pid, st):
+                    if ((eacces_from is None or st >= eacces_from) and not _exiting_or_gone(pid, st)
+                            and not _foreign_spawned_bystander(info, eacces_from, pid)):
                         found.uncertain = True
             env = None
         if env and env.get("MESH_RUN_ID") == run_id:

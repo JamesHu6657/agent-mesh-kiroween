@@ -65,7 +65,7 @@ How I ran it: with the new tests kept, I restored the sources from main (`git sh
 
 ### Suite
 - Focused: test_repos_cas, test_refs_worktrees, test_merge_refs, test_repos, test_deliver_prune, test_code_tasks, test_repo_projects, test_gitops: 48 tests OK.
-- Full `bash scripts/test.sh` (after the fix and test commits): rc 0, wall 771 s. Unit 349, integration 263, recovery 33, all OK. Both tripwire files were absent afterwards. `pgrep -fa run_tier.py` at the start showed another worktree's suite (`/home/node/workspace/mesh-wt-m2-r12`, integration tier), which overlapped this run, so 771 s is not an idle time. No other suite was running at the end.
+- Full `bash scripts/test.sh` (after the fix and test commits): rc 0, wall 771 s. Unit 349, integration 263, recovery 33, all OK. Both tripwire files were absent afterwards. `pgrep -fa run_tier.py` at the start showed another worktree's suite (`/home/user/workspace/mesh-wt-m2-r12`, integration tier), which overlapped this run, so 771 s is not an idle time. No other suite was running at the end.
 
 ---
 
@@ -142,7 +142,7 @@ Branch wt/m3-r9c, from main f484e21. Follow-up to the Linear ACCEPT of r9b.
   final commit: **rc 0, wall 903 s**, 350 unit + 263 integration + 33 recovery
   tests (646 total), all OK.
 - `pgrep -fa run_tier.py` before: `11155 python3 tests/run_tier.py tests/integration`,
-  cwd `/home/node/workspace/mesh-wt-m3-r4`. After: no actual `run_tier.py` process.
+  cwd `/home/user/workspace/mesh-wt-m3-r4`. After: no actual `run_tier.py` process.
   Both calls also matched their own Factory execution-supervisor command lines;
   those are not suite runners. This suite overlapped the other worktree, so its
   wall time is not an idle benchmark.

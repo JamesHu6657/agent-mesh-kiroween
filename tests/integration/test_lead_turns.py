@@ -426,13 +426,19 @@ class TestLeadPromptCapInTurn(LeadTurnCase):
         # 25 follow-ups plus the project.created wake message.
         self.assertEqual(len(rows), 26, len(rows))
         delivered = [r for r in rows if r["delivering_run_id"] == turn["id"]]
-        still_pending = [r for r in rows if r["status"] == "pending"]
+        # The rest was left for later: still pending, or (on a loaded host, where the next
+        # turn may start before this read) already carried by a LATER turn, never by this one.
+        left = [r for r in rows if r["delivering_run_id"] != turn["id"]]
         # A strict subset went into the turn; the rest stayed pending.
         self.assertGreater(len(delivered), 0)
         self.assertLess(len(delivered), len(rows), f"all {len(rows)} messages fit the prompt")
-        self.assertGreater(len(still_pending), 0)
+        self.assertGreater(len(left), 0)
         self.assertEqual({r["status"] for r in delivered}, {"acked"})
-        self.assertEqual({r["delivering_run_id"] for r in still_pending}, {None})
+        for r in left:
+            if r["delivering_run_id"] is None:
+                self.assertEqual(r["status"], "pending", r)
+            else:
+                self.assertGreater(r["delivering_run_id"], turn["id"], r)  # ids sort by creation
 
         # The prompt is within the adapter's limit and names what it omitted.
         prompt_path = os.path.join(turn["run_dir"], "prompt.md")

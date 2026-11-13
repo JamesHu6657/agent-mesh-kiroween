@@ -1,6 +1,6 @@
 # m3-test-kdf: cheap scrypt for testing homes, strictly gated
 
-Branch `grok/m3-test-kdf` from main be54a3c. Product change, small. a helper agent.
+Branch `grok/m3-test-kdf` from main be54a3c. Product change, small. Worker 2.
 
 ## Why
 
@@ -208,7 +208,7 @@ failed with rc 1 before repairing modes.)
 
 ### Fix round 3 suite run
 
-Full `scripts/test.sh` on helper-box (shared box, 1-minute load average about 3.5 at
+Full `scripts/test.sh` on box2 (shared box, 1-minute load average about 3.5 at
 the start): unit 564 OK (1 skipped: the root-only bind mount test) in 39.5 s,
 integration 280 OK in 128.3 s, recovery 49 OK in 22.6 s; 893 run, 892 passed, 0 failed,
 1 skipped; total wall 191 s. Tripwire clean.
@@ -291,7 +291,7 @@ they keep working.
 
 ## Suite time
 
-Measured on helper-box (8 vCPU), full `scripts/test.sh`, run back to back right after
+Measured on box2 (8 vCPU), full `scripts/test.sh`, run back to back right after
 Quest's review jobs on this box had finished (no other test process running; 1-minute
 load average 4-6 from the box's own background services at the start of each run):
 
@@ -309,7 +309,7 @@ should be re-measured on base. Tripwire clean in all three runs.
 
 ### Fix round suite run
 
-Full `scripts/test.sh` on helper-box after merging main 716e95b and the fixes (no other
+Full `scripts/test.sh` on box2 after merging main 716e95b and the fixes (no other
 test process running, 1-minute load average about 2.8 at the start): unit 530 OK
 (1 skipped: the root-only bind mount test) in 28.7 s, integration 280 OK in 127.9 s,
 recovery 49 OK in 22.5 s, total wall 179 s. Tripwire clean.
@@ -322,7 +322,7 @@ checked (6); power-of-two check removed (4).
 
 ### Fix round 2 suite run
 
-Full `scripts/test.sh` on helper-box (Python 3.13) with the round-2 changes: unit 551 OK
+Full `scripts/test.sh` on box2 (Python 3.13) with the round-2 changes: unit 551 OK
 (1 skipped: the root-only bind mount test) in 34.7 s, integration 280 OK in 126.5 s,
 recovery 49 OK in 22.3 s, total wall 184 s. Tripwire clean.
 
@@ -361,7 +361,7 @@ failures), empty/"/" checks removed (34 failures, 1 error); both killed.
 
 ### Fix round 4 suite runs
 
-Full `scripts/test.sh` on helper-box (Python 3.13, 1-minute load average about 3.5 to
+Full `scripts/test.sh` on box2 (Python 3.13, 1-minute load average about 3.5 to
 5.4, shared box), run twice back to back:
 
 | SQLite | unit | integration | recovery | wall |
@@ -419,7 +419,7 @@ inode check (2), the pre-repair install-path check removed (2); all killed.
 
 ### Fix round 5 suite runs
 
-Full `scripts/test.sh` on helper-box (Python 3.13, shared box), run twice back to back:
+Full `scripts/test.sh` on box2 (Python 3.13, shared box), run twice back to back:
 
 | SQLite | unit | integration | recovery | wall |
 |---|---|---|---|---|

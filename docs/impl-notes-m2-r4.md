@@ -1,7 +1,7 @@
 # M2 run r4 (m2-worktrees) — implementation notes
 
 Branch `wt/m2-r4` from 442dcb0 (r3 + r3b merged with main: M1c complete).
-Coder: Quest (author `Quest <quest@example.invalid>`, Q15). Items: K3, K4 (deliverable
+Coder: Quest (author `Quest <coder@example.invalid>`, Q15). Items: K3, K4 (deliverable
 clause). Coordinator decision applied: Q13.
 
 ## 1. Commits

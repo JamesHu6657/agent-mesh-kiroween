@@ -206,9 +206,13 @@ class TestLaunchReviewFixes(unittest.TestCase):
 
     def test_wrapper_killed_without_exit_json_is_lost(self) -> None:
         """Review m1c-run2 finding 3: SIGKILL the wrapper (pid from this home's DB) → failed(lost) once the child is gone."""
-        task_id = self._create('FAKE {"sleep": {"seconds": 1}}')
+        # The child waits for a release file (not a 1 s sleep that can end before the kill on
+        # a loaded host); it is released right after the wrapper is killed, so it exits soon.
+        release = os.path.join(self.harness.fixtures_dir, "lost-release")
+        task_id = self._create('FAKE {"wait_release": {"path": "%s"}}' % release)
         run = self._wait_running(task_id)
         os.kill(run["wrapper_pid"], 9)
+        open(release, "w").close()
         self.assertTrue(self.harness.wait_for(
             lambda: self._row("SELECT status FROM tasks WHERE id = ?;", (task_id,))["status"] == "failed", timeout=30.0))
         failure = json.loads(self._row("SELECT failure_json FROM tasks WHERE id = ?;", (task_id,))["failure_json"])

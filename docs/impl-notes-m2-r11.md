@@ -304,6 +304,6 @@ the second watch requeued the merge. **One expected failure, harness rc 0,
   command's Factory shell wrappers, no other actual test-suite runner.
   After the run it **did show another suite**: PID 64593,
   `python3 tests/run_tier.py tests/integration`, cwd
-  `/home/node/workspace/mesh-wt-m3-r4`. That process was left untouched.
+  `/home/user/workspace/mesh-wt-m3-r4`. That process was left untouched.
 - `git diff --check`: rc 0. No temporary scripts or helper files were created.
   All seven requested r11c items are done; none is blocked or left unfinished.

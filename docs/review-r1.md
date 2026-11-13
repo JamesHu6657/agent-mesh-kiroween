@@ -17,13 +17,13 @@ Overall: the plan is detailed, honest about the same-uid trust limit, and covers
 
 **Evidence.**
 - §7.6: "Agents that misuse the **Mesh API** (confused, over-eager, hallucinating, or prompt-injected agents using the `mesh` CLI) cannot: approve their own requests; act outside their capability or scope ... turn the text 'the user approved' into an approval."
-- §13.5 stores the relayer token at `~/.config/helper-mesh.token`, a 0600 file owned by `box`. Every launched executor also runs as `box`.
+- §13.5 stores the relayer token at `~/.config/worker2-mesh.token`, a 0600 file owned by `box`. Every launched executor also runs as `box`.
 - §7.1: agent tokens are presented by "Env `MESH_TOKEN`, or `--token-file PATH`". In M1 the leads are inbox agents with such tokens (§16 M1: "leads are exercised as inbox-mode agents using their tokens").
 - §14.2: the default profile `edit` grants file reads (kiro `--trust-tools=fs_read,fs_write`, droid `--auto low`). §7.7: "Mesh does not sandbox external CLIs."
 - §18.7: relayed approvals are allowed by default for every category except `config`.
 - Checklist notation `[U]` = `--passphrase-fd 3 3<"$P"`, which models keeping the passphrase in a file.
 
-A prompt-injected executor with read access can run `mesh approval approve <apr> --op-hash <h> --relayed --user-statement "ok" --token-file ~/.config/helper-mesh.token`, or act as the lead with the lead's token file (accept its own task, complete the project). That is a plain `mesh` CLI call, not a deliberate bypass of Mesh, so the §7.6 claim is false as written. Requirement §3 [SUGGESTED] says approvals "can't be satisfied by an executor agent". The same path lets an executor lock the user out (§7.1: 5 bad passphrases, then a 5-minute lockout), which blocks direct approvals.
+A prompt-injected executor with read access can run `mesh approval approve <apr> --op-hash <h> --relayed --user-statement "ok" --token-file ~/.config/worker2-mesh.token`, or act as the lead with the lead's token file (accept its own task, complete the project). That is a plain `mesh` CLI call, not a deliberate bypass of Mesh, so the §7.6 claim is false as written. Requirement §3 [SUGGESTED] says approvals "can't be satisfied by an executor agent". The same path lets an executor lock the user out (§7.1: 5 bad passphrases, then a 5-minute lockout), which blocks direct approvals.
 
 **Required change.**
 - (a) Add **run-session binding** to the server (§4, §7.1). On each connection, take the `SO_PEERCRED` pid and read its `sid` and its PPid ancestry from `/proc`. If the peer belongs to the session of an active launched run, or descends from a known runwrap pid, accept only that run's own run token. Reject agent tokens and user passphrases with exit 4 `CREDENTIAL_NOT_ALLOWED_IN_RUN`, and do not count the attempt toward user lockout. If `/proc` cannot be read, reject.

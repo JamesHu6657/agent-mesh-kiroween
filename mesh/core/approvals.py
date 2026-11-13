@@ -112,6 +112,27 @@ def create_or_get_pending_approval(
         (op_hash,),
     )
     row = cur.fetchone()
+    if row and row["expires_at"] < now_iso_utc():
+        # Past its TTL but not swept yet: never hand out an expired approval for a new
+        # request. Expire it here (same as the scheduler sweep) and create a fresh one.
+        conn.execute("UPDATE approvals SET status = 'expired' WHERE id = ? AND status IN ('pending', 'approved');",
+                     (row["id"],))
+        old = conn.execute("SELECT project_id, task_id, op_type, requested_by FROM approvals WHERE id = ?;",
+                           (row["id"],)).fetchone()
+        record_event(
+            conn=conn,
+            type_="approval.expired",
+            actor_id="system",
+            actor_kind="system",
+            via="system",
+            project_id=old["project_id"],
+            task_id=old["task_id"],
+            approval_id=row["id"],
+            payload={"approval_id": row["id"], "category": row["category"], "op": old["op_type"],
+                     "requested_by": old["requested_by"], "expires_at": row["expires_at"],
+                     "status": "expired", "expired_on": "new_request"},
+        )
+        row = None
     if row:
         return {
             "approval_id": row["id"],

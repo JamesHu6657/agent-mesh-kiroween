@@ -33,6 +33,7 @@ import asyncio
 import errno
 import json
 import os
+import re
 import signal
 import sqlite3
 import subprocess
@@ -376,6 +377,69 @@ def _clip_utf8(text: str, limit: int) -> Tuple[str, bool]:
     if len(raw) <= limit:
         return text, False
     return raw[:limit].decode("utf-8", errors="ignore"), True
+
+
+FAILING_TESTS_LIMIT = 20
+FAILING_TESTS_SCAN_BYTES = 8 * 1024 * 1024
+_UNITTEST_FAIL_RE = re.compile(r"^(FAIL|ERROR): (\S+) \(([^)\s]+)\)")
+_PYTEST_FAIL_RE = re.compile(r"^(FAILED|ERROR) (\S+::\S+)")
+
+
+def failing_tests(path: str, limit: int = FAILING_TESTS_LIMIT) -> Tuple[List[Dict[str, str]], int]:
+    """Failing test ids in a test log: unittest ``FAIL:/ERROR: name (id)`` lines and pytest
+    ``FAILED path::name`` lines, first seen first, de-duplicated. Returns at most
+    ``limit`` entries and the total found (in the last 8 MiB of the log)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - FAILING_TESTS_SCAN_BYTES))
+            data = f.read()
+    except OSError:
+        return [], 0
+    seen: Dict[str, Dict[str, str]] = {}
+    for line in data.decode("utf-8", errors="replace").splitlines():
+        m = _UNITTEST_FAIL_RE.match(line)
+        if m:
+            kind, name, ident = m.group(1), m.group(2), m.group(3)
+            # Python >= 3.11 prints the full id; older versions print the class only.
+            tid = ident if ident.endswith("." + name) else f"{ident}.{name}"
+        else:
+            m = _PYTEST_FAIL_RE.match(line)
+            if not m:
+                continue
+            kind, tid = ("FAIL" if m.group(1) == "FAILED" else "ERROR"), m.group(2)
+        tid = _clip_utf8(tid, 512)[0]
+        if tid not in seen:
+            seen[tid] = {"id": tid, "kind": kind}
+    found = list(seen.values())
+    return found[:limit], len(found)
+
+
+def tests_failed_message(task_id: str, details: Mapping[str, Any]) -> str:
+    """One readable message for TESTS_FAILED: the failing ids and the log path."""
+    log = details.get("log_path")
+    total = details.get("failing_tests_total") or 0
+    ids = details.get("failing_tests") or []
+    if details.get("timeout"):
+        head = f"Merge of task '{task_id}' failed: tests_failed (timed out after {details.get('timeout_s')}s)"
+    elif total:
+        head = f"Merge of task '{task_id}' failed: tests_failed ({total} failing test{'s' if total != 1 else ''})"
+    elif details.get("exit_code") == 0 and details.get("error"):
+        # The tests passed but the post-test process check did not (e.g. a leftover-process
+        # scan that could not be completed): say that rather than "no FAIL lines".
+        head = (f"Merge of task '{task_id}' failed: tests_failed (tests exited 0, but the post-test "
+                f"check failed: {details.get('error')}; retrying the merge is safe)")
+    else:
+        head = (f"Merge of task '{task_id}' failed: tests_failed (exit code {details.get('exit_code')}; "
+                "no FAIL:/ERROR: lines found in the log)")
+    lines = [head]
+    lines.extend(f"  {t['kind']}: {t['id']}" for t in ids)
+    if total > len(ids):
+        lines.append(f"  ... and {total - len(ids)} more")
+    if log:
+        lines.append(f"  log: {log}")
+    return "\n".join(lines)
 
 
 def _log_tail(path: str, lines: int = TEST_LOG_TAIL_LINES) -> List[str]:
@@ -778,6 +842,9 @@ def _run_merge_pipeline(plan: Mapping[str, Any]) -> Dict[str, Any]:
                 details = {"log_path": test["log_path"], "log_tail": tail, "log_tail_truncated": tail_cut,
                            "timeout": test["timeout"], "timeout_s": test["timeout_s"],
                            "exit_code": test["exit_code"], "signal": test["signal"]}
+                fails, n_fails = failing_tests(test["log_path"])
+                details.update({"failing_tests": fails, "failing_tests_total": n_fails,
+                                "failing_tests_truncated": n_fails > len(fails)})
                 for k in ("error", "termination", "leftovers", "leftover_scan_uncertain"):
                     if k in test:
                         details[k] = test[k]
@@ -955,6 +1022,48 @@ def recover_merge_run(conn: sqlite3.Connection, run: Mapping[str, Any]) -> str:
     if isinstance(status, BaseException):
         raise status
     return status
+
+
+class LiveMergeHeld(Exception):
+    """The live ``task merge`` close gate kept the ``merge_test`` run open (uncertain
+    process scan or occupied group). This is a defined state, not an internal error
+    (dogfood): the run and ``merge:<prj>`` stay held, the task stays ``merging``, a
+    ``merge.recovery_blocked`` event is recorded, and the next meshd boot re-checks the
+    run (§11.7 step 2) and decides the task (step 5). The caller gets exit 14
+    ``MERGE_HELD`` with the test outcome and the recovery steps."""
+
+    def __init__(self, plan: Mapping[str, Any], result: Mapping[str, Any], cause: BaseException) -> None:
+        self.plan = plan
+        self.result = result
+        self.cause_text = redact(f"{type(cause).__name__}: {cause}")
+        super().__init__(self.cause_text)
+
+    def to_mesh_error(self) -> MeshError:
+        test = self.result.get("test") or {}
+        merge_commit = self.result.get("merge_commit")
+        committed = self.result.get("outcome") == "merged" and merge_commit and not self.result.get("noop")
+        if committed:
+            # PR #37 review #8: held after the pipeline committed the merge.
+            merged_text = (f"The merge commit {str(merge_commit)[:12]} is already on the integration branch, "
+                           f"but the task stays 'merging'")
+        else:
+            merged_text = "Nothing was merged; the task stays 'merging'"
+        log_path = self.result.get("test_log") or test.get("log_path")  # review #9
+        return MeshError(
+            code=c.MERGE_HELD,
+            exit_code=c.EXIT_MERGE_FAILED,
+            message=(f"Merge of task '{self.plan['task_id']}' is held: the merge test run "
+                     f"{self.plan.get('run_id')} ended (exit code {test.get('exit_code')}) but it could not "
+                     f"be closed safely ({self.cause_text}). {merged_text} "
+                     f"and the project merge lock stays held. Stop any leftover processes "
+                     f"of that run, then restart meshd (mesh daemon stop --user; mesh daemon start): "
+                     f"boot recovery re-checks the run and decides the task."),
+            details={"task_id": self.plan["task_id"], "merge_id": self.plan.get("merge_id"),
+                     "run_id": self.plan.get("run_id"), "reason": "close_held",
+                     "cause": self.cause_text, "test_exit_code": test.get("exit_code"),
+                     "test_passed": test.get("passed"), "log_path": log_path,
+                     "merge_commit": merge_commit if committed else None},
+        )
 
 
 class MergeRunHeld(Exception):
@@ -1351,8 +1460,10 @@ def merge_response(plan: Mapping[str, Any], result: Mapping[str, Any], fin: Mapp
     if reason == "git_failed":
         return MeshError(code=c.INTERNAL_ERROR, exit_code=c.EXIT_INTERNAL,
                          message=f"Merge of task '{plan['task_id']}' failed: a git command failed", details=details)
-    return MeshError(code=REASON_CODES[reason], exit_code=c.EXIT_MERGE_FAILED,
-                     message=f"Merge of task '{plan['task_id']}' failed: {reason}", details=details)
+    message = f"Merge of task '{plan['task_id']}' failed: {reason}"
+    if reason == "tests_failed":
+        message = tests_failed_message(plan["task_id"], details)
+    return MeshError(code=REASON_CODES[reason], exit_code=c.EXIT_MERGE_FAILED, message=message, details=details)
 
 
 def response_envelope(response: Any, request_id: str) -> Dict[str, Any]:
@@ -1449,7 +1560,7 @@ async def run_task_merge(server: Any, ctx: HandlerContext) -> HandlerResult:
             run_row = conn.execute("SELECT * FROM runs WHERE id = ?;", (plan["run_id"],)).fetchone()
             if run_row is not None:
                 _report_recovery_blocked(conn, run_row, exc)
-            raise
+            raise LiveMergeHeld(plan, result, exc) from exc
         conn.execute("BEGIN IMMEDIATE;")
         try:
             fin = _final_tx(conn, plan, result)
@@ -1478,6 +1589,12 @@ async def run_task_merge(server: Any, ctx: HandlerContext) -> HandlerResult:
         done = await asyncio.shield(job)
     except asyncio.CancelledError:
         raise
+    except LiveMergeHeld as held:
+        try:
+            server.log_error(f"task merge {plan['task_id']} held: {held.cause_text}")
+        except Exception:
+            pass
+        raise held.to_mesh_error()
     except Exception as exc:
         try:
             server.log_error(f"task merge {plan['task_id']} final transaction failed: {type(exc).__name__}: {exc}")

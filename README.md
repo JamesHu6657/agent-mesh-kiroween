@@ -25,7 +25,8 @@ Built for [Kiroween 2026](https://kiroween.devpost.com/) (Frankenstein category)
 
 ## Install
 
-Pick one.
+Pick one installation method. Run the venv method from inside the clone. These
+examples install the CLI but do not start a daemon or a model run.
 
 ```sh
 # A. From a clone (no packaging tools needed)
@@ -38,7 +39,8 @@ pipx install git+https://github.com/JamesHu6657/agent-mesh-kiroween.git
 #   or: uv tool install git+https://github.com/JamesHu6657/agent-mesh-kiroween.git
 
 # C. Into a venv you manage
-python3 -m venv ~/.venvs/mesh && ~/.venvs/mesh/bin/pip install ./agent-mesh
+python3 -m venv ~/.venvs/mesh
+~/.venvs/mesh/bin/pip install .   # run inside the cloned agent-mesh directory
 ```
 
 Make sure the directory holding `mesh` is on your `PATH`, then run `mesh version`.
@@ -52,7 +54,9 @@ mesh setup
 `mesh setup` asks for a new passphrase (at least 12 characters, twice), then creates the
 home (`~/.agent-mesh`), starts the daemon, creates an inbox lead agent called `lead`,
 saves its token to `~/.config/agent-mesh/lead.token` (mode 0600), makes it the default
-lead and checks your environment. It is safe to run again: finished steps are skipped.
+lead and checks your environment. With a non-default `MESH_HOME`/`--home`, the token
+filename includes a home-specific suffix; use the `token_file` returned by setup,
+not an assumed `lead.token` path. It is safe to run again: finished steps are skipped.
 
 Non-interactive (scripts, CI): put the passphrase in a 0600 file and pass it on.
 
@@ -79,28 +83,36 @@ passphrase. Details: docs/usage.md §3.4.
 ### Your first project (inbox lead)
 
 ```sh
-T=~/.config/agent-mesh/lead.token
+T=~/.config/agent-mesh/lead.token  # use setup's token_file for a non-default home
 mesh agent create --user --name worker1 --adapter none --delivery inbox --max-concurrency 1
-mesh agent token issue worker1 --user    # save it 0600, as in docs/examples/inbox-agent.sh
+mesh agent token issue worker1 --out ~/.config/agent-mesh/worker1.token --user   # 0600 file
 mesh intake submit --user --title "Hello" --goal "Write hello.txt" --criterion "hello.txt exists"
 mesh inbox list --token-file "$T"                   # the lead sees project.created
-mesh task create --project <prj_id> --title "Write hello.txt" --spec "Create hello.txt" \
+mesh task create --project "$PROJECT_ID" --title "Write hello.txt" --spec "Create hello.txt" \
   --assignee worker1 --token-file "$T"
 ```
+
+Set `PROJECT_ID` to the `project_id` in the intake response. Variables such as
+`TASK_ID`, `RUN_ID`, `FENCE` and `CRITERION_ID` below stand for values returned by
+Mesh; do not paste angle-bracket placeholders into a shell. Agent and user commands
+have different authority: only the human runs the `--user` setup commands.
 
 The executor (here an inbox agent `worker1`, see
 [`docs/examples/inbox-agent.sh`](docs/examples/inbox-agent.sh)) then runs
 `mesh inbox wait`, `mesh task start <tsk>` (prints `run_id`, `fence` and a workspace
-directory), does the work there, and `mesh task submit <tsk> --run <run> --fence <n>
---summary …`. The lead finishes:
+directory), does the work there while sending a heartbeat well before the returned lease expires
+(for the default 120-second lease, every 40 seconds or less), and submits with
+`mesh task submit "$TASK_ID" --run "$RUN_ID" --fence "$FENCE" --summary "Created hello.txt"`. The lead finishes:
 
 ```sh
-mesh task accept <tsk_id> --token-file "$T"     # or: task reject <tsk_id> --reason …
-echo '{"criteria":[{"id":"<crit_id>","met":true,"evidence":"hello.txt exists"}]}' \
-  | mesh project complete <prj_id> --report - --token-file "$T"
+mesh task accept "$TASK_ID" --token-file "$T"
+python3 -c 'import json,sys; print(json.dumps({"criteria":[{"id":sys.argv[1],"met":True,"evidence":"hello.txt exists"}]}))' "$CRITERION_ID" \
+  | mesh project complete "$PROJECT_ID" --report - --token-file "$T"
 ```
 
-Criterion ids are in `mesh project show <prj_id> --user`.
+Task ids are returned by `task create`; criterion ids are in
+`mesh project show "$PROJECT_ID" --token-file "$T"`. For a fully isolated,
+copyable walkthrough, see [the example audit](docs/examples/docs-audit.md).
 
 The lead is whatever agent holds that token: give the token path and the loop in
 [`docs/examples/inbox-agent.sh`](docs/examples/inbox-agent.sh) to Claude Code, Cursor or
@@ -116,8 +128,11 @@ droid, kiro, agy and vibe. Typical launch agent:
 mesh adapter probe kiro --user
 mesh adapter models kiro --user
 mesh agent create --user --name kiro1 --adapter kiro \
-  --allowed-model <model-id> --default-model <model-id> --max-concurrency 2
+  --allowed-model "$MODEL_ID" --default-model "$MODEL_ID" --max-concurrency 2
 ```
+
+Set `MODEL_ID` to an id returned by `adapter models`; listing models may contact
+the vendor, but does not start inference. Creating an agent does not launch it.
 
 Repo projects (`--repo /abs/path --base-branch main --test-command '["make","test"]'` on
 `intake submit`) give each code task its own worktree and branch, and the lead merges
@@ -125,6 +140,9 @@ accepted work with a test step. Mesh never pushes, rebases or force-updates.
 
 The full workflow (agents, intake, tasks, approvals, merge, deliver) is in
 [`docs/usage.md`](docs/usage.md).
+
+- [`docs/inbox-workers.md`](docs/inbox-workers.md): how an external or remote agent works as an inbox worker (token, inbox, start, heartbeat, submit, fail, rework, lease expiry, errors).
+- [`scripts/inbox-worker-example.sh`](scripts/inbox-worker-example.sh): a small bash loop that waits for an offered task, runs your command in its workspace with a heartbeat, then submits or fails.
 
 ### Checking things
 
@@ -184,7 +202,7 @@ general use, is in [`docs/restrictions.md`](docs/restrictions.md).
 
 ## Status
 
-v1, milestones M1 to M3 accepted (gate reports in `docs/`). What works today:
+Current functionality:
 
 - **Projects and tasks:** intake, leads and handover, dependencies, priorities, per-agent
   and global concurrency, approvals with audit, events and outbox.
@@ -197,7 +215,7 @@ v1, milestones M1 to M3 accepted (gate reports in `docs/`). What works today:
 - **Adapters:** droid and kiro-cli passed real end-to-end runs; agy and vibe have
   adapters without smoke evidence yet; hermes and openclaw are stubs.
 
-Known limits are listed in `docs/m3-gate-report.md` and `docs/usage.md` §5.
+Known security and operational limits are described in [the usage guide](docs/usage.md#5-security-model-and-honest-limits).
 
 ## Future work
 
@@ -206,6 +224,11 @@ Known limits are listed in `docs/m3-gate-report.md` and `docs/usage.md` §5.
 - Vendor CLIs as launch-mode leads.
 - Command builders for hermes and openclaw.
 - A read-only local status page.
+- Optional decision-model plugin (approved idea, not built): Jev, TypeSafe AI's "System One"
+  decision model, for task routing only (which coder agent or model tier gets a task;
+  later perhaps review-finding triage and watcher wake decisions). Off by default. It never
+  decides approvals, merges or any safety gate; those stay with the user, the lead and the
+  existing gates.
 
 ## Tests
 
@@ -221,9 +244,9 @@ opt-in and run only with explicit consent (see `tests/smoke/`).
 
 Agent Mesh was built by a mesh of AI agents coordinated by one person. Kiro wrote and
 reviewed plans and specs, reviewed code, and is one of the CLIs Mesh can launch. The
-`.kiro/` directory holds the project's specs (`specs/` per milestone), steering files,
+`.kiro/` directory holds the project's specs (`specs/`), steering files,
 agent configs and hooks (acceptance consistency, affected tests, secret scan). Plans,
-reviews and gate reports are kept in `docs/`. The private coordination log, handoff
+reviews and acceptance reports are kept in `docs/`. The private coordination log, handoff
 notes and raw agent logs are not part of this public snapshot.
 
 ## License

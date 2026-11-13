@@ -12,6 +12,7 @@ from mesh.core.clock import now_iso_utc, parse_duration
 from mesh.core.events import insert_event
 from mesh.core.ids import new_id
 from mesh.core.policy import parse_positive_int
+from mesh.core.settings import get_agent_ack_timeout_s, set_agent_ack_timeout_s, validate_ack_timeout
 from mesh.adapters.registry import get_adapter, is_testing_mode
 from mesh.adapters.base import AdapterNotInstalled, EffortNotAllowed, EffortUnsupported
 from mesh.daemon.handlers.base import HandlerContext, HandlerResult
@@ -21,6 +22,66 @@ VALID_PROFILES = {"readonly", "edit", "dev", "elevated", "unrestricted"}
 VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 EFFORT_SUFFIXES = ("-low", "-medium", "-high", "-xhigh", "-max")
 VALID_CAPABILITIES = {"intake", "relay"}
+
+
+#: Capabilities an agent gets when `agent create` names none.
+DEFAULT_CAPABILITIES = ("intake",)
+
+
+def _ack_timeout_arg(ctx: HandlerContext, delivery: str) -> Optional[int]:
+    """`--ack-timeout`: seconds, or None for 'default' / not given. Inbox agents only."""
+    raw = ctx.args.get("ack_timeout")
+    if raw is None or (isinstance(raw, str) and raw.strip().lower() == "default"):
+        return None
+    if delivery != "inbox":
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="--ack-timeout applies to inbox agents only (launch agents are started by meshd)",
+            details={"param": "ack_timeout", "delivery": delivery},
+        )
+    return validate_ack_timeout(raw)
+
+
+def _ack_timeout_view(conn: Any, own: Optional[int], delivery: str = "inbox") -> Dict[str, Any]:
+    """The ack window an inbox agent gets, and where it comes from."""
+    if delivery != "inbox":
+        return {}
+    if own is not None:
+        return {"ack_timeout_s": own, "ack_timeout_source": "agent"}
+    from mesh.daemon.scheduler import get_inbox_ack_timeout_s
+
+    return {"ack_timeout_s": get_inbox_ack_timeout_s(conn), "ack_timeout_source": "inbox.ack_timeout_s"}
+
+
+#: Fields a lead sees in `agent list/show` (the roster view): what it needs to pick an
+#: assignee and a model. Never credentials, adapter options or binary paths.
+ROSTER_FIELDS = ("id", "name", "adapter", "delivery", "can_lead", "max_concurrency", "disabled",
+                 "default_model", "allowed_models", "default_effort", "allowed_efforts",
+                 "ack_timeout_s", "ack_timeout_source")
+
+
+def _roster_view(ctx: HandlerContext, op_name: str) -> bool:
+    """Who may read agents: the direct user (full view, False) or a lead (roster view, True).
+
+    A lead is an enabled agent with can_lead, or the current lead of an active project.
+    Everyone else (other agents, relayed calls) keeps the user-only rule (plan §7.3):
+    agent definitions are configuration, and only leads need the roster to assign work.
+    """
+    if ctx.actor_kind == "user" and ctx.via == "direct":
+        return False
+    pid = (ctx.principal or {}).get("id")
+    if ctx.actor_kind == "agent" and pid and ctx.via in ("token", "run_token"):
+        row = ctx.conn.execute(
+            """SELECT a.can_lead FROM agents a JOIN principals p ON p.id = a.id
+               WHERE a.id = ? AND p.disabled_at IS NULL;""", (pid,)).fetchone()
+        if row is not None and (row["can_lead"] or ctx.conn.execute(
+                """SELECT 1 FROM lead_assignments la JOIN projects pr ON pr.id = la.project_id
+                   WHERE la.agent_id = ? AND la.ended_at IS NULL AND pr.status = 'active' LIMIT 1;""",
+                (pid,)).fetchone()):
+            return True
+    _check_direct_user_only(ctx, op_name)
+    return False  # not reached
 
 
 def _check_direct_user_only(ctx: HandlerContext, op_name: str) -> None:
@@ -115,15 +176,9 @@ def handle_agent_create(ctx: HandlerContext) -> HandlerResult:
             details={"adapter": "none", "delivery": delivery},
         )
 
-    # Max concurrency
-    if "max_concurrency" not in ctx.args:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="Field 'max_concurrency' is required",
-            details={"param": "max_concurrency"},
-        )
-    max_concurrency = parse_positive_int(ctx.args["max_concurrency"], "max_concurrency")
+    # Max concurrency: 1 when not given (same as `agent onboard`).
+    max_concurrency = (parse_positive_int(ctx.args["max_concurrency"], "max_concurrency")
+                       if "max_concurrency" in ctx.args else 1)
 
     # Allowed models & Default model
     allowed_models = ctx.args.get("allowed_models") or ctx.args.get("allowed_model") or []
@@ -248,9 +303,15 @@ def handle_agent_create(ctx: HandlerContext) -> HandlerResult:
     elif "capability" in ctx.args and ctx.args["capability"] is not None:
         capabilities = ctx.args["capability"]
     else:
-        capabilities = ["intake"]
+        capabilities = None
+    explicit_caps = capabilities is not None
+    if capabilities is None:
+        capabilities = [] if ctx.args.get("no_intake") else list(DEFAULT_CAPABILITIES)
     if isinstance(capabilities, str):
         capabilities = [capabilities]
+    capabilities = list(dict.fromkeys(capabilities))
+    if ctx.args.get("no_intake"):
+        capabilities = [cap for cap in capabilities if cap != "intake"]
     for cap in capabilities:
         if cap not in VALID_CAPABILITIES:
             raise MeshError(
@@ -261,6 +322,7 @@ def handle_agent_create(ctx: HandlerContext) -> HandlerResult:
             )
 
     binary_path = ctx.args.get("binary")
+    ack_timeout_s = _ack_timeout_arg(ctx, delivery)
 
     now = now_iso_utc()
     agent_id = new_id("agt")
@@ -300,6 +362,9 @@ def handle_agent_create(ctx: HandlerContext) -> HandlerResult:
         ),
     )
 
+    if ack_timeout_s is not None:
+        set_agent_ack_timeout_s(ctx.conn, agent_id, ack_timeout_s, now, ctx.principal["id"])
+
     insert_event(
         ctx.conn,
         type_="agent.created",
@@ -331,11 +396,27 @@ def handle_agent_create(ctx: HandlerContext) -> HandlerResult:
         "default_profile": default_profile,
         "max_unapproved_profile": max_unapproved_profile,
         "options": options,
+        **_ack_timeout_view(ctx.conn, ack_timeout_s, delivery),
         "version": 1,
         "created_at": now,
         "updated_at": now,
     }
-    return HandlerResult(data=data)
+    warnings = []
+    if explicit_caps and "intake" not in capabilities and not ctx.args.get("no_intake"):
+        warnings.append(
+            "--capability replaces the default capability list ['intake']: this agent cannot "
+            "submit projects with `mesh intake submit`. Add --capability intake to keep it, or "
+            "pass --no-intake to drop it on purpose (and silence this warning).")
+    if delivery == "inbox" and ack_timeout_s is None:
+        from mesh.daemon.scheduler import get_inbox_ack_timeout_s
+
+        global_ack = get_inbox_ack_timeout_s(ctx.conn)
+        if global_ack < 3600:
+            warnings.append(
+                f"inbox agent {name} uses the global ack window inbox.ack_timeout_s = {global_ack}s: an offer "
+                f"not started within it fails no_response. For a worker that polls slowly (email, cron), "
+                f"set its own window: `mesh agent update {name} --ack-timeout 2h --user`.")
+    return HandlerResult(data=data, warnings=warnings)
 
 
 def handle_agent_update(ctx: HandlerContext) -> HandlerResult:
@@ -452,6 +533,21 @@ def handle_agent_update(ctx: HandlerContext) -> HandlerResult:
         capabilities = ctx.args["capabilities"]
         if isinstance(capabilities, str):
             capabilities = [capabilities]
+        for cap in capabilities:
+            if cap not in VALID_CAPABILITIES:
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Invalid capability '{cap}': must be in {sorted(VALID_CAPABILITIES)}",
+                    details={"param": "capabilities", "value": cap},
+                )
+        capabilities = list(dict.fromkeys(capabilities))
+    if ctx.args.get("no_intake"):
+        capabilities = [cap for cap in capabilities if cap != "intake"]
+
+    ack_raw = ctx.args.get("ack_timeout")
+    ack_change = ack_raw is not None
+    ack_timeout_s = _ack_timeout_arg(ctx, row["delivery"]) if ack_change else get_agent_ack_timeout_s(ctx.conn, row["id"])
 
     default_profile = row["default_profile"]
     if "default_profile" in ctx.args and ctx.args["default_profile"] is not None:
@@ -508,6 +604,9 @@ def handle_agent_update(ctx: HandlerContext) -> HandlerResult:
         ),
     )
 
+    if ack_change:
+        set_agent_ack_timeout_s(ctx.conn, row["id"], ack_timeout_s, now, ctx.principal["id"])
+
     insert_event(
         ctx.conn,
         type_="agent.updated",
@@ -533,15 +632,34 @@ def handle_agent_update(ctx: HandlerContext) -> HandlerResult:
         "max_concurrency": max_concurrency,
         "default_profile": default_profile,
         "max_unapproved_profile": max_unapproved_profile,
+        **_ack_timeout_view(ctx.conn, ack_timeout_s, row["delivery"]),
         "version": new_version,
         "updated_at": now,
     }
-    return HandlerResult(data=data)
+    warnings: List[str] = []
+    if ack_change and row["delivery"] == "inbox":
+        from mesh.daemon.scheduler import get_inbox_ack_timeout_s, offers_kept_by_window
+
+        new_window = ack_timeout_s if ack_timeout_s is not None else get_inbox_ack_timeout_s(ctx.conn)
+        kept = offers_kept_by_window(ctx.conn, row["id"], new_window)
+        if kept:
+            data["offers_keeping_window"] = kept
+            keep = [k["task_id"] for k in kept if k["kept"]]
+            lose = [k["task_id"] for k in kept if not k["kept"]]
+            if keep:
+                warnings.append(
+                    f"{len(keep)} task(s) already offered to {name} keep the ack window they were offered with "
+                    f"(a new window applies to new offers only): " + ", ".join(keep[:10]))
+            if lose:
+                warnings.append(
+                    f"{len(lose)} task(s) offered to {name} before ack windows were recorded will fail no_response "
+                    f"on the next scheduler tick: " + ", ".join(lose[:10]))
+    return HandlerResult(data=data, warnings=warnings)
 
 
 def handle_agent_show(ctx: HandlerContext) -> HandlerResult:
-    """Show details and capability status for an agent."""
-    _check_direct_user_only(ctx, "agent.show")
+    """Show details and capability status for an agent (leads get the roster view)."""
+    roster = _roster_view(ctx, "agent.show")
     name = ctx.args.get("name")
     if not name:
         raise MeshError(
@@ -582,21 +700,25 @@ def handle_agent_show(ctx: HandlerContext) -> HandlerResult:
         "default_profile": row["default_profile"],
         "max_unapproved_profile": row["max_unapproved_profile"],
         "options": json.loads(row["adapter_options_json"]),
+        **_ack_timeout_view(ctx.conn, get_agent_ack_timeout_s(ctx.conn, row["id"]), row["delivery"]),
         "version": row["version"],
         "disabled": row["disabled_at"] is not None,
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
+    if roster:
+        data = {k: data[k] for k in ROSTER_FIELDS if k in data}
     return HandlerResult(data=data)
 
 
 def handle_agent_list(ctx: HandlerContext) -> HandlerResult:
-    """List all registered agents."""
-    _check_direct_user_only(ctx, "agent.list")
+    """List all registered agents (leads get the roster view)."""
+    roster = _roster_view(ctx, "agent.list")
     cur = ctx.conn.execute(
         """SELECT p.id, p.name, p.disabled_at, a.adapter, a.delivery, a.can_lead,
                   a.default_model, a.max_concurrency, a.default_profile,
-                  a.max_unapproved_profile, a.version, a.created_at
+                  a.max_unapproved_profile, a.version, a.created_at,
+                  a.allowed_models_json, a.default_effort, a.allowed_efforts_json
            FROM principals p
            JOIN agents a ON p.id = a.id
            ORDER BY p.name ASC;"""
@@ -617,6 +739,14 @@ def handle_agent_list(ctx: HandlerContext) -> HandlerResult:
             "disabled": row["disabled_at"] is not None,
             "created_at": row["created_at"],
         })
+        items[-1].update(_ack_timeout_view(
+            ctx.conn, get_agent_ack_timeout_s(ctx.conn, row["id"]), row["delivery"]))
+        if roster:
+            item = items[-1]
+            item["allowed_models"] = json.loads(row["allowed_models_json"] or "[]")
+            item["default_effort"] = row["default_effort"]
+            item["allowed_efforts"] = json.loads(row["allowed_efforts_json"] or "[]")
+            items[-1] = {k: item[k] for k in ROSTER_FIELDS if k in item}
     return HandlerResult(data={"agents": items, "items": items})
 
 

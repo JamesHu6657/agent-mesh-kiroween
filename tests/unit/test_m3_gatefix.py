@@ -83,8 +83,17 @@ def _wait(pred, timeout, step=0.02):
     return pred()
 
 
+
+# Real /proc scans: hold the runner's host-wide /proc lock shared (tests/run_tier.py).
+MESH_PROC_LOCK = "shared"
+
 class TestAdoptWrapperExitsBeforeFirstWatch(unittest.TestCase):
     """ACC: N18, A8 (M3 gate P1-1)."""
+    # Host-global /proc scans + same-uid non-dumpable escapees: run serially so a
+    # parallel test's escapee (young, EACCES environ) cannot make this scan uncertain
+    # (dogfood merge failure).
+    mesh_serial = True
+
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="mh-gf-adopt-", dir="/tmp")
@@ -1376,8 +1385,21 @@ class TestSpawnFailsAfterPopen(unittest.TestCase):
         self.groups.append(pid)
         assert _wait(lambda: len(supervisor._scan_group(pid)) >= 3, 15), "member not started"
 
+    def _settled_run(self, timeout=60.0):
+        """The run row once the spawn abort has closed it. `_abort_spawned` gives up after
+        SPAWN_ABORT_WAIT_S (5 s wall clock) and leaves the run open for the watch pass's
+        `retry_spawn_aborts` (production behaviour); on a loaded host the kill/scan can
+        take longer than that, so drive the same retry here instead of reading too early."""
+        deadline = time.monotonic() + timeout
+        while True:
+            run = self.conn.execute("SELECT * FROM runs WHERE task_id = 'tsk_s';").fetchone()
+            if run["status"] == "spawn_failed" or time.monotonic() >= deadline:
+                return run
+            supervisor.retry_spawn_aborts(self.conn, self.home)
+            time.sleep(0.05)
+
     def _assert_aborted(self):
-        run = self.conn.execute("SELECT * FROM runs WHERE task_id = 'tsk_s';").fetchone()
+        run = self._settled_run()
         self.assertEqual((run["status"], run["end_reason"]), ("spawn_failed", "spawn_failed"))
         res = json.loads(run["result_json"])
         pid = res["after_popen"]["pid"]
@@ -1411,7 +1433,7 @@ class TestSpawnFailsAfterPopen(unittest.TestCase):
             self.addCleanup(_kill_same, p, esc["st"])
             raise OSError(errno.EIO, "injected EIO", f"/proc/{pid}/stat")
         self.assertIsNone(self._start(mock.patch.object(children, "get_proc_stat", eio), cmd))
-        run = self.conn.execute("SELECT * FROM runs WHERE task_id = 'tsk_s';").fetchone()
+        run = self._settled_run()
         res = json.loads(run["result_json"])
         self.assertEqual(res["after_popen"].get("escapees"), [esc["pid"]])
         self.assertTrue(_wait(lambda: not _alive(esc["pid"], esc["st"]), 5), "escapee survived")
@@ -1850,6 +1872,11 @@ class TestSpawnFailsAfterPopen(unittest.TestCase):
 
 class TestMergeTestStepScansBeforeReap(unittest.TestCase):
     """ACC: N26, A8 (M3 gate P1-2): zero mocks, real mesh.runwrap via run_test_step()."""
+    # Host-global /proc scans + same-uid non-dumpable escapees: run serially so a
+    # parallel test's escapee (young, EACCES environ) cannot make this scan uncertain
+    # (dogfood merge failure).
+    mesh_serial = True
+
 
     def test_same_group_envless_background_process_terminated(self):
         tmp = tempfile.mkdtemp(prefix="mh-gf-merge-", dir="/tmp")
@@ -2052,6 +2079,11 @@ libc.syscall(SYS_exit, 0)
 
 class TestRound11LeaderZombieAndProcUnknown(unittest.TestCase):
     """ACC: N18, A8 (Round 11: Carbon P1-1 multithreaded leader-zombie; Linear r10 P1-1 EACCES/EIO unknown)."""
+    # Host-global /proc scans + same-uid non-dumpable escapees: run serially so a
+    # parallel test's escapee (young, EACCES environ) cannot make this scan uncertain
+    # (dogfood merge failure).
+    mesh_serial = True
+
 
     def _spawn_mt_leader_zombie(self, env=None, start_new_session=False):
         p = subprocess.Popen(
@@ -3112,6 +3144,11 @@ class TestRound11AdapterAuthzBinaryAsyncDryRun(unittest.TestCase):
 
 class TestClickUpP1ScanUncertain(unittest.TestCase):
     """ACC: N18, A8 (ClickUp P1-1: /proc scan errors must report uncertainty, never empty)."""
+    # Host-global /proc scans + same-uid non-dumpable escapees: run serially so a
+    # parallel test's escapee (young, EACCES environ) cannot make this scan uncertain
+    # (dogfood merge failure).
+    mesh_serial = True
+
 
     def setUp(self):
         try:
@@ -3200,7 +3237,7 @@ class TestClickUpP1ScanUncertain(unittest.TestCase):
         with open(os.path.join(self.run_dir, "spec.json"), "w", encoding="utf-8") as f:
             json.dump({"argv": ["sh", "-c", cmd], "cwd": self.run_dir, "stdin": "devnull"}, f)
         env = {k: v for k, v in os.environ.items() if not k.startswith("MESH_")}
-        env["PYTHONPATH"] = f"/home/node/gf-guard:{root}" if os.path.isdir("/home/node/gf-guard") else root
+        env["PYTHONPATH"] = f"/home/user/gf-guard:{root}" if os.path.isdir("/home/user/gf-guard") else root
         launcher = subprocess.run(
             [sys.executable, "-c",
              "import os, subprocess, sys\n"
@@ -3256,10 +3293,17 @@ class TestClickUpP1ScanUncertain(unittest.TestCase):
         with ctx, mock.patch("os.kill", track_kill), mock.patch("os.killpg", track_killpg), \
                 mock.patch.object(supervisor, "_log_meshd"):
             # Full watch + confirm_pending_exits ticks across POLL_S must keep run & lease held.
-            supervisor.watch_launch_runs(self.conn, self.home)
-            time.sleep(terminate.POLL_S + 0.05)
-            supervisor.advance_terminations(self.conn, self.home)
-            supervisor.watch_launch_runs(self.conn, self.home)
+            # Passes repeat until the injected scan error has fired (a fixed two passes assumed
+            # the exit was confirmed within one POLL_S, which a loaded host can miss).
+            deadline = time.monotonic() + 20
+            while True:
+                supervisor.watch_launch_runs(self.conn, self.home)
+                time.sleep(terminate.POLL_S + 0.05)
+                supervisor.advance_terminations(self.conn, self.home)
+                supervisor.watch_launch_runs(self.conn, self.home)
+                if active["hits"] >= 1 or time.monotonic() >= deadline:
+                    break
+                self.assertEqual(self._status(), "running", "run closed before the injected scan error fired")
 
             self.assertGreaterEqual(active["hits"], 1, "fault injection never fired")
             self.assertEqual(self._status(), "running", "run closed while scan uncertain and member alive")
@@ -3658,6 +3702,11 @@ class TestClickUpP1ScanUncertain(unittest.TestCase):
 class TestClickUpP1SeenHoldUncertain(unittest.TestCase):
     """ACC: N18, A8 (ClickUp P1-1, Quest verification: the seen hold reads an uncertain
     group scan as occupied, so an unusable-seen adopted run never closes on a scan error)."""
+    # Host-global /proc scans + same-uid non-dumpable escapees: run serially so a
+    # parallel test's escapee (young, EACCES environ) cannot make this scan uncertain
+    # (dogfood merge failure).
+    mesh_serial = True
+
 
     def test_seen_hold_uncertain_scan_counts_as_occupied(self):
         from unittest import mock
@@ -3682,6 +3731,11 @@ class TestClickUpRecheckMergeUnknownIdentityUncertain(unittest.TestCase):
     empty but uncertain group scan (EMFILE on /proc). A transient error is rescanned and the
     same-group member terminated; a persistent one is reported as kill_failed + scan_uncertain
     (never a pass, never "no members")."""
+    # Host-global /proc scans + same-uid non-dumpable escapees: run serially so a
+    # parallel test's escapee (young, EACCES environ) cannot make this scan uncertain
+    # (dogfood merge failure).
+    mesh_serial = True
+
 
     def _run(self, emfile_hits):
         import errno
@@ -3759,6 +3813,12 @@ class TestCarbonRoP1b(unittest.TestCase):
     - P1-3: supervisor.wrapper_liveness tri-state and recovery._identity_alive preserve live
       runs on transient /proc/<wrapper>/stat OSError while keeping deadline enforcement.
     """
+    mesh_proc_lock = "exclusive"  # spawns same-uid non-dumpable escapees
+    # Host-global /proc scans + same-uid non-dumpable escapees: run serially so a
+    # parallel test's escapee (young, EACCES environ) cannot make this scan uncertain
+    # (dogfood merge failure).
+    mesh_serial = True
+
 
     def setUp(self):
         try:
@@ -3867,7 +3927,7 @@ class TestCarbonRoP1b(unittest.TestCase):
             json.dump({"argv": ["sh", "-c", cmd], "cwd": rdir, "stdin": "devnull"}, f)
         env = {k: v for k, v in os.environ.items() if not k.startswith("MESH_")}
         env["MESH_RUN_ID"] = rid
-        env["PYTHONPATH"] = f"/home/node/gf-guard:{root}" if os.path.isdir("/home/node/gf-guard") else root
+        env["PYTHONPATH"] = f"/home/user/gf-guard:{root}" if os.path.isdir("/home/user/gf-guard") else root
         launcher = subprocess.run(
             [sys.executable, "-c",
              "import os, subprocess, sys\n"
@@ -3974,8 +4034,10 @@ class TestCarbonRoP1b(unittest.TestCase):
         self.assertEqual(get_proc_environ(member), {})
         self.assertGreaterEqual(state["hits"], 1, "EACCES injection did not fire")
 
-        # Live merge must refuse to close, report INTERNAL_ERROR, keep run/task/lease held, and never emit D25 kill_failed.
-        self.assertEqual(cm.exception.code, c.INTERNAL_ERROR, cm.exception.to_envelope("r"))
+        # Live merge must refuse to close, report MERGE_HELD (was INTERNAL_ERROR), keep run/task/lease held, and never emit D25 kill_failed.
+        self.assertEqual(cm.exception.code, c.MERGE_HELD, cm.exception.to_envelope("r"))
+        self.assertEqual(cm.exception.exit_code, c.EXIT_MERGE_FAILED)
+        self.assertEqual(cm.exception.details["reason"], "close_held")
         run_row = self.conn.execute("SELECT * FROM runs WHERE task_id = 'tsk_m';").fetchone()
         self.addCleanup(terminate.forget, run_row["id"])
         self.assertEqual(run_row["status"], "running", dict(run_row))
@@ -4069,7 +4131,9 @@ class TestCarbonRoP1b(unittest.TestCase):
         member, mst = state["member"], state["mst"]
         self.addCleanup(_kill_same, member, mst)
         self.assertGreaterEqual(state["hits"], 1)
-        self.assertEqual(cm.exception.code, c.INTERNAL_ERROR, cm.exception.to_envelope("r"))
+        self.assertEqual(cm.exception.code, c.MERGE_HELD, cm.exception.to_envelope("r"))
+        self.assertEqual(cm.exception.exit_code, c.EXIT_MERGE_FAILED)
+        self.assertEqual(cm.exception.details["reason"], "close_held")
         run_row = self.conn.execute("SELECT * FROM runs WHERE task_id = 'tsk_m';").fetchone()
         self.addCleanup(terminate.forget, run_row["id"])
         self.assertEqual(run_row["status"], "running", dict(run_row))
@@ -4125,7 +4189,9 @@ class TestCarbonRoP1b(unittest.TestCase):
         self.assertTrue(cinfo is None or not is_tgid_alive(child_pid, cinfo),
                         f"foreground test child {child_pid} survived timeout under /proc EMFILE!")
         # And because /proc scan was uncertain (potential setsid escapees unseen), merge:prj_m stays held!
-        self.assertEqual(cm.exception.code, c.INTERNAL_ERROR, cm.exception.to_envelope("r"))
+        self.assertEqual(cm.exception.code, c.MERGE_HELD, cm.exception.to_envelope("r"))
+        self.assertEqual(cm.exception.exit_code, c.EXIT_MERGE_FAILED)
+        self.assertEqual(cm.exception.details["reason"], "close_held")
         self.assertEqual(run_row["status"], "running")
         self.assertIsNotNone(self.conn.execute("SELECT 1 FROM leases WHERE key = 'merge:prj_m';").fetchone())
 
@@ -4579,6 +4645,11 @@ if __name__ == "__main__":
 
 class TestCarbonRoP1bCoverage(unittest.TestCase):
     """ACC: N18, A8 (Quest p1b review P3-4: surviving mutants M2, M4)."""
+    # Host-global /proc scans + same-uid non-dumpable escapees: run serially so a
+    # parallel test's escapee (young, EACCES environ) cannot make this scan uncertain
+    # (dogfood merge failure).
+    mesh_serial = True
+
 
     def test_live_merge_close_leftover_scan_uncertain_alone_holds(self):
         """M2: only ``leftover_scan_uncertain`` is set (the termination itself was certain and
@@ -4692,6 +4763,12 @@ class TestCarbonRoP1c(unittest.TestCase):
       and treats FileNotFoundError / empty environ on exiting sibling threads as lookup misses.
     - P3-1: proc.find_run_processes marks non-lookup get_proc_environ OSError uncertain.
     """
+    mesh_proc_lock = "exclusive"  # spawns same-uid non-dumpable escapees
+    # Host-global /proc scans + same-uid non-dumpable escapees: run serially so a
+    # parallel test's escapee (young, EACCES environ) cannot make this scan uncertain
+    # (dogfood merge failure).
+    mesh_serial = True
+
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="mh-gf-p1c-", dir="/tmp")
@@ -5141,6 +5218,12 @@ class TestCarbonRoP1c(unittest.TestCase):
 class TestP1cFinalExitingFilter(unittest.TestCase):
     """m3-p1c-final: EACCES from an exiting/zombie/gone process does not hold a run;
     a live non-dumpable same-uid process still does."""
+    mesh_proc_lock = "exclusive"  # spawns same-uid non-dumpable escapees
+    # Host-global /proc scans + same-uid non-dumpable escapees: run serially so a
+    # parallel test's escapee (young, EACCES environ) cannot make this scan uncertain
+    # (dogfood merge failure).
+    mesh_serial = True
+
 
     def test_helper_cases(self) -> None:
         import builtins

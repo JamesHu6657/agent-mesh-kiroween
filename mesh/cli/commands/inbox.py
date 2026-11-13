@@ -23,10 +23,16 @@ def register_inbox_commands(subparsers: argparse._SubParsersAction, parent_parse
         "list",
         parents=[parent_parser],
         help="List pending messages in the calling principal's inbox",
-        description="List pending messages in the calling principal's inbox.",
-        epilog="Examples:\n  mesh inbox list\n  mesh inbox list --all --user\n",
+        description=("List unacknowledged messages in the calling principal's inbox.\n"
+                     "Listing marks pending messages delivered; --peek leaves them untouched."),
+        epilog=("Examples:\n  mesh inbox list\n  mesh inbox list --all --user\n"
+                "  mesh inbox list --peek --token-file worker.token   # a watcher/cron job checking for work\n"
+                "\nWatchers and pollers that are not the worker itself should use --peek, so the\n"
+                "worker's own `inbox list`/`inbox wait` still sees the messages as pending.\n"),
     )
     list_parser.add_argument("--all", action="store_true", default=False, help="Include acknowledged/historical messages")
+    list_parser.add_argument("--peek", action="store_true", default=False,
+                             help="Read only: do not mark pending messages delivered")
     list_parser.set_defaults(func=handle_inbox_list)
 
     # wait
@@ -52,14 +58,93 @@ def register_inbox_commands(subparsers: argparse._SubParsersAction, parent_parse
     ack_parser.set_defaults(func=handle_inbox_ack)
 
 
+def _one_line(v: Any, limit: int = 60) -> str:
+    s = " ".join(str(v).split()) if v is not None else "-"
+    return s if len(s) <= limit else s[: limit - 3] + "..."
+
+
+def short_project(pid: Any) -> str:
+    """`prj_` + the last 8 characters: ids share a time prefix, the tail tells them apart."""
+    if not pid:
+        return "-"
+    pid = str(pid)
+    return pid if len(pid) <= 12 or not pid.startswith("prj_") else "prj_" + pid[-8:]
+
+
+def _approval_kind(p: Dict[str, Any]) -> str:
+    op = p.get("op")
+    if isinstance(op, dict):
+        op = op.get("type") or op.get("cmd") or op.get("op")
+    parts = [str(x) for x in (p.get("category"), op) if x]
+    return "/".join(parts) if parts else "-"
+
+
+def _approval_reason(mtype: str, p: Dict[str, Any]) -> Any:
+    if mtype == "approval.decided":
+        decision = p.get("decision") or p.get("status")
+        note = p.get("note")
+        return f"{decision}: {note}" if decision and note else (decision or note)
+    if mtype == "approval.expired":
+        return "expired" + (f" at {p['expires_at']}" if p.get("expires_at") else "")
+    if mtype == "approval.requested":
+        return p.get("summary") or (f"expires {p['expires_at']}" if p.get("expires_at") else None)
+    return p.get("reason") or p.get("summary") or p.get("status")
+
+
+def inbox_table(items: Any) -> str:
+    """Text form of inbox messages with the payload fields a worker acts on (PR #37 #6, N2):
+    project (short id), subject (task id, or approval id for approval.*), title (task title,
+    or approval kind and summary) and reason (failure/rejection/cancel reason, or the
+    approval decision/note/expiry) next to id/type/status."""
+    if not items:
+        return "(no messages)"
+    rows = [["SEQ", "ID", "TYPE", "STATUS", "PROJECT", "SUBJECT", "TITLE", "REASON"]]
+    for m in items:
+        p = m.get("payload") if isinstance(m.get("payload"), dict) else {}
+        mtype = str(m.get("type") or "-")
+        if mtype.startswith("approval."):
+            subject = p.get("approval_id") or m.get("approval_id")
+            kind = _approval_kind(p)
+            title = kind if kind != "-" else None
+            if mtype == "approval.requested" and p.get("summary") and title:
+                title = f"{kind}: {p['summary']}"
+            reason = _approval_reason(mtype, p)
+            if mtype == "approval.requested" and title and p.get("summary"):
+                reason = f"expires {p['expires_at']}" if p.get("expires_at") else None
+        else:
+            subject = p.get("task_id") or m.get("task_id")
+            title = p.get("title")
+            failure = p.get("failure") if isinstance(p.get("failure"), dict) else {}
+            reason = p.get("reason") or failure.get("reason")
+            if not reason and isinstance(p.get("last_rejection"), dict):
+                reason = "rejected: " + str(p["last_rejection"].get("reason") or "")
+        rows.append([str(m.get("seq") if m.get("seq") is not None else "-"), str(m.get("id") or "-"),
+                     mtype, str(m.get("status") or "-"),
+                     short_project(m.get("project_id") or p.get("project_id")),
+                     str(subject or "-"), _one_line(title, 48), _one_line(reason, 60)])
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    return "\n".join("  ".join(r[i].ljust(widths[i]) for i in range(len(r))).rstrip() for r in rows)
+
+
+def _text_view(args: argparse.Namespace, data: Any) -> Any:
+    if getattr(args, "format", "json") == "text" and isinstance(data, dict) and isinstance(data.get("items"), list):
+        extra = {k: v for k, v in data.items() if k != "items" and v is not None}
+        text = inbox_table(data["items"])
+        if extra:
+            text += "\n" + "\n".join(f"{k}: {v}" for k, v in extra.items())
+        return {"text": text}
+    return data
+
+
 def handle_inbox_list(args: argparse.Namespace) -> Dict[str, Any]:
     client = MeshClient(home=args.home)
     payload = {
         "all": getattr(args, "all", False),
         "user": getattr(args, "user", False),
+        "peek": bool(getattr(args, "peek", False)),
     }
     resp = client.execute_cmd(args, "inbox.list", payload)
-    return resp.get("data", {})
+    return _text_view(args, resp.get("data", {}))
 
 
 def handle_inbox_wait(args: argparse.Namespace) -> Dict[str, Any]:
@@ -85,7 +170,7 @@ def handle_inbox_wait(args: argparse.Namespace) -> Dict[str, Any]:
         "user": getattr(args, "user", False),
     }
     resp = client.execute_cmd(args, "inbox.wait", payload)
-    return resp.get("data", {})
+    return _text_view(args, resp.get("data", {}))
 
 
 def handle_inbox_ack(args: argparse.Namespace) -> Dict[str, Any]:

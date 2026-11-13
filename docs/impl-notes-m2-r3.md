@@ -6,7 +6,7 @@ mesh/runwrap.py, mesh/testing/**, tests/helpers.py, `project cancel`, or the M1c
 tests/integration/test_daemon.py is untouched (it has no `--repo` stub probe, and the
 coordinator asked to stay out of it because of the run-5 merge).
 
-Coder: Quest (author `Quest <quest@example.invalid>`, Q15).
+Coder: Quest (author `Quest <coder@example.invalid>`, Q15).
 
 ## 1. Commits
 

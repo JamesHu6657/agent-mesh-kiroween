@@ -1,4 +1,4 @@
-# m3-agyparse: real AgyAdapter.parse() for agy 1.5.3 stream-json (a helper agent, 2026-11-10; p3 polish same day)
+# m3-agyparse: real AgyAdapter.parse() for agy 1.5.3 stream-json (Worker 2, 2026-11-10; p3 polish same day)
 
 Source: `tests/fixtures/real/agy/1.5.3/` only (no vendor CLI was run). Code: `mesh/adapters/agy.py`
 (`parse()`, `parse_stderr_error()`, `_scan_stream()`, `_read_text()`); tests:

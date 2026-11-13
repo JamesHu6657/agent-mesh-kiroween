@@ -134,6 +134,14 @@ class TestMergeTests(unittest.TestCase):
         self.assertTrue(any("FAILED" in line for line in det["log_tail"]), det["log_tail"])
         self.assertIs(det["restored"], True, det)
         self.assertEqual(det["pre_head"], pre_head)
+        # The failing test ids are parsed out of the log and named in the message.
+        self.assertGreaterEqual(det["failing_tests_total"], 1, det)
+        self.assertIs(det["failing_tests_truncated"], False)
+        ids = [t["id"] for t in det["failing_tests"]]
+        self.assertTrue(all("." in i and i.split(".")[-1].startswith("test") for i in ids), ids)
+        for i in ids:
+            self.assertIn(i, err["message"])
+        self.assertIn(f"log: {det['log_path']}", err["message"])
         self.assert_integration_restored(repo, prj, pre_head)
         self.assertEqual(self.fixture.git(self.integ_wt(prj), "show", "HEAD:calc.py").stdout,
                          "def add(a, b):\n    return a + b\n")
@@ -150,6 +158,26 @@ class TestMergeTests(unittest.TestCase):
         self.assertEqual(run["end_reason"], "tests_failed")
         self.assert_no_merge_lease(prj)
         self.assert_remote_unchanged()
+
+
+    def test_k7_text_mode_names_failing_tests_and_log(self) -> None:
+        """Text mode: a one-line "running tests (log: ...)" note on stderr at start, and the
+        TESTS_FAILED message lists the failing test ids and the log path."""
+        repo, prj = self.make_tested_project("T7T")
+        slow_fail = ("import time\nimport unittest\n\n\nclass TestSlow(unittest.TestCase):\n"
+                     "    def test_slow_fail(self):\n        time.sleep(3)\n        self.fail('boom')\n")
+        tsk, _ = self.accepted_task(prj, "Slow failing test", "test_slow.py", slow_fail)
+        rc, resp = self.harness.cli("--format", "text", "task", "merge", tsk, token=self.tok_lead1, timeout=120.0)
+        self.assertEqual(rc, c.EXIT_MERGE_FAILED, resp)
+        err = resp["raw_stderr"]
+        self.assertIn(f"mesh: merging {tsk}: running the project's tests", err)
+        mrg = self.show(tsk)["merge"]["mrg"]
+        log = os.path.join(os.path.realpath(self.harness.home), "merges", mrg, "test.log")
+        self.assertIn(f"(log: {log})", err)
+        self.assertIn("[TESTS_FAILED]", err)
+        self.assertIn("failing test", err)
+        self.assertIn("  FAIL: test_slow.TestSlow.test_slow_fail", err)
+        self.assertIn(f"  log: {log}", err)
 
 
 class TestRunTestStep(unittest.TestCase):

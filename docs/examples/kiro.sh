@@ -2,7 +2,7 @@
 mesh adapter probe kiro --user
 mesh adapter models kiro --user
 mesh agent create --user --name kiro1 --adapter kiro \
-  --allowed-model <model-id> --default-model <model-id> \
+  --allowed-model "$MODEL_ID" --default-model "$MODEL_ID" \
   --max-concurrency 2
 # optional: a Kiro agent profile for the run
 #   --option agent='"my-kiro-agent"'

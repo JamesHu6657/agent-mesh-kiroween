@@ -14,6 +14,10 @@ import uuid
 from mesh.core.proc import get_proc_environ, get_proc_stat, parse_proc_stat
 from mesh.daemon import children, terminate
 
+# Unique per test process: run ids carried as a real MESH_RUN_ID must not collide
+# with another tier run on the same host (dogfood concurrency).
+_RUN_SFX = f"_{os.getpid()}"
+
 
 # Generous deadline for wait-for-condition polls: they return as soon as the condition holds,
 # so the deadline only matters on a real failure, never on a slow but healthy box.
@@ -72,7 +76,7 @@ class TestTerminationStateMachine(unittest.TestCase):
             proc.stdout.readline()
             # The process models the run's wrapper (session leader) with its starttime.
             st = get_proc_stat(proc.pid)["starttime"]
-            t = terminate.begin(_run_id("run_unit_esc"), proc.pid, proc.pid, "timeout", 1, wrapper_starttime=st)
+            t = terminate.begin(_run_id(f"run_unit_esc{_RUN_SFX}"), proc.pid, proc.pid, "timeout", 1, wrapper_starttime=st)
             self.assertIn(proc.pid, t.initial_pids)
             self.assertEqual(terminate.step(t), "pending")
             reaped = []
@@ -187,7 +191,7 @@ class TestPidReuseSafety(unittest.TestCase):
         st = get_proc_stat(other.pid)["starttime"]
         children.register(other.pid, "wrapper")
         self.addCleanup(children.unregister, other.pid)
-        run_id = _run_id("run_stale")
+        run_id = _run_id(f"run_stale{_RUN_SFX}")
         found = terminate.run_targets(run_id, other.pid, other.pid, int(st) + 1)
         self.assertNotIn(other.pid, found)
         self.assertEqual(found, {})
@@ -201,7 +205,7 @@ class TestPidReuseSafety(unittest.TestCase):
             "import subprocess,sys,time; subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']);"
             " print('r', flush=True); time.sleep(30)")
         st = int(get_proc_stat(stranger.pid)["starttime"])
-        run_id = _run_id("run_gone")
+        run_id = _run_id(f"run_gone{_RUN_SFX}")
         self.assertEqual(terminate.run_targets(run_id, stranger.pid, stranger.pid, st + 1), {})
         self.assertEqual(terminate.run_targets(run_id, stranger.pid, None, None), {})
         # Already seen by this termination with the same starttime: still a target,
@@ -221,18 +225,18 @@ class TestPidReuseSafety(unittest.TestCase):
 
         proc = subprocess.Popen(["true"])
         children.register(proc.pid, "wrapper")
-        supervisor._WRAPPERS["run_reap"] = proc
+        supervisor._WRAPPERS[f"run_reap{_RUN_SFX}"] = proc
         deadline = time.monotonic() + WAIT_S
-        while "run_reap" in supervisor._WRAPPERS and time.monotonic() < deadline:
-            supervisor._reap_wrapper({"id": "run_reap", "wrapper_pid": proc.pid})
+        while f"run_reap{_RUN_SFX}" in supervisor._WRAPPERS and time.monotonic() < deadline:
+            supervisor._reap_wrapper({"id": f"run_reap{_RUN_SFX}", "wrapper_pid": proc.pid})
             time.sleep(0.02)
-        self.assertNotIn("run_reap", supervisor._WRAPPERS)
+        self.assertNotIn(f"run_reap{_RUN_SFX}", supervisor._WRAPPERS)
         self.assertEqual(proc.returncode, 0)
         self.assertNotIn(proc.pid, children.registered_pids())
         # A run with no Popen (adopted): nothing is waited on, the registry is untouched.
         children.register(os.getpid(), "stub")
         try:
-            supervisor._reap_wrapper({"id": "run_adopted", "wrapper_pid": os.getpid()})
+            supervisor._reap_wrapper({"id": f"run_adopted{_RUN_SFX}", "wrapper_pid": os.getpid()})
             self.assertIn(os.getpid(), children.registered_pids())
         finally:
             children.unregister(os.getpid())
@@ -300,7 +304,7 @@ class TestZombieWrapperGroup(unittest.TestCase):
     this run's, so a group member that dropped MESH_RUN_ID is a target."""
 
     def test_env_stripped_member_found_while_wrapper_unreaped(self) -> None:
-        run_id = _run_id("run_zomb")
+        run_id = _run_id(f"run_zomb{_RUN_SFX}")
         env = dict(os.environ, MESH_RUN_ID=run_id)
         leader = subprocess.Popen(
             [sys.executable, "-c",

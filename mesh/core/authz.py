@@ -100,6 +100,12 @@ USER_DIRECT_CMDS = frozenset({
     "run.release",
 })
 
+#: Read-only agent roster commands. They stay user-only except for leads (an enabled
+#: agent with can_lead, or the current lead of an active project), who get a reduced
+#: roster view without credentials or adapter options; the handler decides
+#: (mesh/daemon/handlers/agent.py `_roster_view`). Every other `agent.*` is user-only.
+ROSTER_READ_CMDS = frozenset({"agent.list", "agent.show"})
+
 #: The lead column of the §7.3 matrix, as the lead run token sees it (§7.2).
 #: `config.*`, `agent.*`, `agent token.*`, `audit.*` and `daemon stop` are user-only
 #: and are rejected before this set is consulted.
@@ -120,6 +126,7 @@ LEAD_RUN_TOKEN_CMDS = frozenset({
     "task.retry",
     "task.escalate",
     "task.cancel",
+    "task.close",
     "task.merge",
     "dep.add",
     "dep.remove",
@@ -169,6 +176,7 @@ LEAD_RUN_TOKEN_TASK_CMDS = frozenset({
     "task.retry",
     "task.escalate",
     "task.cancel",
+    "task.close",
     "task.merge",
     "dep.add",
     "dep.remove",
@@ -325,7 +333,20 @@ def check_authz(
     if actor_kind == "user" and via == "direct":
         return
 
-    # 2. Config, agent, and audit operations are user-only (direct factor)
+    # 2. Config, agent, and audit operations are user-only (direct factor); the agent
+    # roster reads are decided by their handler (leads get a roster view).
+    if cmd in ROSTER_READ_CMDS and actor_kind == "agent":
+        # PR #37 review #5: a run token reads the roster only as the project's CURRENT
+        # lead (a superseded lead gets LEAD_SUPERSEDED; executor run tokens are denied).
+        if via != "run_token":
+            return
+        scope = principal.get("scope") or {}
+        if scope.get("role") == "lead":
+            current = get_project_active_lead(conn, scope.get("project_id")) if scope.get("project_id") else None
+            current_id = current["assignment_id"] if current else None
+            if not scope.get("lead_assignment_id") or current_id != scope.get("lead_assignment_id"):
+                raise _lead_superseded(scope.get("project_id"), scope.get("lead_assignment_id"), current_id)
+            return
     if cmd.startswith("config.") or cmd.startswith("agent.") or cmd.startswith("audit."):
         raise MeshError(
             code=c.CAPABILITY_MISSING,
@@ -554,6 +575,7 @@ def check_authz(
         "task.retry",
         "task.escalate",
         "task.cancel",
+        "task.close",
         "task.merge",
         "dep.add",
         "dep.remove",

@@ -344,7 +344,7 @@ Commits on `wt/m3-gf11` (above `fe28f6f`):
 - **Carbon P2-2 (`agent update` ignored flags / `--strict-models`):** `mesh agent update` silently ignores unimplemented update flags and `--strict-models` is not yet implemented. Deferred outside M3 gatefix scope.
 - **Carbon P3 (`kiro` / `agy` prompt separator):** `kiro` and `agy` adapter command builders pass the positional prompt argument without a `--` end-of-options separator (prompts starting with `-` could be parsed as flags; adding `--` requires live vendor CLI smoke verification to ensure neither vendor CLI treats `--` literally). Deferred as a known limitation.
 
-### Round 11 Targeted Runs (sequential, `PYTHONPATH=/home/node/gf-guard`, `timeout 600`)
+### Round 11 Targeted Runs (sequential, `PYTHONPATH=/home/user/gf-guard`, `timeout 600`)
 - **Unit (26 modules, 401 tests, 1 skipped — all `OK`):** `test_m3_gatefix` (66), `test_probe_offline` (7), `test_projects` (10), `test_skeleton` (14), `test_adapters` (31), `test_auth` (5), `test_doctor_fail_closed` (21), `test_fake_agent_behaviors` (6), `test_home_resolution_r3` (13), `test_lead_supersede` (1), `test_lead_turns` (2), `test_merge` (21), `test_merge_recovery_minors` (7), `test_proc_probe` (3), `test_reap_daemons` (53), `test_recovery_units` (7), `test_runtargets_race` (43), `test_runwrap` (3), `test_seen_hold_r4d` (4), `test_seen_hold_r4e` (3), `test_settings` (5), `test_smoke_cases` (15), `test_smoke_harness` (14), `test_termination_units` (13), `test_test_kdf` (27, 1 skipped), `test_vendor_failure_meaning` (7).
 - **Integration (19 modules, 176 tests — all `OK`):** `test_adapters` (6), `test_adapter_evidence` (3), `test_daemon` (25), `test_execution_acc_run2` (17), `test_execution_launch` (5), `test_execution_launch_fences` (9), `test_execution_termination` (16), `test_lead_actions` (5), `test_lead_turns` (8), `test_merge_tests` (5), `test_read_verbs` (4), `test_run_release_seen` (3), `test_test_kdf` (2), `test_vendor_lead_gate` (3), `test_projects` (17), `test_agents` (11), `test_approvals` (22), `test_vendor_exit_meaning` (5), `test_merge` (10).
 - **Recovery (4 modules, 49 tests — all `OK`):** `test_recovery` (15), `test_recovery_adopt_seen` (16), `test_recovery_lead_merge` (16), `test_recovery_merge` (2).
@@ -425,7 +425,7 @@ Round 11 runs (base, idle, Carbon not running): targeted 28 modules, 400 tests, 
     - `test_merge_test_step_leftover_scan_error_not_passed`: `AssertionError: True is not false : merge test step passed despite leftover scan EIO`
 - **Pass-after (`TestClickUpP1ScanUncertain`):**
   - `Ran 8 tests in 6.938s — OK`
-- **Sequential Targeted Runs (`PYTHONPATH=/home/node/gf-guard`, `timeout 600`, one module at a time):**
+- **Sequential Targeted Runs (`PYTHONPATH=/home/user/gf-guard`, `timeout 600`, one module at a time):**
   1. `tests.unit.test_m3_gatefix` — 76 tests (`41.476s`) `OK`
   2. `tests.unit.test_runtargets_race` — 43 tests (`6.595s`) `OK`
   3. `tests.unit.test_termination_units` — 13 tests (`1.977s`) `OK`
@@ -462,7 +462,7 @@ Mutation check of `TestClickUpP1ScanUncertain`, run by the Quest coder on base w
 
 ## Carbon RO P1-1..P1-3 (round p1b)
 
-- **Review addressed:** `/home/node/workspace/review-inbox/m3-clickup-p1-carbon.md` (Carbon adversarial read-only review on `66b0417`, `REVISE`: P1-1, P1-2, P1-3; P2-1 docs; P3-1).
+- **Review addressed:** `/home/user/workspace/review-inbox/m3-clickup-p1-carbon.md` (Carbon adversarial read-only review on `66b0417`, `REVISE`: P1-1, P1-2, P1-3; P2-1 docs; P3-1).
 
 ### Root Cause
 - **P1-1 (`mesh/daemon/merge.py` — live `task.merge` `run_test_step` -> `_pipeline_and_finish` / `_final_tx`):**
@@ -524,7 +524,7 @@ Mutation check of `TestClickUpP1ScanUncertain`, run by the Quest coder on base w
   - Plus 9th test `test_p1_3_watch_lead_turn_transient_wrapper_stat_eio_preserves_live_turn` added to cover `_watch_lead_turn` directly alongside `_watch_task_run`.
 - **Pass-after (`TestCarbonRoP1b` on final sources):**
   - `Ran 9 tests in 30.922s — OK`
-- **Sequential Targeted Runs (`PYTHONPATH=/home/node/gf-guard`, `timeout 600`, one module at a time):**
+- **Sequential Targeted Runs (`PYTHONPATH=/home/user/gf-guard`, `timeout 600`, one module at a time):**
   1. `tests.unit.test_runtargets_race` — 43 tests (`6.568s`) `OK`
   2. `tests.unit.test_m3_gatefix` — 88 tests (`78.313s`) `OK`
   3. `tests.unit.test_termination_units` — 13 tests (`2.087s`) `OK`
@@ -568,7 +568,7 @@ Mutation check of `TestCarbonRoP1b` (9 tests), run by the Quest coder on base wi
 
 ## Round p1c
 
-- **Review addressed:** `/home/node/workspace/review-inbox/m3-clickup-p1b-carbon.md` (Carbon adversarial read-only review on `08810a1`, `REVISE`: P1-1, P2-1, P3-1; coordinator handles P2-2 docs).
+- **Review addressed:** `/home/user/workspace/review-inbox/m3-clickup-p1b-carbon.md` (Carbon adversarial read-only review on `08810a1`, `REVISE`: P1-1, P2-1, P3-1; coordinator handles P2-2 docs).
 
 ### Fix
 - **P1-1 (`mesh/daemon/recovery.py`, `mesh/daemon/merge.py`, `mesh/daemon/supervisor.py`):**
@@ -595,7 +595,7 @@ Mutation check of `TestCarbonRoP1b` (9 tests), run by the Quest coder on base wi
 ### Fail-Before / Pass-After & Targeted Verification
 - **Fail-before (`TestCarbonRoP1c` on unmodified `08810a1` `mesh/`):** `Ran 6 tests in 3.507s — FAILED (failures=5, errors=1)` (1a closed both `task` and `lead_turn` `'lost'` with `runs_lost=2`; 1b closed `merge_test` `'lost'` with `merge_runs_lost=1`; 1c closed `'lost'` in `advance_terminations` after `YOUNG_S`; 2a swallowed `EMFILE` on `/proc/<cand>/status`; 2b raised unhandled `FileNotFoundError` on `/proc/<s1>/environ`; 3-1 left `ScanPids.uncertain == False` on `EMFILE`).
 - **Pass-after (`TestCarbonRoP1c` on round `p1c` sources):** `Ran 6 tests in 5.016s — OK`.
-- **Sequential targeted modules (`PYTHONPATH=/home/node/gf-guard`, `timeout 600`):**
+- **Sequential targeted modules (`PYTHONPATH=/home/user/gf-guard`, `timeout 600`):**
   1. `tests.unit.test_m3_gatefix` — 96 tests (`74.887s`) `OK`
   2. `tests.recovery.test_recovery_adopt_seen` — 16 tests (`16.842s`) `OK`
   3. `tests.recovery.test_recovery_merge` — 2 tests (`7.065s`) `OK`

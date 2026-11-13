@@ -4,7 +4,7 @@ Authorization (from the user, relayed by the coordinating agent): only AFTER the
 create a NEW public GitHub repository and push this project. Never reuse or push to any older AgentMesh repository.
 Until then: no remote, no push, no publishing. M1a is only the first sub-milestone and does not trigger this.
 
-Roles: code review is done by the user's Quest workflow; a helper agent (parent) performs acceptance against the agreed
+Roles: code review is done by the user's Quest workflow; Worker 2 (parent) performs acceptance against the agreed
 gate criteria and coordinates the final release.
 
 Before the public push (checklist for the release coordinator):

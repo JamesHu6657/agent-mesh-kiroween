@@ -15,4 +15,4 @@ so `command` uses placeholders (`<prompt>`, `<repo>`, ...); commands are reconst
 
 agy 1.5.3: these runs were on the Paseo cloud PC before the 2026-11-07 move, where agy 1.5.3
 was installed (log.md line 10: binaries copied, sha256 identical). Contents checked: no
-credentials; paths `/home/box`, `/home/node` and `example.invalid` test addresses only.
+credentials; paths `/home/box`, `/home/user` and `example.invalid` test addresses only.

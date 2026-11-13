@@ -31,9 +31,9 @@ Windows are not supported.
 | Scoped run tokens, central authorization, token redaction in captured output | A launched agent can only act on its own task. |
 | Approvals for gated actions (see `docs/usage.md` §3) and the review/merge gate | The human decides; `config`/`agent`/token commands stay direct-user only. |
 | Passphrase lockout window (`auth.lockout_window_s`, 300 s) and lead wake backoff (`lead.wake_backoff_s`, 30/120/600 s) | Changeable only in testing mode. Lockout is brute-force protection; the backoff stops a failing lead from burning model calls. |
-| Vendor CLIs as launch-mode leads refused (`vendor_lead_m3_lite`) | Lead-turn crash recovery does not yet track the lead's process group (known limitation L4). Use an inbox lead for vendor agents; the test double can still be a launch lead in testing mode. |
+| Vendor CLIs as launch-mode leads refused (`vendor_lead_m3_lite`) | Lead-turn crash recovery does not yet track the lead's process group (process-group tracking is incomplete). Use an inbox lead for vendor agents; the test double can still be a launch lead in testing mode. |
 | hermes and openclaw cannot launch | Their adapters are stubs (no command builder); `agent create` is refused while the CLI is not installed and launch work is refused otherwise. Connect them as inbox agents. |
-| Commands planned for later milestones return `NOT_IMPLEMENTED_IN_M1` | They are not built; the error names the milestone. |
+| Unimplemented commands return legacy `NOT_IMPLEMENTED_IN_M1` | The operation is unavailable; internal milestone metadata is diagnostic only. |
 | `fake` adapter only with `MESH_TESTING=1` | It is a test double, not an agent. |
 | Per-agent model/effort allowlists and concurrency caps | User configuration, set per agent at `agent create`; no global limit is imposed. |
 | Linux only | Process supervision reads `/proc` and uses process groups and Unix sockets. |

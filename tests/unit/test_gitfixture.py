@@ -75,24 +75,24 @@ class TestGitFixture(unittest.TestCase):
         with mock.patch("subprocess.run", side_effect=AssertionError("subprocess.run must not be called")):
             with mock.patch("subprocess.Popen", side_effect=AssertionError("subprocess.Popen must not be called")):
                 with self.assertRaises(AssertionError):
-                    self.fixture.git("/home/node/workspace/mesh-fresh-v1", "status")
+                    self.fixture.git("/home/user/workspace/mesh-fresh-v1", "status")
                 with self.assertRaises(AssertionError):
                     self.fixture.git("/tmp/not-a-repo", "status")
                 with self.assertRaises(AssertionError):
                     self.fixture.path("..", "escape")
                 # Repository-selecting options and absolute path arguments are refused too.
                 with self.assertRaises(AssertionError):
-                    self.fixture.git(repo, "-C", "/home/node/workspace/mesh-fresh-v1", "status")
+                    self.fixture.git(repo, "-C", "/home/user/workspace/mesh-fresh-v1", "status")
                 with self.assertRaises(AssertionError):
-                    self.fixture.git(repo, "--git-dir=/home/node/workspace/mesh-fresh-v1/.git", "status")
+                    self.fixture.git(repo, "--git-dir=/home/user/workspace/mesh-fresh-v1/.git", "status")
                 with self.assertRaises(AssertionError):
-                    self.fixture.git(repo, "--git-dir", "/home/node/workspace/mesh-fresh-v1/.git", "status")
+                    self.fixture.git(repo, "--git-dir", "/home/user/workspace/mesh-fresh-v1/.git", "status")
                 with self.assertRaises(AssertionError):
-                    self.fixture.git(repo, "--work-tree=/home/node/workspace/mesh-fresh-v1", "status")
+                    self.fixture.git(repo, "--work-tree=/home/user/workspace/mesh-fresh-v1", "status")
                 with self.assertRaises(AssertionError):
-                    self.fixture.git(repo, "--work-tree", "/home/node/workspace/mesh-fresh-v1", "status")
+                    self.fixture.git(repo, "--work-tree", "/home/user/workspace/mesh-fresh-v1", "status")
                 with self.assertRaises(AssertionError):
-                    self.fixture.git(repo, "status", "/home/node/workspace/mesh-fresh-v1")
+                    self.fixture.git(repo, "status", "/home/user/workspace/mesh-fresh-v1")
         # The fixture is still usable afterwards.
         self.assertTrue(self.fixture.is_clean(repo))
 
@@ -223,8 +223,8 @@ class TestGitMeshHarness(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     self.fixture.git(harness.home + "-sibling", "status")
                 with self.assertRaises(AssertionError):
-                    self.fixture.git("/home/node/workspace/mesh-fresh-v1", "status")
-            for bad in ("/tmp/other", "/home/node/workspace/mesh-fresh-v1", "relative/mh-x"):
+                    self.fixture.git("/home/user/workspace/mesh-fresh-v1", "status")
+            for bad in ("/tmp/other", "/home/user/workspace/mesh-fresh-v1", "relative/mh-x"):
                 with self.assertRaises(AssertionError):
                     self.fixture.allow_root(bad)
             self.assertEqual(self.fixture.allowed_roots, [self.fixture.base, harness.home])

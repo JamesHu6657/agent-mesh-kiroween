@@ -10,7 +10,8 @@ from mesh.adapters.registry import get_adapter
 from mesh.core.clock import now_iso_utc, parse_utc
 from mesh.core.db import transaction
 from mesh.core.redact import redact
-from mesh.core.events import record_event
+from mesh.core.events import last_rejection, record_event
+from mesh.core.settings import get_agent_ack_timeout_s
 
 #: M3 gate re-review P2 (L11): T6 failure reason for a queued launch task whose adapter is
 #: held (``evidence.LAUNCH_HOLDS``), e.g. a kiro task queued before the hold landed.
@@ -40,6 +41,55 @@ def _log_to_meshd(home: str, msg: str) -> None:
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(f"{now_iso_utc()} ERROR {redact(msg)}\n")
         os.chmod(log_path, 0o600)
+    except Exception:
+        pass
+
+
+#: Scheduler errors since this meshd started (batch 5): count and the latest one. Also
+#: written to $MESH_HOME/run/scheduler_errors.json so `mesh doctor` sees them offline.
+SCHEDULER_ERRORS: Dict[str, Any] = {"count": 0, "last": None, "by_step": {}}
+SCHEDULER_ERRORS_FILE = "scheduler_errors.json"
+
+
+def reset_scheduler_errors(home: str = "") -> None:
+    """At meshd start: forget the previous process's errors."""
+    SCHEDULER_ERRORS.update(count=0, last=None, by_step={})
+    if home:
+        try:
+            os.unlink(os.path.join(home, "run", SCHEDULER_ERRORS_FILE))
+        except OSError:
+            pass
+
+
+def scheduler_errors_view() -> Dict[str, Any]:
+    return {"sweep_errors": SCHEDULER_ERRORS["count"], "last_sweep_error": SCHEDULER_ERRORS["last"],
+            "sweep_errors_by_step": dict(SCHEDULER_ERRORS["by_step"])}
+
+
+def _sweep_error(home: str, step: str, exc: BaseException, item: Optional[str] = None) -> None:
+    """A scheduler step failed: log it with its traceback, count it, record the latest.
+
+    Never raises (the tick goes on with its other steps)."""
+    import traceback
+
+    try:
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        where = f" on {item}" if item else ""
+        _log_to_meshd(home, f"Scheduler step {step} failed{where}: {type(exc).__name__}: {exc}\n{tb}")
+        SCHEDULER_ERRORS["count"] += 1
+        SCHEDULER_ERRORS["by_step"][step] = SCHEDULER_ERRORS["by_step"].get(step, 0) + 1
+        SCHEDULER_ERRORS["last"] = {"step": step, "item": item, "error": redact(f"{type(exc).__name__}: {exc}"),
+                                    "at": now_iso_utc()}
+        if home:
+            run_dir = os.path.join(home, "run")
+            os.makedirs(run_dir, mode=0o700, exist_ok=True)
+            path = os.path.join(run_dir, SCHEDULER_ERRORS_FILE)
+            tmp = path + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"count": SCHEDULER_ERRORS["count"], "last": SCHEDULER_ERRORS["last"],
+                           "by_step": SCHEDULER_ERRORS["by_step"], "pid": os.getpid()}, f)
+            os.replace(tmp, path)
     except Exception:
         pass
 
@@ -227,12 +277,14 @@ def promote_tasks(conn: sqlite3.Connection, home: str = "", testing_mode: bool =
                             "title": task["title"],
                             "spec": task["spec"],
                             "fence": task["fence_seq"] + 1,
+                            "ack_timeout_s": ack_window_now(conn, task["assignee_agent_id"])[0],
+                            "last_rejection": last_rejection(conn, task_id),
                         },
                     )
 
                 promoted.append(task_id)
         except Exception as e:
-            _log_to_meshd(home, f"Scheduler promotion failed on task {task_id}: {e}")
+            _sweep_error(home, "promote", e, task_id)
             continue
 
     return promoted
@@ -358,9 +410,96 @@ def fail_held_launch_tasks(conn: sqlite3.Connection, home: str = "", testing_mod
                 if fail_queued_task_t6(conn, task, LAUNCH_HELD_REASON, details, assignee_id=task["assignee_id"]):
                     failed.append(task["id"])
         except Exception as e:
-            _log_to_meshd(home, f"Scheduler launch-hold check failed on task {task['id']}: {e}")
+            _sweep_error(home, "launch_hold", e, task["id"])
             continue
     return failed
+
+
+def ack_window_now(conn: sqlite3.Connection, agent_id: Optional[str]) -> Tuple[int, bool]:
+    """The ack window an offer made now gets: (seconds, set per agent?)."""
+    own = get_agent_ack_timeout_s(conn, agent_id) if agent_id else None
+    if own is not None:
+        return own, True
+    return get_inbox_ack_timeout_s(conn), False
+
+
+def offered_ack_window(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+    """The ack window recorded in the task's latest task.offered event (None for offers
+    made before windows were recorded)."""
+    row = conn.execute(
+        "SELECT json_extract(payload_json, '$.ack_timeout_s') AS w FROM events "
+        "WHERE task_id = ? AND type = 'task.offered' ORDER BY seq DESC LIMIT 1;",
+        (task_id,),
+    ).fetchone()
+    try:
+        return int(row["w"]) if row and row["w"] is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def effective_ack_window(conn: sqlite3.Connection, task_id: str, agent_id: Optional[str]) -> Tuple[int, bool, Optional[int]]:
+    """Window used for the no_response decision: never shorter than the one the offer was
+    made with. Lowering inbox.ack_timeout_s or `--ack-timeout` applies to new offers only;
+    raising it also extends offers already out. Returns (seconds, per_agent, offered)."""
+    now_s, per_agent = ack_window_now(conn, agent_id)
+    offered = offered_ack_window(conn, task_id)
+    if offered is not None and offered > now_s:
+        return offered, per_agent, offered
+    return now_s, per_agent, offered
+
+
+def offers_kept_by_window(conn: sqlite3.Connection, agent_id: Optional[str], new_window_s: int) -> List[Dict[str, Any]]:
+    """Queued inbox offers (of one agent, or all agents using the global window when
+    agent_id is None) that the new, shorter window would already have timed out; they
+    keep the window they were offered with."""
+    from mesh.core.settings import agent_ack_timeout_key
+
+    rows = conn.execute(
+        """SELECT t.id, t.offered_at, t.assignee_agent_id FROM tasks t JOIN agents a ON a.id = t.assignee_agent_id
+           WHERE t.status = 'queued' AND a.delivery = 'inbox' AND t.offered_at IS NOT NULL"""
+        + (" AND t.assignee_agent_id = ?" if agent_id else "") + ";",
+        ((agent_id,) if agent_id else ()),
+    ).fetchall()
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        if agent_id is None and conn.execute(
+                "SELECT 1 FROM settings WHERE key = ?;", (agent_ack_timeout_key(r["assignee_agent_id"]),)).fetchone():
+            continue  # its own window, unaffected by the global setting
+        try:
+            if now_dt > parse_utc(r["offered_at"]) + datetime.timedelta(seconds=new_window_s):
+                offered = offered_ack_window(conn, r["id"])
+                out.append({"task_id": r["id"], "offered_at": r["offered_at"], "ack_timeout_s": offered,
+                            # offers recorded before windows were stored use the current value
+                            "kept": offered is not None and offered > new_window_s})
+        except Exception:
+            continue
+    return out
+
+
+def no_response_details(task_id: str, agent_name: Optional[str], offered_at: str, window_s: int,
+                        per_agent: bool) -> Dict[str, Any]:
+    """T6 `no_response` details: the window, which setting set it, and how to recover.
+
+    They are stored in the task's failure and the task.failed event, so the lead's
+    notification says the same thing.
+    """
+    who = agent_name or "the assignee"
+    setting = (f"agent {who} --ack-timeout" if per_agent else "inbox.ack_timeout_s")
+    return {
+        "offered_at": offered_at,
+        "ack_window_start": offered_at,
+        "timeout_s": window_s,
+        "setting": setting,
+        "agent": agent_name,
+        "hint": (
+            f"{who} did not run `mesh task start` within {window_s}s of the offer ({setting}). "
+            f"Retry with: mesh task retry {task_id} --reason \"...\". "
+            f"To give {who} longer to pick tasks up: mesh agent update {who} --ack-timeout 2h --user"
+            + ("" if per_agent else " (or `mesh config set inbox.ack_timeout_s <seconds> --user` for every inbox agent)")
+            + "."
+        ),
+    }
 
 
 def check_queued_tasks_t6(conn: sqlite3.Connection, home: str = "", testing_mode: bool = False) -> List[str]:
@@ -379,14 +518,15 @@ def check_queued_tasks_t6(conn: sqlite3.Connection, home: str = "", testing_mode
     cur = conn.execute(
         """SELECT t.id, t.project_id, t.title, t.spec, t.model, t.fence_seq,
                   t.attempt, t.max_attempts, t.offered_at,
-                  a.id as assignee_id, a.delivery, a.adapter, a.binary_path, a.allowed_models_json
+                  a.id as assignee_id, a.delivery, a.adapter, a.binary_path, a.allowed_models_json,
+                  p.name as assignee_name
            FROM tasks t
            JOIN agents a ON t.assignee_agent_id = a.id
+           LEFT JOIN principals p ON p.id = a.id
            WHERE t.status = 'queued';"""
     )
     candidates = cur.fetchall()
     failed_tasks: List[str] = []
-    ack_timeout_s = get_inbox_ack_timeout_s(conn)
     now_dt = datetime.datetime.now(datetime.timezone.utc)
 
     for task in candidates:
@@ -423,10 +563,11 @@ def check_queued_tasks_t6(conn: sqlite3.Connection, home: str = "", testing_mode
                     continue
                 try:
                     offered_dt = parse_utc(task["offered_at"])
-                    if now_dt > offered_dt + datetime.timedelta(seconds=ack_timeout_s):
+                    window_s, per_agent, _offered = effective_ack_window(conn, task_id, task["assignee_id"])
+                    if now_dt > offered_dt + datetime.timedelta(seconds=window_s):
                         reason = "no_response"
-                        details = {"offered_at": task["offered_at"], "ack_window_start": task["offered_at"],
-                                   "timeout_s": ack_timeout_s}
+                        details = no_response_details(task_id, task["assignee_name"], task["offered_at"],
+                                                      window_s, per_agent)
                 except Exception:
                     pass
             elif task["delivery"] == "launch":
@@ -461,7 +602,7 @@ def check_queued_tasks_t6(conn: sqlite3.Connection, home: str = "", testing_mode
                     continue
                 failed_tasks.append(task_id)
         except Exception as e:
-            _log_to_meshd(home, f"Scheduler T6 check failed on task {task_id}: {e}")
+            _sweep_error(home, "t6_check", e, task_id)
             continue
 
     return failed_tasks
@@ -510,7 +651,7 @@ def sweep_expired_approvals(conn: sqlite3.Connection, home: str = "") -> List[st
                 )
                 expired_ids.append(apr_id)
         except Exception as e:
-            _log_to_meshd(home, f"Scheduler approval expiry sweep failed on approval {apr_id}: {e}")
+            _sweep_error(home, "approval_expiry", e, apr_id)
             continue
 
     return expired_ids
@@ -581,7 +722,35 @@ def sweep_expired_inbox_leases(conn: sqlite3.Connection, home: str = "") -> List
                        WHERE id = ? AND status = 'running';""",
                     (json.dumps(failure_dict), now, task_id),
                 )
-                if cur_upd.rowcount == 0:
+                task_failed = cur_upd.rowcount > 0
+                holder = conn.execute("SELECT a.name FROM runs r LEFT JOIN principals a ON a.id = r.agent_id "
+                                      "WHERE r.id = ?;", (run_id,)).fetchone()
+                # 3b. Always a task event for the lost lease (task history + the lead), also
+                #     when the task was no longer running and so does not fail here.
+                record_event(
+                    conn=conn,
+                    type_="task.lease_expired",
+                    actor_id="system",
+                    actor_kind="system",
+                    via="system",
+                    project_id=project_id,
+                    task_id=task_id,
+                    run_id=run_id,
+                    reason="lease_expired",
+                    payload={
+                        "task_id": task_id,
+                        "project_id": project_id,
+                        "run_id": run_id,
+                        "fence": fence,
+                        "attempt": attempt,
+                        "holder": holder["name"] if holder is not None else None,
+                        "lease_expires_at": row["expires_at"],
+                        "task_status": "failed" if task_failed else row["task_status"],
+                        "task_failed": task_failed,
+                    },
+                )
+                if not task_failed:
+                    expired_tasks.append(task_id)
                     continue
 
                 # 4. Record event task.failed (notifies lead via outbox fan-out)
@@ -609,25 +778,67 @@ def sweep_expired_inbox_leases(conn: sqlite3.Connection, home: str = "") -> List
                 )
                 expired_tasks.append(task_id)
         except Exception as e:
-            _log_to_meshd(home, f"Scheduler lease expiry sweep failed on task {task_id}: {e}")
+            _sweep_error(home, "lease_expiry", e, task_id)
             continue
 
     return expired_tasks
 
 
+def _injected_failure(home: str, name: str, testing_mode: bool) -> None:
+    """Testing hook (like ``run/launch_hold``): ``$MESH_HOME/run/scheduler_fail_step``
+    naming a step makes that step raise. Never honoured outside testing mode."""
+    if not (testing_mode and home):
+        return
+    try:
+        with open(os.path.join(home, "run", "scheduler_fail_step"), "r", encoding="utf-8") as f:
+            wanted = f.read().split()
+    except OSError:
+        return
+    if name in wanted:
+        raise RuntimeError(f"injected failure in scheduler step {name} (testing hook)")
+
+
+def _step(_home: str, _name: str, _fn, *args, testing_hook: bool = False, **kwargs) -> List[str]:
+    """Run one tick step; an exception is logged/counted and the tick goes on."""
+    return _step_ok(_home, _name, _fn, *args, testing_hook=testing_hook, **kwargs)[0]
+
+
+def _step_ok(_home: str, _name: str, _fn, *args, testing_hook: bool = False, **kwargs):
+    """Like _step, but also says whether the step completed: (result, ok)."""
+    home, name, fn = _home, _name, _fn
+    try:
+        _injected_failure(home, name, testing_hook)
+        return (fn(*args, **kwargs) or []), True
+    except Exception as e:
+        _sweep_error(home, name, e)
+        return [], False
+
+
 def run_scheduler_tick(conn: sqlite3.Connection, home: str = "", testing_mode: bool = False) -> List[str]:
-    """Execute a single scheduler tick pass."""
-    expired_aprs = sweep_expired_approvals(conn=conn, home=home)
-    expired_leases = sweep_expired_inbox_leases(conn=conn, home=home)
-    closed = watch_launch_runs_tick(conn=conn, home=home)
-    failed = check_queued_tasks_t6(conn=conn, home=home, testing_mode=testing_mode)
-    promoted = promote_tasks(conn=conn, home=home, testing_mode=testing_mode)
+    """Execute a single scheduler tick pass.
+
+    Each step runs on its own (batch 5): one raising step is logged with its traceback,
+    counted (`mesh daemon status`, `mesh doctor`) and does not stop the other steps."""
+    expired_aprs = _step(home, "approval_expiry", sweep_expired_approvals, testing_hook=testing_mode, conn=conn, home=home)
+    expired_leases = _step(home, "lease_expiry", sweep_expired_inbox_leases, testing_hook=testing_mode, conn=conn, home=home)
+    closed = _step(home, "supervisor_watch", watch_launch_runs_tick, testing_hook=testing_mode, conn=conn, home=home)
+    failed, t6_ok = _step_ok(home, "t6_check", check_queued_tasks_t6, testing_hook=testing_mode, conn=conn, home=home,
+                             testing_mode=testing_mode)
+    promoted = _step(home, "promote", promote_tasks, testing_hook=testing_mode, conn=conn, home=home, testing_mode=testing_mode)
     # T5 guard (§6.2, §9.1): tasks promoted in this pass get the same model/adapter
     # re-check before any launch, so a disallowed model never starts.
-    failed = failed + check_queued_tasks_t6(conn=conn, home=home, testing_mode=testing_mode)
-    started = start_queued_launch_tasks(conn=conn, home=home, testing_mode=testing_mode)
+    failed2, t6_ok2 = _step_ok(home, "t6_check", check_queued_tasks_t6, testing_hook=testing_mode, conn=conn,
+                               home=home, testing_mode=testing_mode)
+    failed = failed + failed2
+    # PR #37 review D1: fail closed. If either T6 check raised, this pass did not prove
+    # the queued tasks' model/adapter are allowed, so nothing launches this tick (the
+    # error is already logged and counted); the next tick re-checks and launches.
+    started: List[str] = []
+    if t6_ok and t6_ok2:
+        started = _step(home, "launch_start", start_queued_launch_tasks, testing_hook=testing_mode, conn=conn,
+                        home=home, testing_mode=testing_mode)
     # Lead turns (§12.4, m2-r9): after the task starts, so a turn sees this pass's events.
-    lead_turns = start_lead_turns_tick(conn=conn, home=home, testing_mode=testing_mode)
+    lead_turns = _step(home, "lead_turns", start_lead_turns_tick, testing_hook=testing_mode, conn=conn, home=home, testing_mode=testing_mode)
     return promoted + failed + expired_aprs + expired_leases + closed + started + lead_turns
 
 
@@ -642,7 +853,7 @@ def start_lead_turns_tick(conn: sqlite3.Connection, home: str = "",
     try:
         return start_lead_turns(conn, home, testing_mode=testing_mode)
     except Exception as e:
-        _log_to_meshd(home, f"Scheduler lead turn start failed: {type(e).__name__}: {e}")
+        _sweep_error(home, "lead_turns", e)
         return []
 
 
@@ -653,7 +864,7 @@ def watch_launch_runs_tick(conn: sqlite3.Connection, home: str = "") -> List[str
     try:
         return watch_launch_runs(conn, home)
     except Exception as e:
-        _log_to_meshd(home, f"Supervisor watch failed: {type(e).__name__}: {e}")
+        _sweep_error(home, "supervisor_watch", e)
         return []
 
 
@@ -681,12 +892,11 @@ def start_queued_launch_tasks(conn: sqlite3.Connection, home: str = "", testing_
     try:
         fail_held_launch_tasks(conn, home=home, testing_mode=testing_mode)
     except Exception as e:
-        _log_to_meshd(home, f"Scheduler T5 launch-hold check failed; no launch run this tick: "
-                            f"{type(e).__name__}: {e}")
+        _sweep_error(home, "launch_hold_t5", e)
         return []
 
     try:
         return spawn_launch_runs(conn, home, testing_mode=testing_mode)
     except Exception as e:
-        _log_to_meshd(home, f"Scheduler T5 launch start failed: {type(e).__name__}: {e}")
+        _sweep_error(home, "launch_start", e)
         return []

@@ -22,6 +22,9 @@ import unittest
 
 from mesh.core.proc import get_proc_environ, get_proc_stat
 
+# Real /proc scans: hold the runner's host-wide /proc lock shared (tests/run_tier.py).
+MESH_PROC_LOCK = "shared"
+
 PR_SET_CHILD_SUBREAPER = 36
 PR_SET_NAME = 15
 

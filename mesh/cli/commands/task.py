@@ -1,7 +1,10 @@
-"""Task resource commands: create, list, show, log, assign, reassign, start, heartbeat, progress, submit, fail, accept, reject, retry, escalate, cancel, merge, wait."""
+"""Task resource commands: create, list, show, log, assign, reassign, start, heartbeat, keepalive, progress, submit, fail, accept, reject, retry, escalate, cancel, close, merge, wait."""
 
 import argparse
-from typing import Any, Dict
+import threading
+import sys
+import os
+from typing import Any, Dict, Optional
 from mesh.client import MeshClient
 import mesh.constants as c
 from mesh.errors import MeshError, NotImplementedInM1Error
@@ -23,11 +26,11 @@ def register_task_commands(subparsers: argparse._SubParsersAction, parent_parser
         parents=[parent_parser],
         help="Create a new task under a project",
         description="Create a new task under a project. Flags map directly to JSON keys when using --input -.",
-        epilog="Examples:\n  mesh task create --project prj_123 --title \"Write tests\" --spec \"Cover edge cases\" --assignee fx\n  mesh task create --project prj_123 --title \"Deploy\" --spec \"Run deployment\" --profile elevated\n",
+        epilog="Examples:\n  mesh task create --project prj_123 --title \"Write tests\" --spec \"Cover edge cases\" --assignee fx\n  mesh task create --project prj_123 --title \"Refactor\" --spec - --assignee fx < spec.md\n  mesh task create --project prj_123 --title \"Deploy\" --spec \"Run deployment\" --profile elevated\n",
     )
     create_parser.add_argument("--project", default=None, help="Parent project identifier (JSON key: project)")
     create_parser.add_argument("--title", default=None, help="Task title (JSON key: title)")
-    create_parser.add_argument("--spec", default=None, help="Task specification text or '-' for stdin (JSON key: spec)")
+    create_parser.add_argument("--spec", default=None, help="Task specification text, or '-' to read it from stdin (JSON key: spec; a JSON value is taken literally)")
     create_parser.add_argument("--kind", help="Task kind classification (JSON key: kind)")
     create_parser.add_argument("--assignee", help="Agent identifier to assign task to (JSON key: assignee)")
     create_parser.add_argument("--model", help="Model override for task execution (JSON key: model)")
@@ -48,7 +51,8 @@ def register_task_commands(subparsers: argparse._SubParsersAction, parent_parser
         epilog="Examples:\n  mesh task list --project prj_123\n  mesh task list --status running\n  mesh task list --assignee fx\n",
     )
     list_parser.add_argument("--project", help="Filter by project ID")
-    list_parser.add_argument("--status", help="Filter by status (assigned, queued, running, submitted, accepted, failed, etc.)")
+    list_parser.add_argument("--status", help="Filter by status, or a comma list (e.g. submitted,accepted); "
+                                              "assigned, queued, running, submitted, accepted, failed, etc.")
     list_parser.add_argument("--assignee", help="Filter by assignee agent ID")
     list_parser.set_defaults(func=handle_task_list)
 
@@ -129,6 +133,38 @@ def register_task_commands(subparsers: argparse._SubParsersAction, parent_parser
     heartbeat_parser.add_argument("--run", help="Run identifier")
     heartbeat_parser.add_argument("--fence", type=int, help="Lease fence sequence number")
     heartbeat_parser.set_defaults(func=handle_task_heartbeat)
+
+    # keepalive
+    keepalive_parser = sub.add_parser(
+        "keepalive",
+        parents=[parent_parser],
+        help="Heartbeat a started inbox task in a loop until its run ends",
+        description=(
+            "Keep an inbox run's lease alive: send `task heartbeat` every N seconds until\n"
+            "the run ends. Run it in the background right after `task start` and leave it;\n"
+            "it stops by itself when you submit/fail the task or the run ends any other way."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  mesh task keepalive tsk_123 --run run_123 --fence 1 --token-file $T > keepalive.log 2>&1 &\n"
+            "  mesh task keepalive tsk_123 --run run_123 --fence 1 --every 30 --token-file $T\n"
+            "\n"
+            "--every defaults to heartbeat_every_s from `task start` (a third of lease.ttl_s).\n"
+            "Each beat is logged to stderr. When the run ends the final task state is printed\n"
+            "and the exit code is:\n"
+            "  0  the run ended normally (submitted, failed by the worker, cancelled, ...)\n"
+            "  9  the lease was lost (LEASE_EXPIRED: no heartbeat within lease.ttl_s) or the\n"
+            "     task was restarted with a newer run/fence (FENCE_MISMATCH); stop working on\n"
+            "     this run, your writes will be refused\n"
+            "SIGINT/SIGTERM stop the loop (exit 0); the lease then runs out after lease.ttl_s.\n"
+        ),
+    )
+    keepalive_parser.add_argument("task_id", help="Task identifier")
+    keepalive_parser.add_argument("--run", help="Run identifier (from task start)")
+    keepalive_parser.add_argument("--fence", type=int, help="Lease fence (from task start)")
+    keepalive_parser.add_argument("--every", type=int, metavar="SECONDS",
+                                  help="Seconds between heartbeats (default: heartbeat_every_s of the run)")
+    keepalive_parser.set_defaults(func=handle_task_keepalive)
 
     # progress
     progress_parser = sub.add_parser(
@@ -237,23 +273,45 @@ def register_task_commands(subparsers: argparse._SubParsersAction, parent_parser
     cancel_parser = sub.add_parser(
         "cancel",
         parents=[parent_parser],
-        help="Cancel a task",
-        description="Cancel a task.",
+        help="Cancel a task (--reason is required)",
+        description="Cancel a task. --reason is required and is recorded in the task history.",
         epilog="Examples:\n  mesh task cancel tsk_123 --reason \"No longer needed\"\n",
     )
     cancel_parser.add_argument("task_id", help="Task identifier")
-    cancel_parser.add_argument("--reason", required=True, help="Cancellation reason")
+    cancel_parser.add_argument("--reason", required=True, help="Cancellation reason (required)")
     cancel_parser.set_defaults(func=handle_task_cancel)
 
-    # merge (M2)
+    # close
+    close_parser = sub.add_parser(
+        "close",
+        parents=[parent_parser],
+        help="Close an accepted/merge_failed task whose work landed through another (merged) task",
+        description=("Close an accepted or merge_failed code task as superseded: its work reached the "
+                     "integration branch through another task's merge. The task ends 'cancelled' with a "
+                     "task.closed event linking the other task (task show: superseded_by); its branch and "
+                     "worktree are kept. Lead or user only."),
+        epilog="Examples:\n  mesh task close tsk_123 --superseded-by tsk_456 --reason \"landed in tsk_456's merge\"\n",
+    )
+    close_parser.add_argument("task_id", help="Task identifier")
+    close_parser.add_argument("--superseded-by", dest="superseded_by", required=True,
+                              help="The merged task whose merge carried this task's work")
+    close_parser.add_argument("--reason", help="Optional note recorded with the close")
+    close_parser.set_defaults(func=handle_task_close)
+
+    # merge
     merge_parser = sub.add_parser(
         "merge",
         parents=[parent_parser],
-        help="Merge an accepted task worktree branch into project integration branch (M2)",
-        description="Merge an accepted task worktree branch into project integration branch (M2).",
-        epilog="Examples:\n  mesh task merge tsk_123\n",
+        help="Merge an accepted task worktree branch into the project integration branch",
+        description="Merge an accepted task worktree branch into the project integration branch.",
+        epilog="Examples:\n  mesh task merge tsk_123\n  mesh task merge --all-accepted --project prj_123\n",
     )
-    merge_parser.add_argument("task_id", help="Task identifier")
+    merge_parser.add_argument("task_id", nargs="?", help="Task identifier (or use --all-accepted --project)")
+    merge_parser.add_argument("--all-accepted", action="store_true", default=False,
+                              help="Merge every accepted code task of --project, one at a time in creation "
+                                   "order (each one an ordinary `task merge` with its full gate); stops at "
+                                   "the first failure and prints a summary")
+    merge_parser.add_argument("--project", help="Project for --all-accepted")
     merge_parser.set_defaults(func=handle_task_merge)
 
     # wait
@@ -295,12 +353,25 @@ def handle_task_wait(args: argparse.Namespace) -> Dict[str, Any]:
     return resp.get("data", {})
 
 
+def _spec_value(args: argparse.Namespace) -> Any:
+    """--spec as given, or stdin for ``--spec -`` (a JSON ``spec`` key is always literal)."""
+    spec = getattr(args, "spec", None)
+    if spec == "-" and "spec" not in getattr(args, "_from_json", set()):
+        from mesh.cli.stdin import read_stdin
+        spec = read_stdin("--spec")
+        if not spec.strip():
+            raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
+                            message="--spec -: nothing was read from stdin", details={"param": "spec"})
+    return spec
+
+
 def handle_task_create(args: argparse.Namespace) -> Dict[str, Any]:
+    spec = _spec_value(args)
     client = MeshClient(home=args.home)
     payload = {
         "project": getattr(args, "project", None),
         "title": getattr(args, "title", None),
-        "spec": getattr(args, "spec", None),
+        "spec": spec,
         "kind": getattr(args, "kind", None),
         "assignee": getattr(args, "assignee", None),
         "model": getattr(args, "model", None),
@@ -324,7 +395,43 @@ def handle_task_list(args: argparse.Namespace) -> Dict[str, Any]:
         "assignee": getattr(args, "assignee", None),
     }
     resp = client.execute_cmd(args, "task.list", payload)
-    return resp.get("data", {})
+    data = resp.get("data", {})
+    if getattr(args, "format", "json") == "text" and isinstance(data.get("items"), list):
+        return {"text": task_list_table(data["items"])}
+    return data
+
+
+def _ago(ts: Any, now: float) -> str:
+    """Compact age of an ISO timestamp: 45s, 12m, 3h, 2d."""
+    from mesh.core.clock import parse_utc
+
+    try:
+        secs = max(0, int(now - parse_utc(ts).timestamp()))
+    except Exception:
+        return "-"
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= size:
+            return f"{secs // size}{unit}"
+    return f"{secs}s"
+
+
+def task_list_table(items: Any, now: Optional[float] = None) -> str:
+    """`task list --format text`: id, status, assignee name, age (since created), time in
+    the current status (since the last change), attempt, title."""
+    import time as _t
+
+    if not items:
+        return "(none)"
+    now = _t.time() if now is None else now
+    rows = [["ID", "STATUS", "ASSIGNEE", "AGE", "IN_STATE", "ATTEMPT", "TITLE"]]
+    for t in items:
+        title = " ".join(str(t.get("title") or "").split())
+        rows.append([str(t.get("id")), str(t.get("status")), str(t.get("assignee") or "-"),
+                     _ago(t.get("created_at"), now), _ago(t.get("updated_at"), now),
+                     f"{t.get('attempt') or 0}/{t.get('max_attempts') or '-'}",
+                     title if len(title) <= 48 else title[:45] + "..."])
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    return "\n".join("  ".join(r[i].ljust(widths[i]) for i in range(len(r))).rstrip() for r in rows)
 
 
 def handle_task_show(args: argparse.Namespace) -> Dict[str, Any]:
@@ -357,6 +464,16 @@ def handle_task_assign(args: argparse.Namespace) -> Dict[str, Any]:
     return resp.get("data", {})
 
 
+def handle_task_close(args: argparse.Namespace) -> Dict[str, Any]:
+    client = MeshClient(home=args.home)
+    resp = client.execute_cmd(
+        args,
+        "task.close",
+        {"task_id": args.task_id, "superseded_by": args.superseded_by, "reason": getattr(args, "reason", None)},
+    )
+    return resp.get("data", {})
+
+
 def handle_task_cancel(args: argparse.Namespace) -> Dict[str, Any]:
     client = MeshClient(home=args.home)
     resp = client.execute_cmd(
@@ -374,9 +491,112 @@ DEFAULT_TEST_TIMEOUT_S = 1800
 MERGE_CLIENT_SLACK_S = 120
 
 
+def _merge_progress_note(client: Any, args: argparse.Namespace, done: Any) -> None:
+    """Text mode: once the merge has started, say on stderr that tests run and where the
+    log is, so a merge that blocks for minutes is not silent."""
+    import copy
+
+    show_args = copy.copy(args)
+    show_args.idempotency_key = None
+    show_args.request_id = None
+    show_args.dry_run = False
+    for _ in range(40):
+        if done.wait(0.25):
+            return
+        try:
+            data = MeshClient(home=client.home).execute_cmd(show_args, "task.show", {"task_id": args.task_id}).get("data", {})
+        except Exception:
+            continue
+        merge = data.get("merge") or {}
+        if data.get("status") == "merging" and merge.get("mrg"):
+            if done.is_set():
+                return
+            log = os.path.join(client.home, "merges", merge["mrg"], "test.log")
+            sys.stderr.write(f"mesh: merging {args.task_id}: running the project's tests if any "
+                             f"(log: {log})...\n")
+            sys.stderr.flush()
+            return
+
+
+def handle_task_merge_all(args: argparse.Namespace) -> Dict[str, Any]:
+    """`task merge --all-accepted --project P` (batch 5).
+
+    A client-side loop over ordinary `task.merge` requests: every merge is its own
+    request with the same authz (lead only), the same gate (tests, leftover scan,
+    integration-branch lock) and the same events as `mesh task merge <tsk>`; nothing in
+    the daemon is batched or relaxed. The list of accepted tasks is read once up front;
+    a task that leaves `accepted` meanwhile fails its own merge (stop)."""
+    if args.task_id:
+        raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
+                        message="Give either a task id or --all-accepted --project P, not both",
+                        details={"param": "task_id"})
+    if not getattr(args, "project", None):
+        raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
+                        message="--all-accepted needs --project P", details={"param": "project"})
+    if getattr(args, "idempotency_key", None) or getattr(args, "dry_run", False):
+        raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
+                        message="--all-accepted cannot be combined with --idempotency-key or --dry-run "
+                                "(it sends one merge request per task)",
+                        details={"param": "all_accepted"})
+    lister = MeshClient(home=args.home)
+    resp = lister.execute_cmd(args, "task.list", {"project": args.project, "status": "accepted"})
+    items = [t for t in resp.get("data", {}).get("items", []) if t.get("kind", "code") == "code"]
+    items.sort(key=lambda t: (t.get("created_at") or "", t.get("id") or ""))
+    queue = [t["id"] for t in items]
+    text = getattr(args, "format", "json") == "text"
+    merged: list = []
+    for n, tsk in enumerate(queue):
+        if text:
+            print(f"merge {n + 1}/{len(queue)}: {tsk} ...", file=sys.stderr, flush=True)
+        sub = argparse.Namespace(**vars(args))
+        sub.task_id = tsk
+        try:
+            data = _merge_one(sub)
+        except MeshError as e:
+            summary = {"project": args.project, "merged": merged, "failed": {"task_id": tsk, "code": e.code,
+                       "message": e.message, "details": e.details}, "not_attempted": queue[n + 1:]}
+            raise MeshError(e.code, exit_code=e.exit_code,
+                            message=(f"merge --all-accepted stopped at {tsk} ({n + 1}/{len(queue)}): {e.message} "
+                                     f"[merged {len(merged)}, not attempted {len(queue) - n - 1}]"),
+                            details=summary, data=e.data) from e
+        merged.append({"task_id": tsk, "merge_commit": data.get("merge_commit") or data.get("commit"),
+                       "status": data.get("status")})
+    out = {"project": args.project, "merged": merged, "failed": None, "not_attempted": []}
+    if text:
+        lines = [f"merged {len(merged)} accepted task(s) in {args.project}" if merged
+                 else f"no accepted code tasks in {args.project}"]
+        lines += [f"  {m['task_id']}  {m.get('merge_commit') or '-'}" for m in merged]
+        return {"text": "\n".join(lines)}
+    return out
+
+
 def handle_task_merge(args: argparse.Namespace) -> Dict[str, Any]:
+    if getattr(args, "all_accepted", False):
+        return handle_task_merge_all(args)
+    if not args.task_id:
+        raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
+                        message="task merge needs a task id (or --all-accepted --project P)",
+                        details={"param": "task_id"})
+    if getattr(args, "project", None):
+        raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
+                        message="--project is only used with --all-accepted", details={"param": "project"})
+    return _merge_one(args)
+
+
+def _merge_one(args: argparse.Namespace) -> Dict[str, Any]:
     client = MeshClient(home=args.home, timeout=float(DEFAULT_TEST_TIMEOUT_S + MERGE_CLIENT_SLACK_S))
-    resp = client.execute_cmd(args, "task.merge", {"task_id": args.task_id})
+    note = None
+    done = threading.Event()
+    if getattr(args, "format", "json") == "text" and not getattr(args, "dry_run", False):
+        client.resolve_auth(args)  # one passphrase prompt, before the note thread exists
+        note = threading.Thread(target=_merge_progress_note, args=(client, args, done), daemon=True)
+        note.start()
+    try:
+        resp = client.execute_cmd(args, "task.merge", {"task_id": args.task_id})
+    finally:
+        done.set()
+        if note is not None:
+            note.join(timeout=2)
     return resp.get("data", {})
 
 
@@ -415,11 +635,42 @@ def handle_task_escalate(args: argparse.Namespace) -> Dict[str, Any]:
     return resp.get("data", {})
 
 
+def new_session_id() -> str:
+    import secrets
+
+    return "ses_" + secrets.token_hex(8)
+
+
+def session_for_key(key: str) -> str:
+    import hashlib
+
+    return "ses_" + hashlib.sha256(("mesh-task-start-session\0" + str(key)).encode("utf-8")).hexdigest()[:16]
+
+
 def handle_task_start(args: argparse.Namespace) -> Dict[str, Any]:
     client = MeshClient(home=args.home)
-    payload = {"task_id": args.task_id}
+    payload = _with_session({"task_id": args.task_id})
+    if "session" not in payload:
+        # Default-on (batch 5): a run always belongs to one client session. The id comes
+        # back in the response (`export`, `keepalive`) for this session's later commands.
+        # PR #37 D2: with an idempotency key the id is derived from the key, so a retry
+        # after a lost response sends the same args and gets the original start replayed
+        # (with its session) instead of IDEMPOTENCY_KEY_REUSED.
+        key = getattr(args, "idempotency_key", None)
+        payload["session"] = session_for_key(key) if key else new_session_id()
     resp = client.execute_cmd(args, "task.start", payload)
     return resp.get("data", {})
+
+
+def _with_session(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Add the client session (``MESH_SESSION`` env) when set: `task start` records it on
+    the run and meshd refuses heartbeat/progress/submit/fail of that run from another one."""
+    import os
+
+    session = os.environ.get("MESH_SESSION", "").strip()
+    if session:
+        payload["session"] = session[:200]
+    return payload
 
 
 def _fill_run_from_env(args: argparse.Namespace) -> None:
@@ -449,8 +700,152 @@ def handle_task_heartbeat(args: argparse.Namespace) -> Dict[str, Any]:
         "run": args.run,
         "fence": args.fence,
     }
-    resp = client.execute_cmd(args, "task.heartbeat", payload)
+    resp = client.execute_cmd(args, "task.heartbeat", _with_session(payload))
     return resp.get("data", {})
+
+
+#: Errors that mean this run's lease is gone for good (exit 9).
+_LEASE_LOST_CODES = (c.LEASE_EXPIRED, c.FENCE_MISMATCH)
+
+
+def _keepalive_log(msg: str) -> None:
+    import sys
+    import time as _t
+
+    sys.stderr.write(f"{_t.strftime('%Y-%m-%dT%H:%M:%SZ', _t.gmtime())} keepalive: {msg}\n")
+    sys.stderr.flush()
+
+
+def _keepalive_args(args: argparse.Namespace) -> argparse.Namespace:
+    """A copy of the CLI args for one daemon call: never replay a heartbeat."""
+    import copy
+
+    a = copy.copy(args)
+    a.idempotency_key = None
+    a.request_id = None
+    a.dry_run = False
+    return a
+
+
+def handle_task_keepalive(args: argparse.Namespace) -> Dict[str, Any]:
+    """Heartbeat until the run ends (CLI-side loop over `task.heartbeat`)."""
+    import signal
+    import time as _t
+
+    _fill_run_from_env(args)
+    if not getattr(args, "run", None):
+        raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="--run is required for task keepalive", details={"param": "run"})
+    if getattr(args, "fence", None) is None:
+        raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="--fence is required for task keepalive", details={"param": "fence"})
+    every = getattr(args, "every", None)
+    if every is not None and every < 1:
+        raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="--every must be at least 1 second",
+                        details={"param": "every", "got": every})
+    if getattr(args, "dry_run", False):
+        raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="--dry-run is not supported by task keepalive",
+                        details={"param": "dry_run"})
+
+    client = MeshClient(home=args.home)
+    payload = _with_session({"task_id": args.task_id, "run": args.run, "fence": args.fence})
+    stop = {"signal": None}
+
+    def _on_signal(signum, _frame):  # pragma: no cover - exercised by integration test
+        stop["signal"] = signum
+
+    old = {sig: signal.signal(sig, _on_signal) for sig in (signal.SIGTERM, signal.SIGINT)}
+    beats = 0
+    ttl_s: Optional[int] = None
+    last_ok = _t.monotonic()
+    try:
+        while stop["signal"] is None:
+            try:
+                resp = client.execute_cmd(_keepalive_args(args), "task.heartbeat", payload)
+                beats += 1
+                last_ok = _t.monotonic()
+                expires = (resp.get("data") or {}).get("expires_at")
+                if every is None or ttl_s is None:
+                    live = _keepalive_live_run(client, args)
+                    if live:
+                        ttl_s = live.get("lease_ttl_s")
+                        if every is None:
+                            every = int(live.get("heartbeat_every_s") or 40)
+                    elif every is None:
+                        every = 40
+                    if ttl_s and every >= ttl_s:
+                        _keepalive_log(f"warning: --every {every}s is not shorter than lease_ttl_s {ttl_s}s; the lease may expire between beats")
+                _keepalive_log(f"heartbeat {beats} ok, lease expires at {expires}; next in {every}s")
+            except MeshError as exc:
+                if exc.code in _LEASE_LOST_CODES:
+                    return _keepalive_end(client, args, exc, beats)
+                # Transient (daemon restarting, socket timeout): keep trying until the
+                # lease could have run out, then give up with the last error.
+                waited = _t.monotonic() - last_ok
+                limit = ttl_s or 120
+                _keepalive_log(f"heartbeat failed ({exc.code}: {exc.message}); retrying")
+                if waited > limit:
+                    raise MeshError(exc.code, exit_code=exc.exit_code,
+                                    message=f"task keepalive gave up: no successful heartbeat for {int(waited)}s "
+                                            f"(lease_ttl_s {limit}); last error: {exc.message}",
+                                    details={"task_id": args.task_id, "run_id": args.run, "beats": beats,
+                                             "last_error": exc.code})
+                if every is None:
+                    every = 40
+            slept = 0.0
+            step = min(1.0, float(every))
+            while slept < every and stop["signal"] is None:
+                _t.sleep(step)
+                slept += step
+    finally:
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
+    _keepalive_log(f"stopped by signal {stop['signal']} after {beats} heartbeats; the lease expires after lease_ttl_s")
+    return {"task_id": args.task_id, "run_id": args.run, "fence": args.fence, "beats": beats,
+            "ended": "stopped", "signal": stop["signal"]}
+
+
+def _keepalive_live_run(client: "MeshClient", args: argparse.Namespace) -> Optional[Dict[str, Any]]:
+    try:
+        shown = client.execute_cmd(_keepalive_args(args), "task.show", {"task_id": args.task_id})
+    except MeshError:
+        return None
+    return (shown.get("data") or {}).get("live_run")
+
+
+def _keepalive_end(client: "MeshClient", args: argparse.Namespace, exc: MeshError, beats: int) -> Dict[str, Any]:
+    """The heartbeat was refused: report how this run ended.
+
+    The run itself says why: it ended normally (submit, worker fail, cancel, ...) ->
+    exit 0 with the final run and task state; it was lost because the lease expired,
+    or a newer run/fence holds the task -> exit 9 with a message that says so.
+    """
+    def _show(cmd: str, key: str, ident: str) -> Dict[str, Any]:
+        try:
+            return client.execute_cmd(_keepalive_args(args), cmd, {key: ident}).get("data") or {}
+        except MeshError:
+            return {}
+
+    run = _show("run.show", "run_id", args.run)
+    task = _show("task.show", "task_id", args.task_id)
+    result: Dict[str, Any] = {"task_id": args.task_id, "run_id": args.run, "fence": args.fence, "beats": beats,
+                              "task_status": task.get("status"), "run_status": run.get("status"),
+                              "end_reason": run.get("end_reason")}
+    if run.get("end_reason") == "lease_expired" or (not run and exc.code == c.LEASE_EXPIRED):
+        _keepalive_log("lease lost")
+        raise MeshError(c.LEASE_EXPIRED, exit_code=c.EXIT_STALE,
+                        message=f"Lease on task {args.task_id} expired: no heartbeat within lease_ttl_s, so run "
+                                f"{args.run} was ended (task is now {task.get('status') or 'unknown'}). Stop working "
+                                f"on this run; its writes will be refused. Ask the lead to retry the task.",
+                        details={**result, "reason": "lease_expired"})
+    if run.get("status") in ("starting", "running") or exc.code == c.FENCE_MISMATCH and not run.get("ended_at"):
+        # Our run still looks live but the lease belongs to another run/fence.
+        _keepalive_log(f"run superseded: {exc.message}")
+        raise MeshError(c.FENCE_MISMATCH, exit_code=c.EXIT_STALE,
+                        message=f"Run {args.run} (fence {args.fence}) no longer holds task {args.task_id}'s lease "
+                                f"(current fence {task.get('fence_seq')}). Stop working on this run.",
+                        details={**result, "current_fence": task.get("fence_seq")})
+    _keepalive_log(f"run ended ({run.get('end_reason') or run.get('status')}), task is {task.get('status')}")
+    result["ended"] = "run_ended"
+    return result
 
 
 def handle_task_progress(args: argparse.Namespace) -> Dict[str, Any]:
@@ -468,7 +863,7 @@ def handle_task_progress(args: argparse.Namespace) -> Dict[str, Any]:
         "run": args.run,
         "fence": args.fence,
     }
-    resp = client.execute_cmd(args, "task.progress", payload)
+    resp = client.execute_cmd(args, "task.progress", _with_session(payload))
     return resp.get("data", {})
 
 
@@ -489,7 +884,8 @@ def handle_task_submit(args: argparse.Namespace) -> Dict[str, Any]:
     deliverable_data = None
     if deliverable_arg is not None:
         if deliverable_arg == "-":
-            raw_content = sys.stdin.read()
+            from mesh.cli.stdin import read_stdin
+            raw_content = read_stdin("--deliverable")
         elif os.path.exists(deliverable_arg):
             with open(deliverable_arg, "r", encoding="utf-8") as fp:
                 raw_content = fp.read()
@@ -498,7 +894,17 @@ def handle_task_submit(args: argparse.Namespace) -> Dict[str, Any]:
         try:
             deliverable_data = json.loads(raw_content)
         except Exception:
-            raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="Deliverable must be valid JSON", details={"param": "deliverable"})
+            if deliverable_arg not in ("-",) and not os.path.exists(deliverable_arg) \
+                    and not deliverable_arg.lstrip().startswith(("{", "[")):
+                # Looks like a path, not JSON: say that the file is missing.
+                raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
+                                message=f"--deliverable: file not found: {deliverable_arg} (and not valid inline JSON)",
+                                details={"param": "deliverable", "path": deliverable_arg, "reason": "file_not_found"})
+            where = "stdin" if deliverable_arg == "-" else (
+                f"file {deliverable_arg}" if os.path.exists(deliverable_arg) else "inline value")
+            raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
+                            message=f"Deliverable must be valid JSON (read from {where})",
+                            details={"param": "deliverable"})
         if not isinstance(deliverable_data, dict):
             raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="Deliverable must be a JSON object", details={"param": "deliverable"})
         if len(json.dumps(deliverable_data).encode("utf-8")) > 200 * 1024:
@@ -521,7 +927,7 @@ def handle_task_submit(args: argparse.Namespace) -> Dict[str, Any]:
         "run": args.run,
         "fence": args.fence,
     }
-    resp = client.execute_cmd(args, "task.submit", payload)
+    resp = client.execute_cmd(args, "task.submit", _with_session(payload))
     return resp.get("data", {})
 
 
@@ -540,7 +946,7 @@ def handle_task_fail(args: argparse.Namespace) -> Dict[str, Any]:
         "run": args.run,
         "fence": args.fence,
     }
-    resp = client.execute_cmd(args, "task.fail", payload)
+    resp = client.execute_cmd(args, "task.fail", _with_session(payload))
     return resp.get("data", {})
 
 
