@@ -44,29 +44,66 @@ jobs:
           git apply --index /tmp/carbon-approvals.patch
           git diff --cached --check
           git diff --cached --stat
-      - name: Install test runner
-        run: python3 -m pip install pytest
+      - name: Install test runner and diagnostic reporter
+        shell: bash
+        run: |
+          python3 -m pip install pytest
+          cat > /tmp/report-tests.py <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          for filename in sys.argv[1:]:
+              path = Path(filename)
+              if not path.exists():
+                  print('::error title=Missing test report::' + filename)
+                  continue
+              root = ET.parse(path)
+              cases = list(root.iter('testcase'))
+              failed = 0
+              for case in cases:
+                  for failure in list(case.findall('failure')) + list(case.findall('error')):
+                      failed += 1
+                      text = (case.get('classname', '') + '.' + case.get('name', '') + ': ' + (failure.text or failure.get('message', '')))[:10000]
+                      text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+                      print('::error title=Test failure::' + text)
+              skipped = sum(case.find('skipped') is not None for case in cases)
+              print(f'::notice title=Test counts::{filename}: {len(cases)} total, {failed} failures/errors, {skipped} skipped')
+          PY
       - name: Run unit suite excluding isolated timing-sensitive case
-        run: >-
-          python3 -m pytest -q tests/unit
-          --deselect tests/unit/test_m3_gatefix.py::TestRound11SpawnAbortAndPostPopen::test_r11_spawn_abort_cumulative_pid_starttime_pairs_and_prior_members
+        shell: bash
+        run: |
+          set +e
+          python3 -m pytest -q tests/unit --junitxml=/tmp/unit-results.xml \
+            --deselect tests/unit/test_m3_gatefix.py::TestRound11SpawnAbortAndPostPopen::test_r11_spawn_abort_cumulative_pid_starttime_pairs_and_prior_members
+          result=$?
+          python3 /tmp/report-tests.py /tmp/unit-results.xml
+          exit "$result"
       - name: Run isolated timing-sensitive case with one retry
         shell: bash
         run: |
           set -euo pipefail
           test_case='tests/unit/test_m3_gatefix.py::TestRound11SpawnAbortAndPostPopen::test_r11_spawn_abort_cumulative_pid_starttime_pairs_and_prior_members'
-          python3 -m pytest -q "$test_case" || {
+          python3 -m pytest -q "$test_case" --junitxml=/tmp/timing-results.xml || {
             echo '::warning::Process-starttime-sensitive case failed; retrying once in isolation.'
-            python3 -m pytest -q "$test_case"
+            python3 -m pytest -q "$test_case" --junitxml=/tmp/timing-results.xml || {
+              python3 /tmp/report-tests.py /tmp/timing-results.xml
+              exit 1
+            }
           }
+          python3 /tmp/report-tests.py /tmp/timing-results.xml
       - name: Run relevant integration and regression tests
-        run: >-
-          python3 -m pytest -q
-          tests/integration/test_carbon_review_approvals.py
-          tests/integration/test_approvals.py
-          tests/integration/test_delegated_approval.py
-          tests/integration/test_projects.py
-          tests/integration/test_daemon.py
+        shell: bash
+        run: |
+          set +e
+          python3 -m pytest -q --junitxml=/tmp/integration-results.xml \
+            tests/integration/test_carbon_review_approvals.py \
+            tests/integration/test_approvals.py \
+            tests/integration/test_delegated_approval.py \
+            tests/integration/test_projects.py \
+            tests/integration/test_daemon.py
+          result=$?
+          python3 /tmp/report-tests.py /tmp/integration-results.xml
+          exit "$result"
       - name: Commit and push only source and tests
         shell: bash
         run: |
@@ -79,6 +116,6 @@ jobs:
             echo '## Carbon approval fixes published'
             echo "Commit: $(git rev-parse HEAD)"
             echo 'Branch: fix/carbon-review-approvals'
-            echo 'Unit suite, isolated timing-sensitive case, and 80 related integration tests passed.'
+            echo 'Unit suite, isolated timing-sensitive case, and related integration tests passed.'
             echo 'Temporary workflow and compressed patch are NOT part of the fix branch.'
           } >> "$GITHUB_STEP_SUMMARY"
