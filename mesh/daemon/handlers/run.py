@@ -393,6 +393,13 @@ def _prune_skip_reason(ctx: HandlerContext, task: sqlite3.Row) -> Optional[str]:
     """Why a candidate is skipped, or None when it may be pruned."""
     if ctx.conn.execute("SELECT 1 FROM leases WHERE key = ?;", (f"task:{task['id']}",)).fetchone():
         return "lease_held"
+    # Carbon P2-7: a merge running on the same repository (this project or another one
+    # sharing the repo path) owns the shared .git; prune must not race its git writes.
+    from mesh.daemon.merge import merge_in_progress_for_repo
+
+    project = ctx.conn.execute("SELECT repo_path FROM projects WHERE id = ?;", (task["project_id"],)).fetchone()
+    if project is not None and merge_in_progress_for_repo(ctx.conn, project["repo_path"]) is not None:
+        return "merge_in_progress"
     if task["status"] == "cancelled":
         count = _commits_beyond_base(task["workspace_path"], task["base_commit"])
         if count is None:

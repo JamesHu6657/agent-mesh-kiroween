@@ -1306,6 +1306,22 @@ def handle_project_deliver(ctx: HandlerContext) -> HandlerResult:
             details={"param": "project_id", "reason": "no_repo", "project_id": project_id},
         )
 
+    # Carbon P2-7: never deliver while a merge runs on the same repository (this project or
+    # another one sharing the repo path): the merge commit may exist in git before the
+    # database records it. rc 11, before approval, with no mutation.
+    from mesh.daemon.merge import merge_in_progress_for_repo
+
+    busy = merge_in_progress_for_repo(ctx.conn, row["repo_path"])
+    if busy is not None:
+        raise MeshError(
+            code=c.MERGE_IN_PROGRESS,
+            exit_code=c.EXIT_BUSY,
+            message=f"Cannot deliver project '{project_id}': a merge is in progress on its repository",
+            details={"project_id": project_id, "reason": "merge_in_progress",
+                     "merge_project_id": busy["project_id"], "task_id": busy["task_id"],
+                     "merge_run_id": busy["run_id"], "lease": busy["lease"]},
+        )
+
     # Approval gate (§7.4): `deliver_to_base` defaults to `not_required`.
     policy = get_approval_policy(ctx.conn, "deliver_to_base")
     if policy != "not_required":

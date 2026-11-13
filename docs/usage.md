@@ -413,11 +413,16 @@ integration. A checked-out base must have a clean worktree; otherwise Mesh uses 
 compare-and-swap ref update. Divergence is rc 14 `NOT_FAST_FORWARD`, with no base
 change. It never pushes, rebases or forces. The `deliver_to_base` policy defaults to
 `not_required`; if tightened, the lead needs approval and must re-run with
-`--approval <apr>`.
+`--approval <apr>`. While a merge is running on the same repository (the project's own
+`merge:<prj>` lease or a `merging` task, or the same for any other project sharing the
+repo path, compared by realpath), `project deliver` is rc 11 `MERGE_IN_PROGRESS`
+(`details.reason: "merge_in_progress"`, with the merging task and run), before approval
+and with no change; retry after the merge finishes.
 
 Nothing is deleted automatically. Prune removes only merged code worktrees, or
 cancelled ones with no commits beyond their base. It uses non-forced
-`worktree remove` and `branch -d`, never `-D`; dirty/unsafe candidates are skipped.
+`worktree remove` and `branch -d`, never `-D`; dirty/unsafe candidates are skipped, and so is everything while a merge runs on the same
+repository (`skipped[].reason: "merge_in_progress"`).
 Agents must name `--project` and lead that project; only the user may prune unscoped.
 `workspace delete` requires the `delete` approval for agents (rc 7), or direct user
 authentication. A live task lease blocks it. After checking containment under

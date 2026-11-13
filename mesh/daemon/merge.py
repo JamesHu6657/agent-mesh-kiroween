@@ -86,6 +86,43 @@ def merge_lease_key(project_id: str) -> str:
     return f"merge:{project_id}"
 
 
+def merge_in_progress_for_repo(conn: sqlite3.Connection, repo_path: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Carbon P2-7: is a merge running against ``repo_path`` (compared by realpath)?
+
+    A merge is in progress when any project on the same repository (this one or another
+    project sharing the repo) holds the ``merge:<prj>`` lease or has a task in ``merging``.
+    Returns ``{project_id, task_id, run_id, lease, reason}`` for the first such merge
+    (ordered by project, then task id), or None. Read-only; callers raise or skip.
+    """
+    if not repo_path:
+        return None
+    try:
+        target = os.path.realpath(repo_path)
+    except (OSError, ValueError):
+        return None
+    for prj in conn.execute("SELECT id, repo_path FROM projects WHERE repo_path IS NOT NULL "
+                            "AND repo_path != '' ORDER BY id;").fetchall():
+        try:
+            if os.path.realpath(prj["repo_path"]) != target:
+                continue
+        except (OSError, ValueError):
+            continue
+        key = merge_lease_key(prj["id"])
+        lease = conn.execute("SELECT run_id FROM leases WHERE key = ?;", (key,)).fetchone()
+        task = conn.execute("SELECT id FROM tasks WHERE project_id = ? AND status = 'merging' "
+                            "ORDER BY id LIMIT 1;", (prj["id"],)).fetchone()
+        if lease is None and task is None:
+            continue
+        task_id = task["id"] if task is not None else None
+        run_id = lease["run_id"] if lease is not None else None
+        if task_id is None and run_id is not None:
+            holder = conn.execute("SELECT task_id FROM runs WHERE id = ?;", (run_id,)).fetchone()
+            task_id = holder["task_id"] if holder is not None else None
+        return {"project_id": prj["id"], "task_id": task_id, "run_id": run_id,
+                "lease": key if lease is not None else None, "reason": "merge_in_progress"}
+    return None
+
+
 def _load(conn: sqlite3.Connection, task_id: str) -> Tuple[Optional[sqlite3.Row], Optional[sqlite3.Row]]:
     task = conn.execute("SELECT * FROM tasks WHERE id = ?;", (task_id,)).fetchone()
     if not task:
