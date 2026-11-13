@@ -11,6 +11,7 @@ from mesh.core.canonical import canonical_json, compute_op_hash
 from mesh.core.clock import now_iso_utc, now_utc
 from mesh.core.events import record_event
 from mesh.core.ids import generate_id
+from mesh.core.redact import redact
 from mesh.errors import MeshError
 
 EXCLUDED_OP_PARAMS = {"idempotency_key", "dry_run", "approval", "format", "if_version"}
@@ -97,6 +98,7 @@ def create_or_get_pending_approval(
         target_id=target_id,
         category=category,
     )
+    summary = redact(summary)
     if dry_run:
         return {
             "approval_id": None,
@@ -117,7 +119,7 @@ def create_or_get_pending_approval(
             "approval_id": row["id"],
             "op_hash": row["op_hash"],
             "category": row["category"],
-            "summary": row["summary"],
+            "summary": redact(row["summary"]),
             "expires_at": row["expires_at"],
             "status": row["status"],
         }
@@ -201,6 +203,9 @@ def check_and_consume_approval(
     project_id: Optional[str] = None,
     target_id: Optional[str] = None,
     request_id: Optional[str] = None,
+    actor_kind: str = "agent",
+    via: str = "token",
+    k_user: Optional[bytes] = None,
 ) -> Dict[str, Any]:
     """Verify and consume an approval when re-executing with --approval."""
     cur = conn.execute("SELECT * FROM approvals WHERE id = ?;", (approval_id,))
@@ -301,6 +306,8 @@ def check_and_consume_approval(
             details={"approval_id": approval_id},
         )
 
+    ensure_delegated_decider_current(conn, row)
+
     # Policy channel check against expected gate category
     policy = get_approval_policy(conn, category)
     if row["decided_via"] == "relayed" and policy == "direct_only":
@@ -321,4 +328,53 @@ def check_and_consume_approval(
         WHERE id = ?;""",
         (now, caller_id, request_id, approval_id),
     )
+    record_consumed_event(conn, row, caller_id, actor_kind, via, request_id, k_user)
     return dict(row)
+
+
+def record_consumed_event(conn, row, actor_id, actor_kind, via, request_id, k_user):
+    """Record consumption in the same transaction as the approval update."""
+    record_event(conn=conn, type_="approval.consumed", actor_id=actor_id,
+                 actor_kind=actor_kind, via=via, project_id=row["project_id"],
+                 task_id=row["task_id"], approval_id=row["id"],
+                 payload={"approval_id": row["id"], "op_hash": row["op_hash"],
+                          "category": row["category"], "decided_via": row["decided_via"]},
+                 request_id=request_id, k_user=k_user)
+
+
+def ensure_delegated_decider_current(conn, row):
+    """A delegated decision cannot outlive its lead assignment, including A->B->A."""
+    if row["decided_via"] != "relayed" or not row["project_id"]:
+        return
+    ev = conn.execute(
+        "SELECT via FROM events WHERE type='approval.decided' AND approval_id=? ORDER BY seq DESC LIMIT 1",
+        (row["id"],)).fetchone()
+    if not ev or ev["via"] != "delegated":
+        return
+    from mesh.core.authz import get_project_active_lead
+    lead = get_project_active_lead(conn, row["project_id"])
+    if (not lead or not lead["can_lead"] or lead["delivery"] != "inbox"
+            or lead["agent_id"] != row["relayed_by"]
+            or not row["decided_at"] or lead["started_at"] > row["decided_at"]):
+        raise MeshError(code=c.APPROVAL_INVALID, exit_code=c.EXIT_APPROVAL_INVALID,
+                        message="Delegated approval no longer belongs to the current lead assignment",
+                        details={"approval_id": row["id"], "reason": "delegated_decider_not_current_lead"})
+
+
+def cancel_open_approvals(conn, rows, actor_id, actor_kind, via, reason,
+                          request_id=None, relayed_by=None, k_user=None):
+    """Withdraw unconsumed decisions atomically with one hash-chained event per row."""
+    cancelled = []
+    for row in rows:
+        changed = conn.execute(
+            "UPDATE approvals SET status='cancelled' WHERE id=? AND status IN ('pending','approved')",
+            (row["id"],)).rowcount
+        if not changed:
+            continue
+        cancelled.append(row["id"])
+        record_event(conn=conn, type_="approval.cancelled", actor_id=actor_id,
+                     actor_kind=actor_kind, via=via, relayed_by=relayed_by,
+                     project_id=row["project_id"], approval_id=row["id"],
+                     payload={"approval_id": row["id"], "reason": reason, "from_status": row["status"]},
+                     request_id=request_id, k_user=k_user)
+    return cancelled

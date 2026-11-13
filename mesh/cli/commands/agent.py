@@ -58,7 +58,7 @@ def register_agent_commands(subparsers: argparse._SubParsersAction, parent_parse
     update_parser.add_argument("--default-effort", help="Default reasoning effort")
     update_parser.add_argument("--allowed-effort", action="append", default=None, help="Allowed reasoning efforts (replaces list)")
     update_parser.add_argument("--max-concurrency", help="Maximum concurrency limit")
-    update_parser.add_argument("--can-lead", action="store_true", default=None, help="Lead eligibility")
+    update_parser.add_argument("--can-lead", action=argparse.BooleanOptionalAction, default=None, help="Lead eligibility")
     update_parser.add_argument("--capability", action="append", choices=["intake", "relay"], default=None, help="Capabilities")
     update_parser.add_argument("--default-profile", help="Default profile")
     update_parser.add_argument("--max-unapproved-profile", help="Max unapproved profile")

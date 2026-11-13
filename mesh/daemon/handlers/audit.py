@@ -1,5 +1,9 @@
 """Handler for audit resource commands: verify."""
 
+import hashlib
+import json
+
+from mesh.core.canonical import canonical_json
 from typing import Any, Dict, List, Optional, Tuple
 
 import mesh.constants as c
@@ -84,8 +88,45 @@ def handle_audit_verify(ctx: HandlerContext) -> HandlerResult:
     relayed_decisions = 0
     relayed_counts: Dict[Tuple[str, str], int] = {}
 
+    # Approval rows are mutable SQL data: cross-check them against the event chain.
+    decisions = {}
+    consumed = set()
+    for event in events_rows:
+        if event["type"] == "approval.decided":
+            decisions[event["approval_id"]] = dict(event)
+        elif event["type"] == "approval.consumed":
+            consumed.add(event["approval_id"])
+
     for arow in apr_rows:
         adict = dict(arow)
+        problems = []
+        try:
+            op_doc = json.loads(adict["op_json"])
+            actual_hash = "sha256:" + hashlib.sha256(canonical_json(op_doc)).hexdigest()
+            if actual_hash != adict["op_hash"]:
+                problems.append("op_json hash mismatch")
+        except (TypeError, ValueError):
+            problems.append("invalid op_json")
+        if adict["decided_via"] is not None or adict["status"] in ("approved", "rejected", "consumed"):
+            ev = decisions.get(adict["id"])
+            if not ev:
+                problems.append("decision has no approval.decided event")
+            else:
+                payload = json.loads(ev["payload_json"])
+                expected_decision = "rejected" if adict["status"] == "rejected" else "approved"
+                expected_via = "relayed" if ev["via"] == "delegated" else ev["via"]
+                if (payload.get("decision") != expected_decision or ev["actor_id"] != adict["decided_by"]
+                        or expected_via != adict["decided_via"]):
+                    problems.append("decision differs from approval.decided event")
+                # Old events predate the op_hash payload; require equality when present.
+                if payload.get("op_hash", adict["op_hash"]) != adict["op_hash"]:
+                    problems.append("decision event op_hash mismatch")
+        if adict["status"] == "consumed" and adict["id"] not in consumed:
+            problems.append("consumption has no approval.consumed event")
+        if problems:
+            broken_approval_ids.append(adict["id"])
+            reasons.extend(f"Approval {adict['id']}: {reason}" for reason in problems)
+
         aid = adict["id"]
         status = adict["status"]
         decided_via = adict["decided_via"]
@@ -123,7 +164,7 @@ def handle_audit_verify(ctx: HandlerContext) -> HandlerResult:
                         broken_approval_ids.append(aid)
                     reasons.append(f"Approval {aid} direct decision missing decided_at or user_mac signature")
                 else:
-                    if status in ("consumed", "expired"):
+                    if status in ("consumed", "expired", "cancelled"):
                         decision = "approved"
                     else:
                         decision = status

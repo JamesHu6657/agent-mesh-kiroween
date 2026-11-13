@@ -572,6 +572,7 @@ def handle_workspace_delete(ctx: HandlerContext) -> HandlerResult:
             project_id=project_id,
             target_id=task_id,
             request_id=ctx.request_id,
+            actor_kind=ctx.actor_kind, via=ctx.via, k_user=ctx.k_user,
         )
 
     if ctx.conn.execute("SELECT 1 FROM leases WHERE key = ?;", (f"task:{task_id}",)).fetchone():
