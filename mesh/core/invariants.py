@@ -594,7 +594,8 @@ def check_i9_merged_code_tasks(conn: sqlite3.Connection) -> List[Violation]:
 _I9_REVERSE_MERGE_CAP = 200
 
 
-def check_i9_integrated_unmerged_tasks(conn: sqlite3.Connection) -> List[Violation]:
+def check_i9_integrated_unmerged_tasks(conn: sqlite3.Connection,
+                                       project_id: Optional[str] = None) -> List[Violation]:
     """Reverse I9 (Carbon P1-3): a code task that is not ``merged`` but whose own commits are
     already in its project's integration branch.
 
@@ -604,6 +605,7 @@ def check_i9_integrated_unmerged_tasks(conn: sqlite3.Connection) -> List[Violati
     anything but ``merged`` (``merging`` is the merge in flight and is skipped; ``cancelled``
     and ``merge_failed`` are the dangerous ones: ``project deliver`` would hand the work to
     the base branch) that is a violation. No git process starts without such a candidate.
+    ``project_id`` limits the check to one project (``project deliver`` uses it as a gate).
     """
     violations: List[Violation] = []
     rows = conn.execute(
@@ -614,8 +616,10 @@ def check_i9_integrated_unmerged_tasks(conn: sqlite3.Connection) -> List[Violati
         WHERE t.kind = 'code' AND t.status NOT IN ('merged', 'merging')
           AND t.branch IS NOT NULL AND t.base_commit IS NOT NULL
           AND p.repo_path IS NOT NULL AND p.integration_branch IS NOT NULL
+          AND (? IS NULL OR p.id = ?)
         ORDER BY t.id;
-        """
+        """,
+        (project_id, project_id),
     ).fetchall()
     if not rows:
         return violations

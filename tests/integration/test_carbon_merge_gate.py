@@ -579,6 +579,13 @@ class TestP13IntentAndRecoveryByParents(MergeGateCase):
         self.assertEqual(viol[0]["details"]["status"], "cancelled")
         head = self.fixture.head(repo, self.integ_branch(prj))
         self.assertEqual(self.fixture.git(repo, "rev-list", "--parents", "-n", "1", head).stdout.split()[2], tip)
+        # the cancelled task's code never reaches main: deliver refuses (P1-2 follow-up gate)
+        main_before = self.fixture.head(repo, "main")
+        rc, resp = self.harness.cli("project", "deliver", prj, token=self.tok_lead1, timeout=60.0)
+        self.assertEqual(rc, c.EXIT_CONFLICT, resp)
+        self.assertEqual(resp["error"]["details"]["reason"], "integrated_unmerged_work", resp)
+        self.assertEqual(resp["error"]["details"]["tasks"][0]["status"], "cancelled", resp)
+        self.assertEqual(self.fixture.head(repo, "main"), main_before)
         self.harness.check_invariants_on_teardown = False  # the violation is the point of this test
 
 
@@ -727,6 +734,17 @@ class TestP12TestStepGitState(MergeGateCase):
         self.assertNotEqual(rc, 0, resp)
         reasons = [(v["details"]["task_id"], v["details"]["reason"]) for v in resp["error"]["details"]["violations"]]
         self.assertEqual(reasons, [(tsk, "integrated_but_not_merged")], resp)
+        # ... and `project deliver` refuses to hand that unreviewed commit to the base branch.
+        main_before = self.fixture.head(repo, "main")
+        for args in (("--dry-run",), ()):
+            rc, resp = self.harness.cli("project", "deliver", prj, *args, token=self.tok_lead1, timeout=60.0)
+            self.assertEqual(rc, c.EXIT_CONFLICT, resp)
+            err = resp["error"]
+            self.assertEqual((err["code"], err["details"]["reason"]),
+                             (c.INVALID_TRANSITION, "integrated_unmerged_work"), err)
+            self.assertEqual([t["task_id"] for t in err["details"]["tasks"]], [tsk], err)
+        self.assertEqual(self.fixture.head(repo, "main"), main_before)
+        self.assertEqual(self.q("SELECT 1 FROM events WHERE type = 'project.delivered';"), [])
         self.harness.check_invariants_on_teardown = False
 
 

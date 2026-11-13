@@ -423,9 +423,16 @@ task. `doctor --check-invariants` (I9) also reports the reverse case: a task tha
 integration branch, because `project deliver` would hand it to the base branch.
 `project cancel` during a merge is rc 6 with reason `merge_in_progress`.
 
-Test commands must leave no untracked, non-ignored artifacts in the integration
-worktree, or later merges report `INTEGRATION_DIRTY`. Mesh does not clean those
-files for you. When testing Mesh itself, use only `/tmp/mh-*` homes and fixture
+The test command runs in the integration worktree. HEAD, `MERGE_HEAD` and the index are
+compared before and after it: a test that stages anything (`git add`, `git add -N`),
+commits or aborts the merge fails as `TESTS_FAILED` whatever its exit code
+(`details.git_changes`), so nothing it staged enters the merge commit. Afterwards Mesh
+puts the worktree back to the index: untracked, non-ignored files (coverage, junit,
+build output) are removed and tracked files the test rewrote are restored
+(`details.cleanup`), so a test never leaves the project `INTEGRATION_DIRTY`. Ignored
+files are left alone. Mesh never resets or rewinds the integration branch: a test that
+committed is reported (`head_moved`, `restored: false`), and until that work is dealt
+with `project deliver` refuses (below). When testing Mesh itself, use only `/tmp/mh-*` homes and fixture
 repos, never a home or repo inside the Mesh checkout; test commands must not leave
 untracked files in the checkout. `bash scripts/test.sh` uses isolated fixtures.
 
@@ -438,7 +445,12 @@ change. It never pushes, rebases or forces. The `deliver_to_base` policy default
 `merge:<prj>` lease or a `merging` task, or the same for any other project sharing the
 repo path, compared by realpath), `project deliver` is rc 11 `MERGE_IN_PROGRESS`
 (`details.reason: "merge_in_progress"`, with the merging task and run), before approval
-and with no change; retry after the merge finishes.
+and with no change; retry after the merge finishes. If the integration branch carries
+work of a code task of the project that is not `merged` (the reverse I9 case above, or a
+test command that committed during its merge), `project deliver` is rc 6
+`INVALID_TRANSITION` (`details.reason: "integrated_unmerged_work"`, with the tasks and
+merge commits), before approval and with no change: merge that task again (a no-op merge
+that re-runs the tests) or repair the integration branch yourself first.
 
 Nothing is deleted automatically. Prune removes only merged code worktrees, or
 cancelled ones with no commits beyond their base. It uses non-forced
