@@ -54,15 +54,21 @@ def register_run_commands(subparsers: argparse._SubParsersAction, parent_parser:
     release_parser = sub.add_parser(
         "release",
         parents=[parent_parser],
-        help="Release a run held because its seen state is unusable (operator, user only)",
+        help="Release a held run (unusable seen state or a held merge test run; operator, user only)",
         description=("Release a task run that meshd holds because its recorded group members "
-                     "(seen.json) are unusable. Requires --force-seen-unusable. The run closes as "
-                     "lost and its lease is released; no process is signalled."),
-        epilog="Examples:\n  mesh run release run_abc456 --force-seen-unusable\n",
+                     "(seen.json) are unusable (--force-seen-unusable), or an open merge_test run "
+                     "that the merge close gate holds (--force-merge-held; refused while its wrapper "
+                     "process is alive). The run closes as lost and its lease is released; no "
+                     "process is signalled."),
+        epilog=("Examples:\n  mesh run release run_abc456 --force-seen-unusable --user\n"
+                "  mesh run release run_def789 --force-merge-held --user\n"),
     )
     release_parser.add_argument("run_id", help="Run identifier")
     release_parser.add_argument("--force-seen-unusable", action="store_true", dest="force_seen_unusable",
                                 help="Confirm releasing the seen-state hold without signalling any process")
+    release_parser.add_argument("--force-merge-held", action="store_true", dest="force_merge_held",
+                                help="Release an open merge_test run held by the merge close gate "
+                                     "(and its merge:<prj> lease); refused while its wrapper is alive")
     release_parser.set_defaults(func=handle_run_release)
 
 
@@ -86,5 +92,6 @@ def handle_run_log(args: argparse.Namespace) -> Dict[str, Any]:
 def handle_run_release(args: argparse.Namespace) -> Dict[str, Any]:
     """Execute `mesh run release` (r4c)."""
     client = MeshClient(home=args.home)
-    payload = {"run_id": args.run_id, "force_seen_unusable": bool(getattr(args, "force_seen_unusable", False))}
+    payload = {"run_id": args.run_id, "force_seen_unusable": bool(getattr(args, "force_seen_unusable", False)),
+               "force_merge_held": bool(getattr(args, "force_merge_held", False))}
     return client.execute_cmd(args, "run.release", payload).get("data", {})

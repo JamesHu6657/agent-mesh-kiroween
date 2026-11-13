@@ -98,7 +98,8 @@ def validate_git_args(args: List[str]) -> None:
         if wt_verb not in ("add", "list", "remove", "prune"):
             raise AssertionError(f"Disallowed git worktree verb: {wt_verb}")
         for arg in rest[1:]:
-            if arg in FORBIDDEN_TOKENS:
+            if (arg in FORBIDDEN_TOKENS or arg.startswith("--force")
+                    or (arg.startswith("-") and not arg.startswith("--") and "f" in arg[1:])):
                 raise AssertionError(f"Disallowed flag '{arg}' for git worktree {wt_verb}")
         return
 
@@ -124,9 +125,11 @@ def validate_git_args(args: List[str]) -> None:
         return
 
     if subcmd == "update-ref":
+        # Require compare-and-swap: no deletion, stdin batch, or unconditional update.
+        if len(rest) != 3:
+            raise AssertionError("git update-ref requires <ref> <new> <old>")
         for arg in rest:
-            if arg in FORBIDDEN_TOKENS:
-                raise AssertionError(f"Disallowed flag '{arg}' for git update-ref")
+            _check_ref(arg, "update-ref")
         return
 
     raise AssertionError(f"Disallowed git subcommand: {subcmd}")

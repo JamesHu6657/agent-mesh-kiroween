@@ -5,10 +5,12 @@ import json
 import sqlite3
 from typing import Any, Dict, List, Optional
 
-from mesh.core.redact import redact
+from mesh.core.redact import redact, redact_value
 import mesh.constants as c
 from mesh.core.approvals import (
     DEFAULT_POLICIES,
+    ensure_delegated_decider_current,
+    record_consumed_event,
     HUMAN_CONFIRMED_MAX,
     compute_user_approval_mac,
     get_approval_mode,
@@ -67,7 +69,7 @@ def _decision_channel(conn: sqlite3.Connection, ctx: HandlerContext, row: sqlite
     if (ctx.via == "token" and pid and get_approval_mode(conn) == "delegated"
             and is_project_lead(conn, pid, me)):
         lead = get_project_active_lead(conn, pid)
-        if lead and lead.get("delivery") == "inbox":
+        if lead and lead.get("delivery") == "inbox" and lead.get("can_lead"):
             return "delegated"
     caps = ctx.principal.get("capabilities", [])
     if ("relay" in caps and me != row["requested_by"]
@@ -145,7 +147,11 @@ def _check_delegated_decision(ctx: HandlerContext, row: sqlite3.Row, human_confi
             details={"project_id": project_id, "caller": ctx.principal.get("name")},
         )
     lead = get_project_active_lead(ctx.conn, project_id)
-    if lead and lead.get("delivery") == "launch":
+    if not lead or not lead.get("can_lead"):
+        raise MeshError(code=c.NOT_PROJECT_LEAD, exit_code=c.EXIT_FORBIDDEN,
+                        message="The current lead no longer has can_lead",
+                        details={"project_id": project_id, "reason": "not_can_lead"})
+    if lead.get("delivery") == "launch":
         raise MeshError(
             code=c.CAPABILITY_MISSING,
             exit_code=c.EXIT_FORBIDDEN,
@@ -166,7 +172,7 @@ def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResu
     """Decide (approve or reject) a pending approval request per plan §7.3 and §7.4."""
     approval_id = ctx.args.get("approval_id")
     op_hash = ctx.args.get("op_hash")
-    note = ctx.args.get("note")
+    note = _redact_opt(ctx.args.get("note"))
 
     if not approval_id:
         raise MeshError(
@@ -300,7 +306,9 @@ def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResu
         )
 
     # Idempotency: same decision again -> rc 0, already_decided: true, no new event
-    if status == decision:
+    upgrade_to_direct = (status == decision == "approved" and row["decided_via"] == "relayed"
+                         and not delegated and ctx.actor_kind == "user" and ctx.via == "direct")
+    if status == decision and not upgrade_to_direct:
         decided_via = row["decided_via"]
         return HandlerResult(data={
             "approval_id": approval_id,
@@ -413,7 +421,13 @@ def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResu
             ),
         )
 
-    payload: Dict[str, Any] = {"decision": decision, "note": note}
+    payload: Dict[str, Any] = {"decision": decision, "note": note, "op_hash": row["op_hash"]}
+    if delegated or ctx.via == "relayed":
+        payload["user_statement"] = _redact_opt(human_confirmed if delegated else
+                                             ctx.args.get("user_statement") or ctx.user_statement)
+        payload["evidence_ref"] = _redact_opt(ctx.args.get("evidence_ref") or ctx.evidence_ref)
+    if upgrade_to_direct:
+        payload["upgraded_from"] = "relayed"
     if delegated:
         payload["mode"] = "delegated"
         payload["human_confirmed"] = redact(human_confirmed)
@@ -439,6 +453,8 @@ def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResu
         "trust": "direct_verified" if decided_via == "direct" else "relayed_unverified",
         "user_mac": user_mac,
     }
+    if upgrade_to_direct:
+        data["upgraded_from"] = "relayed"
     if delegated:
         data["delegated"] = True
         data["human_confirmed"] = redact(human_confirmed)
@@ -477,22 +493,22 @@ def handle_approval_cancel(ctx: HandlerContext) -> HandlerResult:
 
     _check_approval_run_scope(ctx, row)
 
-    # Requester only
-    if row["requested_by"] != ctx.principal["id"]:
+    # The user may also withdraw an approved, unconsumed request.
+    if ctx.actor_kind != "user" and row["requested_by"] != ctx.principal["id"]:
         raise MeshError(
             code=c.NOT_REQUESTER,
             exit_code=c.EXIT_FORBIDDEN,
-            message="Only the requester can cancel an approval request",
+            message="Only the requester or user can cancel an approval request",
             details={"approval_id": approval_id, "requested_by": row["requested_by"], "caller": ctx.principal["id"]},
         )
 
-    # pending -> cancelled only
+    # Pending or approved -> cancelled; consumed decisions remain immutable.
     status = row["status"]
-    if status != "pending":
+    if status not in ("pending", "approved"):
         raise MeshError(
             code=c.INVALID_TRANSITION,
             exit_code=c.EXIT_CONFLICT,
-            message=f"Approval '{approval_id}' is '{status}'; only pending approvals can be cancelled",
+            message=f"Approval '{approval_id}' is '{status}'; only pending or approved approvals can be cancelled",
             details={"approval_id": approval_id, "status": status},
         )
 
@@ -507,7 +523,8 @@ def handle_approval_cancel(ctx: HandlerContext) -> HandlerResult:
         via=ctx.via,
         project_id=row["project_id"],
         approval_id=approval_id,
-        payload={"reason": ctx.args.get("reason", "cancelled_by_requester")},
+        payload={"approval_id": approval_id, "reason": ctx.args.get("reason") or "cancelled_by_requester",
+                 "from_status": status},
         request_id=ctx.request_id,
         k_user=ctx.k_user,
     )
@@ -660,6 +677,8 @@ def handle_approval_consume(ctx: HandlerContext) -> HandlerResult:
             details={"approval_id": approval_id},
         )
 
+    ensure_delegated_decider_current(ctx.conn, row)
+
     # 4. Policy check
     policy = get_approval_policy(ctx.conn, row["category"])
     if row["decided_via"] == "relayed" and policy == "direct_only":
@@ -680,6 +699,8 @@ def handle_approval_consume(ctx: HandlerContext) -> HandlerResult:
         WHERE id = ?;""",
         (now, ctx.principal["id"], ctx.request_id, approval_id),
     )
+    record_consumed_event(ctx.conn, row, ctx.principal["id"], ctx.actor_kind,
+                          ctx.via, ctx.request_id, ctx.k_user)
 
     decided_via = row["decided_via"]
     trust = "direct_verified" if decided_via == "direct" else ("relayed_unverified" if decided_via == "relayed" else None)
@@ -722,9 +743,12 @@ def _format_approval_dict(conn: sqlite3.Connection, r: sqlite3.Row) -> Dict[str,
 
     if "op_json" in data and data["op_json"]:
         try:
-            data["op"] = json.loads(data["op_json"])
+            data["op"] = redact_value(json.loads(data["op_json"]))
         except Exception:
             pass
+    for field in ("summary", "decision_note", "user_statement", "evidence_ref", "op_json"):
+        if isinstance(data.get(field), str):
+            data[field] = redact(data[field])
     return data
 
 
@@ -913,7 +937,7 @@ def handle_approval_request(ctx: HandlerContext) -> HandlerResult:
             "approval_id": None,
             "op_hash": apr_info["op_hash"],
             "category": category,
-            "summary": summary,
+            "summary": redact(summary),
         })
 
     return HandlerResult(data=apr_info)

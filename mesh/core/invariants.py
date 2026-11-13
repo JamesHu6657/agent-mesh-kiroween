@@ -590,6 +590,83 @@ def check_i9_merged_code_tasks(conn: sqlite3.Connection) -> List[Violation]:
     return violations
 
 
+#: Cap on the merge commits examined per task by the reverse I9 check.
+_I9_REVERSE_MERGE_CAP = 200
+
+
+def check_i9_integrated_unmerged_tasks(conn: sqlite3.Connection,
+                                       project_id: Optional[str] = None) -> List[Violation]:
+    """Reverse I9 (Carbon P1-3): a code task that is not ``merged`` but whose own commits are
+    already in its project's integration branch.
+
+    A merge commit of ``refs/heads/<integration>`` that came after the task's ``base_commit``
+    and whose second parent is a commit of the task's branch (reachable from the branch tip,
+    not from ``base_commit``) means the task's work entered integration. If the task is
+    anything but ``merged`` (``merging`` is the merge in flight and is skipped; ``cancelled``
+    and ``merge_failed`` are the dangerous ones: ``project deliver`` would hand the work to
+    the base branch) that is a violation. No git process starts without such a candidate.
+    ``project_id`` limits the check to one project (``project deliver`` uses it as a gate).
+    """
+    violations: List[Violation] = []
+    rows = conn.execute(
+        """
+        SELECT t.id AS task_id, t.status AS status, t.branch AS branch, t.base_commit AS base_commit,
+               p.id AS project_id, p.repo_path AS repo_path, p.integration_branch AS integration_branch
+        FROM tasks t JOIN projects p ON t.project_id = p.id
+        WHERE t.kind = 'code' AND t.status NOT IN ('merged', 'merging')
+          AND t.branch IS NOT NULL AND t.base_commit IS NOT NULL
+          AND p.repo_path IS NOT NULL AND p.integration_branch IS NOT NULL
+          AND (? IS NULL OR p.id = ?)
+        ORDER BY t.id;
+        """,
+        (project_id, project_id),
+    ).fetchall()
+    if not rows:
+        return violations
+
+    from mesh.core.gitops import run_git
+
+    def git(args: List[str], cwd: str) -> Any:
+        return run_git(args, cwd=cwd)
+
+    for row in rows:
+        repo = row["repo_path"]
+        if not os.path.isdir(repo) or not _SHA_RE.match(row["base_commit"] or ""):
+            continue
+        try:
+            tip = git(["rev-parse", "--verify", "--quiet", f"refs/heads/{row['branch']}^{{commit}}"], repo)
+            if tip.returncode != 0:
+                continue  # the branch is gone (pruned): nothing to compare
+            tip_sha = tip.stdout.strip()
+            merges = git(["log", "--merges", "--first-parent", "--format=%H %P", "-n", str(_I9_REVERSE_MERGE_CAP),
+                          f"refs/heads/{row['integration_branch']}", f"^{row['base_commit']}"], repo)
+            if merges.returncode != 0:
+                continue
+            for line in merges.stdout.splitlines():
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                for parent in parts[2:]:
+                    in_branch = git(["merge-base", "--is-ancestor", parent, tip_sha], repo).returncode == 0
+                    in_base = git(["merge-base", "--is-ancestor", parent, row["base_commit"]], repo).returncode == 0
+                    if in_branch and not in_base:
+                        violations.append(Violation(
+                            invariant="I9",
+                            message=(f"Code task {row['task_id']} is '{row['status']}' but its work is already in "
+                                     f"the integration branch (merge commit {parts[0]})"),
+                            details={"task_id": row["task_id"], "project_id": row["project_id"],
+                                     "status": row["status"], "reason": "integrated_but_not_merged",
+                                     "merge_commit": parts[0], "integration_branch": row["integration_branch"]},
+                        ))
+                        break
+                else:
+                    continue
+                break
+        except Exception:  # git missing or timed out: the forward I9 check reports such repos
+            continue
+    return violations
+
+
 def check_invariants(conn: sqlite3.Connection) -> List[Violation]:
     """Run all invariant checks (I1-I9) on the database.
 
@@ -606,4 +683,5 @@ def check_invariants(conn: sqlite3.Connection) -> List[Violation]:
     violations.extend(check_i7_event_hash_chain(conn))
     violations.extend(check_i8_cancelling_and_leases(conn))
     violations.extend(check_i9_merged_code_tasks(conn))
+    violations.extend(check_i9_integrated_unmerged_tasks(conn))
     return violations

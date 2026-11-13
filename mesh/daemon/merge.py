@@ -87,6 +87,43 @@ def merge_lease_key(project_id: str) -> str:
     return f"merge:{project_id}"
 
 
+def merge_in_progress_for_repo(conn: sqlite3.Connection, repo_path: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Carbon P2-7: is a merge running against ``repo_path`` (compared by realpath)?
+
+    A merge is in progress when any project on the same repository (this one or another
+    project sharing the repo) holds the ``merge:<prj>`` lease or has a task in ``merging``.
+    Returns ``{project_id, task_id, run_id, lease, reason}`` for the first such merge
+    (ordered by project, then task id), or None. Read-only; callers raise or skip.
+    """
+    if not repo_path:
+        return None
+    try:
+        target = os.path.realpath(repo_path)
+    except (OSError, ValueError):
+        return None
+    for prj in conn.execute("SELECT id, repo_path FROM projects WHERE repo_path IS NOT NULL "
+                            "AND repo_path != '' ORDER BY id;").fetchall():
+        try:
+            if os.path.realpath(prj["repo_path"]) != target:
+                continue
+        except (OSError, ValueError):
+            continue
+        key = merge_lease_key(prj["id"])
+        lease = conn.execute("SELECT run_id FROM leases WHERE key = ?;", (key,)).fetchone()
+        task = conn.execute("SELECT id FROM tasks WHERE project_id = ? AND status = 'merging' "
+                            "ORDER BY id LIMIT 1;", (prj["id"],)).fetchone()
+        if lease is None and task is None:
+            continue
+        task_id = task["id"] if task is not None else None
+        run_id = lease["run_id"] if lease is not None else None
+        if task_id is None and run_id is not None:
+            holder = conn.execute("SELECT task_id FROM runs WHERE id = ?;", (run_id,)).fetchone()
+            task_id = holder["task_id"] if holder is not None else None
+        return {"project_id": prj["id"], "task_id": task_id, "run_id": run_id,
+                "lease": key if lease is not None else None, "reason": "merge_in_progress"}
+    return None
+
+
 def _load(conn: sqlite3.Connection, task_id: str) -> Tuple[Optional[sqlite3.Row], Optional[sqlite3.Row]]:
     task = conn.execute("SELECT * FROM tasks WHERE id = ?;", (task_id,)).fetchone()
     if not task:
@@ -321,12 +358,32 @@ def probe_integration_head(integration: str) -> Optional[str]:
         return None
 
 
-def _abort_and_verify(integ: str, pre_head: str) -> Dict[str, Any]:
-    """`merge --abort`, then HEAD == pre_head, clean tree, no MERGE_HEAD (§10.5 step 2)."""
+def _abort_and_verify(integ: str, pre_head: str, abort: bool = True, cleanup: bool = False) -> Dict[str, Any]:
+    """`merge --abort`, then HEAD == pre_head, clean tree, no MERGE_HEAD (§10.5 step 2).
+
+    ``abort=False`` (a noop merge, nothing in progress) only verifies. ``cleanup=True``
+    (Carbon P1-2: after a test command, or recovering a merge that ran one) also puts the
+    working tree back to the index before the abort (so `merge --abort` is not refused over a
+    file the test rewrote) and again after it (what the test left beside the merge: untracked
+    files, staged additions the abort unstaged), so a failed test never leaves the project
+    INTEGRATION_DIRTY."""
     out: Dict[str, Any] = {}
-    cp = _git("merge --abort", ["merge", "--abort"], integ)
-    if cp.returncode != 0:
+    cleanups: List[Dict[str, Any]] = []
+
+    def _clean() -> None:
+        try:
+            cleanups.append(restore_worktree_to_index(integ))
+        except _GitFailed as gf:
+            cleanups.append({"error": gf.details})
+
+    if cleanup and abort:
+        _clean()
+    cp = _git("merge --abort", ["merge", "--abort"], integ) if abort else None
+    if cp is not None and cp.returncode != 0:
         out["abort_stderr"] = _clip(cp.stderr)
+    if cleanup:
+        _clean()
+        out["cleanup"] = _merge_cleanups(cleanups)
     try:
         head = _head(integ, "verify HEAD")
         dirty = _dirty_paths(integ, "verify status")
@@ -338,6 +395,263 @@ def _abort_and_verify(integ: str, pre_head: str) -> Dict[str, Any]:
     if not out["restored"]:
         out.update({"head": head, "merge_head": merge_head})
         _capped(out, "dirty_files", dirty)
+    return out
+
+
+def _merge_cleanups(cleanups: List[Mapping[str, Any]]) -> Dict[str, Any]:
+    removed: List[str] = []
+    restored: List[str] = []
+    errors: List[Any] = []
+    for c_ in cleanups:
+        removed.extend(x for x in c_.get("removed", []) if x not in removed)
+        restored.extend(x for x in c_.get("restored", []) if x not in restored)
+        if c_.get("errors"):
+            errors.extend(c_["errors"])
+        if c_.get("error"):
+            errors.append({"error": c_["error"]})
+    out: Dict[str, Any] = {}
+    _capped(out, "removed", removed)
+    _capped(out, "restored", restored)
+    if errors:
+        out["errors"] = errors[:FILES_LIMIT]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Carbon P1-2: the test command runs in the integration worktree itself
+# ---------------------------------------------------------------------------
+#
+# The integration worktree is Mesh's own: it is verified clean before every merge, so
+# anything a test command leaves behind there (an untracked coverage.xml, a rewritten
+# tracked file, a `git add`) is the test's doing. Git state that matters for the commit
+# (HEAD, MERGE_HEAD and the index) is snapshotted before the test and compared after it:
+# any change fails the test step. The working tree is then put back to the index with
+# filesystem operations and allow-listed reads only (`status`, `diff --raw`, `cat-file`):
+# `reset`, `clean` and `checkout` stay forbidden (gitops allow-list), so nothing here
+# rewrites a ref or the index.
+
+_ZERO_SHA = re.compile(r"^0+$")
+
+
+def _git_bytes(step: str, args: List[str], cwd: str) -> Any:
+    try:
+        return run_git(args, cwd=cwd, timeout_s=GIT_TIMEOUT_S, text=False)
+    except Exception as exc:  # timeout, missing cwd, …
+        raise _GitFailed(step, exc=exc)
+
+
+def _merge_head_sha(cwd: str) -> Optional[str]:
+    cp = _git("verify MERGE_HEAD", ["rev-parse", "-q", "--verify", "MERGE_HEAD"], cwd)
+    if cp.returncode != 0:
+        return None
+    return (cp.stdout or "").strip() or None
+
+
+def _raw_entries(out: bytes) -> List[Dict[str, Any]]:
+    """Parse `diff --raw -z --no-renames --no-abbrev` output."""
+    parts = (out or b"").split(b"\0")
+    entries: List[Dict[str, Any]] = []
+    i = 0
+    while i + 1 < len(parts):
+        meta, path = parts[i], parts[i + 1]
+        i += 2
+        if not meta.startswith(b":"):
+            continue
+        fields = meta[1:].decode("ascii", "replace").split()
+        if len(fields) < 5:
+            continue
+        entries.append({"src_mode": fields[0], "dst_mode": fields[1], "src_sha": fields[2],
+                        "dst_sha": fields[3], "status": fields[4][:1], "path": os.fsdecode(path)})
+    return entries
+
+
+def _untracked_entries(out: bytes) -> List[str]:
+    """Untracked (`??`) paths of `status --porcelain=v1 -z --no-renames` (dirs end in '/')."""
+    paths: List[str] = []
+    for rec in (out or b"").split(b"\0"):
+        if rec.startswith(b"?? "):
+            paths.append(os.fsdecode(rec[3:]))
+    return paths
+
+
+def snapshot_git_state(integ: str, base: str) -> Dict[str, Any]:
+    """HEAD, MERGE_HEAD and the index (as its raw diff against ``base``) of ``integ``."""
+    cp = _git_bytes("snapshot index", ["diff", "--cached", "--raw", "-z", "--no-renames", "--no-abbrev",
+                                       "--no-ext-diff", base], integ)
+    if cp.returncode != 0:
+        raise _GitFailed("snapshot index", cp)
+    return {"head": _head(integ, "snapshot HEAD"), "merge_head": _merge_head_sha(integ),
+            "index": bytes(cp.stdout or b"")}
+
+
+def _worktree_vs_index(integ: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    cp = _git_bytes("diff worktree", ["diff", "--raw", "-z", "--no-renames", "--no-abbrev", "--no-ext-diff"],
+                    integ)
+    if cp.returncode != 0:
+        raise _GitFailed("diff worktree", cp)
+    tracked = _raw_entries(cp.stdout)
+    cp = _git_bytes("status untracked", ["status", "--porcelain=v1", "-z", "--untracked-files=all",
+                                         "--no-renames"], integ)
+    if cp.returncode != 0:
+        raise _GitFailed("status untracked", cp)
+    return tracked, _untracked_entries(cp.stdout)
+
+
+def git_state_changes(before: Mapping[str, Any], after: Mapping[str, Any],
+                      tracked: List[Dict[str, Any]]) -> List[str]:
+    """What the test command changed in git: ``head_moved``, ``merge_head_changed``,
+    ``index_changed`` (any staged change, including an intent-to-add entry)."""
+    changes: List[str] = []
+    if after["head"] != before["head"]:
+        changes.append("head_moved")
+    if after["merge_head"] != before["merge_head"]:
+        changes.append("merge_head_changed")
+    # `git add -N` entries are invisible to `diff --cached`; they show as added in the worktree diff.
+    if after["index"] != before["index"] or any(e["status"] == "A" for e in tracked):
+        changes.append("index_changed")
+    return changes
+
+
+def _inside(root: str, rel: str) -> Optional[str]:
+    """``root/rel`` when ``rel`` is a plain relative path whose parents are real directories
+    inside ``root`` (no symlink is ever followed), else None."""
+    rel = rel.rstrip("/")
+    if not rel or os.path.isabs(rel):
+        return None
+    parts = rel.split("/")
+    if any(p in ("", ".", "..", ".git") for p in parts):
+        return None
+    cur = root
+    for p in parts[:-1]:
+        cur = os.path.join(cur, p)
+        try:
+            st = os.lstat(cur)
+        except FileNotFoundError:
+            return os.path.join(root, *parts)
+        import stat as _stat
+
+        if not _stat.S_ISDIR(st.st_mode):
+            return None
+    return os.path.join(root, *parts)
+
+
+def _remove_path(path: str) -> None:
+    import shutil
+    import stat as _stat
+
+    st = os.lstat(path)
+    if _stat.S_ISDIR(st.st_mode):
+        shutil.rmtree(path)  # never follows symlinks inside
+    else:
+        os.unlink(path)
+
+
+def _prune_empty_parents(root: str, path: str) -> None:
+    parent = os.path.dirname(path)
+    while parent and os.path.realpath(parent) != os.path.realpath(root) and parent.startswith(root + os.sep):
+        try:
+            os.rmdir(parent)
+        except OSError:
+            return
+        parent = os.path.dirname(parent)
+
+
+def _write_index_blob(integ: str, path: str, rel: str, mode: str, sha: str) -> None:
+    """Recreate ``rel`` from its index blob (what `checkout-index` would write)."""
+    if mode == "120000":
+        cp = _git_bytes("cat-file blob", ["cat-file", "blob", sha], integ)
+    else:
+        # --filters applies the worktree's attributes (eol, smudge) for this path, as checkout does.
+        cp = _git_bytes("cat-file blob", ["cat-file", "--filters", f"--path={rel}", sha], integ)
+    if cp.returncode != 0:
+        raise _GitFailed("cat-file blob", cp)
+    data = bytes(cp.stdout or b"")
+    if os.path.lexists(path):
+        _remove_path(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if mode == "120000":
+        os.symlink(os.fsdecode(data), path)
+        return
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                 0o777 if mode == "100755" else 0o666)
+    try:
+        view = memoryview(data)
+        while view:
+            n = os.write(fd, view)
+            view = view[n:]
+    finally:
+        os.close(fd)
+
+
+def restore_worktree_to_index(integ: str) -> Dict[str, Any]:
+    """Carbon P1-2: make the integration working tree match its index again.
+
+    Untracked (not ignored) paths are removed; tracked files the test changed, deleted or
+    retyped are rewritten from their index blobs. Ignored files are left alone (they never
+    make the tree dirty). Returns ``{removed, restored, errors}`` (capped path lists)."""
+    removed: List[str] = []
+    restored: List[str] = []
+    errors: List[Dict[str, str]] = []
+    real_root = os.path.realpath(integ)
+    tracked, untracked = _worktree_vs_index(integ)
+    for rel in untracked:
+        path = _inside(real_root, rel)
+        if path is None:
+            errors.append({"path": rel, "error": "unsafe_path"})
+            continue
+        try:
+            if os.path.lexists(path):
+                _remove_path(path)
+                _prune_empty_parents(real_root, path)
+            removed.append(rel)
+        except OSError as exc:
+            errors.append({"path": rel, "error": f"{type(exc).__name__}: {exc}"})
+    for e in tracked:
+        rel = e["path"]
+        if e["status"] not in ("M", "T", "D") or e["src_mode"] in ("000000", "160000") \
+                or _ZERO_SHA.match(e["src_sha"]):
+            if e["status"] != "A":  # intent-to-add: reported as an index change, settled by the abort
+                errors.append({"path": rel, "error": f"unrestorable_{e['status']}_{e['src_mode']}"})
+            continue
+        path = _inside(real_root, rel)
+        if path is None:
+            errors.append({"path": rel, "error": "unsafe_path"})
+            continue
+        try:
+            _write_index_blob(integ, path, rel, e["src_mode"], e["src_sha"])
+            restored.append(rel)
+        except (OSError, _GitFailed) as exc:
+            errors.append({"path": rel, "error": f"{type(exc).__name__}: {exc}"})
+    if restored:
+        # The rewritten files have new stat data: `status` refreshes the index's stat cache
+        # (an opportunistic index write, contents unchanged) so that a following
+        # `merge --abort` does not refuse them as "not uptodate".
+        _git_bytes("status refresh", ["status", "--porcelain=v1", "-z", "--untracked-files=no"], integ)
+    out: Dict[str, Any] = {}
+    _capped(out, "removed", removed)
+    _capped(out, "restored", restored)
+    if errors:
+        out["errors"] = errors[:FILES_LIMIT]
+    return out
+
+
+def settle_after_test(integ: str, base: str, before: Mapping[str, Any]) -> Dict[str, Any]:
+    """After the test command: what it changed in git (``changes``) and the working tree put
+    back to the index (``cleanup``). ``clean`` is True only when nothing in git changed and
+    the tree now matches the index exactly. Never raises."""
+    out: Dict[str, Any] = {"changes": [], "clean": False}
+    try:
+        after = snapshot_git_state(integ, base)
+        tracked, _ = _worktree_vs_index(integ)
+        out["changes"] = git_state_changes(before, after, tracked)
+        out["cleanup"] = restore_worktree_to_index(integ)
+        tracked, untracked = _worktree_vs_index(integ)
+        out["clean"] = not out["changes"] and not tracked and not untracked \
+            and not out["cleanup"].get("errors")
+        if tracked or untracked:
+            _capped(out, "left_dirty", [e["path"] for e in tracked] + untracked)
+    except _GitFailed as gf:
+        out["error"] = gf.details
     return out
 
 
@@ -785,6 +1099,173 @@ def run_merge_pipeline(plan: Mapping[str, Any]) -> Dict[str, Any]:
     return out
 
 
+INTENT_NAME = "merge_intent.json"
+_SHA40 = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
+
+
+def merge_intent_path(run_dir: str) -> str:
+    return os.path.join(run_dir, INTENT_NAME)
+
+
+def write_merge_intent(run_dir: str, intent: Mapping[str, Any]) -> None:
+    """Carbon P1-3: durably record ``(pre_head, tip)`` before the merge commit is made.
+
+    Written to a temp file, fsynced, renamed into place and the directory fsynced, so that a
+    crash right after ``git commit`` finds it. Raises OSError when it cannot be made durable
+    (the caller then does not commit)."""
+    os.makedirs(run_dir, mode=0o700, exist_ok=True)
+    path = merge_intent_path(run_dir)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, (json.dumps(dict(intent), sort_keys=True) + "\n").encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    dfd = os.open(run_dir, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def read_merge_intent(run_dir: Optional[str]) -> Optional[Dict[str, Any]]:
+    """The intent of a merge run, or None when absent or malformed (legacy runs, a crash
+    before the intent was written)."""
+    if not run_dir:
+        return None
+    data = _read_json(merge_intent_path(run_dir))
+    if not data:
+        return None
+    if not (isinstance(data.get("task_id"), str) and isinstance(data.get("pre_head"), str)
+            and isinstance(data.get("tip"), str)):
+        return None
+    if not (_SHA40.match(data["pre_head"]) and _SHA40.match(data["tip"])):
+        return None
+    return data
+
+
+def _find_intended_merge(integ: str, intent: Mapping[str, Any]) -> Optional[str]:
+    """The commit in integration's first-parent history above ``pre_head`` whose parents are
+    exactly ``[pre_head, tip]`` (Carbon P1-3): the merge commit this task's merge made,
+    matched by its parents, never by its message, and independent of where the task branch
+    is now. None when there is none (or ``pre_head`` is not in this repo)."""
+    pre, tip = intent["pre_head"], intent["tip"]
+    cp = _git("find merge commit", ["log", "--first-parent", "--format=%H %P", f"{pre}..HEAD"], integ)
+    if cp.returncode != 0:
+        return None
+    for line in (cp.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[1] == pre and parts[2] == tip:
+            return parts[0]
+    return None
+
+
+def _integrating_commit(integ: str, tip: str) -> str:
+    """The commit of ``integ``'s first-parent history that brought ``tip`` in (Carbon P2-5).
+
+    The oldest first-parent commit of HEAD that has ``tip`` as an ancestor: the merge commit
+    that merged the task earlier, or the first commit on top of a branch that is simply
+    contained in integration. ``tip`` itself when nothing sits on top of it (HEAD is ``tip``)
+    or when ``tip`` lies on the first-parent line (nothing merged it)."""
+    cp = _git("log integrating commit",
+              ["log", "--first-parent", "--ancestry-path", "--format=%H", f"{tip}..HEAD"], integ)
+    if cp.returncode != 0:
+        raise _GitFailed("log integrating commit", cp)
+    shas = [ln.strip() for ln in (cp.stdout or "").splitlines() if ln.strip()]
+    if not shas:
+        return tip
+    # When ``tip`` is itself on the first-parent line (a zero-commit task: its tip is the base
+    # it started from), nothing merged it: the oldest commit above it is just the next
+    # integration commit (another task's merge), so the tip is recorded, as before P2-5.
+    cp = _git("log integrating parents", ["log", "-1", "--format=%P", shas[-1]], integ)
+    if cp.returncode != 0:
+        raise _GitFailed("log integrating parents", cp)
+    parents = (cp.stdout or "").split()
+    return tip if parents and parents[0] == tip else shas[-1]
+
+
+def _run_noop_merge(plan: Mapping[str, Any], integ: str, tip: str, pre_head: str) -> Dict[str, Any]:
+    """Carbon P2-5: the task branch is already contained in integration (a zero-commit task,
+    or a merge commit that exists but was never recorded). Nothing is merged, but the gate
+    is not skipped: ``test_command`` still runs on the integration tree, and the recorded
+    ``merge_commit`` is the commit that really carries the task: the merge commit that merged
+    it, or the tip itself for a zero-commit task (never an unrelated later commit)."""
+    tests: Dict[str, Any] = {"tests": "none", "test_log": None}
+    if plan.get("test_argv"):
+        test, tests = _gated_test_step(plan, integ, pre_head)
+        if not test["passed"]:
+            verify = _abort_and_verify(integ, pre_head, abort=False, cleanup=True)
+            return {"outcome": "failed", "reason": "tests_failed", "pre_head": pre_head,
+                    "details": _test_failure_details(test, verify), **tests}
+    return {"outcome": "merged", "noop": True, "pre_head": pre_head,
+            "merge_commit": _integrating_commit(integ, tip), **tests}
+
+
+def _gated_test_step(plan: Mapping[str, Any], integ: str, pre_head: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """The test step with the Carbon P1-2 gate around it.
+
+    HEAD, MERGE_HEAD and the index are snapshotted before ``test_command`` runs and compared
+    after it: a test that moved HEAD or changed the index (``git add``, ``git add -N``,
+    ``git merge --abort``, ``git commit``) fails, whatever its exit code, so nothing it staged
+    can enter the merge commit. The working tree is then put back to the index (untracked
+    files removed, rewritten tracked files restored). A test that passed but left a tree
+    that cannot be restored fails too. Returns ``(test, tests)`` as the pipeline records them.
+    """
+    test: Dict[str, Any]
+    try:
+        before = snapshot_git_state(integ, pre_head)
+    except _GitFailed as gf:
+        before = None
+        settle_error: Optional[Dict[str, Any]] = gf.details
+    else:
+        settle_error = None
+    test = dict(run_test_step(plan))
+    if before is None:
+        test["passed"] = False
+        test["settle_error"] = settle_error
+    else:
+        settled = settle_after_test(integ, pre_head, before)
+        if settled.get("changes"):
+            test["git_changes"] = list(settled["changes"])
+        if settled.get("cleanup"):
+            test["cleanup"] = settled["cleanup"]
+        for k in ("left_dirty", "left_dirty_count", "left_dirty_truncated"):
+            if k in settled:
+                test[k] = settled[k]
+        if settled.get("error"):
+            test["settle_error"] = settled["error"]
+        if not settled.get("clean"):
+            test["passed"] = False
+            if "error" not in test:
+                test["error"] = "test_changed_git_state" if settled.get("changes") else "test_left_tree_dirty"
+    tests = {"tests": "passed" if test["passed"] else "failed", "test_log": test["log_path"],
+             "test": {k: v for k, v in test.items() if k != "log_path"}}
+    return test, tests
+
+
+def _test_failure_details(test: Mapping[str, Any], verify: Mapping[str, Any]) -> Dict[str, Any]:
+    tail, tail_cut = log_tail_capped(test["log_path"])
+    details = {"log_path": test["log_path"], "log_tail": tail, "log_tail_truncated": tail_cut,
+               "timeout": test["timeout"], "timeout_s": test["timeout_s"],
+               "exit_code": test["exit_code"], "signal": test["signal"]}
+    fails, n_fails = failing_tests(test["log_path"])
+    details.update({"failing_tests": fails, "failing_tests_total": n_fails,
+                    "failing_tests_truncated": n_fails > len(fails)})
+    for k in ("error", "termination", "leftovers", "leftover_scan_uncertain", "git_changes", "settle_error",
+              "left_dirty", "left_dirty_count", "left_dirty_truncated"):
+        if k in test:
+            details[k] = test[k]
+    if (test.get("termination") or {}).get("kill_failed"):
+        details["kill_failed"] = True
+    details.update(verify)
+    if test.get("cleanup") or verify.get("cleanup"):
+        # Carbon P1-2: what was cleared right after the test and around the abort, together.
+        details["cleanup"] = _merge_cleanups([c_ for c_ in (test.get("cleanup"), verify.get("cleanup")) if c_])
+    return details
+
+
 def _run_merge_pipeline(plan: Mapping[str, Any]) -> Dict[str, Any]:
     integ = plan["integration"]
     wt = plan["worktree"]
@@ -808,10 +1289,10 @@ def _run_merge_pipeline(plan: Mapping[str, Any]) -> Dict[str, Any]:
             raise _GitFailed("rev-parse branch", cp)
         tip = (cp.stdout or "").strip()
         cp = _git("merge-base --is-ancestor", ["merge-base", "--is-ancestor", tip, "HEAD"], integ)
-        if cp.returncode == 0:
-            return {"outcome": "merged", "noop": True, "pre_head": pre_head, "merge_commit": tip}
-        if cp.returncode != 1:
+        if cp.returncode not in (0, 1):
             raise _GitFailed("merge-base --is-ancestor", cp)
+        if cp.returncode == 0:
+            return _run_noop_merge(plan, integ, tip, pre_head)
 
         cp = _git("merge", ["merge", "--no-ff", "--no-commit", tip], integ, GIT_MERGE_TIMEOUT_S)
         if cp.returncode != 0:
@@ -833,27 +1314,23 @@ def _run_merge_pipeline(plan: Mapping[str, Any]) -> Dict[str, Any]:
 
         tests: Dict[str, Any] = {"tests": "none", "test_log": None}
         if plan.get("test_argv"):
-            test = run_test_step(plan)
-            tests = {"tests": "passed" if test["passed"] else "failed", "test_log": test["log_path"],
-                     "test": {k: v for k, v in test.items() if k != "log_path"}}
+            test, tests = _gated_test_step(plan, integ, pre_head)
             if not test["passed"]:
-                verify = _abort_and_verify(integ, pre_head)
-                tail, tail_cut = log_tail_capped(test["log_path"])
-                details = {"log_path": test["log_path"], "log_tail": tail, "log_tail_truncated": tail_cut,
-                           "timeout": test["timeout"], "timeout_s": test["timeout_s"],
-                           "exit_code": test["exit_code"], "signal": test["signal"]}
-                fails, n_fails = failing_tests(test["log_path"])
-                details.update({"failing_tests": fails, "failing_tests_total": n_fails,
-                                "failing_tests_truncated": n_fails > len(fails)})
-                for k in ("error", "termination", "leftovers", "leftover_scan_uncertain"):
-                    if k in test:
-                        details[k] = test[k]
-                if (test.get("termination") or {}).get("kill_failed"):
-                    details["kill_failed"] = True
-                details.update(verify)
+                verify = _abort_and_verify(integ, pre_head, cleanup=True)
                 return {"outcome": "failed", "reason": "tests_failed", "pre_head": pre_head,
-                        "details": details, **tests}
+                        "details": _test_failure_details(test, verify), **tests}
 
+        try:
+            write_merge_intent(plan["run_dir"], {"v": 1, "task_id": plan["task_id"], "merge_id": plan["merge_id"],
+                                                 "run_id": plan["run_id"], "pre_head": pre_head, "tip": tip})
+        except OSError as exc:
+            # Never commit without a durable intent: a crash after the commit could not be
+            # recognised. The merge is aborted and reported as a failed git step.
+            verify = _abort_and_verify(integ, pre_head)
+            details = {"step": "write merge_intent", "error": f"{type(exc).__name__}: {exc}"}
+            details.update(verify)
+            return {"outcome": "failed", "reason": "git_failed", "pre_head": pre_head, "details": details,
+                    **tests}
         msg = f"Merge mesh task {plan['task_id']}: {plan['title']}"
         cp = _git("commit", ["commit", "--no-edit", "-m", msg], integ, GIT_MERGE_TIMEOUT_S)
         if cp.returncode != 0:
@@ -1204,12 +1681,18 @@ def _branch_tip(integ: str, branch: Optional[str]) -> Optional[str]:
     return (cp.stdout or "").strip() or None
 
 
-def decide_recovery(integ: str, task_id: str, branch: Optional[str], pre_head: Optional[str]) -> Dict[str, Any]:
+def decide_recovery(integ: str, task_id: str, branch: Optional[str], pre_head: Optional[str],
+                    intent: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """§11.7 step 5 git decision for a task left in ``merging``.
 
     - ``MERGE_HEAD`` exists → ``merge --abort`` (then verify) → ``interrupted``;
-    - HEAD is a merge commit whose second parent is the task branch tip
-      and whose message contains the task id → reconcile ``merged``;
+    - a merge commit above the intent's ``pre_head`` whose parents are exactly
+      ``[pre_head, tip]`` of the durable ``merge_intent`` written before the commit
+      (Carbon P1-3: matched by parents, not by message, and independent of where the task
+      branch is now) → reconcile ``merged``. Only when there is no intent (a run made before
+      intents existed, or a crash before it was written) the old rule applies: HEAD is a
+      merge commit whose second parent is the current task branch tip and whose message
+      contains the task id;
     - otherwise → ``interrupted``.
 
     ``pre_head`` is the probe stored by TX1, read before the merge lease was held, so it can
@@ -1230,15 +1713,23 @@ def decide_recovery(integ: str, task_id: str, branch: Optional[str], pre_head: O
             current_pre = true_pre
             if pre_head and pre_head != true_pre:
                 details["recorded_pre_head"] = pre_head
-            details.update(_abort_and_verify(integ, true_pre))
+            # Carbon P1-2: the interrupted merge may have been in its test step; what the test
+            # left in the (Mesh-owned) integration tree is cleared with the abort.
+            details.update(_abort_and_verify(integ, true_pre, cleanup=True))
             return {"outcome": "failed", "reason": "interrupted", "pre_head": true_pre, "details": details}
         head = _head(integ, "rev-parse HEAD")
         current_pre = head
         parents, body = _inspect_head(integ, head)
         tip = _branch_tip(integ, branch)
-        if len(parents) >= 2 and tip is not None and parents[1] == tip and task_id in body:
+        if intent is not None and intent.get("task_id") == task_id:
+            found = _find_intended_merge(integ, intent)
+            if found is not None:
+                return {"outcome": "merged", "noop": False, "pre_head": intent["pre_head"],
+                        "merge_commit": found, "matched_by": "merge_intent",
+                        **({"recorded_pre_head": pre_head} if pre_head and pre_head != intent["pre_head"] else {})}
+        elif len(parents) >= 2 and tip is not None and parents[1] == tip and task_id in body:
             return {"outcome": "merged", "noop": False, "pre_head": parents[0],
-                    "merge_commit": head,
+                    "merge_commit": head, "matched_by": "message",
                     **({"recorded_pre_head": pre_head} if pre_head and pre_head != parents[0] else {})}
         true_pre = head
         if parents and (task_id in body or (tip is not None and tip in parents[1:])):
@@ -1250,6 +1741,13 @@ def decide_recovery(integ: str, task_id: str, branch: Optional[str], pre_head: O
             details["recorded_pre_head"] = pre_head
         current_pre = true_pre
         dirty = _dirty_paths(integ, "verify status")
+        if dirty and head == true_pre:
+            # Carbon P1-2: a noop merge interrupted during its test step leaves the test's
+            # output (no MERGE_HEAD to abort). The integration worktree is Mesh's own and is
+            # clean before every merge, so the tree is put back to the index here too. An
+            # unmatched task commit on HEAD (head_moved) is left alone and reported.
+            details["cleanup"] = _merge_cleanups([restore_worktree_to_index(integ)])
+            dirty = _dirty_paths(integ, "verify status")
         if dirty:
             _capped(details, "dirty_files", dirty)
         details["restored"] = head == true_pre and not dirty
@@ -1291,7 +1789,8 @@ def recover_merging_task(conn: sqlite3.Connection, home: str, task: Mapping[str,
     integ = integration_worktree_path(get_workspaces_root(conn, home), task["project_id"])
     pre_head = mj.get("pre_head")
     if os.path.isdir(integ):
-        result = decide_recovery(integ, task["id"], task["branch"], pre_head)
+        intent = read_merge_intent(os.path.join(home, "merges", mj["mrg"])) if mj.get("mrg") else None
+        result = decide_recovery(integ, task["id"], task["branch"], pre_head, intent)
     else:
         result = {"outcome": "failed", "reason": "interrupted", "pre_head": pre_head,
                   "details": {"integration_missing": True, "restored": None}}
@@ -1317,6 +1816,8 @@ def recover_merging_task(conn: sqlite3.Connection, home: str, task: Mapping[str,
     extra: Dict[str, Any] = {"recovered": True, "reconciled": reconciled}
     if reconciled and result.get("recorded_pre_head"):
         extra["recorded_pre_head"] = result["recorded_pre_head"]
+    if reconciled and result.get("matched_by"):
+        extra["matched_by"] = result["matched_by"]
     if reconciled and run_termination.get("kill_failed"):
         extra["kill_failed"] = True
         extra["kill_failed_pids"] = run_termination.get("pids") or []

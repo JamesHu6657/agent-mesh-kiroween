@@ -14,6 +14,7 @@ from typing import Any, Deque, Dict, List, Optional
 
 import mesh.constants as c
 from mesh.core.authz import can_principal_read_project, can_principal_read_task, check_authz, get_agent_capabilities, lead_run_token_scope
+from mesh.core.clock import now_iso_utc
 from mesh.core.events import record_event
 from mesh.core.redact import redact, redact_value
 from mesh.core.workspaces import compute_lead_workspace_path, get_workspaces_root
@@ -393,6 +394,13 @@ def _prune_skip_reason(ctx: HandlerContext, task: sqlite3.Row) -> Optional[str]:
     """Why a candidate is skipped, or None when it may be pruned."""
     if ctx.conn.execute("SELECT 1 FROM leases WHERE key = ?;", (f"task:{task['id']}",)).fetchone():
         return "lease_held"
+    # Carbon P2-7: a merge running on the same repository (this project or another one
+    # sharing the repo path) owns the shared .git; prune must not race its git writes.
+    from mesh.daemon.merge import merge_in_progress_for_repo
+
+    project = ctx.conn.execute("SELECT repo_path FROM projects WHERE id = ?;", (task["project_id"],)).fetchone()
+    if project is not None and merge_in_progress_for_repo(ctx.conn, project["repo_path"]) is not None:
+        return "merge_in_progress"
     if task["status"] == "cancelled":
         count = _commits_beyond_base(task["workspace_path"], task["base_commit"])
         if count is None:
@@ -572,6 +580,7 @@ def handle_workspace_delete(ctx: HandlerContext) -> HandlerResult:
             project_id=project_id,
             target_id=task_id,
             request_id=ctx.request_id,
+            actor_kind=ctx.actor_kind, via=ctx.via, k_user=ctx.k_user,
         )
 
     if ctx.conn.execute("SELECT 1 FROM leases WHERE key = ?;", (f"task:{task_id}",)).fetchone():
@@ -647,10 +656,18 @@ def handle_run_release(ctx: HandlerContext) -> HandlerResult:
     if not run_id:
         raise _usage("Missing required parameter run_id", "run_id")
     run = _get_run(ctx.conn, run_id)
-    if not ctx.args.get("force_seen_unusable"):
+    force_seen = bool(ctx.args.get("force_seen_unusable"))
+    force_merge = bool(ctx.args.get("force_merge_held"))
+    if force_seen and force_merge:
+        raise _usage("run release takes exactly one of --force-seen-unusable and --force-merge-held",
+                     "force_merge_held")
+    if force_merge:
+        return _release_merge_held(ctx, run)
+    if not force_seen:
         raise _usage(
             "run release only lifts a hold caused by unusable seen state and requires "
-            "--force-seen-unusable (usage: mesh run release <run-id> --force-seen-unusable)",
+            "--force-seen-unusable (usage: mesh run release <run-id> --force-seen-unusable); "
+            "a merge_test run held by the merge close gate needs --force-merge-held instead",
             "force_seen_unusable",
         )
     from mesh.daemon import supervisor
@@ -700,3 +717,97 @@ def handle_run_release(ctx: HandlerContext) -> HandlerResult:
     ctx.effects.append(Effect(kind="seen_release_forced",
                               params={"run_id": run_id, "reason": reason, "actor": actor}))
     return HandlerResult(data={"run_id": run_id, "released": True, "status": "lost", "reason": reason})
+
+
+def _merge_wrapper_alive(run: Any) -> bool:
+    """True while the merge_test run's wrapper process may still be alive (fail closed).
+
+    The identity comes from the DB (``pgid``/``proc_starttime``, recorded by the merge
+    close gate) or ``wrapper.json``. A pid whose starttime differs is a reused pid, not the
+    wrapper. An unreadable ``/proc`` (EACCES/EIO) is unknown, never gone. A run with no
+    recorded identity at all has no known wrapper to wait for.
+    """
+    from mesh.core.proc import get_proc_stat, is_tgid_alive
+    from mesh.daemon import supervisor
+
+    pid, starttime = supervisor.close_identity(run)
+    if not pid or pid <= 1:
+        return False
+    try:
+        info = get_proc_stat(int(pid))
+        if info is None:
+            return False
+        if starttime and int(info["starttime"]) != int(starttime):
+            return False
+        return is_tgid_alive(int(pid), info)
+    except OSError:
+        return True
+
+
+def _release_merge_held(ctx: HandlerContext, run: Any) -> HandlerResult:
+    """`mesh run release <run-id> --force-merge-held --user` (Carbon P2-8).
+
+    The operator path for a ``merge_test`` run that the merge close gate keeps open
+    (:class:`mesh.daemon.merge.MergeRunHeld`): the run stays ``running``, the task stays
+    ``merging`` and ``merge:<prj>`` stays held until the next boot, which the
+    ``--force-seen-unusable`` path (task runs only) cannot lift. Refused unless the run is
+    a ``merge_test`` run that is still open, and while its wrapper process is alive. No
+    process is signalled: occupants of the run's group are the operator's call. The run
+    closes ``lost``, ``merge:<prj>`` is released and ``run.merge_release_forced`` is
+    recorded; after the commit the task is decided exactly as boot recovery would
+    (reconciled ``merged`` when its merge commit is in integration, else ``merge_failed``
+    ``interrupted``), so the project's merge channel is usable again without a restart.
+    """
+    from mesh.daemon.merge import merge_lease_key
+
+    run_id = run["id"]
+    if run["kind"] != "merge_test":
+        raise MeshError(
+            code=c.INVALID_TRANSITION, exit_code=c.EXIT_CONFLICT,
+            message=f"Run '{run_id}' is not a merge_test run; --force-merge-held only releases merge test runs",
+            details={"run_id": run_id, "kind": run["kind"], "reason": "not_merge_test"},
+        )
+    if run["status"] not in ("starting", "running"):
+        raise MeshError(
+            code=c.INVALID_TRANSITION, exit_code=c.EXIT_CONFLICT,
+            message=f"Run '{run_id}' is already closed ({run['status']})",
+            details={"run_id": run_id, "status": run["status"], "reason": "run_not_open"},
+        )
+    if _merge_wrapper_alive(run):
+        raise MeshError(
+            code=c.RUN_STILL_ACTIVE, exit_code=c.EXIT_CONFLICT,
+            message=f"Run '{run_id}': its wrapper process is still alive; wait for it to exit or stop it first",
+            details={"run_id": run_id, "status": run["status"], "reason": "wrapper_alive"},
+        )
+    actor = ctx.principal.get("id")
+    key = merge_lease_key(run["project_id"])
+    if ctx.dry_run:
+        return HandlerResult(data={"run_id": run_id, "released": False, "dry_run": True,
+                                   "lease": key, "task_id": run["task_id"]})
+    now = now_iso_utc()
+    result = {"reason": "merge_release_forced", "actor": actor}
+    ctx.conn.execute(
+        "UPDATE runs SET status = 'lost', end_reason = 'merge_release_forced', ended_at = ?, result_json = ? "
+        "WHERE id = ? AND status IN ('starting', 'running');",
+        (now, json.dumps(result), run_id),
+    )
+    released = ctx.conn.execute("DELETE FROM leases WHERE key = ? AND run_id = ?;", (key, run_id)).rowcount
+    record_event(
+        conn=ctx.conn,
+        type_="run.merge_release_forced",
+        actor_id=actor,
+        actor_kind=ctx.actor_kind,
+        via=ctx.via,
+        relayed_by=ctx.relayed_by,
+        project_id=run["project_id"],
+        task_id=run["task_id"],
+        run_id=run_id,
+        payload={"run_id": run_id, "task_id": run["task_id"], "actor": actor, "lease": key,
+                 "lease_released": bool(released), "previous_status": run["status"]},
+        request_id=ctx.request_id,
+        k_user=ctx.k_user,
+    )
+    if run["task_id"]:
+        ctx.effects.append(Effect(kind="reconcile_merging_task", params={"task_id": run["task_id"]}))
+    return HandlerResult(data={"run_id": run_id, "released": True, "status": "lost", "lease": key,
+                               "lease_released": bool(released), "task_id": run["task_id"]})

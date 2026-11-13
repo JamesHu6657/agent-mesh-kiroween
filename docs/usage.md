@@ -463,6 +463,16 @@ passphrase.** It cannot detect either.
   `mesh run release <run-id> --force-seen-unusable --user` closes the run as `lost` and
   releases its lease without signalling any process (event `run.seen_release_forced`).
   It is user-only and refuses runs that are not held this way.
+- A `merge_test` run that the merge close gate keeps open (its group is still occupied
+  after the test step) holds `merge:<prj>` and leaves the task `merging` until the next
+  boot. Once you have checked the leftover processes yourself,
+  `mesh run release <run-id> --force-merge-held --user` closes that run as `lost`,
+  releases `merge:<prj>` and records `run.merge_release_forced`; the task is then decided
+  as boot recovery would (reconciled `merged` if its merge commit is in integration,
+  otherwise `merge_failed` with reason `interrupted`). It is user-only, only for a
+  `merge_test` run that is still open (otherwise rc 6 `not_merge_test` / `run_not_open`),
+  and refused (rc 6 `RUN_STILL_ACTIVE`, reason `wrapper_alive`) while the run's wrapper
+  process is alive. No process is signalled.
 
 ---
 
@@ -545,9 +555,20 @@ in `--format text` it prints `mesh: merging TSK: running the project's tests if 
 (log: PATH)...` to stderr once the merge has started. (`--no-wait` was left out: the
 merge result, idempotency record and lead notification are tied to the request; a
 second terminal can follow `task show` (status `merging`, `merge.mrg`) and the log.) A successful merge records its commit and `tests:"passed"` or
-`"none"`; a branch already integrated is a no-op and skips tests. Failures notify
+`"none"`; a branch already integrated is a no-op that still runs the tests (failing tests
+make it `merge_failed`) and records the commit that really merged it as `merge_commit`
+(never the task's tip). Failures notify
 the lead. A client disconnect does not cancel a merge. Boot recovery aborts an
-unfinished merge or reconciles an already-created matching merge commit.
+unfinished merge or reconciles an already-created matching merge commit. Before the
+merge commit is made, `(pre_head, tip)` is written to `$MESH_HOME/merges/<mrg>/merge_intent.json`
+and fsynced (no intent, no commit); recovery recognises the merge commit by those
+parents (a commit above `pre_head` with parents exactly `[pre_head, tip]`), not by its
+message, so a `commit-msg` hook or a task branch that moved on cannot hide it. A run
+without an intent file (made before intents existed) falls back to the old rule: a merge
+commit on HEAD whose second parent is the current branch tip and whose message names the
+task. `doctor --check-invariants` (I9) also reports the reverse case: a task that is not
+`merged` (for example cancelled after an unrecognised merge) whose work is already in the
+integration branch, because `project deliver` would hand it to the base branch.
 `project cancel` during a merge is rc 6 with reason `merge_in_progress`.
 
 `task close TSK --superseded-by TSK2` (lead or user) is for an `accepted` or
@@ -559,9 +580,17 @@ state with a `task.closed` event (`superseded_by`, `from_state`, optional `--rea
 state is added, so project completion, deliver, doctor and prune treat it like any
 cancelled task.
 
-Test commands must leave no untracked, non-ignored artifacts in the integration
-worktree, or later merges report `INTEGRATION_DIRTY`. Mesh does not clean those
-files for you. When testing Mesh itself, use only `/tmp/mh-*` homes and fixture
+
+The test command runs in the integration worktree. HEAD, `MERGE_HEAD` and the index are
+compared before and after it: a test that stages anything (`git add`, `git add -N`),
+commits or aborts the merge fails as `TESTS_FAILED` whatever its exit code
+(`details.git_changes`), so nothing it staged enters the merge commit. Afterwards Mesh
+puts the worktree back to the index: untracked, non-ignored files (coverage, junit,
+build output) are removed and tracked files the test rewrote are restored
+(`details.cleanup`), so a test never leaves the project `INTEGRATION_DIRTY`. Ignored
+files are left alone. Mesh never resets or rewinds the integration branch: a test that
+committed is reported (`head_moved`, `restored: false`), and until that work is dealt
+with `project deliver` refuses (below). When testing Mesh itself, use only `/tmp/mh-*` homes and fixture
 repos, never a home or repo inside the Mesh checkout; test commands must not leave
 untracked files in the checkout. `bash scripts/test.sh` uses isolated fixtures.
 
@@ -570,11 +599,21 @@ integration. A checked-out base must have a clean worktree; otherwise Mesh uses 
 compare-and-swap ref update. Divergence is rc 14 `NOT_FAST_FORWARD`, with no base
 change. It never pushes, rebases or forces. The `deliver_to_base` policy defaults to
 `not_required`; if tightened, the lead needs approval and must re-run with
-`--approval <apr>`.
+`--approval <apr>`. While a merge is running on the same repository (the project's own
+`merge:<prj>` lease or a `merging` task, or the same for any other project sharing the
+repo path, compared by realpath), `project deliver` is rc 11 `MERGE_IN_PROGRESS`
+(`details.reason: "merge_in_progress"`, with the merging task and run), before approval
+and with no change; retry after the merge finishes. If the integration branch carries
+work of a code task of the project that is not `merged` (the reverse I9 case above, or a
+test command that committed during its merge), `project deliver` is rc 6
+`INVALID_TRANSITION` (`details.reason: "integrated_unmerged_work"`, with the tasks and
+merge commits), before approval and with no change: merge that task again (a no-op merge
+that re-runs the tests) or repair the integration branch yourself first.
 
 Nothing is deleted automatically. Prune removes only merged code worktrees, or
 cancelled ones with no commits beyond their base. It uses non-forced
-`worktree remove` and `branch -d`, never `-D`; dirty/unsafe candidates are skipped.
+`worktree remove` and `branch -d`, never `-D`; dirty/unsafe candidates are skipped, and so is everything while a merge runs on the same
+repository (`skipped[].reason: "merge_in_progress"`).
 Agents must name `--project` and lead that project; only the user may prune unscoped.
 `workspace delete` requires the `delete` approval for agents (rc 7), or direct user
 authentication. A live task lease blocks it. After checking containment under

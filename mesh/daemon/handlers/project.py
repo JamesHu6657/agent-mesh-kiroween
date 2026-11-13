@@ -614,6 +614,7 @@ def handle_project_set_lead(ctx: HandlerContext) -> HandlerResult:
                 params={"project_id": project_id, "agent": new_lead_name, "reason": reason},
                 project_id=project_id,
                 request_id=ctx.request_id,
+                actor_kind=ctx.actor_kind, via=ctx.via, k_user=ctx.k_user,
             )
 
     # 3. New lead agent validation
@@ -692,6 +693,19 @@ def handle_project_set_lead(ctx: HandlerContext) -> HandlerResult:
     )
     _lead_dir_effect(ctx, project_id, new_lead_id)  # §10.1 lead dir at set-lead (after COMMIT)
 
+    # Withdraw approvals before re-delivering any of the old lead's messages.
+    from mesh.core.approvals import cancel_open_approvals
+    cancelled_approvals = []
+    if old_lead_id:
+        approval_rows = ctx.conn.execute(
+            """SELECT * FROM approvals WHERE project_id=? AND (
+               (requested_by=? AND status IN ('pending','approved')) OR
+               (relayed_by=? AND decided_via='relayed' AND status='approved'))""",
+            (project_id, old_lead_id, old_lead_id)).fetchall()
+        cancelled_approvals = cancel_open_approvals(
+            ctx.conn, approval_rows, ctx.principal["id"], ctx.actor_kind, ctx.via,
+            "lead_changed", ctx.request_id, ctx.relayed_by, ctx.k_user)
+
     # Step 3: Mark old lead's pending outbox messages for this project superseded and re-create them for new lead.
     # 'delivering' rows belong to the old lead's running turn, which is terminated below:
     # they are superseded too, so its termination cannot put them back to 'pending'.
@@ -709,6 +723,11 @@ def handle_project_set_lead(ctx: HandlerContext) -> HandlerResult:
             (old_lead_id, project_id),
         )
         for msg in old_messages:
+            if msg["type"].startswith("approval."):
+                ev = ctx.conn.execute("SELECT approval_id FROM events WHERE seq=?",
+                                      (msg["event_seq"],)).fetchone()
+                if ev and ev["approval_id"] in cancelled_approvals:
+                    continue
             new_msg_id = generate_id("msg")
             target_channel = "lead_wake" if new_lead_delivery == "launch" else "inbox"
             new_dedup = f"{msg['type']}:{project_id}:{msg['event_seq']}:{new_asg_id}"
@@ -744,13 +763,7 @@ def handle_project_set_lead(ctx: HandlerContext) -> HandlerResult:
             ctx.effects.append(Effect("terminate_lead_turn",
                                       {"run_id": trow["id"], "end_reason": "lead_superseded"}))
 
-    # Step 4: Cancel pending approvals requested by old lead (checklist E10)
-    if old_lead_id:
-        ctx.conn.execute(
-            """UPDATE approvals SET status = 'cancelled'
-               WHERE requested_by = ? AND project_id = ? AND status = 'pending';""",
-            (old_lead_id, project_id),
-        )
+    # Step 4: approvals were already cancelled before copying outbox messages.
 
     # Step 5: Emit project.lead_changed event
     event = record_event(
@@ -875,6 +888,7 @@ def handle_project_set_lead(ctx: HandlerContext) -> HandlerResult:
             "old_lead": old_lead_name,
             "new_lead": new_lead_name,
             "assignment_id": new_asg_id,
+            "cancelled_approvals": cancelled_approvals,
         }
     )
 
@@ -959,6 +973,7 @@ def handle_project_pause(ctx: HandlerContext) -> HandlerResult:
                 project_id=project_id,
                 target_id=project_id,
                 request_id=ctx.request_id,
+                actor_kind=ctx.actor_kind, via=ctx.via, k_user=ctx.k_user,
             )
 
     now = now_iso_utc()
@@ -1061,6 +1076,7 @@ def handle_project_resume(ctx: HandlerContext) -> HandlerResult:
                 project_id=project_id,
                 target_id=project_id,
                 request_id=ctx.request_id,
+                actor_kind=ctx.actor_kind, via=ctx.via, k_user=ctx.k_user,
             )
 
     now = now_iso_utc()
@@ -1172,6 +1188,7 @@ def handle_project_cancel(ctx: HandlerContext) -> HandlerResult:
                 project_id=project_id,
                 target_id=project_id,
                 request_id=ctx.request_id,
+                actor_kind=ctx.actor_kind, via=ctx.via, k_user=ctx.k_user,
             )
 
     now = now_iso_utc()
@@ -1218,11 +1235,13 @@ def handle_project_cancel(ctx: HandlerContext) -> HandlerResult:
         )
         emit_dependents_blocked(ctx.conn, trow["id"], ctx.request_id)
 
-    # Cancel pending approvals
-    ctx.conn.execute(
-        "UPDATE approvals SET status = 'cancelled' WHERE project_id = ? AND status = 'pending';",
-        (project_id,),
-    )
+    from mesh.core.approvals import cancel_open_approvals
+    cancel_open_approvals(
+        ctx.conn, ctx.conn.execute(
+            "SELECT * FROM approvals WHERE project_id=? AND status IN ('pending','approved')",
+            (project_id,)).fetchall(),
+        ctx.principal["id"], ctx.actor_kind, ctx.via, "project_cancelled",
+        ctx.request_id, ctx.relayed_by, ctx.k_user)
 
     record_event(
         conn=ctx.conn,
@@ -1287,6 +1306,41 @@ def handle_project_deliver(ctx: HandlerContext) -> HandlerResult:
             details={"param": "project_id", "reason": "no_repo", "project_id": project_id},
         )
 
+    # Carbon P2-7: never deliver while a merge runs on the same repository (this project or
+    # another one sharing the repo path): the merge commit may exist in git before the
+    # database records it. rc 11, before approval, with no mutation.
+    from mesh.daemon.merge import merge_in_progress_for_repo
+
+    busy = merge_in_progress_for_repo(ctx.conn, row["repo_path"])
+    if busy is not None:
+        raise MeshError(
+            code=c.MERGE_IN_PROGRESS,
+            exit_code=c.EXIT_BUSY,
+            message=f"Cannot deliver project '{project_id}': a merge is in progress on its repository",
+            details={"project_id": project_id, "reason": "merge_in_progress",
+                     "merge_project_id": busy["project_id"], "task_id": busy["task_id"],
+                     "merge_run_id": busy["run_id"], "lease": busy["lease"]},
+        )
+
+    # Carbon P1-2 / P1-3: never deliver work nobody merged. A code task of this project that
+    # is not `merged` but whose own commits are already in the integration branch (a test
+    # command that committed during its merge, a crash the recovery could not reconcile)
+    # would reach the base branch with this delivery. Same check as `doctor
+    # --check-invariants` (reverse I9); rc 6, before approval, with no mutation.
+    from mesh.core.invariants import check_i9_integrated_unmerged_tasks
+
+    unmerged = check_i9_integrated_unmerged_tasks(ctx.conn, project_id)
+    if unmerged:
+        raise MeshError(
+            code=c.INVALID_TRANSITION,
+            exit_code=c.EXIT_CONFLICT,
+            message=(f"Cannot deliver project '{project_id}': the integration branch carries work of "
+                     f"tasks that are not merged ({', '.join(v.details['task_id'] for v in unmerged)})"),
+            details={"project_id": project_id, "reason": "integrated_unmerged_work",
+                     "tasks": [{"task_id": v.details["task_id"], "status": v.details["status"],
+                                "merge_commit": v.details["merge_commit"]} for v in unmerged]},
+        )
+
     # Approval gate (§7.4): `deliver_to_base` defaults to `not_required`.
     policy = get_approval_policy(ctx.conn, "deliver_to_base")
     if policy != "not_required":
@@ -1329,6 +1383,7 @@ def handle_project_deliver(ctx: HandlerContext) -> HandlerResult:
                 project_id=project_id,
                 target_id=project_id,
                 request_id=ctx.request_id,
+                actor_kind=ctx.actor_kind, via=ctx.via, k_user=ctx.k_user,
             )
 
     base = row["base_branch"]
@@ -1483,6 +1538,7 @@ def handle_project_update(ctx: HandlerContext) -> HandlerResult:
                 project_id=project_id,
                 target_id=project_id,
                 request_id=ctx.request_id,
+                actor_kind=ctx.actor_kind, via=ctx.via, k_user=ctx.k_user,
             )
 
     now = now_iso_utc()

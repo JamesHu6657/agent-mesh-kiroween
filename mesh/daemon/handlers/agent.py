@@ -527,6 +527,12 @@ def handle_agent_update(ctx: HandlerContext) -> HandlerResult:
     can_lead = row["can_lead"]
     if "can_lead" in ctx.args and ctx.args["can_lead"] is not None:
         can_lead = 1 if ctx.args["can_lead"] else 0
+        if not can_lead and ctx.conn.execute(
+                "SELECT 1 FROM lead_assignments WHERE agent_id=? AND ended_at IS NULL",
+                (row["id"],)).fetchone():
+            raise MeshError(code=c.INVALID_TRANSITION, exit_code=c.EXIT_CONFLICT,
+                            message="Hand over active projects before revoking can_lead",
+                            details={"reason": "active_lead"})
 
     capabilities = json.loads(row["capabilities_json"])
     if "capabilities" in ctx.args and ctx.args["capabilities"] is not None:

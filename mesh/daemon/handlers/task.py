@@ -431,6 +431,7 @@ def _validate_assignment_guards(
                     params=ctx.args,
                     project_id=project_id,
                     request_id=ctx.request_id,
+                    actor_kind=ctx.actor_kind, via=ctx.via, k_user=ctx.k_user,
                 )
 
     return agent, resolved_profile, resolved_model, resolved_effort
@@ -1306,6 +1307,7 @@ def handle_task_reassign(ctx: HandlerContext) -> HandlerResult:
                     params=ctx.args,
                     project_id=project_id,
                     request_id=ctx.request_id,
+                    actor_kind=ctx.actor_kind, via=ctx.via, k_user=ctx.k_user,
                 )
 
     # Validate assignment guards for new assignee
@@ -1509,6 +1511,7 @@ def handle_task_retry(ctx: HandlerContext) -> HandlerResult:
                     params=ctx.args,
                     project_id=project_id,
                     request_id=ctx.request_id,
+                    actor_kind=ctx.actor_kind, via=ctx.via, k_user=ctx.k_user,
                 )
 
     # Validate model and effort overrides
@@ -2700,6 +2703,7 @@ def handle_task_reject(ctx: HandlerContext) -> HandlerResult:
                     params=ctx.args,
                     project_id=project_id,
                     request_id=ctx.request_id,
+                    actor_kind=ctx.actor_kind, via=ctx.via, k_user=ctx.k_user,
                 )
 
     now = now_iso_utc()
