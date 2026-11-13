@@ -25,7 +25,7 @@ from mesh.core.auth import (
     parse_kdf_params,
     verify_user_passphrase,
 )
-from mesh.core.authz import ADAPTER_CMDS, UNAUTH_CMDS, check_authz
+from mesh.core.authz import ADAPTER_CMDS, ROSTER_READ_CMDS, UNAUTH_CMDS, check_authz
 from mesh.core.canonical import canonical_json
 from mesh.core.clock import now_iso_utc, now_monotonic
 from mesh.core.db import connect_db
@@ -96,6 +96,7 @@ from mesh.daemon.handlers.task import (
     prepare_task_submit_git,
     handle_task_assign,
     handle_task_cancel,
+    handle_task_close,
     handle_task_create,
     handle_task_escalate,
     handle_task_fail,
@@ -128,7 +129,7 @@ from mesh.daemon.handlers.run import (
     handle_workspace_delete,
     handle_workspace_show,
 )
-from mesh.daemon.scheduler import run_scheduler_tick
+from mesh.daemon.scheduler import _sweep_error, reset_scheduler_errors, run_scheduler_tick, scheduler_errors_view
 from mesh.core.policy import parse_positive_int
 from mesh.core.redact import redact, redact_value
 from mesh.core.settings import validate_setting
@@ -200,6 +201,7 @@ INTERNAL_REQUEST_HANDLERS: Dict[str, Callable[[HandlerContext], HandlerResult]] 
     "task.retry": handle_task_retry,
     "task.escalate": handle_task_escalate,
     "task.cancel": handle_task_cancel,
+    "task.close": handle_task_close,
     "dep.add": handle_dep_add,
     "dep.remove": handle_dep_remove,
     "project.note": handle_project_note,
@@ -485,7 +487,7 @@ class DaemonServer:
                     self.start_queued_lead_merges()
                     await self.notify_waiters()
             except Exception as e:
-                self.log_error(f"Scheduler tick failed in loop: {e}")
+                _sweep_error(self.home, "tick", e)
             self._maybe_reap()
             if not self._scheduler_wake:
                 break
@@ -644,6 +646,7 @@ class DaemonServer:
     def record_boot(self) -> None:
         """Insert boots table row and mark previous active boots crashed."""
         self.boot_id = new_id("boot")
+        reset_scheduler_errors(self.home)
         now = now_iso_utc()
         with self.db_conn:
             self.db_conn.execute("BEGIN IMMEDIATE;")
@@ -1263,7 +1266,8 @@ class DaemonServer:
             # User-only operations per plan §7.3: config.*, agent.*, audit.*
             # Any agent credential (with or without --relayed, with or without relay capability) gets exit 4 CAPABILITY_MISSING
             if cmd.startswith("config.") or cmd.startswith("agent.") or cmd.startswith("audit."):
-                if actor_kind != "user":
+                if actor_kind != "user" and not (cmd in ROSTER_READ_CMDS and actor_kind == "agent"
+                                                 and not req.get("relayed")):
                     raise MeshError(
                         code=c.CAPABILITY_MISSING,
                         exit_code=c.EXIT_FORBIDDEN,
@@ -1330,14 +1334,9 @@ class DaemonServer:
                     db_conn=self.db_conn,
                 )
             elif cmd == "agent.create":
-                if "max_concurrency" not in args:
-                    raise MeshError(
-                        code=c.INVALID_ARGUMENT,
-                        exit_code=c.EXIT_USAGE,
-                        message="Field 'max_concurrency' is required",
-                        details={"param": "max_concurrency"},
-                    )
-                parse_positive_int(args["max_concurrency"], "max_concurrency")
+                # Absent: 1 (the handler applies the default). Present (even null): validated.
+                if "max_concurrency" in args:
+                    parse_positive_int(args["max_concurrency"], "max_concurrency")
             elif cmd == "agent.update":
                 if args.get("max_concurrency") is not None:
                     parse_positive_int(args["max_concurrency"], "max_concurrency")
@@ -1496,7 +1495,7 @@ class DaemonServer:
                     try:
                         run_scheduler_tick(self.db_conn, self.home, testing_mode=self.testing_mode)
                     except Exception as e:
-                        self.log_error(f"Scheduler tick failed post-merge: {e}")
+                        _sweep_error(self.home, "tick_post_merge", e)
                     self.start_queued_lead_merges()
                     self.wake_scheduler()
                     await self.notify_waiters()
@@ -1531,6 +1530,7 @@ class DaemonServer:
                         "active_streams": self.active_streams,
                         "active_waits": self.active_waits,
                         "kill_failed_runs": _kill_failed_runs(),
+                        "scheduler": scheduler_errors_view(),
                     }
                     res = handle_daemon_status(ctx, daemon_info)
                 elif cmd == "daemon.stop":
@@ -1653,6 +1653,8 @@ class DaemonServer:
                     res = handle_task_list(ctx)
                 elif cmd == "task.cancel":
                     res = handle_task_cancel(ctx)
+                elif cmd == "task.close":
+                    res = handle_task_close(ctx)
                 elif cmd == "task.start":
                     res = handle_task_start(ctx)
                 elif cmd == "task.heartbeat":
@@ -1683,7 +1685,7 @@ class DaemonServer:
                     raise MeshError(
                         code=c.NOT_IMPLEMENTED_IN_M1,
                         exit_code=c.EXIT_USAGE,
-                        message=f"Command '{cmd}' is not implemented in M1.4",
+                        message=f"Command '{cmd}' is not available in this version of Agent Mesh",
                         details=details,
                     )
                 else:
@@ -1746,7 +1748,7 @@ class DaemonServer:
                         try:
                             run_scheduler_tick(self.db_conn, self.home, testing_mode=self.testing_mode)
                         except Exception as e:
-                            self.log_error(f"Scheduler tick failed post-commit: {e}")
+                            _sweep_error(self.home, "tick_post_commit", e)
                         self.start_queued_lead_merges()
                         self.wake_scheduler()
                         await self.notify_waiters()

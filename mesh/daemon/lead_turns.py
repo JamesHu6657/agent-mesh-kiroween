@@ -439,7 +439,8 @@ def lead_launch_check(conn: sqlite3.Connection, adapter: Any, testing_mode: bool
     ev = effective_launch(conn, adapter, testing_mode, binary_path)
     if not ev.ok:
         raise AdapterUnsupported(
-            f"Adapter '{adapter.id}' is not launch-enabled in this milestone",
+            f"Adapter '{adapter.id}' is not enabled for launch"
+            + (f" ({ev.reason})" if ev.reason else ""),
             milestone=getattr(ev, "milestone", None) or adapter.launch_milestone or "M3",
             reason=ev.reason,
         )
@@ -452,7 +453,7 @@ VENDOR_LEAD_REFUSED_REASON = "vendor_lead_m3_lite"
 def vendor_lead_refused(adapter: Any) -> AdapterUnsupported:
     """The rc 13 error for a vendor lead turn in M3-lite (`details.reason` set)."""
     exc = AdapterUnsupported(
-        f"Adapter '{adapter.id}' cannot run lead turns in M3-lite (vendor lead turns are off)",
+        f"Adapter '{adapter.id}' cannot run launch-mode lead turns (vendor lead turns are off; use an inbox lead)",
         milestone="M3",
     )
     exc.details["reason"] = VENDOR_LEAD_REFUSED_REASON

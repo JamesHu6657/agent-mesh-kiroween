@@ -9,4 +9,4 @@ Scope (James 2026-11-12 21:04): M4 is polish only, with no new features. The pla
   - Result: **pass**. Task `submitted`, deliverable summary "Replied with MESH_SMOKE_OK as instructed…", argv has `--model claude-haiku-5.5` and `--trust-tools=` (readonly), exit 0, end_reason `exited`. It ran in about 5 s.
   - Record: `tests/smoke/results/e2e-N13-kiro-3.1.0-run_a1cfe019a5dgqkf4tu7kwjs7sf.json` plus fixtures under `tests/fixtures/real/kiro/3.1.0/` (promoted with `python3 -m tests.tierlib promote`).
   - Kiro usage (tokscale): claude-haiku-5.5 went from 12,896 to 26,576 tokens (+13,680), cost under $0.01. A first attempt with `MESH_SMOKE_OUT=/tmp/kn13` was refused by `load_config` before any run (it has to be under `/tmp/mh-*`), so no model run was spent there.
-  - Note: the prompt is passed without `--` (known P3 from M3, being fixed in a helper agent's m4-p3-cleanup).
+  - Note: the prompt is passed without `--` (known P3 from M3, being fixed in Worker 2's m4-p3-cleanup).

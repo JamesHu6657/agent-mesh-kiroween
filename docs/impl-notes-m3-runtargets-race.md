@@ -1,8 +1,8 @@
-# m3-runtargets-race: env-read race in run_targets (a helper agent, 2026-11-10)
+# m3-runtargets-race: env-read race in run_targets (Worker 2, 2026-11-10)
 
 ## The race
 
-A reviewer measured on helper-box (gVisor) that reading `/proc/<pid>/environ`
+A reviewer measured on box2 (gVisor) that reading `/proc/<pid>/environ`
 right after `Popen` returned missed `MESH_RUN_ID` in **92/200** cases.
 `get_proc_environ` then returns `{}`, so "not visible yet" looked like
 "readable, no MESH_RUN_ID" and `run_targets` skipped the process.
@@ -18,7 +18,7 @@ Head before the round: 09f0a1e. Main (with #12, fdd550d) merged in first.
   of now), has meshd's own uid, and is not a kernel thread (pid 2, PPid 2, or
   `PF_KTHREAD` in `/proc/<pid>/stat` field 9). The cmdline is no longer consulted:
   in most real misses it is empty too (Q4).
-- Other-user processes (environ unreadable forever; 29 on helper-box) and old
+- Other-user processes (environ unreadable forever; 29 on box2) and old
   processes are never UNKNOWN, so they cost one stat + one environ read per scan,
   as before the PR (Q2).
 - `run_targets` makes **one** pass over /proc and never sleeps. The 30 ms in-call
@@ -123,7 +123,7 @@ No vendor CLI was run; no secrets.
 
 ## Round 2 (review #20b: Linear REVISE + Quest REVISE on bf78bec), Quest coder
 
-Taken over from a helper agent; branch merged with main `adebc01` (clean).
+Taken over from Worker 2; branch merged with main `adebc01` (clean).
 
 Two-scan rule kept: no single-scan "done" (both reviews, with evidence: pid hopper
 311/400 empty single scans with no UNKNOWN pid; exec storm 22/81).
@@ -179,7 +179,7 @@ caller passes `unknown`.
 confirmation is due (`supervisor.next_exit_check_in`), not a fixed 200 ms beat, so a
 clean exit closes POLL_S after the first empty scan instead of up to 2 x POLL_S.
 New handoff/merge tests patch `terminate.POLL_S` down where they wait on it.
-Full `scripts/test.sh` on base (Devbox, same window, box slower than when main
+Full `scripts/test.sh` on base (HostA, same window, box slower than when main
 measured 446 s): this branch 477 s (unit 61.9 / integration 378.2 / recovery 36.5;
 634 / 280 / 49 tests); main adebc01 right after it 515 s (56.9 / 419.8 / 38.0);
 m3-r7d (main + small) shortly before 475 s. The PR's cost is within the box's

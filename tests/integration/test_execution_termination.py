@@ -283,11 +283,17 @@ class TestTermination(TerminationBase):
     def test_c15_python_isolation_flags(self) -> None:
         """ACC: C15 - shadow mesh/ in the workspace: wrapper cmdline has -P -s -m mesh.runwrap, shadow file never written, attempt 2 fails exit_nonzero."""
         shadow = self.pid_file("acc-shadow")
+        # Attempt 2 must still be running when its cmdline is read: it waits for a release
+        # file (absent then) instead of a 2 s sleep that can end first on a loaded host.
+        # Attempt 1 finds the file already there and fails at once.
+        release = self.pid_file("acc-c15-release")
+        open(release, "w").close()
         spec = ('FAKE {"steps": [{"write_file": {"path": "mesh/__init__.py", "content": ""}}, '
                 '{"write_file": {"path": "mesh/runwrap.py", "content": "open(\'%s\',\'w\')"}}, '
-                '{"sleep": {"seconds": 2}}, {"fail": {}}]}' % shadow)
+                '{"wait_release": {"path": "%s"}}, {"fail": {}}]}' % (shadow, release))
         task_id = self.create_task(spec)
         self.wait_status(task_id, "failed", timeout=30.0)
+        os.unlink(release)
         rc, resp = self.harness.cli("task", "retry", task_id, token=self.tok_lead1)
         self.assertEqual(rc, 0, resp)
         self.assertTrue(self.harness.wait_for(
@@ -296,6 +302,7 @@ class TestTermination(TerminationBase):
         with open(f"/proc/{run2['wrapper_pid']}/cmdline", "rb") as f:
             cmdline = f.read().replace(b"\0", b" ").decode()
         self.assertIn("-P -s -m mesh.runwrap", cmdline)
+        open(release, "w").close()
         self.wait_status(task_id, "failed", timeout=30.0)
         self.assertFalse(os.path.exists(shadow))
         failure = json.loads(self.q1("SELECT failure_json FROM tasks WHERE id = ?;", (task_id,))["failure_json"])

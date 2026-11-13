@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import shlex
 import sqlite3
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -22,12 +23,13 @@ from mesh.core.approvals import (
 )
 from mesh.core.authz import check_authz, get_agent_capabilities, is_project_lead, lead_run_token_scope
 from mesh.core.clock import now_iso_utc, parse_duration
-from mesh.core.events import record_event
+from mesh.core.events import last_rejection, record_event
 from mesh.core.ids import generate_id
-from mesh.core.leases import get_lease_ttl_s, verify_task_lease_and_fence
-from mesh.core.states import check_task_transition, is_task_terminal
+from mesh.core.leases import check_run_session, get_lease_ttl_s, verify_task_lease_and_fence, remember_run_session
+from mesh.core.states import TASK_STATES, check_task_transition, is_task_terminal
 from mesh.core.db import transaction
 from mesh.core.repos import submission_git_info
+from mesh.core.token_roots import remember_protected_path
 from mesh.core.workspaces import (
     WorkspaceError,
     compute_task_workspace_path,
@@ -36,7 +38,7 @@ from mesh.core.workspaces import (
     run_code_workspace_plan,
 )
 from mesh.daemon.handlers.base import Effect, HandlerContext, HandlerResult
-from mesh.daemon.scheduler import compute_queue_info, fail_queued_task_t6, promote_tasks
+from mesh.daemon.scheduler import ack_window_now, compute_queue_info, fail_queued_task_t6, promote_tasks
 from mesh.errors import MeshError
 
 PROFILE_RANKS: Dict[str, int] = {
@@ -46,6 +48,33 @@ PROFILE_RANKS: Dict[str, int] = {
     "elevated": 3,
     "unrestricted": 4,
 }
+
+
+def heartbeat_every_s(lease_ttl_s: int) -> int:
+    """Recommended heartbeat interval: a third of the lease TTL, so two beats can be
+    missed before the lease expires."""
+    return max(1, int(lease_ttl_s) // 3)
+
+
+def _lease_timing(lease_ttl_s: int, expires_at: Optional[str], timeout_s: Any,
+                  heartbeat_at: Optional[str] = None) -> Dict[str, Any]:
+    """Lease/deadline facts an inbox worker needs to keep its run alive.
+
+    An inbox (external) run has no daemon-enforced deadline: it ends when the worker
+    submits/fails or when the lease expires. ``timeout_s`` is the task's time budget
+    (what a launch run would be killed at), reported for planning only.
+    """
+    info: Dict[str, Any] = {
+        "lease_ttl_s": lease_ttl_s,
+        "lease_expires_at": expires_at,
+        "heartbeat_every_s": heartbeat_every_s(lease_ttl_s),
+        "timeout_s": timeout_s,
+        "deadline_at": None,
+        "deadline_enforced": False,
+    }
+    if heartbeat_at:
+        info["last_heartbeat_at"] = heartbeat_at
+    return info
 
 
 def _get_task(conn: sqlite3.Connection, task_id: str) -> sqlite3.Row:
@@ -117,24 +146,31 @@ def _format_task(
             """SELECT seq, ts, type, reason, payload_json
                FROM events
                WHERE task_id = ?
-                 AND type IN ('task.failed', 'task.rejected', 'task.retried', 'task.reassigned', 'task.escalated')
+                 AND type IN ('task.failed', 'task.rejected', 'task.retried', 'task.reassigned', 'task.escalated',
+                              'task.lease_expired', 'task.closed')
                ORDER BY seq ASC;""",
             (row["id"],),
         )
         for erow in cur_ev.fetchall():
             att = None
+            pld = {}
             if erow["payload_json"]:
                 try:
                     pld = json.loads(erow["payload_json"])
                     att = pld.get("attempt")
                 except Exception:
-                    pass
-            history.append({
+                    pld = {}
+            item = {
                 "ts": erow["ts"],
                 "type": erow["type"],
                 "reason": erow["reason"],
                 "attempt": att,
-            })
+            }
+            if erow["type"] == "task.lease_expired":
+                item.update({k: pld.get(k) for k in ("run_id", "fence", "holder", "task_status")})
+            elif erow["type"] == "task.closed":
+                item.update({k: pld.get(k) for k in ("superseded_by", "from_state")})
+            history.append(item)
 
     return {
         "id": row["id"],
@@ -167,6 +203,9 @@ def _format_task(
         "submitted_at": submitted_at,
         "failure": failure,
         "merge": merge,
+        "last_rejection": last_rejection(conn, row["id"]) if conn is not None else None,
+        "superseded_by": (superseded_by(conn, row["id"]) if conn is not None and row["status"] == "cancelled"
+                          else None),
         "created_by": row["created_by"],
         "version": row["version"],
         "created_at": row["created_at"],
@@ -345,7 +384,7 @@ def _validate_assignment_guards(
         ev = effective_launch(ctx.conn, adapter, ctx.testing_mode, agent["binary_path"])
         if not ev.ok:
             raise AdapterUnsupported(
-                f"Adapter '{agent['adapter']}' is not launch-enabled in this milestone"
+                f"Adapter '{agent['adapter']}' is not enabled for launch"
                 + (f" ({ev.reason})" if ev.reason else ""),
                 milestone=ev.milestone or adapter.launch_milestone or "M3",
                 reason=ev.reason,
@@ -806,7 +845,30 @@ def handle_task_show(ctx: HandlerContext) -> HandlerResult:
     )
     depended_on_by = [r["task_id"] for r in cur_dep_by.fetchall()]
 
-    return HandlerResult(data=_format_task(row, conn=ctx.conn, depends_on=depends_on, depended_on_by=depended_on_by))
+    data = _format_task(row, conn=ctx.conn, depends_on=depends_on, depended_on_by=depended_on_by)
+    live = _live_run_for_viewer(ctx, row)
+    if live is not None:
+        data["live_run"] = live
+    return HandlerResult(data=data)
+
+
+def _live_run_for_viewer(ctx: HandlerContext, task: sqlite3.Row) -> Optional[Dict[str, Any]]:
+    """The live inbox run's lease timing, for the assignee (and the user) only.
+
+    Only an agent-held (inbox) lease is shown: a launch run's lease is renewed by meshd.
+    """
+    if task["status"] != "running":
+        return None
+    viewer = (ctx.principal or {}).get("id")
+    if ctx.actor_kind != "user" and viewer != task["assignee_agent_id"]:
+        return None
+    lease = ctx.conn.execute("SELECT * FROM leases WHERE key = ?;", (f"task:{task['id']}",)).fetchone()
+    if lease is None or lease["holder_kind"] != "agent":
+        return None
+    live: Dict[str, Any] = {"run_id": lease["run_id"], "fence": lease["fence"]}
+    live.update(_lease_timing(get_lease_ttl_s(ctx.conn), lease["expires_at"], task["timeout_s"],
+                              heartbeat_at=lease["heartbeat_at"]))
+    return live
 
 
 def handle_task_list(ctx: HandlerContext) -> HandlerResult:
@@ -833,8 +895,16 @@ def handle_task_list(ctx: HandlerContext) -> HandlerResult:
 
     status = ctx.args.get("status")
     if status:
-        query += " AND t.status = ?"
-        params.append(status)
+        # One status or a comma list (`--status submitted,accepted`).
+        wanted = [s.strip() for s in str(status).split(",") if s.strip()]
+        unknown = [s for s in wanted if s not in TASK_STATES]
+        if unknown or not wanted:
+            raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
+                            message=f"--status: unknown task status {', '.join(unknown) or repr(status)}; "
+                                    f"valid: {', '.join(TASK_STATES)} (comma-separate several)",
+                            details={"param": "status", "unknown": unknown, "valid": list(TASK_STATES)})
+        query += " AND t.status IN (" + ",".join("?" * len(wanted)) + ")"
+        params.extend(wanted)
 
     assignee = ctx.args.get("assignee")
     if assignee:
@@ -951,6 +1021,113 @@ def handle_task_cancel(ctx: HandlerContext) -> HandlerResult:
         events=["task.cancelled"],
         transitions=[{"entity": "task", "id": task_id, "from": task["status"], "to": "cancelled"}],
     )
+
+
+def handle_task_close(ctx: HandlerContext) -> HandlerResult:
+    """Close an accepted / merge_failed code task whose work landed through another task.
+
+    `task close TSK --superseded-by TSK2`: TSK goes to the terminal `cancelled` state (no
+    new state, so project completion, doctor and deliver keep working) with a
+    `task.closed` event that links TSK2; `task show` prints `superseded_by`. The branch
+    and worktree are kept. Only for a lead or the user (same rule as `task cancel`).
+    """
+    task_id = ctx.args.get("task_id")
+    other_id = ctx.args.get("superseded_by")
+    note = (ctx.args.get("reason") or "").strip() or None
+    if not task_id:
+        raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="Missing required parameter task_id",
+                        details={"param": "task_id"})
+    if not other_id:
+        raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
+                        message="--superseded-by TASK is required (the task whose merge landed this work)",
+                        details={"param": "superseded_by"})
+    task = _get_task(ctx.conn, task_id)
+    project_id = task["project_id"]
+    check_authz(ctx.conn, "task.cancel", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id,
+                task_id=task_id)
+    if other_id == task_id:
+        raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="A task cannot supersede itself",
+                        details={"param": "superseded_by", "task_id": task_id})
+    if task["status"] not in ("accepted", "merge_failed") or task["kind"] != "code":
+        raise MeshError(
+            code=c.INVALID_TRANSITION,
+            exit_code=c.EXIT_CONFLICT,
+            message=(f"Only an accepted or merge_failed code task can be closed as superseded; task '{task_id}' "
+                     f"is a {task['kind']} task in '{task['status']}'. Use `mesh task cancel` otherwise."),
+            details={"task_id": task_id, "status": task["status"], "kind": task["kind"],
+                     "allowed": ["accepted", "merge_failed"]},
+        )
+    other = ctx.conn.execute("SELECT id, project_id, status FROM tasks WHERE id = ?;", (other_id,)).fetchone()
+    if other is None or other["project_id"] != project_id:
+        raise MeshError(c.NOT_FOUND, exit_code=c.EXIT_NOT_FOUND,
+                        message=f"--superseded-by: task '{other_id}' not found in project '{project_id}'",
+                        details={"param": "superseded_by", "task_id": other_id, "project_id": project_id})
+    if other["status"] != "merged":
+        raise MeshError(
+            code=c.INVALID_TRANSITION,
+            exit_code=c.EXIT_CONFLICT,
+            message=(f"--superseded-by: task '{other_id}' is '{other['status']}', not merged; close '{task_id}' "
+                     f"after the other task's merge has landed."),
+            details={"param": "superseded_by", "task_id": other_id, "status": other["status"]},
+        )
+    open_deps = ctx.conn.execute(
+        """SELECT t.id FROM tasks t JOIN task_deps td ON t.id = td.task_id
+           WHERE td.depends_on_task_id = ? AND t.status NOT IN ('merged', 'cancelled')
+             AND NOT (t.kind = 'general' AND t.status = 'accepted') ORDER BY t.id;""",
+        (task_id,),
+    ).fetchall()
+    if open_deps:
+        ids = [r["id"] for r in open_deps]
+        raise MeshError(
+            code=c.INVALID_TRANSITION,
+            exit_code=c.EXIT_CONFLICT,
+            message=(f"Task '{task_id}' has open dependents ({', '.join(ids)}); a closed task never satisfies a "
+                     f"dependency. Point them at '{other_id}' first (`mesh dep remove` / `mesh dep add`)."),
+            details={"task_id": task_id, "dependents": ids, "superseded_by": other_id},
+        )
+    check_task_transition(task["status"], "cancelled")
+
+    now = now_iso_utc()
+    _supersede_offers(ctx.conn, task)
+    ctx.conn.execute(
+        "UPDATE tasks SET status = 'cancelled', updated_at = ?, version = version + 1 WHERE id = ?;",
+        (now, task_id),
+    )
+    payload = {"task_id": task_id, "project_id": project_id, "superseded_by": other_id,
+               "from_state": task["status"], "branch": task["branch"], "note": note}
+    record_event(
+        conn=ctx.conn,
+        type_="task.closed",
+        actor_id=ctx.principal["id"],
+        actor_kind=ctx.actor_kind,
+        via=ctx.via,
+        relayed_by=ctx.relayed_by,
+        project_id=project_id,
+        task_id=task_id,
+        from_state=task["status"],
+        to_state="cancelled",
+        reason="superseded",
+        payload=payload,
+        request_id=ctx.request_id,
+        k_user=ctx.k_user,
+    )
+    updated_row = _get_task(ctx.conn, task_id)
+    return HandlerResult(
+        data=_format_task(updated_row, conn=ctx.conn),
+        events=["task.closed"],
+        transitions=[{"entity": "task", "id": task_id, "from": task["status"], "to": "cancelled"}],
+    )
+
+
+def superseded_by(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    row = conn.execute("SELECT payload_json FROM events WHERE task_id = ? AND type = 'task.closed' "
+                       "ORDER BY seq DESC LIMIT 1;", (task_id,)).fetchone()
+    if row is None:
+        return None
+    try:
+        return json.loads(row["payload_json"] or "{}").get("superseded_by")
+    except ValueError:
+        return None
 
 
 def _supersede_offers(conn: Any, task: Any) -> None:
@@ -1177,6 +1354,8 @@ def handle_task_reassign(ctx: HandlerContext) -> HandlerResult:
             next_attempt = max(1, task["attempt"]) + 1
             ws_root = get_workspaces_root(ctx.conn, ctx.home)
             new_ws_path = compute_task_workspace_path(ws_root, project_id, task_id, attempt=next_attempt)
+            remember_protected_path(ctx.conn, task["workspace_path"])
+            remember_protected_path(ctx.conn, new_ws_path)
 
     ctx.conn.execute(
         """UPDATE tasks
@@ -1245,7 +1424,7 @@ def _requeue_launch_guard(ctx: HandlerContext, assignee_id: Optional[str]) -> No
     ev = effective_launch(ctx.conn, adapter, ctx.testing_mode, agent["binary_path"])
     if not ev.ok:
         raise AdapterUnsupported(
-            f"Adapter '{agent['adapter']}' is not launch-enabled in this milestone"
+            f"Adapter '{agent['adapter']}' is not enabled for launch"
             + (f" ({ev.reason})" if ev.reason else ""),
             milestone=ev.milestone or adapter.launch_milestone or "M3",
             reason=ev.reason,
@@ -1390,6 +1569,8 @@ def handle_task_retry(ctx: HandlerContext) -> HandlerResult:
             next_attempt = max(1, task["attempt"]) + 1
             ws_root = get_workspaces_root(ctx.conn, ctx.home)
             new_ws_path = compute_task_workspace_path(ws_root, project_id, task_id, attempt=next_attempt)
+            remember_protected_path(ctx.conn, task["workspace_path"])
+            remember_protected_path(ctx.conn, new_ws_path)
 
     offered_at = now if is_inbox else None
     ctx.conn.execute(
@@ -1446,6 +1627,8 @@ def handle_task_retry(ctx: HandlerContext) -> HandlerResult:
                 "spec": task["spec"],
                 "fence": task["fence_seq"] + 1,
                 "assignee_id": assignee_id,
+                "ack_timeout_s": ack_window_now(ctx.conn, assignee_id)[0],
+                "last_rejection": last_rejection(ctx.conn, task_id),
             },
             request_id=ctx.request_id,
         )
@@ -1917,10 +2100,12 @@ def handle_task_start(ctx: HandlerContext) -> HandlerResult:
         run_id=run_id,
         from_state="queued",
         to_state="running",
-        payload={"run_id": run_id, "fence": fence, "attempt": attempt},
+        payload={"run_id": run_id, "fence": fence, "attempt": attempt,
+                 **({"session": ctx.args["session"]} if ctx.args.get("session") else {})},
         request_id=ctx.request_id,
         k_user=ctx.k_user,
     )
+    remember_run_session(ctx.conn, run_id, ctx.args.get("session"))
 
     # Queue post-commit effect for directories
     ctx.effects.append(Effect("create_run_and_workspace_dirs", {"run_dir": run_dir, "workspace_dir": ws_path}))
@@ -1934,6 +2119,14 @@ def handle_task_start(ctx: HandlerContext) -> HandlerResult:
     }
     if task["kind"] == "code":
         data["branch"] = branch
+    data.update(_lease_timing(lease_ttl_s, expires_at, task["timeout_s"]))
+    data["keepalive"] = (f"mesh task keepalive {task_id} --run {run_id} --fence {fence} "
+                         f"--every {data['heartbeat_every_s']}")
+    session = ctx.args.get("session")
+    if session:
+        data["session"] = session
+        data["export"] = f"export MESH_SESSION={shlex.quote(session)}"
+        data["keepalive"] = f"MESH_SESSION={shlex.quote(session)} {data['keepalive']}"
     return HandlerResult(
         data=data,
         transitions=[{"from": "queued", "to": "running", "task_id": task_id}],
@@ -1996,6 +2189,7 @@ def handle_task_heartbeat(ctx: HandlerContext) -> HandlerResult:
 
     # Verify lease and fence
     lease = verify_task_lease_and_fence(ctx.conn, task_id, presented_run_id=run_id, presented_fence=fence)
+    check_run_session(ctx.conn, task_id, run_id, ctx.args.get("session"))
 
     # Update lease
     ttl_s = get_lease_ttl_s(ctx.conn)
@@ -2044,6 +2238,7 @@ def handle_task_progress(ctx: HandlerContext) -> HandlerResult:
 
     # Verify lease and fence
     lease = verify_task_lease_and_fence(ctx.conn, task_id, presented_run_id=run_id, presented_fence=fence)
+    check_run_session(ctx.conn, task_id, run_id, ctx.args.get("session"))
 
     # Update lease expiration
     ttl_s = get_lease_ttl_s(ctx.conn)
@@ -2145,6 +2340,7 @@ def handle_task_submit(ctx: HandlerContext) -> HandlerResult:
 
     # Verify lease and fence first per plan §11.5
     lease = verify_task_lease_and_fence(ctx.conn, task_id, presented_run_id=run_id, presented_fence=fence)
+    check_run_session(ctx.conn, task_id, run_id, ctx.args.get("session"))
 
     # Verify task state
     if task["status"] != "running":
@@ -2229,6 +2425,7 @@ def handle_task_submit(ctx: HandlerContext) -> HandlerResult:
             "submitted_by": submitted_by,
             "submitted_at": now,
             "deliverable": deliverable_data,
+            **({"session": ctx.args["session"]} if ctx.args.get("session") else {}),
         },
         request_id=ctx.request_id,
         k_user=ctx.k_user,
@@ -2271,6 +2468,7 @@ def handle_task_fail(ctx: HandlerContext) -> HandlerResult:
 
     # Verify lease and fence first per plan §11.5 (stale writes report 9, not 6)
     lease = verify_task_lease_and_fence(ctx.conn, task_id, presented_run_id=run_id, presented_fence=fence)
+    check_run_session(ctx.conn, task_id, run_id, ctx.args.get("session"))
 
     if task["status"] != "running":
         raise MeshError(
@@ -2532,6 +2730,8 @@ def handle_task_reject(ctx: HandlerContext) -> HandlerResult:
             "task_id": task_id,
             "project_id": project_id,
             "reason": reason,
+            "rejected_by": "user" if ctx.actor_kind == "user" else ctx.principal.get("name"),
+            "assignee_id": task["assignee_agent_id"],
             "attempt": task["attempt"],
             "max_attempts": task["max_attempts"],
         },

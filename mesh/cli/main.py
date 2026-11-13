@@ -93,19 +93,10 @@ def format_success_response(
         request_id = generate_request_id()
 
     if text_format:
-        if isinstance(data, dict):
-            if "text" in data:
-                sys.stdout.write(str(data["text"]) + "\n")
-            elif "version" in data:
-                sys.stdout.write(f"mesh {data['version']}\n")
-            elif "items" in data and isinstance(data["items"], list):
-                for item in data["items"]:
-                    sys.stdout.write(json.dumps(item) + "\n")
-            else:
-                for k, v in data.items():
-                    sys.stdout.write(f"{k}: {v}\n")
-        else:
-            sys.stdout.write(str(data) + "\n")
+        from mesh.cli.render import render_text
+        sys.stdout.write(render_text(data) + "\n")
+        for w in warnings:
+            sys.stderr.write(f"mesh: warning: {w}\n")
         sys.stdout.flush()
     else:
         doc = {
@@ -137,7 +128,7 @@ class MeshArgumentParser(argparse.ArgumentParser):
 
 
 def create_parent_parser() -> argparse.ArgumentParser:
-    """Create parent parser with all global flags per plan §13.1."""
+    """Create the parent parser holding every global flag."""
     parent = argparse.ArgumentParser(add_help=False)
     default_home = os.environ.get("MESH_HOME") or os.path.expanduser("~/.agent-mesh")
     parent.add_argument("--home", default=argparse.SUPPRESS, help=f"Storage root directory (default: {default_home})")
@@ -161,7 +152,7 @@ def create_parent_parser() -> argparse.ArgumentParser:
 
 
 def build_parser() -> MeshArgumentParser:
-    """Build the complete CLI parser tree per plan §13.3."""
+    """Build the complete CLI parser tree."""
     parent_parser = create_parent_parser()
 
     root_parser = MeshArgumentParser(
@@ -171,6 +162,9 @@ def build_parser() -> MeshArgumentParser:
         parents=[parent_parser],
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+
+    root_parser.add_argument("--version", action="store_true", default=argparse.SUPPRESS, dest="show_version",
+                             help="Show the Agent Mesh version and exit (same as `mesh version`)")
 
     subparsers = root_parser.add_subparsers(dest="resource", metavar="<resource>")
 
@@ -196,7 +190,20 @@ def build_parser() -> MeshArgumentParser:
     register_setup_command(subparsers, parent_parser)
     register_audit_commands(subparsers, parent_parser)
 
+    _keep_help_layout(root_parser)
     return root_parser
+
+
+def _keep_help_layout(parser: argparse.ArgumentParser) -> None:
+    """Keep the line breaks of every description and epilog (examples stay one per line).
+
+    argparse's default formatter rewraps them into one paragraph; the raw-description
+    formatter keeps them as written and still wraps the argument help."""
+    parser.formatter_class = argparse.RawDescriptionHelpFormatter
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for sub in action.choices.values():
+                _keep_help_layout(sub)
 
 
 GLOBAL_FLAG_DESTS = {
@@ -221,6 +228,7 @@ GLOBAL_FLAG_DESTS = {
     "verb",
     "token_verb",
     "help",
+    "show_version",
 }
 
 SYNONYMS = {
@@ -256,14 +264,15 @@ def parse_and_apply_input_file(
     parser: argparse.ArgumentParser,
     argv: Optional[List[str]] = None,
 ) -> None:
-    """Process --input FILE|- per plan §13.1."""
+    """Process --input FILE|-."""
     input_source = getattr(args, "input", None)
     if not input_source:
         return
 
     try:
         if input_source == "-":
-            raw_data = sys.stdin.read()
+            from mesh.cli.stdin import read_stdin
+            raw_data = read_stdin("--input")
         else:
             with open(input_source, "r", encoding="utf-8") as f:
                 raw_data = f.read()
@@ -357,6 +366,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     req_id = generate_request_id()
     text_fmt = is_text_format(argv)
+    from mesh.cli import stdin as _stdin
+    _stdin.reset()
 
     has_input = any(arg == "--input" or arg.startswith("--input=") for arg in argv)
     if has_input:
@@ -416,6 +427,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         setattr(args, "timeout", None)
     if not hasattr(args, "quiet"):
         setattr(args, "quiet", False)
+
+    if getattr(args, "show_version", False):
+        from mesh.cli.commands.top import handle_version
+        format_success_response(data=handle_version(args), request_id=req_id, text_format=text_fmt)
+        return c.EXIT_OK
 
     # Check for subcommand function
     func = getattr(args, "func", None)

@@ -3,8 +3,8 @@
 "allow": [
 "read_file(/workspace/mesh-fresh-v1)",
 "write_file(/workspace/mesh-fresh-v1)",
-"write_file(/home/node/workspace/mesh-fresh-v1)",
-"read_file(/home/node/workspace/mesh-fresh-v1)",
+"write_file(/home/user/workspace/mesh-fresh-v1)",
+"read_file(/home/user/workspace/mesh-fresh-v1)",
 "read_file(/tmp)",
 "write_file(/tmp)",
 "command(python3)",

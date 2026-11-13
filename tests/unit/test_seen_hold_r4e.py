@@ -24,6 +24,9 @@ from mesh.daemon.handlers.run import handle_run_release
 from mesh.daemon.server import DaemonServer
 from tests.unit.test_seen_hold_r4d import _SeenDb, _same_alive, _wait_for
 
+# Real /proc scans: hold the runner's host-wide /proc lock shared (tests/run_tier.py).
+MESH_PROC_LOCK = "shared"
+
 
 class _Injected(Exception):
     """Injected failure after the handler ran: the request transaction rolls back."""
@@ -180,6 +183,8 @@ class TestRestoredHoldDropsCache(_R4eDb):
 
 
 class TestPendingEventSurvivesClose(_R4eDb):
+    mesh_serial = True  # host-global /proc scan (dogfood merge failure)
+
     """r4e item 2 (MINOR): a pending `run.seen_unusable` is not dropped when the run closes."""
 
     def test_failure_on_close_tick_then_success(self) -> None:

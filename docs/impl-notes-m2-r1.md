@@ -64,7 +64,7 @@ which rejects the repository-selecting options `-C`, `--git-dir`, `--git-dir=*`,
 argument cannot redirect git at the Mesh checkout either. The module docstring states exactly
 what is checked. `test_guard_refuses_paths_outside_base_before_spawn` patches
 `subprocess.run`/`subprocess.Popen` to fail the test if called and asserts that
-`fixture.git("/home/node/workspace/mesh-fresh-v1", "status")`, `fixture.git("/tmp/not-a-repo", ...)`,
+`fixture.git("/home/user/workspace/mesh-fresh-v1", "status")`, `fixture.git("/tmp/not-a-repo", ...)`,
 `fixture.path("..", "escape")`, `fixture.git(repo, "-C", "<mesh checkout>", "status")`,
 `--git-dir=<mesh checkout>/.git`, `--git-dir <...>`, `--work-tree=<...>`, `--work-tree <...>` and
 an absolute path argument outside `/tmp/mh-` all raise `AssertionError`. The Mesh checkout is

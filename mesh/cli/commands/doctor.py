@@ -634,10 +634,15 @@ def handle_doctor(args: argparse.Namespace) -> Dict[str, Any]:
     from mesh.cli.commands.doctor_env import environment_checks
 
     checks = environment_checks(home_dir, db_present, testing_mode=testing_mode)
-    return {
-        "status": "healthy",
+    out: Dict[str, Any] = {
+        # An uninitialised home (no mesh.db and no init marker, checked strictly above)
+        # is not "healthy": nothing can run there until it is set up.
+        "status": "healthy" if db_present else "not_initialized",
         "install_root": install_root,
         "home": home_dir,
         "checks": checks,
         "problems": [f"{x['name']}: {x['detail']} -> {x.get('hint', '')}" for x in checks if not x["ok"]],
     }
+    if not db_present:
+        out["hint"] = f"Mesh is not set up in {home_dir} yet; run `mesh setup` (or `mesh init`)"
+    return out

@@ -117,11 +117,10 @@ class TestDocsM19(unittest.TestCase):
             line for line in usage_doc.splitlines() if "| **launch** lead" in line
         ]
         self.assertEqual(len(launch_lead_rows), 1)
-        self.assertIn("M2", launch_lead_rows[0])
-        self.assertIn("delivery=inbox", launch_lead_rows[0])
-        self.assertIn("Available in M2", launch_lead_rows[0])
-        self.assertIn("`fake` test double only", launch_lead_rows[0])
-        self.assertIn("Vendor adapters cannot be launch-mode leads until M3", launch_lead_rows[0])
+        self.assertIn("Available only for the `fake` test double", launch_lead_rows[0])
+        self.assertIn("MESH_TESTING=1", launch_lead_rows[0])
+        self.assertIn("Vendor launch leads are refused", launch_lead_rows[0])
+        self.assertIn("use an inbox lead for vendors", launch_lead_rows[0])
         self.assertIn("rc 13 `ADAPTER_UNSUPPORTED`", launch_lead_rows[0])
         self.assertIn("lead.turn_refused", launch_lead_rows[0])
         self.assertIn("lead for vendors", launch_lead_rows[0])
@@ -150,13 +149,13 @@ class TestDocsM19(unittest.TestCase):
             "hermes": "not_installed",
             "openclaw": "not_installed",
         }
-        expected_milestone = {
-            "droid": "—",
-            "agy": "M3",
-            "kiro": "—",
-            "vibe": "M3",
-            "hermes": "M4",
-            "openclaw": "M4",
+        expected_warn = {
+            "droid": "Allowed when installed and profile supported",
+            "agy": "Allowed with evidence warning and supported profile",
+            "kiro": "Allowed when installed and profile supported",
+            "vibe": "Allowed with evidence warning and supported profile",
+            "hermes": "Cannot launch: stub adapter",
+            "openclaw": "Cannot launch: stub adapter",
         }
         allowed = {"verified", "partially_verified", "not_installed", "unsupported"}
 
@@ -179,15 +178,8 @@ class TestDocsM19(unittest.TestCase):
                 [status],
                 f"{adapter} must have exactly one status word, got {status_cells}",
             )
-            # m3-r7b supersession (named launch-column assertion): the milestone cell
-            # now pins the live effective launch_milestone, not the class attribute;
-            # "—" means adapter show printed null (launch enabled by evidence).
-            with self.subTest(adapter=adapter, source="launch_milestone"):
-                self.assertEqual(
-                    cells[-1],
-                    expected_milestone[adapter],
-                    f"{adapter} row milestone does not match live adapter show: {cells}",
-                )
+            with self.subTest(adapter=adapter, source="warn_executor_launch"):
+                self.assertEqual(cells[-1], expected_warn[adapter])
             # m3-r7b2: tie the literal back to the code. Run the real evidence path
             # (load_evidence on the committed results + apply_to_probe, as `adapter show`
             # does) for the documented version; no launch rule is restated here.
@@ -199,11 +191,8 @@ class TestDocsM19(unittest.TestCase):
                     get_adapter(adapter, testing_mode=False),
                     ev,
                 )
-                self.assertEqual(
-                    cells[-1],
-                    shown["launch_milestone"] or "—",
-                    f"{adapter} doc milestone != code effective milestone",
-                )
+                # Strict evidence parity remains independent of the warn wording.
+                self.assertEqual(cells[5], shown["launch_reason"] or "—")
                 self.assertEqual(cells[4], "true" if shown["launch_enabled"] else "false")
 
         self.assertIn("never counted as vendor support", normalized)

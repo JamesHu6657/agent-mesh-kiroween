@@ -87,7 +87,15 @@ class TestDocsM3(unittest.TestCase):
                 self.assertEqual(row[4], enabled)
                 self.assertEqual(row[5], reason)
                 self.assertEqual(row[6], results)
-                self.assertEqual(row[7], milestone)
+                expected_warn = {
+                    "droid": "Allowed when installed and profile supported",
+                    "kiro": "Allowed when installed and profile supported",
+                    "agy": "Allowed with evidence warning and supported profile",
+                    "vibe": "Allowed with evidence warning and supported profile",
+                    "hermes": "Cannot launch: stub adapter",
+                    "openclaw": "Cannot launch: stub adapter",
+                }
+                self.assertEqual(row[7], expected_warn[adapter])
                 # Launch enabled exactly when there is no reason (independent reading).
                 self.assertEqual(enabled == "true", reason == "—")
 
@@ -175,7 +183,8 @@ class TestDocsM3(unittest.TestCase):
             "Vendor lead turns",
             "Resume.",
             "hermes and openclaw",
-            "N11",
+            "coverage is incomplete",
+            "agy/vibe have no promoted results",
             "S-X-3, S-X-5, S-X-7 and S-KIRO-8 were not run",
         ):
             self.assertIn(phrase, deferred)
@@ -203,7 +212,8 @@ class TestDocsM3(unittest.TestCase):
             "Promotion is coordinator-only",
             "python3 -m tests.tierlib promote",
             "Stage it",
-            "(D5)",
+            "meshd reads this evidence from the checkout's `tests/` tree at runtime",
+            "strict evidence checking",
             "`tests/smoke/results/`",
             "vendor_lead_m3_lite",
             "every vendor launch lead is refused, even with launch evidence",

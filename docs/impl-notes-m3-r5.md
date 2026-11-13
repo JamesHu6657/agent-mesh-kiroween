@@ -91,7 +91,7 @@ Branch wt/m3-r5 is based on wt/m3-r3 at bd51e7f, which includes the C1 probe fix
 - In the `count_one` exited-before-signal test, the one-line stub could now be seen as "first byte, not 2 lines". The loop still exits on `poll()`, so it stays `exited_before_signal`. Check that this holds.
 - `term_then_err` sleeps 1 s in its SIGTERM handler, so `gone_within_s` has to be at least 5.
 - Never put MESH_SMOKE* into os.environ.
-- Author every commit with `--author "Quest <quest@example.invalid>"`. The worktree identity is wrong (finding 8).
+- Author every commit with `--author "Quest <coder@example.invalid>"`. The worktree identity is wrong (finding 8).
 
 ## r5b-s2 (findings 4 and 7)
 - **Commits:** 8e2eac2 fix (tests/smoke/harness.py, tests/smoke/test_smoke.py), 83e82b6 test (tests/unit/test_smoke_cases.py). Drafts from /tmp/r5b-B/ taken unchanged after review.

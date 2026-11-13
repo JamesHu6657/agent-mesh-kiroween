@@ -13,7 +13,7 @@ GL=/tmp/gitleaks; [ -x $GL ] || { echo "REFUSED: gitleaks missing at $GL"; exit 
 # Known fake test fixtures are allowlisted by fingerprint in scripts/coord/gitleaks-baseline.json
 if ! $GL git --no-banner --redact --log-opts="$R" --baseline-path scripts/coord/gitleaks-baseline.json . > /tmp/sync-gl.txt 2>&1; then
   echo "REFUSED: gitleaks hits in new commits:"; grep -E "RuleID|File|Commit" /tmp/sync-gl.txt | head -30; exit 3; fi
-P='[0-9]{8,10}:AA[A-Za-z0-9_-]{30,}|ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|AKIA[0-9A-Z]{16}|brd-customer-[a-z0-9_-]+|sk-(ant-|proj-)?[A-Za-z0-9_-]{24,}|(AGENT37_API_KEY|BRIGHTDATA_[A-Z_]+|HERMES_TELEGRAM_BOT_TOKEN|MWAPI_API_KEY|WECHAT_ROUTINE_WEBHOOK_KEY)=[^` "\\]{6,}|BEGIN (OPENSSH|EC|DSA) PRIVATE KEY'
+P='[0-9]{8,10}:AA[A-Za-z0-9_-]{30,}|ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|AKIA[0-9A-Z]{16}|brd-customer-[a-z0-9_-]+|sk-(ant-|proj-)?[A-Za-z0-9_-]{24,}|(HOSTA_API_KEY|BRIGHTDATA_[A-Z_]+|HERMES_TELEGRAM_BOT_TOKEN|MWAPI_API_KEY|WECHAT_ROUTINE_WEBHOOK_KEY)=[^` "\\]{6,}|BEGIN (OPENSSH|EC|DSA) PRIVATE KEY'
 H=$(git log -p $R | grep -E '^\+' | grep -cE "$P" || true)
 [ "$H" = 0 ] || { echo "REFUSED: $H pattern hits in new commits"; exit 3; }
 git push github main:main

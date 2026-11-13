@@ -75,6 +75,83 @@ def get_default_settings(home: str) -> Dict[str, Any]:
     return defaults
 
 
+#: Settings whose value is a plain string (or null). `mesh config set` accepts a bare
+#: word for them (`lead.default_agent lead1`), see `string_setting`.
+STRING_SETTING_KEYS = frozenset({
+    "lead.default_agent", "lead.profile", "workspaces.root", "adapter.evidence_mode", "approval.mode",
+})
+
+
+def string_setting(key: str) -> bool:
+    return key in STRING_SETTING_KEYS or key.startswith("approval.policy.")
+
+
+#: Per-agent inbox ack window (task.offered -> `task start`). Stored as a settings row
+#: keyed by agent id (``agent.<agt_id>.inbox.ack_timeout_s``) so the schema does not
+#: change; it is written only by `agent create/update --ack-timeout` and is not a
+#: `config` key. Absent -> the global ``inbox.ack_timeout_s``.
+AGENT_ACK_TIMEOUT_KEY = "agent.{agent_id}.inbox.ack_timeout_s"
+
+
+def agent_ack_timeout_key(agent_id: str) -> str:
+    return AGENT_ACK_TIMEOUT_KEY.format(agent_id=agent_id)
+
+
+def ack_timeout_range() -> Tuple[int, int]:
+    """Same range as the global inbox.ack_timeout_s."""
+    return (1 if is_testing_mode() else 10, 86400)
+
+
+def validate_ack_timeout(val: Any) -> int:
+    """`--ack-timeout` value (a duration such as 30m / 2h or seconds) -> seconds."""
+    from mesh.core.clock import parse_duration
+
+    lo, hi = ack_timeout_range()
+    try:
+        secs = parse_duration(val)
+    except Exception:
+        secs = None
+    if isinstance(val, bool) or secs is None or not (lo <= secs <= hi):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=f"--ack-timeout must be a duration between {lo}s and {hi}s (e.g. 30m, 2h), or 'default'",
+            details={"param": "ack_timeout", "expected": f"{lo}..{hi} seconds", "got": val},
+        )
+    return int(secs)
+
+
+def get_agent_ack_timeout_s(conn: Any, agent_id: str) -> Optional[int]:
+    """The agent's own ack window in seconds, or None when it uses the global one."""
+    import json as _json
+
+    row = conn.execute("SELECT value_json FROM settings WHERE key = ?;",
+                       (agent_ack_timeout_key(agent_id),)).fetchone()
+    if not row:
+        return None
+    try:
+        val = _json.loads(row["value_json"])
+    except Exception:
+        return None
+    return int(val) if isinstance(val, int) and not isinstance(val, bool) else None
+
+
+def set_agent_ack_timeout_s(conn: Any, agent_id: str, secs: Optional[int], now: str, by: str) -> None:
+    """Store (or with None, clear) the agent's ack window. Caller owns the transaction."""
+    import json as _json
+
+    key = agent_ack_timeout_key(agent_id)
+    if secs is None:
+        conn.execute("DELETE FROM settings WHERE key = ?;", (key,))
+        return
+    conn.execute(
+        """INSERT INTO settings (key, value_json, updated_at, updated_by) VALUES (?, ?, ?, ?)
+           ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json,
+               updated_at = excluded.updated_at, updated_by = excluded.updated_by;""",
+        (key, _json.dumps(int(secs)), now, by),
+    )
+
+
 def validate_setting(
     key: str,
     val: Any,

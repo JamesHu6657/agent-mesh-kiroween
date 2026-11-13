@@ -109,6 +109,10 @@ class MeshHarness:
         else:
             env["PATH"] = f"{shims_dir}:{bin_dir}:{env.get('PATH', '')}"
         env["MESH_HOME"] = self.home
+        # One fixed client session for every CLI call of a test (batch 5: `task start`
+        # records a session and later run writes must name it). Tests of the session
+        # rules pass their own MESH_SESSION (or "" for none) via extra_env.
+        env["MESH_SESSION"] = "ses_harness"
         token = getattr(self, "_harness_token", None)
         if token:
             env[reap_daemons.HARNESS_TOKEN_VAR] = token

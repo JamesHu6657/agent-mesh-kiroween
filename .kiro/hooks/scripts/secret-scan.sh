@@ -52,7 +52,7 @@ if [ ! -f "$BASELINE" ]; then
 fi
 
 # Verbatim from scripts/coord/sync-github.sh (variable P).
-P='[0-9]{8,10}:AA[A-Za-z0-9_-]{30,}|ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|AKIA[0-9A-Z]{16}|brd-customer-[a-z0-9_-]+|sk-(ant-|proj-)?[A-Za-z0-9_-]{24,}|(AGENT37_API_KEY|BRIGHTDATA_[A-Z_]+|HERMES_TELEGRAM_BOT_TOKEN|MWAPI_API_KEY|WECHAT_ROUTINE_WEBHOOK_KEY)=[^` "\\]{6,}|BEGIN (OPENSSH|EC|DSA) PRIVATE KEY'
+P='[0-9]{8,10}:AA[A-Za-z0-9_-]{30,}|ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|AKIA[0-9A-Z]{16}|brd-customer-[a-z0-9_-]+|sk-(ant-|proj-)?[A-Za-z0-9_-]{24,}|(HOSTA_API_KEY|BRIGHTDATA_[A-Z_]+|HERMES_TELEGRAM_BOT_TOKEN|MWAPI_API_KEY|WECHAT_ROUTINE_WEBHOOK_KEY)=[^` "\\]{6,}|BEGIN (OPENSSH|EC|DSA) PRIVATE KEY'
 # Written so that this file does not match itself.
 HOMEP='(/home/[A-Za-z0-9._-]+/|/roo[t]/|/Users/[A-Za-z0-9._-]+/)'
 

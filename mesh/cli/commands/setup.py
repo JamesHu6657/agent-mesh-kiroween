@@ -114,8 +114,8 @@ _LEAD_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 DEFAULT_TOKEN_DIR = "~/.config/agent-mesh"
 
 
-def _usage(msg: str, **details: Any) -> MeshError:
-    return MeshError(code=c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message=f"mesh setup: {msg}",
+def _usage(msg: str, _prefix: str = "mesh setup", **details: Any) -> MeshError:
+    return MeshError(code=c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message=f"{_prefix}: {msg}",
                      details=details or None)
 
 
@@ -132,7 +132,7 @@ def token_path_for(home: str, lead: str, token_dir: Optional[str]) -> str:
     return os.path.join(tdir, name)
 
 
-def _configured_roots(home: str) -> List[str]:
+def _configured_roots(home: str, prefix: str = "mesh setup") -> List[str]:
     """The configured workspaces.root and every registered project repository (realpaths).
     Fails closed when an existing database cannot be inspected (Linear round 4 P2)."""
     from mesh.core.token_roots import configured_roots
@@ -140,7 +140,7 @@ def _configured_roots(home: str) -> List[str]:
     try:
         ws, repos = configured_roots(home)
     except MeshError as exc:
-        raise _usage(f"cannot check token destination: {exc.message}")
+        raise _usage(f"cannot check token destination: {exc.message}", _prefix=prefix)
     return [os.path.realpath(p) for p in ([ws] if ws else []) + repos]
 
 
@@ -156,34 +156,34 @@ def _enclosing_git_worktree(directory: str) -> Optional[str]:
         cur = parent
 
 
-def _check_token_destination(home: str, path: str) -> None:
+def _check_token_destination(home: str, path: str, prefix: str = "mesh setup") -> None:
     """Refuse destinations the client would later reject, or that are not plain files we
     own (Linear PR30 P2-1, P2-3). Called before a token is issued."""
     from mesh.core.paths import is_path_equal_or_parent
     tdir = os.path.dirname(path)
     if os.path.lexists(tdir) and not os.path.isdir(tdir):
-        raise _usage(f"token directory {tdir} exists and is not a directory", token_dir=tdir)
+        raise _usage(_prefix=prefix, msg=f"token directory {tdir} exists and is not a directory", token_dir=tdir)
     real = os.path.realpath(path)
     for name in ("runs", "workspaces"):
         bad = os.path.realpath(os.path.join(home, name))
         if is_path_equal_or_parent(bad, real):
-            raise _usage(f"token file {path} would be inside {bad}; Mesh refuses token files there. "
+            raise _usage(_prefix=prefix, msg=f"token file {path} would be inside {bad}; Mesh refuses token files there. "
                          "Use a directory outside the Mesh home's runs/ and workspaces/ (default ~/.config/agent-mesh)",
                          token_file=path, conflict=bad)
-    for bad in _configured_roots(home):
+    for bad in _configured_roots(home, prefix):
         if is_path_equal_or_parent(bad, real):
-            raise _usage(f"token file {path} would be inside {bad} (a workspace root or project repository "
+            raise _usage(_prefix=prefix, msg=f"token file {path} would be inside {bad} (a workspace root or project repository "
                          "agents can read); choose a token directory outside it (default ~/.config/agent-mesh)",
                          token_file=path, conflict=bad)
     git_top = _enclosing_git_worktree(tdir)
     if git_top:
-        raise _usage(f"token file {path} would be inside the git work tree {git_top}; a credential there can be "
+        raise _usage(_prefix=prefix, msg=f"token file {path} would be inside the git work tree {git_top}; a credential there can be "
                      "committed or read by agents. Choose a token directory outside any repository",
                      token_file=path, conflict=git_top)
     if os.path.islink(path):
-        raise _usage(f"token file {path} is a symlink; refusing to write through it", token_file=path)
+        raise _usage(_prefix=prefix, msg=f"token file {path} is a symlink; refusing to write through it", token_file=path)
     if os.path.lexists(path) and not os.path.isfile(path):
-        raise _usage(f"token file {path} exists and is not a regular file", token_file=path)
+        raise _usage(_prefix=prefix, msg=f"token file {path} exists and is not a regular file", token_file=path)
 
 
 def _token_works(home: str, path: str, lead: str) -> bool:

@@ -606,6 +606,15 @@ class TestExecutionInbox(unittest.TestCase):
         rc_sub, resp_sub = self.harness.cli("task", "submit", tskA, "--summary", "Late", "--run", run_id_A, "--fence", str(fence_A), token=self.tok_ibx)
         self.assertEqual(rc_sub, c.EXIT_STALE)
         self.assertEqual(resp_sub["error"]["code"], c.LEASE_EXPIRED)
+        # Dogfood: the remote worker is told why and what to do (code unchanged).
+        self.assertIn("lease expired", resp_sub["error"]["message"])
+        self.assertIn("Stop work", resp_sub["error"]["message"])
+        self.assertEqual(resp_sub["error"]["details"]["run_end_reason"], "lease_expired")
+        self.assertEqual(resp_sub["error"]["details"]["task_status"], "failed")
+        rc_hbl, resp_hbl = self.harness.cli("task", "heartbeat", tskA, "--run", run_id_A, "--fence", str(fence_A), token=self.tok_ibx)
+        self.assertEqual(rc_hbl, c.EXIT_STALE)
+        self.assertEqual(resp_hbl["error"]["code"], c.LEASE_EXPIRED)
+        self.assertIn("lease expired", resp_hbl["error"]["message"])
 
         # Task B: heartbeat every 0.6s for 5s -> stays running; then submit -> rc 0
         rc_tb, resp_tb = self.harness.cli(

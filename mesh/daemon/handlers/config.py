@@ -8,6 +8,8 @@ from mesh.errors import MeshError
 from mesh.core.clock import now_iso_utc
 from mesh.core.events import insert_event
 from mesh.core.settings import get_default_settings, validate_setting
+from mesh.core.token_roots import remember_protected_path
+from mesh.core.workspaces import get_workspaces_root
 from mesh.daemon.handlers.base import HandlerContext, HandlerResult
 
 
@@ -106,6 +108,11 @@ def handle_config_set(ctx: HandlerContext) -> HandlerResult:
     val_json = json.dumps(validated_val)
 
     if not ctx.dry_run:
+        if key == "workspaces.root":
+            # Keep the previous and the new root unredacted for the token guard.
+            remember_protected_path(ctx.conn, get_workspaces_root(ctx.conn, ctx.home))
+            if isinstance(validated_val, str):
+                remember_protected_path(ctx.conn, validated_val)
         ctx.conn.execute(
             """INSERT INTO settings (key, value_json, updated_at, updated_by)
                VALUES (?, ?, ?, ?)
@@ -127,4 +134,22 @@ def handle_config_set(ctx: HandlerContext) -> HandlerResult:
             k_user=ctx.k_user,
         )
 
-    return HandlerResult(data={"key": key, "value": validated_val, "updated_at": now})
+    data = {"key": key, "value": validated_val, "updated_at": now}
+    warnings = []
+    if key == "inbox.ack_timeout_s" and isinstance(validated_val, int):
+        from mesh.daemon.scheduler import offers_kept_by_window
+
+        kept = offers_kept_by_window(ctx.conn, None, validated_val)
+        if kept:
+            data["offers_keeping_window"] = kept
+            keep = [k["task_id"] for k in kept if k["kept"]]
+            lose = [k["task_id"] for k in kept if not k["kept"]]
+            if keep:
+                warnings.append(
+                    f"{len(keep)} task(s) already offered keep the ack window they were offered with "
+                    f"(a new window applies to new offers only): " + ", ".join(keep[:10]))
+            if lose:
+                warnings.append(
+                    f"{len(lose)} task(s) offered before ack windows were recorded will fail no_response "
+                    f"on the next scheduler tick: " + ", ".join(lose[:10]))
+    return HandlerResult(data=data, warnings=warnings)

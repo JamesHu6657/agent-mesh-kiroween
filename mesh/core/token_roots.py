@@ -2,6 +2,7 @@
 every registered project repository (Linear round 4: shared by `mesh setup` (write side)
 and the client (read side))."""
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -10,6 +11,24 @@ from typing import List, Optional, Tuple
 import mesh.constants as c
 from mesh.core.db import sqlite_ro_uri
 from mesh.errors import MeshError
+
+
+PROTECTED_PATH_META_PREFIX = "protected_path:"
+
+
+def remember_protected_path(conn: sqlite3.Connection, path: Optional[str]) -> None:
+    """Record a workspace root / task workspace path unredacted in ``meta``.
+
+    Events are redacted before storage (plan §15.2), so a path that happens to match a
+    redaction pattern (e.g. ``/srv/secret=x/ws``) is unusable when read back from
+    ``config.updated`` / ``task.retried`` payloads. This side record keeps the real path
+    so the token guard keeps protecting it after a root change (dogfood P3).
+    """
+    if not isinstance(path, str) or not path.strip():
+        return
+    norm = os.path.abspath(path.strip())
+    key = PROTECTED_PATH_META_PREFIX + hashlib.sha256(norm.encode("utf-8")).hexdigest()
+    conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?);", (key, norm))
 
 
 def configured_roots(home: str) -> Tuple[Optional[str], List[str]]:
@@ -49,6 +68,15 @@ def configured_roots(home: str) -> Tuple[Optional[str], List[str]]:
                 v = pl.get("value") if isinstance(pl, dict) and pl.get("key") == "workspaces.root" else None
                 if isinstance(v, str) and v.strip():
                     paths.append(os.path.abspath(v.strip()))
+            # Unredacted side record (remember_protected_path): event payloads above are
+            # redacted, so a root like /srv/secret=x/ws reads back as "[REDACTED]".
+            has_meta = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta';").fetchone()
+            if has_meta:
+                for (mv,) in conn.execute("SELECT value FROM meta WHERE key LIKE ?;",
+                                          (PROTECTED_PATH_META_PREFIX + "%",)):
+                    if isinstance(mv, str) and mv.strip():
+                        paths.append(os.path.abspath(mv.strip()))
             # Every task workspace path, current and from earlier attempts (reassign/retry
             # payloads). The full path is kept as well as its project directory: the check
             # resolves each with realpath, so a symlinked workspace's real target is covered.

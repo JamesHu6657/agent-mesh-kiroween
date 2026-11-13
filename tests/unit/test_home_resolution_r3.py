@@ -230,7 +230,8 @@ class TestUnreadableHome(_CwdCase):
     def test_really_absent_home_is_still_uninitialised(self) -> None:
         rc, env = self.run_cli(os.path.join(self.base, "nope"), "doctor")
         self.assertEqual(rc, 0, env)
-        self.assertEqual(env["data"]["status"], "healthy")
+        # An uninitialised home is reported as such, never as healthy.
+        self.assertEqual(env["data"]["status"], "not_initialized")
         rc, env = self.run_cli(os.path.join(self.base, "nope"), "doctor", "--check-invariants")
         self.assertEqual(rc, 0, env)
         self.assertEqual(env["data"]["violations"], [])

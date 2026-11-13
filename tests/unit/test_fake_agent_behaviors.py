@@ -62,7 +62,7 @@ class TestFakeAgentBehaviors(unittest.TestCase):
 
     def test_spawn_setsid_grandchild_escapes_and_keeps_run_id(self) -> None:
         """The escapee has its own session and group, outlives the agent, and keeps MESH_RUN_ID."""
-        res = self._run_fake('{"spawn_setsid_grandchild": {"seconds": 30}}', {"MESH_RUN_ID": "run_unitescape"})
+        res = self._run_fake('{"spawn_setsid_grandchild": {"seconds": 30}}', {"MESH_RUN_ID": f"run_unitescape_{os.getpid()}"})
         self.assertEqual(res.returncode, 0, res.stderr)
         pid = self._grandchild_pid(res.stdout)
         self.pids.append(pid)
@@ -74,11 +74,11 @@ class TestFakeAgentBehaviors(unittest.TestCase):
         self.assertNotEqual(info["session"], os.getsid(0))
         env = get_proc_environ(pid)
         self.assertIsNotNone(env)
-        self.assertEqual(env.get("MESH_RUN_ID"), "run_unitescape")
+        self.assertEqual(env.get("MESH_RUN_ID"), f"run_unitescape_{os.getpid()}")
 
     def test_spawn_grandchild_keeps_process_group(self) -> None:
         """The grandchild stays in the agent's process group and session."""
-        res = self._run_fake('{"spawn_grandchild": {"seconds": 30}}', {"MESH_RUN_ID": "run_unitgroup"},
+        res = self._run_fake('{"spawn_grandchild": {"seconds": 30}}', {"MESH_RUN_ID": f"run_unitgroup_{os.getpid()}"},
                              new_session=True)
         self.assertEqual(res.returncode, 0, res.stderr)
         pid = self._grandchild_pid(res.stdout)
@@ -89,7 +89,7 @@ class TestFakeAgentBehaviors(unittest.TestCase):
         self.assertEqual(info["pgrp"], info["session"])
         self.assertNotEqual(info["session"], os.getsid(0))
         self.assertNotEqual(info["pgrp"], pid)
-        self.assertEqual(get_proc_environ(pid).get("MESH_RUN_ID"), "run_unitgroup")
+        self.assertEqual(get_proc_environ(pid).get("MESH_RUN_ID"), f"run_unitgroup_{os.getpid()}")
 
     def test_bad_passphrase_fresh_pipe_each_call(self) -> None:
         """Every call reads a full wrong passphrase from its own pipe and prints rc and code."""

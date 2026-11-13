@@ -8,7 +8,7 @@ Be concrete and honest; where something is unknown say so and how it will be ver
 
 ## Observed CLI facts on the box (2026-11-07)
 - Factory droid 1.3.0: `droid exec [-f file] -m <model> -r <low|medium|high|xhigh|max> --auto <low|medium|high> --output-format text|json|stream-json --cwd <dir> -s <session-id>`; default read-only; `--skip-permissions-unsafe` exists; stream-json first event `system/init` echoes `model` and `reasoning_effort`. Model id `claude-opus-5-5`. Auth via FACTORY_API_KEY env or login session.
-- Kiro CLI 3.1.0 (`$HOME/.local/bin/kiro-cli`): `kiro-cli chat --no-interactive --model <id> --effort <low..max> --trust-tools=<list> | -a --trust-all-tools --output-format stream-json --resume-id <id> --list-models -f json`; stream-json emits ACP events incl. `metadata.reasoning.effort`. Model id `claude-opus-5.5`. Invalid model → exit 1.
+- Kiro CLI 3.1.0 (`/home/box/.local/bin/kiro-cli`): `kiro-cli chat --no-interactive --model <id> --effort <low..max> --trust-tools=<list> | -a --trust-all-tools --output-format stream-json --resume-id <id> --list-models -f json`; stream-json emits ACP events incl. `metadata.reasoning.effort`. Model id `claude-opus-5.5`. Invalid model → exit 1.
 - Antigravity agy (1.4.8, droid observed 1.5.2 later): `agy -p "<prompt>" --model <id> --effort <...> --output-format text|json|stream-json --mode accept-edits|auto|plan --conversation <id> --dangerously-skip-permissions --sandbox --print-timeout`; `agy models` lists `gemini-3.8-flash-high`.
 - Mistral Vibe 3.1.0 installed (`vibe`); flags to be verified by implementer via `vibe --help`.
 - Hermes and OpenClaw: NOT installed on the box → status "not installed / unverified"; adapter interface only, no claimed support.
@@ -27,7 +27,7 @@ Legend: **[CONFIRMED]** = explicitly decided by the user (James). **[SUGGESTED]*
 - [SUGGESTED] No cloud repo / push / deploy is part of v1 development.
 
 ## 1. Task intake and the lead agent
-- [CONFIRMED] The user hands project work to the project's **lead agent** (主 agent) through a helper agent or any other agent. Mesh must expose one unified task-intake entry usable by any agent.
+- [CONFIRMED] The user hands project work to the project's **lead agent** (主 agent) through Worker 2 or any other agent. Mesh must expose one unified task-intake entry usable by any agent.
 - [CONFIRMED] The lead agent decomposes work and **directly assigns** executors (not a free-for-all claim market), collects deliverables, accepts / rejects (sends back for rework), and drives the project to completion, then notifies the user.
 - [CONFIRMED] Each project has a lead agent chosen by the user at creation; a configurable **global default** lead is used when none is given; the lead can be changed mid-project. Task history and context records persist across lead changes.
 - [CONFIRMED] Project completion: lead agent confirms completion against the project's acceptance criteria and then notifies the user. The user does not re-confirm completion.
@@ -64,4 +64,4 @@ Legend: **[CONFIRMED]** = explicitly decided by the user (James). **[SUGGESTED]*
 - [SUGGESTED] Non-interactive first; layered `--help` with examples; JSON output; stdin input; clear exit codes; idempotency keys; `--dry-run`; safe defaults; consistent `resource verb` structure. Logs must contain no secrets.
 
 ## 9. Pipeline for building this project
-- [CONFIRMED] Plan written by Factory droid (Opus 5.5); reviewed by Kiro CLI (Opus 5.5); implemented by agy (Gemini 3.8 Flash High); final acceptance by a helper agent.
+- [CONFIRMED] Plan written by Factory droid (Opus 5.5); reviewed by Kiro CLI (Opus 5.5); implemented by agy (Gemini 3.8 Flash High); final acceptance by Worker 2.

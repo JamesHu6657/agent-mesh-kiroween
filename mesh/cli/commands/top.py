@@ -61,7 +61,7 @@ def register_top_commands(subparsers: argparse._SubParsersAction, parent_parser:
         parents=[parent_parser],
         help="Display layered help topics and exit-code documentation",
         description="Display layered help topics and exit-code documentation.",
-        epilog="Examples:\n  mesh help exit-codes\n  mesh help auth\n  mesh help approvals\n",
+        epilog="Examples:\n  mesh help quickstart\n  mesh help exit-codes\n  mesh help auth\n  mesh help approvals\n",
     )
     help_parser.add_argument(
         "topic",
@@ -75,8 +75,8 @@ def register_top_commands(subparsers: argparse._SubParsersAction, parent_parser:
     top_parser = subparsers.add_parser(
         "top",
         parents=[parent_parser],
-        help="Top-level overview",
-        description="Top-level overview.",
+        help="Live overview (not available yet)",
+        description="Live overview of projects, tasks and runs (not available yet).",
     )
     top_parser.set_defaults(func=lambda args: _handle_top(args))
 
@@ -118,6 +118,6 @@ def handle_help(args: argparse.Namespace) -> Dict[str, Any]:
     topic = getattr(args, "topic", None)
     if not topic:
         topics_list = sorted(HELP_TOPICS.keys())
-        text = f"Available help topics: {', '.join(topics_list)}\n\nUse 'mesh help <topic>' for details.\n\nExamples:\n  mesh help exit-codes\n  mesh help auth\n"
+        text = f"Available help topics: {', '.join(topics_list)}\n\nUse 'mesh help <topic>' for details.\n\nExamples:\n  mesh help quickstart\n  mesh help exit-codes\n  mesh help auth\n"
         return {"topics": topics_list, "text": text}
     return {"topic": topic, "text": get_topic_help(topic)}

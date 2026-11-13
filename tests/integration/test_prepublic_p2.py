@@ -306,6 +306,28 @@ class TestRunTokenScopeOverSocket(unittest.TestCase):
         self.assertTrue(wp.startswith(root + os.sep), wp)
         self._db("DELETE FROM settings WHERE key = 'workspaces.root';")
 
+    def test_secret_like_workspaces_root_stays_protected_after_change(self):
+        """Dogfood P3: a root matching a redaction pattern is redacted in config.updated,
+        so after a root change the old root (and its lead dirs) lost token protection."""
+        from mesh.core.token_roots import configured_roots
+
+        old_root = os.path.join(self.h.fixtures_dir, "secret=abc", "ws")
+        new_root = os.path.join(self.h.fixtures_dir, "ws-new")
+        os.makedirs(old_root, mode=0o700)
+        os.makedirs(new_root, mode=0o700)
+        rc, r = self.h.cli("config", "set", "workspaces.root", json.dumps(old_root), user=True)
+        self.assertEqual(rc, 0, r)
+        rc, r = self.h.cli("config", "set", "workspaces.root", json.dumps(new_root), user=True)
+        self.assertEqual(rc, 0, r)
+        try:
+            _ws, paths = configured_roots(self.h.home)
+            self.assertIn(os.path.abspath(old_root), paths)
+            self.assertIn(os.path.abspath(new_root), paths)
+            # the default root in use before the first change is kept too
+            self.assertIn(os.path.abspath(os.path.join(self.h.home, "workspaces")), paths)
+        finally:
+            self._db("DELETE FROM settings WHERE key = 'workspaces.root';")
+
     def test_replay_does_not_cross_scope(self):
         from mesh.client import MeshClient
 

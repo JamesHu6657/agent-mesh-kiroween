@@ -121,8 +121,8 @@ Whole observation including before/after checks: **695.1 s**.
 extra benchmark loops or attempt to discount concurrent time.
 
 `pgrep -fa run_tier.py` observations, via `python3 -c` subprocess:
-- Before: PID 26081, recovery, `/home/node/workspace/mesh-fresh-v1`.
-- After: PID 48876, integration, `/home/node/workspace/mesh-wt-m3-r5`.
+- Before: PID 26081, recovery, `/home/user/workspace/mesh-fresh-v1`.
+- After: PID 48876, integration, `/home/user/workspace/mesh-wt-m3-r5`.
 - No check-command matches included. No processes stopped.
 
 Both exact runner tripwire paths are absent:
@@ -289,7 +289,7 @@ regressions passed in the full suite. No code/test changed after this run.
 `pgrep -fa run_tier.py` observations (excluding observation-command matches):
 - Before: no other suite observed.
 - After: PID 7172, integration,
-  `/home/node/workspace/mesh-wt-m3-r9b`.
+  `/home/user/workspace/mesh-wt-m3-r9b`.
 - This is endpoint evidence only, not an idle-host claim or a timing discount.
   No other suite or worktree was stopped or modified.
 
@@ -369,7 +369,7 @@ Test changes committed as **`d2be66a`**:
   Unit: **346 / 64.191 s**; integration: **262 / 763.997 s**;
   recovery: **33 / 36.478 s**. Both revised regressions and K4 ref tests passed.
 - `pgrep -fa run_tier.py` before: PID **21735**, integration,
-  `/home/node/workspace/mesh-fresh-v1`. After: **no actual suite process**.
+  `/home/user/workspace/mesh-fresh-v1`. After: **no actual suite process**.
   The observation's own supervisor/watcher command matched at both endpoints
   (PID 28327); it is not another suite. No other process/worktree was changed
   or stopped. These are endpoint observations, not an idle-host claim.
@@ -429,7 +429,7 @@ above; it does not change their measurements or claim a new full-suite run.
 
 [Kiro execution checks](coordination/reviews/m2-gate-kiro.md): **ACCEPT**.
 Two back-to-back idle `bash scripts/test.sh` runs in
-`/home/node/workspace/mesh-fresh-v1` measured **556 s / 555 s**, each
+`/home/user/workspace/mesh-fresh-v1` measured **556 s / 555 s**, each
 **678 tests, rc 0**: unit **356**, integration **273**, recovery **49**.
 No other suite was running. Both the default `/tmp/mesh-tripwire-hit.log`
 and checkout suite-keyed log were absent after each run (no

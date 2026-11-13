@@ -294,11 +294,11 @@ Tags: the step each commit belongs to (from the run/branch it was made in), not 
 | 40 | `73e3b34` | coord | chore(coord): move project to VPS vps1; agy via local WARP proxy; M1.6 resume prompt |
 | 41 | `0bf73ba` | coord | docs(coord): VPS coordinator takeover; review M1.7 prompt |
 | 42 | `7ca8231` | M1.6 | feat(m1b): state machine definitions and exhaustive transition tests |
-| 43 | `428943a` | coord | chore(coord): move project to Devbox instance <instance> (HANDOFF §10 migration checklist); M1.6 resume prompt step6c |
-| 44 | `3098748` | coord | docs(coord): devbox takeover; m1b-step6c write-denied (symlink path); BLOCKED on agy settings path |
-| 45 | `52fc5c9` | coord | chore(coord): agy settings allow the real path of the repo on devbox (symlinked /workspace) |
+| 43 | `428943a` | coord | chore(coord): move project to HostA instance <instance> (HANDOFF §10 migration checklist); M1.6 resume prompt step6c |
+| 44 | `3098748` | coord | docs(coord): hosta takeover; m1b-step6c write-denied (symlink path); BLOCKED on agy settings path |
+| 45 | `52fc5c9` | coord | chore(coord): agy settings allow the real path of the repo on hosta (symlinked /workspace) |
 | 46 | `0c3cc31` | coord | docs(coord): resolve BLOCKED (agy real-path permission fixed in 52fc5c9); restart coordinator |
-| 47 | `08eef08` | coord | docs: handoff to Quest (supervision of the devbox run) |
+| 47 | `08eef08` | coord | docs: handoff to Quest (supervision of the hosta run) |
 | 48 | `98ced1c` | coord | docs: vps1 repo copy deleted at James's request |
 | 49 | `8761ec6` | M1.6 | feat(m1b): task create, show, list, cancel and task/project deps |
 | 50 | `27a3949` | M1.6 | feat(m1b): scheduler promotion and queue ordering |

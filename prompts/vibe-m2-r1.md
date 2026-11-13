@@ -10,7 +10,7 @@ Hard rules:
 - Every checklist item you cover gets a test with `ACC: <ID>` in its docstring. Where the item is about CLI behaviour, the test drives the REAL CLI path (bin/mesh subprocess against a /tmp/mh-* daemon via the harness). A test that covers only part of an item still gets the tag, and your notes list the item as partial.
 - **Git safety.**
   - Mesh product code runs git ONLY through `mesh/core/gitops.py` (A6; `test_no_git_subprocesses_outside_gitops` must stay green). Mesh never pushes, never sets git identity or config, never rebases, resets, checks out, or forces.
-  - Tests run git ONLY through the helpers in `tests/gitfixture.py`, always with `cwd` inside a `/tmp/mh-*` directory the test created. Never run git without an explicit cwd. Never pass the Mesh checkout (`/workspace/mesh-fresh-v1`, `/home/node/workspace/mesh-fresh-v1`, any `mesh-wt-*`) or any directory outside `/tmp/mh-*` as `--repo`, as a repo path, or as a cwd for git.
+  - Tests run git ONLY through the helpers in `tests/gitfixture.py`, always with `cwd` inside a `/tmp/mh-*` directory the test created. Never run git without an explicit cwd. Never pass the Mesh checkout (`/workspace/mesh-fresh-v1`, `/home/user/workspace/mesh-fresh-v1`, any `mesh-wt-*`) or any directory outside `/tmp/mh-*` as `--repo`, as a repo path, or as a cwd for git.
   - Do not put `GIT_AUTHOR_*` or `GIT_COMMITTER_*` into meshd's env. A test that needs a commit in a task worktree makes it with `git -c user.name=t -c user.email=t@example.invalid commit …` via the fixture helper, unless the K0 repo-local identity applies.
 - Mock adapters and fixtures ONLY. Tasks and lead turns launch only on the `fake` adapter (testing mode); inbox agents use `none`. Vendor adapters stay `launch_enabled:false` (exit 13, milestone M3). No real vendor CLI runs, no inference, no login, no network, no TCP ports, no reading vendor credential or config dirs. Python stdlib only.
 - Tests use /tmp/mh-* homes, /tmp/mh-* git fixtures and Unix sockets only, and clean up only what they created: homes, fixture repos, daemons, and processes whose environ carries the `MESH_RUN_ID` of a run in their own home. Never kill by name or pattern. No push (also not to the fixture's bare remote), no remote creation outside the fixture, no deploy.
@@ -75,7 +75,7 @@ SUB-STEPS
   - K0 repo exists on `main`; `python3 -m unittest discover -s tests -t .` with `cwd=R` passes; `git config --get user.name` in R is set.
   - `make_k0(identity=False)`: `git config --get user.name` is empty (rc 1), and a commit attempt without `-c` identity fails, which proves `useConfigOnly` and the empty global config work.
   - `remote_refs` lists `refs/heads/main` and equals R's main head.
-  - The guard: `fixture.git("/home/node/workspace/mesh-fresh-v1", "status")` raises `AssertionError` **before** any process starts (patch `subprocess.run`/`Popen` to fail the test if called).
+  - The guard: `fixture.git("/home/user/workspace/mesh-fresh-v1", "status")` raises `AssertionError` **before** any process starts (patch `subprocess.run`/`Popen` to fail the test if called).
   - `cleanup()` removes the base dir.
 
 (2) I9. Commit `feat(m2): invariant I9 for merged code tasks (ACC: A8)`.

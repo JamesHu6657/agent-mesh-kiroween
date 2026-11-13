@@ -89,8 +89,9 @@ def handle_inbox_list(ctx: HandlerContext) -> HandlerResult:
         if r["status"] == "pending":
             pending_ids.append(r["id"])
 
-    # Update pending messages to delivered
-    if pending_ids:
+    # Update pending messages to delivered (not for --peek: watchers must not change
+    # what the worker itself sees).
+    if pending_ids and not ctx.args.get("peek"):
         placeholders = ",".join("?" for _ in pending_ids)
         ctx.conn.execute(
             f"UPDATE outbox SET status = 'delivered', delivered_at = ? WHERE id IN ({placeholders});",
