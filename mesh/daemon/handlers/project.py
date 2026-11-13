@@ -1306,6 +1306,41 @@ def handle_project_deliver(ctx: HandlerContext) -> HandlerResult:
             details={"param": "project_id", "reason": "no_repo", "project_id": project_id},
         )
 
+    # Carbon P2-7: never deliver while a merge runs on the same repository (this project or
+    # another one sharing the repo path): the merge commit may exist in git before the
+    # database records it. rc 11, before approval, with no mutation.
+    from mesh.daemon.merge import merge_in_progress_for_repo
+
+    busy = merge_in_progress_for_repo(ctx.conn, row["repo_path"])
+    if busy is not None:
+        raise MeshError(
+            code=c.MERGE_IN_PROGRESS,
+            exit_code=c.EXIT_BUSY,
+            message=f"Cannot deliver project '{project_id}': a merge is in progress on its repository",
+            details={"project_id": project_id, "reason": "merge_in_progress",
+                     "merge_project_id": busy["project_id"], "task_id": busy["task_id"],
+                     "merge_run_id": busy["run_id"], "lease": busy["lease"]},
+        )
+
+    # Carbon P1-2 / P1-3: never deliver work nobody merged. A code task of this project that
+    # is not `merged` but whose own commits are already in the integration branch (a test
+    # command that committed during its merge, a crash the recovery could not reconcile)
+    # would reach the base branch with this delivery. Same check as `doctor
+    # --check-invariants` (reverse I9); rc 6, before approval, with no mutation.
+    from mesh.core.invariants import check_i9_integrated_unmerged_tasks
+
+    unmerged = check_i9_integrated_unmerged_tasks(ctx.conn, project_id)
+    if unmerged:
+        raise MeshError(
+            code=c.INVALID_TRANSITION,
+            exit_code=c.EXIT_CONFLICT,
+            message=(f"Cannot deliver project '{project_id}': the integration branch carries work of "
+                     f"tasks that are not merged ({', '.join(v.details['task_id'] for v in unmerged)})"),
+            details={"project_id": project_id, "reason": "integrated_unmerged_work",
+                     "tasks": [{"task_id": v.details["task_id"], "status": v.details["status"],
+                                "merge_commit": v.details["merge_commit"]} for v in unmerged]},
+        )
+
     # Approval gate (§7.4): `deliver_to_base` defaults to `not_required`.
     policy = get_approval_policy(ctx.conn, "deliver_to_base")
     if policy != "not_required":

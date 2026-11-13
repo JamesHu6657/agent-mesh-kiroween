@@ -27,12 +27,17 @@ class CurrentRefsRecoveryTest(tm.TaskBranchCase):
                 self.assertEqual((out["outcome"], out["reason"]), ("failed", "interrupted"))
                 self.assertEqual(out["pre_head"], current)
                 self.assertEqual(out["details"]["recorded_pre_head"], self.base)
-                self.assertIs(out["details"]["restored"], not dirty)
+                # Carbon P1-2: what an interrupted (noop-merge) test step left in the Mesh-owned
+                # integration tree is cleared by recovery, so the tree is restored either way.
+                self.assertIs(out["details"]["restored"], True, out)
                 self.assertNotIn("head_moved", out["details"])
                 self.assertFalse(self.fixture.has_merge_head(self.repo))
                 self.assertEqual(self.fixture.head(self.repo), current)
                 if dirty:
-                    self.assertEqual(out["details"]["dirty_files"], ["untracked.txt"])
+                    self.assertNotIn("dirty_files", out["details"])
+                    self.assertEqual(out["details"]["cleanup"]["removed"], ["untracked.txt"])
+                    self.assertFalse(os.path.exists(os.path.join(self.repo, "untracked.txt")))
+                    self.assertTrue(self.fixture.is_clean(self.repo))
         with mock.patch.object(merge, "_dirty_paths", side_effect=merge._GitFailed("verify status")):
             out = merge.decide_recovery(self.repo, self.TASK, self.BRANCH, self.base)
         self.assertEqual(out["pre_head"], current)
