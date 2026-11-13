@@ -224,3 +224,20 @@ class TestGitops(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCarbonGitAllowList(unittest.TestCase):
+    def test_ref_update_requires_compare_and_swap(self):
+        from mesh.core.gitops import validate_git_args
+        for args in (["update-ref", "--stdin"], ["update-ref", "-d", "refs/heads/main"],
+                     ["update-ref", "refs/heads/main", "a" * 40]):
+            with self.assertRaises(AssertionError):
+                validate_git_args(args)
+        validate_git_args(["update-ref", "refs/heads/main", "a" * 40, "b" * 40])
+
+    def test_combined_force_flags_are_rejected(self):
+        from mesh.core.gitops import validate_git_args
+        for flag in ("-ff", "-df", "--force=1"):
+            with self.assertRaises(AssertionError):
+                validate_git_args(["worktree", "remove", flag, "/tmp/worktree"])
+        validate_git_args(["worktree", "add", "-b", "topic", "/tmp/worktree", "main"])

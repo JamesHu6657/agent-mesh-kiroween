@@ -53,7 +53,7 @@ from mesh.core.lead_actions import (
 from mesh.core.leases import get_lease_ttl_s
 from mesh.core.paths import get_install_root
 from mesh.core.prompts import PROMPT_LIMIT_BYTES, pointer_prompt, prompt_strategy
-from mesh.core.redact import redact_value, register_secret, unregister_secret
+from mesh.core.redact import redact, redact_value, register_secret, unregister_secret
 from mesh.core.repos import add_lead_repo_worktree, integration_branch_name, lead_repo_worktree_path
 from mesh.core.settings import LEAD_WAKE_BACKOFF_S
 from mesh.core.workspaces import (
@@ -211,7 +211,7 @@ def _approvals(conn: sqlite3.Connection, project_id: str) -> List[Dict[str, Any]
         "ORDER BY requested_at ASC, id ASC;",
         (project_id,),
     ).fetchall()
-    return [{"id": r["id"], "category": r["category"], "summary": r["summary"]} for r in rows]
+    return [{"id": r["id"], "category": r["category"], "summary": redact(r["summary"])} for r in rows]
 
 
 def _notes(conn: sqlite3.Connection, project_id: str) -> List[Dict[str, Any]]:
