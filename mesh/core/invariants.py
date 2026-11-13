@@ -594,6 +594,25 @@ def check_i9_merged_code_tasks(conn: sqlite3.Connection) -> List[Violation]:
 _I9_REVERSE_MERGE_CAP = 200
 
 
+def _superseded_by_merged(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the task's latest ``task.closed`` event names a superseding task
+    (``task close --superseded-by``) and that task is ``merged`` in the same project."""
+    ev = conn.execute("SELECT payload_json FROM events WHERE task_id = ? AND type = 'task.closed' "
+                      "ORDER BY seq DESC LIMIT 1;", (task_id,)).fetchone()
+    if ev is None:
+        return False
+    try:
+        other = json.loads(ev["payload_json"] or "{}").get("superseded_by")
+    except (TypeError, ValueError):
+        return False
+    if not other:
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM tasks o JOIN tasks t ON t.id = ? WHERE o.id = ? AND o.status = 'merged' "
+        "AND o.project_id = t.project_id;", (task_id, other)).fetchone()
+    return row is not None
+
+
 def check_i9_integrated_unmerged_tasks(conn: sqlite3.Connection,
                                        project_id: Optional[str] = None) -> List[Violation]:
     """Reverse I9 (Carbon P1-3): a code task that is not ``merged`` but whose own commits are
@@ -602,7 +621,8 @@ def check_i9_integrated_unmerged_tasks(conn: sqlite3.Connection,
     A merge commit of ``refs/heads/<integration>`` that came after the task's ``base_commit``
     and whose second parent is a commit of the task's branch (reachable from the branch tip,
     not from ``base_commit``) means the task's work entered integration. If the task is
-    anything but ``merged`` (``merging`` is the merge in flight and is skipped; ``cancelled``
+    anything but ``merged`` (``merging`` is the merge in flight and is skipped, and so is a
+    task closed with ``task close --superseded-by`` a ``merged`` task; ``cancelled``
     and ``merge_failed`` are the dangerous ones: ``project deliver`` would hand the work to
     the base branch) that is a violation. No git process starts without such a candidate.
     ``project_id`` limits the check to one project (``project deliver`` uses it as a gate).
@@ -633,6 +653,8 @@ def check_i9_integrated_unmerged_tasks(conn: sqlite3.Connection,
         repo = row["repo_path"]
         if not os.path.isdir(repo) or not _SHA_RE.match(row["base_commit"] or ""):
             continue
+        if row["status"] == "cancelled" and _superseded_by_merged(conn, row["task_id"]):
+            continue  # closed with `task close --superseded-by`: its work came in through that merged task
         try:
             tip = git(["rev-parse", "--verify", "--quiet", f"refs/heads/{row['branch']}^{{commit}}"], repo)
             if tip.returncode != 0:

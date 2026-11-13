@@ -191,6 +191,43 @@ class TestReverseI9(unittest.TestCase):
         self.merge_into_integration(merging)             # the merge in flight is not a violation
         self.assertEqual(self.reverse_violations(), [])
 
+    def _close_superseded(self, task_id: str, other: str) -> None:
+        from mesh.core.events import record_event
+        with transaction(self.conn):
+            record_event(self.conn, type_="task.closed", actor_id="usr_1", actor_kind="user", via="direct",
+                         project_id="prj_x", task_id=task_id, from_state="merge_failed", to_state="cancelled",
+                         payload={"superseded_by": other, "from_state": "merge_failed"})
+
+    def test_task_superseded_by_a_merged_task_is_not_reported(self) -> None:
+        """`task close TSK --superseded-by TSK2`: TSK (cancelled) carries the work TSK2 merged
+        (here TSK2's branch is TSK's tip): not a violation while TSK2 is merged; reported
+        again when the named task is not merged."""
+        self._create_repo_project()
+        old = self.make_task("tsk_s", "cancelled", True)
+        new_branch = "mesh/prj_x/tsk_n"
+        self.fixture.git(self.repo, "branch", new_branch, old)
+        with transaction(self.conn):
+            self.conn.execute(
+                "INSERT INTO tasks (id, project_id, title, spec, kind, status, assignee_agent_id, profile, "
+                "timeout_s, max_attempts, fence_seq, branch, base_commit, created_by, created_at, updated_at) "
+                "VALUES ('tsk_n', 'prj_x', 'T2', 'S', 'code', 'merged', 'agt_lead', 'edit', 3600, 3, 1, ?, ?, "
+                "'usr_1', '2026-11-07T00:00:00.000Z', '2026-11-07T00:00:00.000Z');",
+                (new_branch, self.fixture.head(self.repo, "main")))
+        mc = self.merge_into_integration(new_branch)
+        with transaction(self.conn):
+            self.conn.execute("UPDATE tasks SET merge_json = ? WHERE id = 'tsk_n';",
+                              (json.dumps({"merge_commit": mc}),))
+        # Not closed as superseded yet: a plain cancelled task with integrated work is reported.
+        self.assertEqual([v.details["task_id"] for v in self.reverse_violations()], ["tsk_s"])
+        self._close_superseded("tsk_s", "tsk_n")
+        self.assertEqual(self.reverse_violations(), [])
+        from mesh.core.invariants import check_i9_integrated_unmerged_tasks
+        self.assertEqual(check_i9_integrated_unmerged_tasks(self.conn, "prj_x"), [])  # the deliver gate
+        # The superseding task is no longer merged: the exemption no longer applies.
+        with transaction(self.conn):
+            self.conn.execute("UPDATE tasks SET status = 'merge_failed' WHERE id = 'tsk_n';")
+        self.assertIn("tsk_s", [v.details["task_id"] for v in self.reverse_violations()])
+
     def test_a_merged_task_is_not_reported(self) -> None:
         self._create_repo_project()
         branch = self.make_task("tsk_ok", "merged", True)
