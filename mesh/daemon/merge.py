@@ -1633,6 +1633,13 @@ def decide_recovery(integ: str, task_id: str, branch: Optional[str], pre_head: O
             details["recorded_pre_head"] = pre_head
         current_pre = true_pre
         dirty = _dirty_paths(integ, "verify status")
+        if dirty and head == true_pre:
+            # Carbon P1-2: a noop merge interrupted during its test step leaves the test's
+            # output (no MERGE_HEAD to abort). The integration worktree is Mesh's own and is
+            # clean before every merge, so the tree is put back to the index here too. An
+            # unmatched task commit on HEAD (head_moved) is left alone and reported.
+            details["cleanup"] = _merge_cleanups([restore_worktree_to_index(integ)])
+            dirty = _dirty_paths(integ, "verify status")
         if dirty:
             _capped(details, "dirty_files", dirty)
         details["restored"] = head == true_pre and not dirty

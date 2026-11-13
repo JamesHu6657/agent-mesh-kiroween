@@ -101,6 +101,26 @@ class TestDecideRecoveryByParents(unittest.TestCase):
         out = merge.decide_recovery(self.repo, "tsk_1", "mesh/prj_x/tsk_1", self.pre, other)
         self.assertEqual((out["outcome"], out["reason"]), ("failed", "interrupted"), out)
 
+    def test_recovery_clears_test_output_but_never_touches_an_unmatched_task_commit(self) -> None:
+        """Carbon P1-2: without MERGE_HEAD, leftovers are cleared only when HEAD is the baseline."""
+        with open(os.path.join(self.repo, "cov.xml"), "w", encoding="utf-8") as f:
+            f.write("x")
+        out = merge.decide_recovery(self.repo, "tsk_1", "mesh/prj_x/tsk_1", self.pre,
+                                    {"task_id": "tsk_1", "pre_head": self.pre, "tip": self.tip})
+        self.assertIs(out["details"]["restored"], True, out)
+        self.assertEqual(out["details"]["cleanup"]["removed"], ["cov.xml"], out)
+        # an unmatched task commit on HEAD: reported (head_moved), the tree is not touched
+        self.merge_commit("Merge mesh task tsk_1: x")
+        with open(os.path.join(self.repo, "cov.xml"), "w", encoding="utf-8") as f:
+            f.write("x")
+        other = {"task_id": "tsk_1", "pre_head": self.pre, "tip": "c" * 40}
+        out = merge.decide_recovery(self.repo, "tsk_1", "mesh/prj_x/tsk_1", self.pre, other)
+        self.assertIs(out["details"]["head_moved"], True, out)
+        self.assertIs(out["details"]["restored"], False, out)
+        self.assertNotIn("cleanup", out["details"])
+        self.assertEqual(out["details"]["dirty_files"], ["cov.xml"], out)
+        self.assertTrue(os.path.exists(os.path.join(self.repo, "cov.xml")))
+
     def test_unmerged_branch_with_intent_is_interrupted_and_restored(self) -> None:
         intent = {"task_id": "tsk_1", "pre_head": self.pre, "tip": self.tip}
         out = merge.decide_recovery(self.repo, "tsk_1", "mesh/prj_x/tsk_1", self.pre, intent)
