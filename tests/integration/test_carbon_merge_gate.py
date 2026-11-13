@@ -565,5 +565,153 @@ class TestP13IntentAndRecoveryByParents(MergeGateCase):
         self.harness.check_invariants_on_teardown = False  # the violation is the point of this test
 
 
+# Carbon P1-2 test commands (run with cwd = the integration worktree).
+COV_FAIL_SCRIPT = ('open("cov.xml", "w").write("x"); raise SystemExit(1)')  # the report's repro
+COV_SCRIPT = ("import os\n"
+              "open('cov.xml', 'w').write('x')\n"
+              "os.makedirs('build', exist_ok=True)\n"
+              "open(os.path.join('build', 'junit.xml'), 'w').write('<x/>')\n"
+              "raise SystemExit(1 if os.path.exists('broken.txt') else 0)\n")
+STAGE_SCRIPT = ("import subprocess\n"
+                "open('injected.py', 'w').write('evil = 1\\n')\n"
+                "subprocess.run(['git', 'add', 'injected.py'], check=True)\n")
+REWRITE_SCRIPT = ("with open('calc.py', 'a') as f:\n"
+                  "    f.write('# rewritten by the test\\n')\n")
+COMMIT_SCRIPT = ("import subprocess\n"
+                 "subprocess.run(['git', '-c', 'user.name=t', '-c', 'user.email=t@example.invalid',\n"
+                 "                'commit', '--no-edit', '-m', 'by the test'], check=True)\n")
+
+
+class TestP12TestStepGitState(MergeGateCase):
+    """P1-2: test_command runs in the integration worktree; whatever it changes in git fails
+    the step, and what it leaves in the tree is cleared, so the project never ends up
+    INTEGRATION_DIRTY and nothing unreviewed enters the merge commit."""
+
+    def py_command(self, script: str) -> str:
+        return json.dumps(["python3", "-c", script])
+
+    def project_with(self, name: str, script: str) -> Tuple[str, str]:
+        repo, prj = self.make_project(name, test_command=self.py_command(script))
+        self.repo = repo
+        self.remote_before = self.fixture.remote_refs(repo)
+        return repo, prj
+
+    def tree_files(self, repo: str, rev: str) -> List[str]:
+        out = self.fixture.git(repo, "ls-tree", "-r", "--name-only", rev).stdout
+        return [ln for ln in out.splitlines() if ln]
+
+    def test_report_repro_failed_test_with_untracked_output_does_not_wedge_the_project(self) -> None:
+        repo, prj = self.project_with("P12a", COV_FAIL_SCRIPT)
+        tsk_a, _ = self.accepted_task(prj, "A", "a.txt", "a\n")
+        pre_head = self.fixture.head(repo, self.integ_branch(prj))
+        rc, resp = self.merge(tsk_a)
+        self.assertEqual(rc, c.EXIT_MERGE_FAILED, resp)
+        self.assertEqual(resp["error"]["code"], c.TESTS_FAILED, resp)
+        det = resp["error"]["details"]
+        self.assertIs(det["restored"], True, det)
+        self.assertIn("cov.xml", det["cleanup"]["removed"], det)
+        self.assert_integration_restored(repo, prj, pre_head)
+        self.assertFalse(os.path.exists(os.path.join(self.integ_wt(prj), "cov.xml")))
+        # Task B: before the fix rc 14 INTEGRATION_DIRTY; now its own test run decides (and fails).
+        tsk_b, _ = self.accepted_task(prj, "B", "b.txt", "b\n")
+        rc, resp = self.merge(tsk_b)
+        self.assertEqual(rc, c.EXIT_MERGE_FAILED, resp)
+        self.assertEqual(resp["error"]["code"], c.TESTS_FAILED, resp)
+        self.assertNotEqual(resp["error"]["code"], c.INTEGRATION_DIRTY)
+        self.assert_integration_restored(repo, prj, pre_head)
+        self.assert_no_merge_lease(prj)
+        self.assert_remote_unchanged()
+        self.doctor_ok()
+
+    def test_later_merge_succeeds_and_test_output_never_enters_the_merge_commit(self) -> None:
+        repo, prj = self.project_with("P12b", COV_SCRIPT)
+        tsk_a, _ = self.accepted_task(prj, "Broken", "broken.txt", "x\n")
+        pre_head = self.fixture.head(repo, self.integ_branch(prj))
+        rc, resp = self.merge(tsk_a)
+        self.assertEqual((rc, resp["error"]["code"]), (c.EXIT_MERGE_FAILED, c.TESTS_FAILED), resp)
+        self.assert_integration_restored(repo, prj, pre_head)
+        tsk_b, _ = self.accepted_task(prj, "Good", "b.txt", "b\n")
+        rc, resp = self.merge(tsk_b)
+        self.assertEqual(rc, 0, resp)
+        self.assertEqual(resp["data"]["tests"], "passed", resp)
+        mc = resp["data"]["merge_commit"]
+        files = self.tree_files(repo, mc)
+        self.assertIn("b.txt", files)
+        for leaked in ("cov.xml", "build/junit.xml", "broken.txt"):
+            self.assertNotIn(leaked, files)
+        wt = self.integ_wt(prj)
+        self.assertEqual(self.fixture.head(wt), mc)
+        self.assertEqual(self.fixture.git(wt, "status", "--porcelain", "--untracked-files=all").stdout, "")
+        self.assertEqual(self.show(tsk_b)["status"], "merged")
+        self.doctor_ok()
+
+    def test_a_passing_test_that_stages_a_file_is_tests_failed_and_nothing_is_committed(self) -> None:
+        repo, prj = self.project_with("P12c", STAGE_SCRIPT)
+        tsk, _ = self.accepted_task(prj, "Feature", "f.txt", "f\n")
+        pre_head = self.fixture.head(repo, self.integ_branch(prj))
+        rc, resp = self.merge(tsk)
+        self.assertEqual(rc, c.EXIT_MERGE_FAILED, resp)
+        self.assertEqual(resp["error"]["code"], c.TESTS_FAILED, resp)
+        det = resp["error"]["details"]
+        self.assertEqual(det["exit_code"], 0, det)  # the command itself "passed"
+        self.assertIn("index_changed", det["git_changes"], det)
+        self.assertEqual(det["error"], "test_changed_git_state", det)
+        self.assertIs(det["restored"], True, det)
+        self.assert_integration_restored(repo, prj, pre_head)
+        self.assertNotIn("injected.py", self.tree_files(repo, self.integ_branch(prj)))
+        self.assertFalse(os.path.exists(os.path.join(self.integ_wt(prj), "injected.py")))
+        self.assertEqual(self.show(tsk)["status"], "merge_failed")
+        self.assertEqual(self.merge_runs(tsk)[0]["end_reason"], "tests_failed")
+        self.assert_no_merge_lease(prj)
+        self.assert_remote_unchanged()
+        self.doctor_ok()
+
+    def test_a_tracked_file_rewritten_by_a_passing_test_is_restored_before_the_commit(self) -> None:
+        repo, prj = self.project_with("P12d", REWRITE_SCRIPT)
+        original = self.fixture.git(repo, "show", "main:calc.py").stdout
+        tsk, _ = self.accepted_task(prj, "Feature", "f.txt", "f\n")
+        rc, resp = self.merge(tsk)
+        self.assertEqual(rc, 0, resp)
+        mc = resp["data"]["merge_commit"]
+        self.assertEqual(self.fixture.git(repo, "show", f"{mc}:calc.py").stdout, original)
+        wt = self.integ_wt(prj)
+        with open(os.path.join(wt, "calc.py"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), original)
+        self.assertEqual(self.fixture.git(wt, "status", "--porcelain", "--untracked-files=all").stdout, "")
+        self.doctor_ok()
+
+    def test_noop_merge_test_output_is_cleared(self) -> None:
+        repo, prj = self.project_with("P12e", COV_SCRIPT)
+        tsk, _ = self.accepted_task(prj, "Nothing", None)
+        rc, resp = self.merge(tsk)
+        self.assertEqual(rc, 0, resp)
+        self.assertEqual((resp["data"]["noop"], resp["data"]["tests"]), (True, "passed"), resp)
+        wt = self.integ_wt(prj)
+        self.assertEqual(self.fixture.git(wt, "status", "--porcelain", "--untracked-files=all").stdout, "")
+        tsk_b, _ = self.accepted_task(prj, "Next", "n.txt", "n\n")
+        rc, resp = self.merge(tsk_b)
+        self.assertEqual(rc, 0, resp)
+
+    def test_a_test_that_commits_moves_head_and_is_tests_failed(self) -> None:
+        repo, prj = self.project_with("P12f", COMMIT_SCRIPT)
+        tsk, _ = self.accepted_task(prj, "Feature", "f.txt", "f\n")
+        rc, resp = self.merge(tsk)
+        self.assertEqual(rc, c.EXIT_MERGE_FAILED, resp)
+        self.assertEqual(resp["error"]["code"], c.TESTS_FAILED, resp)
+        det = resp["error"]["details"]
+        self.assertIn("head_moved", det["git_changes"], det)
+        # HEAD is never rewound (no reset, no non-CAS ref update): reported as not restored.
+        self.assertIs(det["restored"], False, det)
+        self.assertEqual(self.show(tsk)["status"], "merge_failed")
+        self.assert_no_merge_lease(prj)
+        self.assert_remote_unchanged()
+        # The commit the test made stays in integration; reverse I9 (P1-3) is what reports it.
+        rc, resp = self.harness.cli("doctor", "--check-invariants")
+        self.assertNotEqual(rc, 0, resp)
+        reasons = [(v["details"]["task_id"], v["details"]["reason"]) for v in resp["error"]["details"]["violations"]]
+        self.assertEqual(reasons, [(tsk, "integrated_but_not_merged")], resp)
+        self.harness.check_invariants_on_teardown = False
+
+
 if __name__ == "__main__":
     unittest.main()

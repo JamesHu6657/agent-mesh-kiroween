@@ -1,7 +1,9 @@
-"""Unit regression tests for the Carbon merge-gate review (P1-3: intent file and reverse I9)."""
+"""Unit regression tests for the Carbon merge-gate review (P1-3: intent file and reverse I9;
+P1-2: git state around the test command and the integration tree restore)."""
 
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -177,6 +179,155 @@ class TestReverseI9(unittest.TestCase):
             self.conn.execute("UPDATE tasks SET merge_json = ? WHERE id = 'tsk_ok';",
                               (json.dumps({"merge_commit": mc}),))
         self.assertEqual(check_invariants(self.conn), [])
+
+
+class TestP12TestStepGitState(unittest.TestCase):
+    """Carbon P1-2: git state is compared around the test command and the integration
+    tree is put back to the index with filesystem operations and allow-listed reads only."""
+
+    def setUp(self) -> None:
+        self.fixture = GitFixture()
+        self.addCleanup(self.fixture.cleanup)
+        self.repo = self.fixture.make_k0()
+        env_patch = mock.patch.dict(os.environ, clear=False)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+        for key in [k for k in os.environ if k.startswith("GIT_")]:
+            del os.environ[key]
+        os.environ.update(self.fixture.git_env_vars())
+        self.head = self.fixture.head(self.repo)
+
+    def write(self, rel: str, data: bytes) -> None:
+        path = os.path.join(self.repo, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+
+    def read(self, rel: str) -> bytes:
+        with open(os.path.join(self.repo, rel), "rb") as f:
+            return f.read()
+
+    def status(self) -> str:
+        return self.fixture.git(self.repo, "status", "--porcelain", "--untracked-files=all").stdout
+
+    def test_untracked_files_and_dirs_are_removed_ignored_files_kept(self) -> None:
+        self.write("cov.xml", b"x")
+        self.write("build/out/junit.xml", b"<x/>")
+        self.write("__pycache__/m.pyc", b"\0")  # ignored by the K0 .gitignore
+        out = merge.restore_worktree_to_index(self.repo)
+        self.assertEqual(self.status(), "")
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "cov.xml")))
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "build")))  # emptied dirs pruned
+        self.assertTrue(os.path.exists(os.path.join(self.repo, "__pycache__", "m.pyc")))
+        self.assertEqual(sorted(out["removed"]), ["build/out/junit.xml", "cov.xml"])
+        self.assertNotIn("errors", out)
+
+    def test_modified_deleted_and_chmodded_tracked_files_are_restored_from_the_index(self) -> None:
+        original_calc = self.read("calc.py")
+        original_test = self.read("tests/test_calc.py")
+        self.write("calc.py", b"def add(a, b):\n    return 0\n")
+        os.unlink(os.path.join(self.repo, "tests", "test_calc.py"))
+        os.chmod(os.path.join(self.repo, ".gitignore"), 0o755)
+        out = merge.restore_worktree_to_index(self.repo)
+        self.assertEqual(self.status(), "")
+        self.assertEqual(self.read("calc.py"), original_calc)
+        self.assertEqual(self.read("tests/test_calc.py"), original_test)
+        self.assertFalse(os.stat(os.path.join(self.repo, ".gitignore")).st_mode & 0o111)
+        self.assertEqual(sorted(out["restored"]), [".gitignore", "calc.py", "tests/test_calc.py"])
+
+    def test_a_tracked_file_replaced_by_a_symlink_out_of_the_tree_is_restored_without_following_it(self) -> None:
+        outside = self.fixture.path("outside.txt")
+        with open(outside, "w", encoding="utf-8") as f:
+            f.write("keep me\n")
+        original = self.read("calc.py")
+        os.unlink(os.path.join(self.repo, "calc.py"))
+        os.symlink(outside, os.path.join(self.repo, "calc.py"))
+        merge.restore_worktree_to_index(self.repo)
+        self.assertEqual(self.status(), "")
+        self.assertFalse(os.path.islink(os.path.join(self.repo, "calc.py")))
+        self.assertEqual(self.read("calc.py"), original)
+        with open(outside, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "keep me\n")  # the symlink target was never written
+
+    def test_restores_to_the_index_not_to_head_during_a_no_commit_merge(self) -> None:
+        self.fixture.git(self.repo, "branch", "feature", "main")
+        wt = self.fixture.path("wt-f")
+        self.fixture.git(self.repo, "worktree", "add", wt, "feature")
+        with open(os.path.join(wt, "f.txt"), "w", encoding="utf-8") as f:
+            f.write("feature\n")
+        self.fixture.git(wt, "add", "f.txt")
+        self.fixture.git(wt, "commit", "-m", "f", identity=True)
+        self.fixture.git(self.repo, "worktree", "remove", wt)
+        self.fixture.git(self.repo, "merge", "--no-ff", "--no-commit", "feature", identity=True)
+        staged = self.status()
+        self.write("f.txt", b"tampered\n")
+        self.write("cov.xml", b"x")
+        merge.restore_worktree_to_index(self.repo)
+        self.assertEqual(self.status(), staged)  # the merge result, nothing more
+        self.assertEqual(self.read("f.txt"), b"feature\n")
+
+    def test_changes_detect_add_intent_to_add_commit_and_merge_abort(self) -> None:
+        before = merge.snapshot_git_state(self.repo, self.head)
+        tracked, _ = merge._worktree_vs_index(self.repo)
+        self.assertEqual(merge.git_state_changes(before, merge.snapshot_git_state(self.repo, self.head), tracked), [])
+        # git add of an untracked file
+        self.write("injected.py", b"evil = 1\n")
+        self.fixture.git(self.repo, "add", "injected.py")
+        after = merge.snapshot_git_state(self.repo, self.head)
+        tracked, _ = merge._worktree_vs_index(self.repo)
+        self.assertEqual(merge.git_state_changes(before, after, tracked), ["index_changed"])
+        self.fixture.git(self.repo, "rm", "--cached", "-q", "injected.py")
+        # git add -N (invisible to diff --cached)
+        self.fixture.git(self.repo, "add", "-N", "injected.py")
+        after = merge.snapshot_git_state(self.repo, self.head)
+        tracked, _ = merge._worktree_vs_index(self.repo)
+        self.assertEqual(merge.git_state_changes(before, after, tracked), ["index_changed"])
+        self.fixture.git(self.repo, "rm", "--cached", "-q", "injected.py")
+        os.unlink(os.path.join(self.repo, "injected.py"))
+        # a commit moves HEAD
+        self.fixture.git(self.repo, "commit", "--allow-empty", "-m", "by the test", identity=True)
+        after = merge.snapshot_git_state(self.repo, self.head)
+        tracked, _ = merge._worktree_vs_index(self.repo)
+        self.assertIn("head_moved", merge.git_state_changes(before, after, tracked))
+        # MERGE_HEAD going away (the test ran `git merge --abort`)
+        self.assertEqual(merge.git_state_changes({**before, "merge_head": "a" * 40}, before, []),
+                         ["merge_head_changed"])
+
+    def test_settle_reports_clean_only_when_nothing_changed(self) -> None:
+        before = merge.snapshot_git_state(self.repo, self.head)
+        self.write("cov.xml", b"x")
+        settled = merge.settle_after_test(self.repo, self.head, before)
+        self.assertEqual((settled["changes"], settled["clean"]), ([], True), settled)
+        self.write("injected.py", b"evil = 1\n")
+        self.fixture.git(self.repo, "add", "injected.py")
+        settled = merge.settle_after_test(self.repo, self.head, before)
+        self.assertEqual(settled["changes"], ["index_changed"])
+        self.assertIs(settled["clean"], False)
+
+    def test_abort_with_cleanup_leaves_no_staged_or_untracked_leftovers(self) -> None:
+        self.fixture.git(self.repo, "branch", "feature", "main")
+        wt = self.fixture.path("wt-g")
+        self.fixture.git(self.repo, "worktree", "add", wt, "feature")
+        with open(os.path.join(wt, "g.txt"), "w", encoding="utf-8") as f:
+            f.write("g\n")
+        self.fixture.git(wt, "add", "g.txt")
+        self.fixture.git(wt, "commit", "-m", "g", identity=True)
+        self.fixture.git(self.repo, "worktree", "remove", wt)
+        self.fixture.git(self.repo, "merge", "--no-ff", "--no-commit", "feature", identity=True)
+        # what a test leaves behind: a rewritten merged file, a staged new file, an untracked file
+        self.write("g.txt", b"changed\n")
+        self.write("injected.py", b"evil = 1\n")
+        self.fixture.git(self.repo, "add", "injected.py")
+        self.write("cov.xml", b"x")
+        plain = self.fixture.path("plain")
+        shutil.copytree(self.repo, plain, symlinks=True)
+        out = merge._abort_and_verify(self.repo, self.head, cleanup=True)
+        self.assertIs(out["restored"], True, out)
+        self.assertEqual(self.status(), "")
+        for name in ("injected.py", "cov.xml", "g.txt"):
+            self.assertFalse(os.path.exists(os.path.join(self.repo, name)), name)
+        # without the cleanup the same state stays dirty (INTEGRATION_DIRTY before the fix)
+        self.assertIs(merge._abort_and_verify(plain, self.head)["restored"], False)
 
 
 if __name__ == "__main__":
