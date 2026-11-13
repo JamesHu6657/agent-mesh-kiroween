@@ -160,6 +160,16 @@ def _get_project_lead_info(conn: sqlite3.Connection, project_id: str) -> Optiona
     return dict(row) if row else None
 
 
+def _approval_mode(conn: sqlite3.Connection) -> str:
+    row = conn.execute("SELECT value_json FROM settings WHERE key = 'approval.mode';").fetchone()
+    if row and row["value_json"]:
+        try:
+            return json.loads(row["value_json"])
+        except Exception:
+            pass
+    return "passphrase"
+
+
 def _get_user_id(conn: sqlite3.Connection) -> Optional[str]:
     cur = conn.execute("SELECT id FROM principals WHERE kind = 'user' LIMIT 1;")
     row = cur.fetchone()
@@ -267,6 +277,11 @@ def fan_out_event(conn: sqlite3.Connection, event: Dict[str, Any]) -> None:
         user_id = _get_user_id(conn)
         origin_id = _get_origin_agent_id(conn, project_id) if project_id else None
         recipients = [r for r in [user_id, origin_id] if r]
+        # Delegated mode: the project's inbox lead asks the human, so it is told too.
+        if project_id and _approval_mode(conn) == "delegated":
+            lead = _get_project_lead_info(conn, project_id)
+            if lead and lead["delivery"] == "inbox" and lead["agent_id"] not in recipients:
+                recipients.append(lead["agent_id"])
         for r in recipients:
             dedup = f"apr_req:{approval_id}:{r}"
             _insert_outbox_msg(conn, event_seq, r, "inbox", dedup, project_id, etype, payload_raw, now)

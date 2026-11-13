@@ -161,7 +161,7 @@ Mesh gates the operations it controls:
    shown as `trust:"direct_verified"`. Relayed decisions have no user MAC and are shown
    as `via: relayed (unverified; by <agent>)`, `trust:"relayed_unverified"`.
 
-### 3.3 Direct vs relayed
+### 3.3 Direct, relayed and delegated
 
 - **Direct:** `mesh approval approve <apr> --op-hash <h> --user`. The user types the
   passphrase.
@@ -171,6 +171,53 @@ Mesh gates the operations it controls:
   sensitive categories** (`spend_money`, `deploy`, `delete_external`,
   `permission_escalation`). A relayer may not approve its own request or a project it
   leads. `config` is never relayable.
+- **Delegated:** the project's own lead asks you and decides with `--human-confirmed`;
+  off unless `approval.mode` is `delegated`. See 3.4.
+
+### 3.4 Delegated mode: the lead asks you
+
+If you would rather answer your lead in chat than type a passphrase, turn on delegated
+mode once:
+
+```sh
+mesh config set approval.mode '"delegated"' --user      # or: mesh setup --approval-mode delegated
+```
+
+Then:
+
+1. A gated op creates a pending approval as usual. In delegated mode the project's inbox
+   lead also gets the `approval.requested` message.
+2. The lead runs `mesh approval pending --token-file lead.tok`. Each item shows what is
+   asked (category, summary, operation, expiry), its `decision_channel` (`delegated`,
+   or `user_only` when only you can decide it) and ready approve/reject commands with
+   the caller's `--token-file`/`--home`.
+3. The lead asks you through whatever channel it uses with you (chat, email, Telegram).
+4. With your answer, the lead decides with its own agent token and quotes you:
+
+   ```sh
+   mesh approval approve apr_123 --op-hash sha256:... \
+     --human-confirmed "James 08:03: yes, deploy it" [--evidence-ref msg-id] --token-file lead.tok
+   mesh approval reject  apr_123 --op-hash sha256:... --human-confirmed "James: no" --token-file lead.tok
+   ```
+
+What Mesh enforces: only the **current lead of the approval's project** can do this, with
+its own agent token and an inbox delivery (a launch-mode lead has no channel to you).
+Workers, other leads, former leads, relayers and every run token are refused, and a
+handover cancels the old lead's open requests. `--human-confirmed` is required and
+non-empty (max 4000 chars, redacted like every other text); it is stored as the
+approval's `user_statement` and in the `approval.decided` event (`via: "delegated"`,
+payload `human_confirmed`). `mesh approval show <apr>` shows who decided, when, the
+operation and the quoted words; `mesh event list` has the event; `mesh audit verify`
+counts delegated decisions with the relayed ones (per lead and credential). Categories whose policy is `direct_only`
+(`config` always, `permission_escalation` by default) still need your passphrase; set
+others to `direct_only` to keep them for yourself. Your own `--user` approvals keep
+working in delegated mode.
+
+What Mesh cannot do: check that you really said it. Delegated mode **trusts the lead**,
+and anything that can read the lead's token file (any process of your user) can approve
+in your name for that lead's projects. Decisions are recorded as unverified
+(`trust: "relayed_unverified"`, no user MAC). Keep `passphrase` mode (the default) when
+that trust is not acceptable.
 
 Set a category's policy with `mesh config set approval.policy.<category> '"direct_only"' --user`.
 For an external action (deploy, spend), use `mesh approval request`, then

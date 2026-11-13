@@ -31,7 +31,8 @@ def register_setup_command(subparsers: argparse._SubParsersAction, parent_parser
                      "Safe to re-run: finished steps are skipped."),
         epilog=("Examples:\n  mesh setup\n  mesh setup --passphrase-file ~/.config/agent-mesh/passphrase\n"
                 "  MESH_PASSPHRASE_FILE=~/.config/agent-mesh/passphrase mesh setup --lead-name lead1\n"
-                "  mesh setup --no-lead\n"),
+                "  mesh setup --no-lead\n"
+                "  mesh setup --approval-mode delegated\n"),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--lead-name", default="lead", help="Name of the inbox lead agent to create (default: lead)")
@@ -39,6 +40,10 @@ def register_setup_command(subparsers: argparse._SubParsersAction, parent_parser
     p.add_argument("--token-dir", default=None,
                    help="Where to save the lead's token file (default: ~/.config/agent-mesh, mode 0700)")
     p.add_argument("--no-start", action="store_true", default=False, help="Do not start the daemon")
+    p.add_argument("--approval-mode", choices=["passphrase", "delegated"], default=None,
+                   help=("Who decides approvals: 'passphrase' (you, with the passphrase; the default) or "
+                         "'delegated' (the lead asks you and decides with your quoted reply). "
+                         "Left unchanged when omitted."))
     p.set_defaults(func=handle_setup)
 
 
@@ -242,7 +247,7 @@ def handle_setup(args: argparse.Namespace) -> Dict[str, Any]:
     done: List[str] = []
     skipped: List[str] = []
     initialized = os.path.exists(os.path.join(home, "mesh.db"))
-    need_pass = (not initialized) or not args.no_lead
+    need_pass = (not initialized) or not args.no_lead or bool(getattr(args, "approval_mode", None))
     passphrase = read_passphrase(args, "Mesh user passphrase (>= 12 chars): ") if need_pass else None
     if passphrase is not None and not initialized and (getattr(args, "passphrase_fd", None) is None
                                                        and not getattr(args, "passphrase_file", None)
@@ -307,6 +312,13 @@ def handle_setup(args: argparse.Namespace) -> Dict[str, Any]:
         if rc != 0:
             raise _fail("config set lead.default_agent", rc, body, done)
         done.append(f"lead.default_agent = {lead}")
+
+    mode = getattr(args, "approval_mode", None)
+    if mode:
+        rc, body = _run(home, ["config", "set", "approval.mode", json.dumps(mode), "--user"], passphrase)
+        if rc != 0:
+            raise _fail("config set approval.mode", rc, body, done)
+        done.append(f"approval.mode = {mode}")
 
     checks = environment_checks(home, os.path.exists(os.path.join(home, "mesh.db")))
     tok = token_file or "<token file>"

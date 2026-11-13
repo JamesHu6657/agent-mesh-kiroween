@@ -46,6 +46,25 @@ def get_approval_policy(conn: sqlite3.Connection, category: str) -> str:
     return DEFAULT_POLICIES.get(category, "direct_or_relayed")
 
 
+APPROVAL_MODES = ("passphrase", "delegated")
+#: Max length of the human's words recorded with a delegated decision (as --user-statement).
+HUMAN_CONFIRMED_MAX = 4000
+
+
+def get_approval_mode(conn: sqlite3.Connection) -> str:
+    """Effective ``approval.mode``: ``passphrase`` (default) or ``delegated``."""
+    cur = conn.execute("SELECT value_json FROM settings WHERE key = 'approval.mode';")
+    row = cur.fetchone()
+    if row and row["value_json"]:
+        try:
+            val = json.loads(row["value_json"])
+        except Exception:
+            val = None
+        if val in APPROVAL_MODES:
+            return val
+    return "passphrase"
+
+
 def compute_user_approval_mac(k_user: bytes, approval_id: str, op_hash: str, decision: str, decided_at: str) -> str:
     """Compute HMAC-SHA256 user MAC for direct approval decisions per plan §7.4."""
     msg = f"mesh-approval-v1\n{approval_id}\n{op_hash}\n{decision}\n{decided_at}".encode("utf-8")

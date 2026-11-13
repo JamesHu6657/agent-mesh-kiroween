@@ -1,6 +1,7 @@
 """Approval resource commands: request, list, show, approve, reject, cancel, check, consume."""
 
 import argparse
+import shlex
 import json
 from typing import Any, Dict
 
@@ -48,6 +49,20 @@ def register_approval_commands(subparsers: argparse._SubParsersAction, parent_pa
     list_parser.add_argument("--project", help="Filter by project ID")
     list_parser.set_defaults(func=handle_approval_list)
 
+    # pending
+    pending_parser = sub.add_parser(
+        "pending",
+        parents=[parent_parser],
+        help="List pending approvals with a summary and the exact command to decide each",
+        description=("List pending approvals you can see, oldest first, each with what it asks for "
+                     "and the command to approve or reject it. In delegated mode the lead runs this, "
+                     "asks the human, and then decides with --human-confirmed."),
+        epilog="Examples:\n  mesh approval pending --token-file lead.tok\n  mesh approval pending --project prj_123 --user\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    pending_parser.add_argument("--project", help="Filter by project ID")
+    pending_parser.set_defaults(func=handle_approval_pending)
+
     # show
     show_parser = sub.add_parser(
         "show",
@@ -63,13 +78,20 @@ def register_approval_commands(subparsers: argparse._SubParsersAction, parent_pa
     approve_parser = sub.add_parser(
         "approve",
         parents=[parent_parser],
-        help="Approve a pending approval request (direct or relayed)",
-        description="Approve a pending approval request (direct or relayed).",
-        epilog="Examples:\n  mesh approval approve apr_123 --op-hash sha256:... --user\n  mesh approval approve apr_123 --op-hash sha256:... --relayed --user-statement \"Approved\" --token-file agent.tok\n",
+        help="Approve a pending approval request (direct, relayed, or delegated)",
+        description=("Approve a pending approval request (direct, relayed, or delegated).\n\n"
+                     "Delegated (approval.mode = delegated): the project's current inbox lead asks the "
+                     "human, then approves with its own token and --human-confirmed quoting the reply."),
+        epilog=("Examples:\n  mesh approval approve apr_123 --op-hash sha256:... --user\n"
+                "  mesh approval approve apr_123 --op-hash sha256:... --relayed --user-statement \"Approved\" --token-file agent.tok\n"
+                "  mesh approval approve apr_123 --op-hash sha256:... --human-confirmed \"James 08:03: yes, deploy it\" --token-file lead.tok\n"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     approve_parser.add_argument("approval_id", help="Approval identifier")
     approve_parser.add_argument("--op-hash", required=True, help="Expected sha256 operation hash")
     approve_parser.add_argument("--note", help="Decision note")
+    approve_parser.add_argument("--human-confirmed", dest="human_confirmed", default=None,
+                                help="Delegated mode (lead only): the human's reply, quoted or referenced; recorded in the audit log")
     approve_parser.set_defaults(func=handle_approval_approve)
 
     # reject
@@ -78,11 +100,15 @@ def register_approval_commands(subparsers: argparse._SubParsersAction, parent_pa
         parents=[parent_parser],
         help="Reject a pending approval request",
         description="Reject a pending approval request.",
-        epilog="Examples:\n  mesh approval reject apr_123 --op-hash sha256:... --note \"Cost too high\" --user\n",
+        epilog=("Examples:\n  mesh approval reject apr_123 --op-hash sha256:... --note \"Cost too high\" --user\n"
+                "  mesh approval reject apr_123 --op-hash sha256:... --human-confirmed \"James: no\" --token-file lead.tok\n"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     reject_parser.add_argument("approval_id", help="Approval identifier")
     reject_parser.add_argument("--op-hash", required=True, help="Expected sha256 operation hash")
     reject_parser.add_argument("--note", help="Rejection rationale")
+    reject_parser.add_argument("--human-confirmed", dest="human_confirmed", default=None,
+                               help="Delegated mode (lead only): the human's reply, quoted or referenced; recorded in the audit log")
     reject_parser.set_defaults(func=handle_approval_reject)
 
     # cancel
@@ -138,6 +164,10 @@ def handle_approval_approve(args: argparse.Namespace) -> Dict[str, Any]:
         "op_hash": args.op_hash,
         "note": getattr(args, "note", None),
     }
+    if getattr(args, "human_confirmed", None) is not None:
+        payload["human_confirmed"] = args.human_confirmed
+        if getattr(args, "evidence_ref", None):
+            payload["evidence_ref"] = args.evidence_ref
     resp = client.execute_cmd(args, "approval.approve", payload)
     return resp.get("data", {})
 
@@ -149,6 +179,10 @@ def handle_approval_reject(args: argparse.Namespace) -> Dict[str, Any]:
         "op_hash": args.op_hash,
         "note": getattr(args, "note", None),
     }
+    if getattr(args, "human_confirmed", None) is not None:
+        payload["human_confirmed"] = args.human_confirmed
+        if getattr(args, "evidence_ref", None):
+            payload["evidence_ref"] = args.evidence_ref
     resp = client.execute_cmd(args, "approval.reject", payload)
     return resp.get("data", {})
 
@@ -186,6 +220,64 @@ def handle_approval_list(args: argparse.Namespace) -> Dict[str, Any]:
     }
     resp = client.execute_cmd(args, "approval.list", payload)
     return resp.get("data", {})
+
+
+def _pending_commands(args: argparse.Namespace, aid: str, h: str, channel: str) -> Dict[str, Any]:
+    """Ready-to-run decide commands for this caller, shell-quoted, with its --home/auth."""
+    q = shlex.quote
+    ctx_flags = []
+    if getattr(args, "home", None):
+        ctx_flags += ["--home", q(args.home)]
+    if channel == "direct" or channel == "user_only":
+        auth = ["--user"]
+    else:
+        tf = getattr(args, "token_file", None)
+        # Token from the environment (MESH_TOKEN...): the same environment authenticates
+        # the decide command, so add nothing and never embed the token itself.
+        auth = ["--token-file", q(tf)] if tf else []
+    if channel == "delegated":
+        extra = ["--human-confirmed", "\"<the human's reply>\""]
+    elif channel == "relayed":
+        extra = ["--relayed", "--user-statement", "\"<the human's words>\""]
+    else:
+        extra = []
+    base = ["--op-hash", q(h)] + extra + auth + ctx_flags
+    out = {
+        "approve": " ".join(["mesh", "approval", "approve", q(aid)] + base),
+        "reject": " ".join(["mesh", "approval", "reject", q(aid)] + base),
+    }
+    if channel == "user_only":
+        out["note"] = "Only the user can decide this (passphrase); ask them to run the command."
+    elif channel == "delegated":
+        out["note"] = "Ask the human first, then quote their reply in --human-confirmed."
+    return out
+
+
+def handle_approval_pending(args: argparse.Namespace) -> Dict[str, Any]:
+    client = MeshClient(home=args.home)
+    payload = {"status": "pending", "project": getattr(args, "project", None), "with_channel": True}
+    resp = client.execute_cmd(args, "approval.list", payload)
+    data = resp.get("data", {}) or {}
+    items = []
+    for a in data.get("items", []):
+        aid, h = a.get("id"), a.get("op_hash")
+        channel = a.get("decision_channel") or ("direct" if getattr(args, "user", False) else "user_only")
+        item = {
+            "id": aid,
+            "project_id": a.get("project_id"),
+            "task_id": a.get("task_id"),
+            "category": a.get("category"),
+            "summary": a.get("summary"),
+            "requested_by": a.get("requested_by"),
+            "requested_at": a.get("requested_at"),
+            "expires_at": a.get("expires_at"),
+            "op_hash": h,
+            "op": a.get("op"),
+            "decision_channel": channel,
+        }
+        item.update(_pending_commands(args, aid, h, channel))
+        items.append(item)
+    return {"items": items, "count": len(items)}
 
 
 def handle_approval_request(args: argparse.Namespace) -> Dict[str, Any]:

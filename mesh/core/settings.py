@@ -54,6 +54,10 @@ def get_default_settings(home: str) -> Dict[str, Any]:
         "kill.post_submit_grace_s": 60,
         "outbox.max_attempts": 3,
         "approval.ttl_seconds": 86400,
+        # "passphrase": only the user (passphrase) or a relayer outside the project
+        # decides approvals. "delegated": the project's current inbox lead asks the human
+        # and records the decision with the human's own words (--human-confirmed).
+        "approval.mode": "passphrase",
         "notify.command": None,
         # Productize: "warn" lets a vendor adapter launch without matching committed smoke
         # evidence (the gap is reported by probe/doctor and in the assign response);
@@ -228,6 +232,17 @@ def validate_setting(
                 exit_code=c.EXIT_USAGE,
                 message=f"Setting '{key}' must be \"warn\" or \"strict\"",
                 details={"key": key, "expected": ["warn", "strict"], "got": val},
+            )
+        return val
+
+    # 5c. approval.mode
+    if key == "approval.mode":
+        if val not in ("passphrase", "delegated"):
+            raise MeshError(
+                code=c.INVALID_SETTING,
+                exit_code=c.EXIT_USAGE,
+                message=f"Setting '{key}' must be \"passphrase\" or \"delegated\"",
+                details={"key": key, "expected": ["passphrase", "delegated"], "got": val},
             )
         return val
 

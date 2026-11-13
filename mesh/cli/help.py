@@ -64,6 +64,10 @@ Channels:
   - direct: User approves directly with passphrase. Cryptographically signed with user MAC.
   - relayed: An agent with 'relay' capability relays an approval with --user-statement.
     Mesh cannot verify a relayed statement and advises direct_only for sensitive categories (spend_money, deploy, delete_external, permission_escalation).
+  - delegated (opt-in: mesh config set approval.mode '"delegated"' --user): the project's current
+    inbox lead lists `mesh approval pending`, asks the human, then decides with its own token and
+    --human-confirmed "<the human's words>". Trusts the lead; recorded unverified with those words.
+    direct_only categories (config, permission_escalation by default) still need the passphrase.
 
 Examples:
   # User directly approves an operation:
@@ -71,6 +75,9 @@ Examples:
 
   # Agent relays user approval:
   mesh approval approve apr_12345 --op-hash sha256:... --relayed --user-statement "Alice approved via chat" --token-file agent.tok
+
+  # Delegated mode: the lead approves on the human's quoted reply:
+  mesh approval approve apr_12345 --op-hash sha256:... --human-confirmed "Alice 09:12: yes, deploy" --token-file lead.tok
 """,
     "exit-codes": f"""Exit Codes Table (plan §13.2 verbatim):
 

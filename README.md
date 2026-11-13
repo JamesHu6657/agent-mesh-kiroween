@@ -70,6 +70,12 @@ strips every `MESH_*` variable from the agents it launches.
 Launched agents run as your user, so they can read a passphrase file too: use the
 file only when every agent is trusted, and the terminal prompt when approvals matter.
 
+Rather not type the passphrase for every approval? `mesh setup --approval-mode delegated`
+(or later `mesh config set approval.mode '"delegated"' --user`) lets your inbox lead ask
+you in chat and approve with your quoted reply (`--human-confirmed`), recorded in the
+audit log. It trusts the lead; `config` and `permission_escalation` still need the
+passphrase. Details: docs/usage.md §3.4.
+
 ### Your first project (inbox lead)
 
 ```sh

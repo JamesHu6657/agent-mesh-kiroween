@@ -9,11 +9,19 @@ from mesh.core.redact import redact
 import mesh.constants as c
 from mesh.core.approvals import (
     DEFAULT_POLICIES,
+    HUMAN_CONFIRMED_MAX,
     compute_user_approval_mac,
+    get_approval_mode,
     create_or_get_pending_approval,
     get_approval_policy,
 )
-from mesh.core.authz import can_principal_read_project, check_authz, is_project_lead, lead_run_token_scope
+from mesh.core.authz import (
+    can_principal_read_project,
+    check_authz,
+    get_project_active_lead,
+    is_project_lead,
+    lead_run_token_scope,
+)
 from mesh.core.canonical import canonical_json, check_no_floats
 from mesh.core.clock import now_iso_utc, parse_duration
 from mesh.core.events import record_event
@@ -31,6 +39,126 @@ def _check_approval_run_scope(ctx: HandlerContext, row: sqlite3.Row) -> None:
             message="Lead run token cannot access an approval outside its run scope",
             details={"approval_id": row["id"], "project_id": row["project_id"],
                      "scope_project_id": scope_project},
+        )
+
+
+def _redact_opt(value: Any) -> Any:
+    """Redact free text supplied with a decision (evidence references included)."""
+    return redact(value) if isinstance(value, str) and value else value
+
+
+def _decision_channel(conn: sqlite3.Connection, ctx: HandlerContext, row: sqlite3.Row) -> str:
+    """How the caller of `approval pending` can decide this approval.
+
+    ``direct``: the caller is the user. ``delegated``: the caller is the current inbox
+    lead and delegated mode allows it. ``relayed``: the caller holds ``relay`` and the
+    policy allows relaying for a project it does not lead. ``user_only``: only the user
+    with the passphrase can decide it for this caller.
+    """
+    if ctx.actor_kind == "user":
+        return "direct"
+    if ctx.via not in ("token", "relayed"):
+        return "user_only"
+    policy = get_approval_policy(conn, row["category"])
+    if policy == "direct_only":
+        return "user_only"
+    pid = row["project_id"]
+    me = ctx.principal["id"]
+    if (ctx.via == "token" and pid and get_approval_mode(conn) == "delegated"
+            and is_project_lead(conn, pid, me)):
+        lead = get_project_active_lead(conn, pid)
+        if lead and lead.get("delivery") == "inbox":
+            return "delegated"
+    caps = ctx.principal.get("capabilities", [])
+    if ("relay" in caps and me != row["requested_by"]
+            and not (pid and is_project_lead(conn, pid, me))):
+        return "relayed"
+    return "user_only"
+
+
+def _check_delegated_decision(ctx: HandlerContext, row: sqlite3.Row, human_confirmed: Any) -> None:
+    """Authorize a delegated decision (``approval.mode = delegated``).
+
+    The current lead of the approval's project, with its own agent token, decides on the
+    human's behalf after asking them, and records the human's words. Nobody else can:
+    not the user (they approve directly), not a relayer (--relayed is a different path),
+    not an executor or lead run token, not a worker, not a former lead. Categories whose
+    policy is ``direct_only`` (always ``config``) still need the passphrase.
+    """
+    if not isinstance(human_confirmed, str) or not human_confirmed.strip():
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="--human-confirmed must quote the human's reply (non-empty)",
+            details={"param": "human_confirmed"},
+        )
+    if len(human_confirmed) > HUMAN_CONFIRMED_MAX:
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=f"--human-confirmed exceeds {HUMAN_CONFIRMED_MAX} characters",
+            details={"param": "human_confirmed"},
+        )
+    if ctx.actor_kind == "user":
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="--human-confirmed is for the project lead; the user approves directly with --user",
+            details={"param": "human_confirmed"},
+        )
+    if ctx.via == "relayed":
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="--human-confirmed and --relayed cannot be combined",
+            details={"param": "human_confirmed"},
+        )
+    if ctx.via != "token":
+        # Executor and lead run tokens never decide approvals.
+        raise MeshError(
+            code=c.CREDENTIAL_NOT_ALLOWED_IN_RUN,
+            exit_code=c.EXIT_FORBIDDEN,
+            message="Run tokens cannot decide approvals; the lead uses its own agent token",
+            details={"via": ctx.via},
+        )
+    if get_approval_mode(ctx.conn) != "delegated":
+        raise MeshError(
+            code=c.CAPABILITY_MISSING,
+            exit_code=c.EXIT_FORBIDDEN,
+            message=("Delegated approval is off (approval.mode is 'passphrase'). "
+                     "The user can enable it: mesh config set approval.mode '\"delegated\"' --user"),
+            details={"setting": "approval.mode", "expected": "delegated"},
+        )
+    project_id = row["project_id"]
+    if not project_id:
+        raise MeshError(
+            code=c.CAPABILITY_MISSING,
+            exit_code=c.EXIT_FORBIDDEN,
+            message="Approvals without a project can only be decided by the user directly",
+            details={"approval_id": row["id"]},
+        )
+    if not is_project_lead(ctx.conn, project_id, ctx.principal["id"]):
+        raise MeshError(
+            code=c.NOT_PROJECT_LEAD,
+            exit_code=c.EXIT_FORBIDDEN,
+            message="Only the current lead of the approval's project can decide it on the human's behalf",
+            details={"project_id": project_id, "caller": ctx.principal.get("name")},
+        )
+    lead = get_project_active_lead(ctx.conn, project_id)
+    if lead and lead.get("delivery") == "launch":
+        raise MeshError(
+            code=c.CAPABILITY_MISSING,
+            exit_code=c.EXIT_FORBIDDEN,
+            message="A launch-mode lead has no channel to the human; delegated approval needs an inbox lead",
+            details={"project_id": project_id},
+        )
+    policy = get_approval_policy(ctx.conn, row["category"])
+    if policy == "direct_only":
+        raise MeshError(
+            code=c.CHANNEL_NOT_ALLOWED,
+            exit_code=c.EXIT_APPROVAL_INVALID,
+            message=f"Category '{row['category']}' requires direct user approval (passphrase), even in delegated mode",
+            details={"category": row["category"], "policy": policy},
         )
 
 
@@ -64,9 +192,14 @@ def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResu
             details={"approval_id": approval_id},
         )
 
+    human_confirmed = ctx.args.get("human_confirmed")
+    delegated = human_confirmed is not None
+    if delegated:
+        _check_delegated_decision(ctx, row, human_confirmed)
+
     # Auth check order per plan §7.3:
     # (1) agent caller without --relayed -> 4 CAPABILITY_MISSING
-    if ctx.actor_kind != "user" and ctx.via != "relayed":
+    if not delegated and ctx.actor_kind != "user" and ctx.via != "relayed":
         raise MeshError(
             code=c.CAPABILITY_MISSING,
             exit_code=c.EXIT_FORBIDDEN,
@@ -187,7 +320,38 @@ def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResu
             details={"approval_id": approval_id, "status": status},
         )
 
-    if ctx.via == "relayed":
+    if delegated:
+        # Recorded like a relayed decision (unverified, no user MAC): relayed_by is the
+        # lead, user_statement the human's words. The approval.decided event carries
+        # via "delegated" so audit and `approval show` can tell the two apart.
+        user_mac = None
+        decided_via = "relayed"
+        ctx.conn.execute(
+            """UPDATE approvals SET
+                status = ?,
+                decided_by = ?,
+                decided_via = 'relayed',
+                relayed_by = ?,
+                relayer_credential_id = ?,
+                user_statement = ?,
+                evidence_ref = ?,
+                decision_note = ?,
+                decided_at = ?,
+                user_mac = NULL
+            WHERE id = ?;""",
+            (
+                decision,
+                ctx.principal["id"],
+                ctx.principal["id"],
+                ctx.credential_id,
+                redact(human_confirmed),
+                _redact_opt(ctx.args.get("evidence_ref") or ctx.evidence_ref),
+                note,
+                now,
+                approval_id,
+            ),
+        )
+    elif ctx.via == "relayed":
         user_mac = None
         decided_via = "relayed"
         ctx.conn.execute(
@@ -209,7 +373,7 @@ def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResu
                 ctx.principal["id"],
                 ctx.credential_id,
                 redact(ctx.user_statement) if ctx.user_statement else ctx.user_statement,
-                ctx.evidence_ref,
+                _redact_opt(ctx.evidence_ref),
                 note,
                 now,
                 approval_id,
@@ -249,28 +413,36 @@ def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResu
             ),
         )
 
+    payload: Dict[str, Any] = {"decision": decision, "note": note}
+    if delegated:
+        payload["mode"] = "delegated"
+        payload["human_confirmed"] = redact(human_confirmed)
     record_event(
         conn=ctx.conn,
         type_="approval.decided",
         actor_id=ctx.principal["id"],
         actor_kind=ctx.actor_kind,
-        via=ctx.via,
-        relayed_by=ctx.relayed_by,
+        via="delegated" if delegated else ctx.via,
+        relayed_by=ctx.principal["id"] if delegated else ctx.relayed_by,
         credential_id=ctx.credential_id,
         project_id=row["project_id"],
         approval_id=approval_id,
-        payload={"decision": decision, "note": note},
+        payload=payload,
         request_id=ctx.request_id,
         k_user=ctx.k_user,
     )
 
-    return HandlerResult(data={
+    data = {
         "approval_id": approval_id,
         "status": decision,
         "decided_via": decided_via,
         "trust": "direct_verified" if decided_via == "direct" else "relayed_unverified",
         "user_mac": user_mac,
-    })
+    }
+    if delegated:
+        data["delegated"] = True
+        data["human_confirmed"] = redact(human_confirmed)
+    return HandlerResult(data=data)
 
 
 def handle_approval_approve(ctx: HandlerContext) -> HandlerResult:
@@ -535,7 +707,15 @@ def _format_approval_dict(conn: sqlite3.Connection, r: sqlite3.Row) -> Dict[str,
             prow = pcur.fetchone()
             if prow and prow["name"]:
                 relayer_name = prow["name"]
-        data["via"] = f"relayed (unverified; by {relayer_name})"
+        ev = conn.execute(
+            "SELECT via FROM events WHERE type = 'approval.decided' AND approval_id = ? ORDER BY seq DESC LIMIT 1;",
+            (data.get("id"),),
+        ).fetchone()
+        if ev and ev["via"] == "delegated":
+            data["delegated"] = True
+            data["via"] = f"delegated (unverified; lead {relayer_name} on the human's word)"
+        else:
+            data["via"] = f"relayed (unverified; by {relayer_name})"
     else:
         data["trust"] = None
         data["via"] = None
@@ -816,6 +996,8 @@ def handle_approval_list(ctx: HandlerContext) -> HandlerResult:
                 if not r["project_id"] or not can_principal_read_project(ctx.conn, agent_id, r["project_id"]):
                     continue
         d = _format_approval_dict(ctx.conn, r)
+        if ctx.args.get("with_channel"):
+            d["decision_channel"] = _decision_channel(ctx.conn, ctx, r)
         items.append(d)
 
     return HandlerResult(data={"items": items})
