@@ -877,14 +877,24 @@ def handle_approval_request(ctx: HandlerContext) -> HandlerResult:
             )
 
     if task_id:
-        tcur = ctx.conn.execute("SELECT id FROM tasks WHERE id = ?;", (task_id,))
-        if not tcur.fetchone():
+        tcur = ctx.conn.execute("SELECT id, project_id FROM tasks WHERE id = ?;", (task_id,))
+        trow0 = tcur.fetchone()
+        if not trow0:
             raise MeshError(
                 code=c.NOT_FOUND,
                 exit_code=c.EXIT_NOT_FOUND,
                 message=f"Task '{task_id}' not found",
                 details={"task_id": task_id},
             )
+        # Full review P1: a task approval always belongs to the task's project.
+        if project_id and trow0["project_id"] != project_id:
+            raise MeshError(
+                code=c.SCOPE_MISMATCH,
+                exit_code=c.EXIT_FORBIDDEN,
+                message=f"Task '{task_id}' is not in project '{project_id}'",
+                details={"task_id": task_id, "project_id": project_id},
+            )
+        project_id = project_id or trow0["project_id"]
 
     # Authority check per plan §7.3 and coordinator Q2:
     if ctx.actor_kind == "user":
@@ -915,7 +925,9 @@ def handle_approval_request(ctx: HandlerContext) -> HandlerResult:
             message="Executor run tokens cannot request approvals",
         )
     else:
-        # Agent caller:
+        # Agent caller (full review P1: project-scoped authz, incl. relayed self-approval):
+        check_authz(ctx.conn, "approval.request", ctx.principal, ctx.actor_kind, ctx.via,
+                    project_id=project_id, task_id=task_id)
         caps = ctx.principal.get("capabilities", [])
         has_relay = "relay" in caps
         if project_id:

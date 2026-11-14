@@ -955,7 +955,7 @@ def handle_agent_token_revoke(ctx: HandlerContext) -> HandlerResult:
     cur = ctx.conn.execute(
         """SELECT id, principal_id, revoked_at
            FROM credentials
-           WHERE id = ? OR lookup = ?;""",
+           WHERE (id = ? OR lookup = ?) AND kind = 'agent_token';""",
         (cred_arg, cred_arg),
     )
     row = cur.fetchone()
@@ -982,4 +982,4 @@ def handle_agent_token_revoke(ctx: HandlerContext) -> HandlerResult:
             k_user=ctx.k_user,
         )
 
-    return HandlerResult(data={"credential_id": row["id"], "revoked": True, "revoked_at": now})
+    return HandlerResult(data={"credential_id": row["id"], "revoked": True, "revoked_at": row["revoked_at"] or now})

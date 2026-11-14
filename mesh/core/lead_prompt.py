@@ -727,7 +727,9 @@ def render_lead_prompt(inp: LeadPromptInput) -> RenderedLeadPrompt:
         remaining = []
         for task in kept_tasks:
             status = task.get("status")
-            if status in TERMINAL_STATUSES:
+            if status in TERMINAL_STATUSES and not (
+                status == "accepted" and (task.get("kind") or "general") == "code"
+            ):
                 terminal_counts[status] = terminal_counts.get(status, 0) + 1
                 omitted["terminal_tasks"] = omitted.get("terminal_tasks", 0) + 1
             else:
@@ -839,9 +841,11 @@ def render_lead_prompt(inp: LeadPromptInput) -> RenderedLeadPrompt:
         # the line's own measured envelope, minus a small margin for the
         # Omitted line.
         without = build_without_messages()
+        # Full review: measure the envelope with an EMPTY body; measuring build()
+        # with the step-4b cut body made the room always negative.
         overhead = max(
             MESSAGE_LINE_OVERHEAD,
-            _size(build()) - _size(without),
+            _size(_message_line(kept_messages[0], "")) + 1,
         )
         room = limit - _size(without) - overhead - MESSAGE_ROOM_MARGIN
         if passes > 1:

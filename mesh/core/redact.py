@@ -57,6 +57,7 @@ _ARM_RE = re.compile(r"(?i)(?:" + _KW + r"\s*[:=]|bearer)\s*$")
 #: Keyword at the end of the line with no ``:``/``=`` yet: armed if the next
 #: non-blank line starts with one.
 _KW_END_RE = re.compile(r"(?i)" + _KW + r"\s*$")
+_MESH_FENCE_RE = re.compile(r"\s*`{3,}mesh-(?:actions|deliverable)[ \t]*\r?$")
 _LEAD_ASSIGN_RE = re.compile(r"\s*[:=]\s*(\S*)")
 _FIRST_TOKEN_RE = re.compile(r"\s*(\S+)")
 _BEGIN_RE = re.compile(r"-----BEGIN [A-Z ]{0,64}PRIVATE KEY-----")
@@ -316,6 +317,10 @@ class _LineRedactor:
             self.in_key = False
             start = m.end()
         rest = body[start:]
+        if self.armed and _MESH_FENCE_RE.match(rest):
+            # Full review: a mesh-actions/mesh-deliverable fence header is never the
+            # value of an armed keyword; redacting it would drop the whole block.
+            self.armed = ""
         if self.armed and rest.strip():
             if self.armed == "tok":
                 m = _FIRST_TOKEN_RE.match(rest)
@@ -432,7 +437,10 @@ def redact_value(value: Any, exact_values: Optional[Sequence[Tuple[str, str]]] =
     if isinstance(value, str):
         return redact(value, exact_values)
     if isinstance(value, dict):
-        return {key: redact_value(val, exact_values) for key, val in value.items()}
+        return {
+            (redact(key, exact_values) if isinstance(key, str) else key): redact_value(val, exact_values)
+            for key, val in value.items()
+        }
     if isinstance(value, list):
         return [redact_value(item, exact_values) for item in value]
     if isinstance(value, tuple):

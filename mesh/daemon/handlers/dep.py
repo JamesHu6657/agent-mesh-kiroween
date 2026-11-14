@@ -32,6 +32,18 @@ def _dfs_cycle_check(conn: sqlite3.Connection, start_task_id: str, target_task_i
     return False
 
 
+
+def _require_open_project(conn, project_id):
+    """Full review: dependencies of a completed/cancelled project are frozen (E18)."""
+    row = conn.execute("SELECT status FROM projects WHERE id = ?;", (project_id,)).fetchone()
+    if row is not None and row["status"] in ("completed", "cancelled"):
+        raise MeshError(
+            code=c.PROJECT_NOT_ACTIVE,
+            exit_code=c.EXIT_CONFLICT,
+            message=f"Project '{project_id}' is {row['status']}",
+            details={"project_id": project_id, "status": row["status"]},
+        )
+
 def handle_dep_add(ctx: HandlerContext) -> HandlerResult:
     """Add a prerequisite dependency: task depends on on_task."""
     task_id = ctx.args.get("task_id")
@@ -124,6 +136,7 @@ def handle_dep_add(ctx: HandlerContext) -> HandlerResult:
                      "on_status": t2["status"]},
         )
 
+    _require_open_project(ctx.conn, t1["project_id"])
     # Insert into task_deps if not already present
     ctx.conn.execute(
         "INSERT OR IGNORE INTO task_deps (task_id, depends_on_task_id) VALUES (?, ?);",
@@ -177,6 +190,7 @@ def handle_dep_remove(ctx: HandlerContext) -> HandlerResult:
 
     project_id = trow["project_id"]
     check_authz(ctx.conn, "dep.remove", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id, task_id=task_id)
+    _require_open_project(ctx.conn, project_id)
 
     ctx.conn.execute(
         "DELETE FROM task_deps WHERE task_id = ? AND depends_on_task_id = ?;",

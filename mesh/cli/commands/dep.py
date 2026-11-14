@@ -4,6 +4,8 @@ import argparse
 from typing import Any, Dict
 
 from mesh.client import MeshClient
+import mesh.constants as c
+from mesh.errors import MeshError
 from mesh.errors import NotImplementedInM1Error
 
 
@@ -55,9 +57,19 @@ def register_dep_commands(subparsers: argparse._SubParsersAction, parent_parser:
     list_parser.set_defaults(func=handle_dep_list)
 
 
+def _on_value(args: argparse.Namespace):
+    on, on_arg = getattr(args, "on", None), getattr(args, "on_arg", None)
+    if on is not None and on_arg is not None and on != on_arg:
+        # Full review: never silently drop one of two conflicting values.
+        raise MeshError(code=c.DUPLICATE_PARAM, exit_code=c.EXIT_USAGE,
+                        message="Dependency given twice (positional and --on)",
+                        details={"param": "on"})
+    return on if on is not None else on_arg
+
+
 def handle_dep_add(args: argparse.Namespace) -> Dict[str, Any]:
     client = MeshClient(home=args.home)
-    on_val = getattr(args, "on", None) or getattr(args, "on_arg", None)
+    on_val = _on_value(args)
     resp = client.execute_cmd(
         args,
         "dep.add",
@@ -68,7 +80,7 @@ def handle_dep_add(args: argparse.Namespace) -> Dict[str, Any]:
 
 def handle_dep_remove(args: argparse.Namespace) -> Dict[str, Any]:
     client = MeshClient(home=args.home)
-    on_val = getattr(args, "on", None) or getattr(args, "on_arg", None)
+    on_val = _on_value(args)
     resp = client.execute_cmd(
         args,
         "dep.remove",

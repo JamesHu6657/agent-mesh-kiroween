@@ -124,14 +124,21 @@ def render_executor_prompt(
 def parse_deliverable(final_text: str) -> Dict[str, Any]:
     """Parse the last valid ``mesh-deliverable`` block, else fall back (§12.5)."""
     text = final_text or ""
-    matches = list(DELIVERABLE_FENCE_RE.finditer(text))
-    for match in reversed(matches):
-        try:
-            value = json.loads(match.group(1).strip())
-        except (ValueError, TypeError):
-            continue
-        if isinstance(value, dict):
-            return value
+    from mesh.core.lead_actions import _iter_blocks
+
+    # Full review: close only on a standalone fence line (inline ``` inside a JSON
+    # string must not end the block); the lazy regex stays as a fallback.
+    # PR41 r1: the last valid standalone-fenced block wins; the lazy regex is only a
+    # fallback when no such block parses (keeps the §12.5 "last valid block" rule).
+    for group in ([body for info, body in _iter_blocks(text) if info == "mesh-deliverable"],
+                  [m.group(1) for m in DELIVERABLE_FENCE_RE.finditer(text)]):
+        for raw in reversed(group):
+            try:
+                value = json.loads(raw.strip())
+            except (ValueError, TypeError):
+                continue
+            if isinstance(value, dict):
+                return value
     return {"summary": text[-FALLBACK_SUMMARY_CHARS:], "structured": False}
 
 
@@ -144,11 +151,14 @@ def read_rework_feedback(conn: Any, task_id: str) -> Optional[Dict[str, str]]:
     """
     reason = ""
     cur = conn.execute(
-        "SELECT reason, payload_json FROM events WHERE task_id = ? AND type = 'task.rejected' "
-        "ORDER BY seq DESC LIMIT 1;",
+        "SELECT type, reason, payload_json FROM events WHERE task_id = ? "
+        "AND type IN ('task.rejected', 'task.accepted') ORDER BY seq DESC LIMIT 1;",
         (task_id,),
     )
     row = cur.fetchone()
+    # Full review: no rejection, or one superseded by a later acceptance -> no rework.
+    if row is None or row["type"] != "task.rejected":
+        return None
     if row:
         reason = row["reason"] or ""
         if not reason and row["payload_json"]:

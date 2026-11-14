@@ -18,6 +18,25 @@ def handle_event_list(ctx: HandlerContext) -> HandlerResult:
     return _list_events(ctx, "event.list")
 
 
+def _int_arg(val, name, lo, hi):
+    """Full review: validate limit/since (no LIMIT -1 dumps, no INTERNAL_ERROR)."""
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        bad = True
+    else:
+        try:
+            val = int(val)
+            bad = val < lo or (hi is not None and val > hi)
+        except (TypeError, ValueError):
+            bad = True
+    if bad:
+        rng = f"{lo}..{hi}" if hi is not None else f">= {lo}"
+        raise MeshError(code=c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
+                        message=f"--{name} must be an integer {rng}", details={"param": name})
+    return val
+
+
 async def handle_event_tail_live(server: Any, ctx: HandlerContext, reader: Any, writer: Any) -> None:
     """Stream live events matching filters as NDJSON over the Unix socket."""
     project_id = ctx.args.get("project")
@@ -52,7 +71,7 @@ async def handle_event_tail_live(server: Any, ctx: HandlerContext, reader: Any, 
         row_m = cur_m.fetchone()
         last_seq = row_m["m"] if row_m and row_m["m"] is not None else 0
     else:
-        last_seq = int(since_seq)
+        last_seq = _int_arg(since_seq, "since", 0, None)
 
     start_mono = time.monotonic()
     end_mono = (start_mono + timeout_s) if timeout_s is not None else None
@@ -237,7 +256,10 @@ def _list_events(ctx: HandlerContext, op: str) -> HandlerResult:
     task_id = ctx.args.get("task")
     event_type = ctx.args.get("type")
     since_seq = ctx.args.get("since")
-    limit = int(ctx.args.get("limit") or (100 if op == "event.tail" else 50))
+    limit = _int_arg(ctx.args.get("limit"), "limit", 1, 10000)
+    if limit is None:
+        limit = 100 if op == "event.tail" else 50
+    since_seq = _int_arg(since_seq, "since", 0, None)
 
     if op == "event.tail" and since_seq is None:
         cur_m = ctx.conn.execute("SELECT MAX(seq) as m FROM events;")

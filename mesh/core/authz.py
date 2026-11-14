@@ -110,6 +110,10 @@ ROSTER_READ_CMDS = frozenset({"agent.list", "agent.show"})
 #: `config.*`, `agent.*`, `agent token.*`, `audit.*` and `daemon stop` are user-only
 #: and are rejected before this set is consulted.
 LEAD_RUN_TOKEN_CMDS = frozenset({
+    # full review: handlers implement lead run-token auth for these
+    "approval.cancel",
+    "workspace.prune",
+    "workspace.delete",
     # intake submit / project create (lead needs the `intake` capability, checked below)
     "intake.submit",
     "project.create",
@@ -162,6 +166,7 @@ LEAD_RUN_TOKEN_CMDS = frozenset({
 #: Review m2-r9 finding 1(b): every command that carries a `task_id` is checked, so
 #: `event.list`, `event.tail`, `run.list`, `run.show` and `run.log` are included.
 LEAD_RUN_TOKEN_TASK_CMDS = frozenset({
+    "workspace.delete",
     "task.show",
     "task.list",
     "task.wait",
@@ -269,7 +274,7 @@ def _check_lead_run_token(
     # (3) Scope: the lead acts only for its own project.
     # Review m2-r9 finding 1(c): a lead turn may follow up on its own project, but it
     # may not open new intake or create a project (no project to scope it to).
-    if resource_resolved and cmd in ("intake.submit", "project.create") and project_id is None:
+    if resource_resolved and cmd in ("intake.submit", "project.create", "workspace.prune") and project_id is None:
         raise MeshError(
             code=c.SCOPE_MISMATCH,
             exit_code=c.EXIT_FORBIDDEN,
@@ -338,8 +343,15 @@ def check_authz(
     if cmd in ROSTER_READ_CMDS and actor_kind == "agent":
         # PR #37 review #5: a run token reads the roster only as the project's CURRENT
         # lead (a superseded lead gets LEAD_SUPERSEDED; executor run tokens are denied).
-        if via != "run_token":
+        if via == "token":
             return
+        if via != "run_token":
+            raise MeshError(
+                code=c.CAPABILITY_MISSING,
+                exit_code=c.EXIT_FORBIDDEN,
+                message=f"Command '{cmd}' is not available via '{via}'",
+                details={"cmd": cmd, "via": via},
+            )
         scope = principal.get("scope") or {}
         if scope.get("role") == "lead":
             current = get_project_active_lead(conn, scope.get("project_id")) if scope.get("project_id") else None
@@ -681,6 +693,12 @@ def check_authz(
                     message=f"Agent '{principal.get('name')}' cannot access task '{task_id}' outside its scope",
                     details={"task_id": task_id, "principal": principal.get("name")},
                 )
+        elif cmd == "workspace.list" and project_id and conn.execute(
+            "SELECT 1 FROM tasks WHERE project_id = ? AND assignee_agent_id = ? LIMIT 1;",
+            (project_id, agent_id),
+        ).fetchone() is not None:
+            # Full review: an assignee lists its own task workspaces (the handler filters rows).
+            pass
         elif cmd in ("project.show", "project.leads", "project.wait", "workspace.list") or (
             cmd in ("run.show", "run.log") and not task_id
         ):

@@ -533,6 +533,11 @@ def _refuse_dry_run(args: argparse.Namespace, what: str) -> None:
 
 
 def handle_doctor(args: argparse.Namespace) -> Dict[str, Any]:
+    # PR41 r1: refuse the combination before any repair runs.
+    if getattr(args, "fix_perms", False) and getattr(args, "check_invariants", False):
+        raise MeshError(code=c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
+                        message="--fix-perms and --check-invariants cannot be combined",
+                        details={"params": ["fix_perms", "check_invariants"]})
     if getattr(args, "fix_perms", False):
         _refuse_dry_run(args, "mesh doctor --fix-perms")
     # Round 4: only a missing home falls back to MESH_HOME / the default; an empty

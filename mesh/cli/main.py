@@ -34,12 +34,16 @@ def is_text_format(argv: Optional[List[str]] = None) -> bool:
     """Check if --format text was requested in argv."""
     if argv is None:
         argv = sys.argv[1:]
+    # Full review: the last --format wins, and nothing after "--" is an option.
+    found = None
     for i, arg in enumerate(argv):
-        if arg == "--format" and i + 1 < len(argv) and argv[i + 1] == "text":
-            return True
-        if arg.startswith("--format=") and arg.split("=", 1)[1] == "text":
-            return True
-    return False
+        if arg == "--":
+            break
+        if arg == "--format" and i + 1 < len(argv):
+            found = argv[i + 1]
+        elif arg.startswith("--format="):
+            found = arg.split("=", 1)[1]
+    return found == "text"
 
 
 def generate_request_id() -> str:
@@ -59,6 +63,12 @@ def format_error_response(
     """Print error response either as JSON envelope to stdout or text to stderr."""
     if details is None:
         details = {}
+    # Full review P1: CLI-side errors are redacted like daemon envelopes (§15.2).
+    from mesh.core.redact import redact, redact_value
+    message = redact(message) if isinstance(message, str) else message
+    details = redact_value(details)
+    if data is not None:
+        data = redact_value(data)
     if text_format:
         sys.stderr.write(f"mesh: error [{code}]: {message}\n")
     else:
@@ -416,6 +426,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return exc.exit_code
     if not hasattr(args, "format"):
         setattr(args, "format", "json")
+    # Full review: argparse is the source of truth (prefixes, repeats).
+    text_fmt = args.format == "text"
     if not hasattr(args, "user"):
         setattr(args, "user", False)
     if not hasattr(args, "passphrase_fd"):

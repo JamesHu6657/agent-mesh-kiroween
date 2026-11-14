@@ -77,8 +77,14 @@ def transaction(conn: sqlite3.Connection, mode: str = "IMMEDIATE") -> Generator[
     try:
         yield conn
         conn.execute("COMMIT;")
-    except Exception:
-        conn.execute("ROLLBACK;")
+    except BaseException:
+        # Full review: SQLite may have rolled back already (SQLITE_FULL/IOERR); never
+        # mask the real error, and roll back on KeyboardInterrupt/SystemExit too.
+        if conn.in_transaction:
+            try:
+                conn.execute("ROLLBACK;")
+            except sqlite3.Error:
+                pass
         raise
 
 

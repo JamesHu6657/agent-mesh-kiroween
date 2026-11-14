@@ -165,6 +165,9 @@ def handle_daemon_stop(args: argparse.Namespace) -> Dict[str, Any]:
     """Stop the running meshd daemon gracefully."""
     client = MeshClient(home=args.home, timeout=5.0)
     resp = client.execute_cmd(args, "daemon.stop")
+    if getattr(args, "dry_run", False):
+        # Full review: a dry run stops nothing; report what would happen.
+        return resp.get("data", {})
 
     # Wait for socket to disappear (up to 5s)
     deadline = time.monotonic() + 5.0
@@ -176,7 +179,10 @@ def handle_daemon_stop(args: argparse.Namespace) -> Dict[str, Any]:
             # Socket closed or gone
             return {"status": "stopped", "message": "Daemon stopped gracefully"}
 
-    return {"status": "stopped", "message": "Daemon stopped"}
+    # Full review: never claim "stopped" while meshd still answers.
+    raise MeshError(code=c.INTERNAL_ERROR, exit_code=c.EXIT_INTERNAL,
+                    message="Daemon accepted stop but is still running after 5s",
+                    details={"status": "stopping"})
 
 
 def handle_daemon_status(args: argparse.Namespace) -> Dict[str, Any]:

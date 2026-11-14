@@ -153,6 +153,14 @@ def handle_inbox_ack(ctx: HandlerContext) -> HandlerResult:
                 message=f"Message '{mid}' not found",
                 details={"message": mid},
             )
+        if row["status"] in ("delivering", "superseded", "dead"):
+            # Full review: only pending/delivered rows can be acked (outbox transitions).
+            raise MeshError(
+                code=c.INVALID_TRANSITION,
+                exit_code=c.EXIT_CONFLICT,
+                message=f"Message '{mid}' cannot be acked from status '{row['status']}'",
+                details={"message": mid, "status": row["status"]},
+            )
         if row["status"] != "acked":
             ctx.conn.execute(
                 "UPDATE outbox SET status = 'acked', acked_at = ? WHERE id = ?;",

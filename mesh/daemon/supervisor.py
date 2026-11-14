@@ -238,11 +238,18 @@ def _fail_task_spawn(
         conn.execute("UPDATE runs SET wrapper_pid = ?, pgid = ?, proc_starttime = ? WHERE id = ?;",
                      (after_popen["pid"], after_popen["pid"], after_popen.get("starttime"), run_id))
     failure = {"reason": "spawn_failed", "details": {"message": message, "run_id": run_id}}
-    conn.execute(
+    cur = conn.execute(
         "UPDATE tasks SET status = 'failed', failure_json = ?, updated_at = ?, version = version + 1 "
         "WHERE id = ? AND status = 'running';",
         (json.dumps(failure), now, task_id),
     )
+    if cur.rowcount != 1:
+        # Full review: a cancel arrived while the spawn abort was pending. Never record
+        # a false task.failed (I8); finish the pending cancel instead (T10).
+        task_row = conn.execute("SELECT * FROM tasks WHERE id = ?;", (task_id,)).fetchone()
+        if task_row is not None and task_row["status"] == "cancelling":
+            _task_cancelled(conn, task_row, {"id": run_id}, "spawn_failed")
+        return
     record_event(
         conn=conn,
         type_="task.failed",
@@ -270,10 +277,11 @@ def _fail_task_spawn(
 def _has_rejection(conn: sqlite3.Connection, task_id: str) -> bool:
     """Keep the latest rejection context across failed rework attempts and retries."""
     row = conn.execute(
-        "SELECT 1 FROM events WHERE task_id = ? AND type = 'task.rejected' ORDER BY seq DESC LIMIT 1;",
+        "SELECT type FROM events WHERE task_id = ? AND type IN ('task.rejected', 'task.accepted') "
+        "ORDER BY seq DESC LIMIT 1;",
         (task_id,),
     ).fetchone()
-    return row is not None
+    return row is not None and row["type"] == "task.rejected"
 
 
 def build_run_options(agent: Mapping[str, Any], run_id: str) -> Dict[str, Any]:
