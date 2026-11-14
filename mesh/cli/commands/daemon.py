@@ -66,6 +66,24 @@ def register_daemon_commands(subparsers: argparse._SubParsersAction, parent_pars
     status_parser.set_defaults(func=handle_daemon_status)
 
 
+def _meshd_lock_held(home: str) -> bool:
+    """PR42 r1: True while some meshd still holds $MESH_HOME/run/meshd.lock (e.g. one
+    that stopped answering but is still draining in-flight merges)."""
+    import fcntl
+    path = os.path.join(home, "run", "meshd.lock")
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        return True
+    finally:
+        os.close(fd)  # closing the fd also drops a probe lock we got
+    return False
+
+
 def _refuse_dry_run(args: argparse.Namespace, what: str) -> None:
     """Linear full review C1: local commands that write cannot simulate; refuse rather
     than perform the change under --dry-run."""
@@ -95,6 +113,17 @@ def handle_daemon_start(args: argparse.Namespace) -> Dict[str, Any]:
         }
     except Exception:
         pass
+
+    # PR42 r1: an old meshd that closed its socket but is still finishing merges keeps
+    # the lock; a new one would exit at once with an unexplained rc 1.
+    if _meshd_lock_held(client.home):
+        raise MeshError(
+            code=c.DAEMON_ALREADY_RUNNING,
+            exit_code=c.EXIT_INTERNAL,
+            message="A previous meshd is still stopping (finishing in-flight merges) and holds "
+                    "meshd.lock; retry `mesh daemon start` when it has exited",
+            details={"status": "stopping"},
+        )
 
     install_root = get_install_root()
     from mesh.core.paths import get_mesh_bin_dir
@@ -169,15 +198,24 @@ def handle_daemon_stop(args: argparse.Namespace) -> Dict[str, Any]:
         # Full review: a dry run stops nothing; report what would happen.
         return resp.get("data", {})
 
-    # Wait for socket to disappear (up to 5s)
+    # Wait (up to 5s) for the socket to stop answering AND for meshd.lock to be free:
+    # PR42 r1, meshd closes its socket first and then drains in-flight merges.
     deadline = time.monotonic() + 5.0
+    answering = True
     while time.monotonic() < deadline:
-        try:
-            client.send_request({"v": 1, "cmd": "daemon.status", "auth": {"type": "none"}})
-            time.sleep(0.1)
-        except Exception:
-            # Socket closed or gone
+        if answering:
+            try:
+                client.send_request({"v": 1, "cmd": "daemon.status", "auth": {"type": "none"}})
+            except Exception:
+                answering = False  # socket closed or gone
+        if not answering and not _meshd_lock_held(client.home):
             return {"status": "stopped", "message": "Daemon stopped gracefully"}
+        time.sleep(0.1)
+    if not answering:
+        raise MeshError(code=c.INTERNAL_ERROR, exit_code=c.EXIT_INTERNAL,
+                        message="meshd stopped accepting requests but is still finishing in-flight "
+                                "merges (it holds meshd.lock and exits when they end)",
+                        details={"status": "stopping"})
 
     # Full review: never claim "stopped" while meshd still answers.
     raise MeshError(code=c.INTERNAL_ERROR, exit_code=c.EXIT_INTERNAL,

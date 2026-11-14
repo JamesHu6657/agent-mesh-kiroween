@@ -392,6 +392,10 @@ def _queue_internal_merge(ctx: HandlerContext) -> Dict[str, Any]:
     }
 
 
+# PR42 r1: handlers shutdown may cancel ("unknown"/"" = request line not read yet).
+_CANCEL_ON_STOP = frozenset({"unknown", "", "inbox.wait", "task.wait", "project.wait", "event.tail"})
+
+
 class DaemonServer:
     """The background orchestration daemon service (meshd)."""
 
@@ -425,6 +429,23 @@ class DaemonServer:
         self._lead_merge_tasks: Set[asyncio.Future] = set()
         # Carbon P2-6: queued lead merges of one project run one at a time, in queue order.
         self._lead_merge_queues: Dict[str, "collections.deque[Dict[str, Any]]"] = {}
+        # Full review P1 (daemon-rest): shutdown waits for these before it releases
+        # meshd.lock and closes SQLite. `_merge_jobs` holds the shielded
+        # `_pipeline_and_finish` futures (merge.py), `_client_tasks` the socket handlers.
+        self._merge_jobs: Set[asyncio.Future] = set()
+        self._client_tasks: Set[asyncio.Task] = set()
+        # PR42 r1: the command each handler is serving ("unknown" until its request
+        # line is read); shutdown cancels only long polls and unread requests.
+        self._client_cmds: Dict[asyncio.Task, str] = {}
+        # PR42 Linear r1: each handler's writer, so shutdown can abort a connection
+        # whose client stopped reading (a blocked drain() would hold meshd.lock forever).
+        self._client_writers: Dict[asyncio.Task, Any] = {}
+        self._stopping = False
+
+    def track_merge_job(self, job: "asyncio.Future") -> None:
+        """Register an in-flight merge pipeline; shutdown awaits it (full review P1)."""
+        self._merge_jobs.add(job)
+        job.add_done_callback(self._merge_jobs.discard)
 
     @property
     def notify_cond(self) -> asyncio.Condition:
@@ -1113,6 +1134,10 @@ class DaemonServer:
 
         if not self.db_conn:
             return
+        if self._stopping:
+            # Full review P1: no new merge once shutdown began; the queued items stay
+            # in memory and go with the process, as they did before.
+            return
         items = lead_turns.take_queued_lead_merges()
         if not items:
             return
@@ -1162,7 +1187,9 @@ class DaemonServer:
     async def _drain_lead_merges(self, key: str) -> None:
         queue = self._lead_merge_queues[key]
         try:
-            while queue:
+            # batch6: once meshd is stopping, the merge in progress finishes (shutdown
+            # awaits this task) but no further queued merge starts.
+            while queue and not self._stopping:
                 item = queue.popleft()
                 try:
                     await self._run_lead_merge(item)
@@ -1237,6 +1264,12 @@ class DaemonServer:
         connection over the limit gets a BUSY error and is closed), and a client must send
         its request line within ``INITIAL_READ_TIMEOUT_S``."""
         self.active_connections = getattr(self, "active_connections", 0) + 1
+        me = asyncio.current_task()
+        clients = getattr(self, "_client_tasks", None)
+        if me is not None and clients is not None:
+            clients.add(me)
+            if hasattr(self, "_client_writers"):
+                self._client_writers[me] = writer
         try:
             max_conn, _ = _conn_limits()
             if self.active_connections > max_conn:
@@ -1256,6 +1289,10 @@ class DaemonServer:
             await self._handle_client(reader, writer)
         finally:
             self.active_connections -= 1
+            if me is not None and clients is not None:
+                clients.discard(me)
+                getattr(self, "_client_cmds", {}).pop(me, None)
+                getattr(self, "_client_writers", {}).pop(me, None)
 
     async def _handle_client(
         self,
@@ -1319,6 +1356,9 @@ class DaemonServer:
             req = json.loads(line_bytes.decode("utf-8"))
             request_id = req.get("request_id") or request_id
             cmd = req.get("cmd", "")
+            _me = asyncio.current_task()
+            if _me is not None and hasattr(self, "_client_cmds"):
+                self._client_cmds[_me] = str(cmd)
             auth_info = req.get("auth", {})
             args = req.get("args", {})
             idempotency_key = req.get("idempotency_key")
@@ -1567,10 +1607,13 @@ class DaemonServer:
                         "dry_run": False,
                         "exit_code": exit_code,
                     }
-                    try:
-                        run_scheduler_tick(self.db_conn, self.home, testing_mode=self.testing_mode)
-                    except Exception as e:
-                        _sweep_error(self.home, "tick_post_merge", e)
+                    # PR42 r2: no tick (promotion, launches, lead turns) once stopping;
+                    # the next boot's scheduler does it.
+                    if not getattr(self, "_stopping", False):
+                        try:
+                            run_scheduler_tick(self.db_conn, self.home, testing_mode=self.testing_mode)
+                        except Exception as e:
+                            _sweep_error(self.home, "tick_post_merge", e)
                     self.start_queued_lead_merges()
                     self.wake_scheduler()
                     await self.notify_waiters()
@@ -1846,7 +1889,7 @@ class DaemonServer:
                     self.db_conn.execute("COMMIT;")
                     self.execute_effects(ctx.effects)
                     await self.notify_waiters()
-                    if not dry_run and exit_code == 0:
+                    if not dry_run and exit_code == 0 and not getattr(self, "_stopping", False):
                         try:
                             run_scheduler_tick(self.db_conn, self.home, testing_mode=self.testing_mode)
                         except Exception as e:
@@ -1904,6 +1947,100 @@ class DaemonServer:
             try:
                 writer.close()
                 await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def _drain_for_shutdown(self, grace_s: float = 2.0, settle_s: float = 10.0) -> None:
+        """Full review P1 (daemon-rest): settle all in-flight work before the lock goes.
+
+        Order: no new lead merges (`_stopping`), give socket handlers a short grace
+        (the `daemon stop` caller is still writing its response), cancel long polls and
+        unread requests, then await every other handler, merge pipeline and queued lead
+        merge to completion: their
+        worker threads run git and the test command in the integration worktree, and
+        their final transaction needs the open SQLite connection. Only after this does
+        `run_server` record the stop, release meshd.lock and close the database, so a new
+        meshd cannot run boot recovery against a merge that is still running.
+        """
+        self._stopping = True
+        me = asyncio.current_task()
+        # PR42 r2: let handler tasks of connections accepted just before close() start
+        # and register before the snapshot.
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        def cancel_polls(tasks):
+            hit = [t for t in tasks if not t.done()
+                   and self._client_cmds.get(t, "unknown") in _CANCEL_ON_STOP]
+            for t in hit:
+                # PR42 Linear r2: abort first, so the handler's cleanup (wait_closed on
+                # a client that stopped reading) cannot block the gather below.
+                w = self._client_writers.get(t)
+                try:
+                    if w is not None:
+                        w.transport.abort()
+                except Exception:
+                    pass
+                t.cancel()
+            return hit
+
+        clients = [t for t in self._client_tasks if t is not me and not t.done()]
+        if clients:
+            _done, pending = await asyncio.wait(clients, timeout=grace_s)
+            # PR42 r1: cancel only long polls and connections whose request was never
+            # read. Every other handler (task.merge parked on its shielded job, task.start
+            # or task.submit in a worker thread, ...) is awaited below so its caller gets
+            # the real response and no worker thread outlives meshd.lock.
+            cancel = cancel_polls(pending)
+            if cancel:
+                await asyncio.gather(*cancel, return_exceptions=True)
+        idle_since: Optional[float] = None
+        aborted: Set[asyncio.Task] = set()
+        while True:
+            jobs = [j for j in (self._merge_jobs | self._lead_merge_tasks) if not j.done()]
+            busy = [t for t in self._client_tasks if t is not me and not t.done()]
+            # PR42 Linear r1: once no merge is left, handlers get settle_s to deliver
+            # their responses; after that their connections are aborted, so a client
+            # that never reads cannot block shutdown in drain(). A handler still in a
+            # worker thread keeps being awaited (its late write just fails).
+            if jobs:
+                idle_since = None
+            elif busy:
+                now = time.monotonic()
+                if idle_since is None:
+                    idle_since = now
+                elif now - idle_since >= settle_s:
+                    for t in busy:
+                        if t in aborted:
+                            continue
+                        aborted.add(t)
+                        w = self._client_writers.get(t)
+                        try:
+                            if w is not None:
+                                w.transport.abort()
+                        except Exception:
+                            pass
+            if not jobs and not busy:
+                # One more turn: a handler created in this iteration registers on its
+                # first step (PR42 r2).
+                await asyncio.sleep(0)
+                if not any(t is not me and not t.done() for t in self._client_tasks):
+                    break
+                continue
+            # PR42 r2: late handlers get the same policy (a poll would hold shutdown).
+            cancel_polls(busy)
+            try:
+                self.log_error(f"meshd stopping: waiting for {len(jobs)} in-flight merge(s) "
+                               f"and {len(busy)} request(s)")
+            except Exception:
+                pass
+            # Not cancelled: a cancelled to_thread() await would not stop the thread.
+            # Bounded wait so newly registered late handlers are re-checked.
+            await asyncio.wait(jobs + busy, timeout=1.0, return_when=asyncio.ALL_COMPLETED)
+        # A cancelled handler may have left a transaction open; the stop record needs none.
+        if self.db_conn is not None and self.db_conn.in_transaction:
+            try:
+                self.db_conn.execute("ROLLBACK;")
             except Exception:
                 pass
 
@@ -1973,8 +2110,15 @@ class DaemonServer:
                         pass
 
             if self.server:
+                # Stop accepting first. On Python 3.11 wait_closed() does not wait for
+                # the connection handlers, so they are drained below.
                 self.server.close()
-                await self.server.wait_closed()
+            await self._drain_for_shutdown()
+            if self.server:
+                try:
+                    await asyncio.wait_for(self.server.wait_closed(), timeout=5.0)
+                except (asyncio.TimeoutError, Exception):
+                    pass
 
             if os.path.exists(sock_path):
                 try:
