@@ -114,6 +114,8 @@ Channels:
     inbox lead lists `mesh approval pending`, asks the human, then decides with its own token and
     --human-confirmed "<the human's words>". Trusts the lead; recorded unverified with those words.
     direct_only categories (config, permission_escalation by default) still need the passphrase.
+    The lead may decide requests it raised itself (recorded self_requested: true); to forbid that:
+    mesh config set approval.delegated_self_approve false --user
 
 Examples:
   # User directly approves an operation:

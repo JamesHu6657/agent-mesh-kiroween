@@ -15,6 +15,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import mesh.constants as c
+from mesh.core.logfile import append_line, escape_field
 from mesh.errors import DbIntegrityError, MeshError, SchemaTooNewError
 from mesh.core.auth import (
     classify_peer_run_session,
@@ -31,6 +32,7 @@ from mesh.core.clock import now_iso_utc, now_monotonic
 from mesh.core.db import connect_db
 from mesh.core.events import insert_event
 from mesh.core.ids import new_id
+from mesh.core.leases import task_start_replay_matches
 from mesh.core.paths import (
     check_home_permissions,
     check_install_path_secure,
@@ -139,6 +141,23 @@ from mesh.core.workspaces import ensure_run_dir, ensure_workspace_dir
 # Linux PR_SET_CHILD_SUBREAPER. 34 is PR_SET_THP_DISABLE and yields EINVAL (M1a bug).
 PR_SET_CHILD_SUBREAPER = 36
 MAX_REQUEST_BYTES = 1024 * 1024  # 1 MiB
+#: Blind review P2: connections served at once, and how long a client may take to send
+#: its request line (long waits start after the line is read, so they are unaffected).
+MAX_CONNECTIONS = 256
+INITIAL_READ_TIMEOUT_S = 30.0
+#: How long an oversized request line is still drained before the connection closes.
+OVERSIZE_DRAIN_S = 2.0
+
+
+def _conn_limits() -> Tuple[int, float]:
+    """(max connections, initial read timeout); tests may lower them (MESH_TESTING only)."""
+    if os.environ.get("MESH_TESTING") == "1":
+        try:
+            return (int(os.environ.get("MESH_TEST_MAX_CONNECTIONS", MAX_CONNECTIONS)),
+                    float(os.environ.get("MESH_TEST_INITIAL_READ_TIMEOUT_S", INITIAL_READ_TIMEOUT_S)))
+        except ValueError:
+            pass
+    return MAX_CONNECTIONS, INITIAL_READ_TIMEOUT_S
 
 PLANNED_COMMAND_MILESTONES = {
     # Task commands
@@ -150,6 +169,30 @@ PLANNED_COMMAND_MILESTONES = {
 
 
 REAP_INTERVAL_S = 5.0
+
+
+def _start_replay_ok(cmd: str, args: Dict[str, Any], approval: Any, idempotency_key: Optional[str],
+                     stored_hash: str, stored_response_json: str) -> bool:
+    """Sakana PR #4 P2-3: a `task.start` retry that differs from the stored request only in
+    its key-derived default session replays the original start (see
+    ``task_start_replay_matches``). Every other command keeps the exact-hash rule."""
+    if cmd != "task.start":
+        return False
+    try:
+        stored = json.loads(stored_response_json)
+    except (TypeError, ValueError):
+        return False
+
+    def matches(new_args: Dict[str, Any]) -> bool:
+        doc: Dict[str, Any] = {"cmd": cmd, "args": new_args}
+        if approval:
+            doc["approval"] = approval
+        try:
+            return hashlib.sha256(canonical_json(doc)).hexdigest() == stored_hash
+        except ValueError:
+            return False
+
+    return task_start_replay_matches(args, idempotency_key, stored, matches)
 
 
 def idempotency_partition(principal: Dict[str, Any], via: Optional[str]) -> str:
@@ -239,7 +282,8 @@ def dispatch_internal_request(ctx: HandlerContext, idempotency_key: Optional[str
             (principal_id, idempotency_key),
         ).fetchone()
         if irow:
-            if irow["request_hash"] != req_hash:
+            if irow["request_hash"] != req_hash and not _start_replay_ok(
+                    cmd, ctx.args, ctx.approval, idempotency_key, irow["request_hash"], irow["response_json"]):
                 return MeshError(
                     code=c.IDEMPOTENCY_KEY_REUSED,
                     exit_code=c.EXIT_CONFLICT,
@@ -509,34 +553,17 @@ class DaemonServer:
 
         Never records the auth field or credential secrets.
         """
-        logs_dir = os.path.join(self.home, "logs")
-        os.makedirs(logs_dir, mode=0o700, exist_ok=True)
-        log_path = os.path.join(logs_dir, "meshd.log")
-
-        # Format line without the word "auth" (C11: grep -c '"auth"' meshd.log == 0)
-        line = (
-            f"{now_iso_utc()} req={request_id} cmd={cmd} principal={principal_id} "
-            f"rc={exit_code} dur_ms={duration_ms:.2f}\n"
-        )
-        try:
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(line)
-            os.chmod(log_path, 0o600)
-        except Exception:
-            pass
+        # Format line without the word "auth" (C11: grep -c '"auth"' meshd.log == 0).
+        # Blind review P3: request fields are client-supplied: redacted and escaped, and
+        # the file rotates (mesh.core.logfile).
+        append_line(self.home, (
+            f"{now_iso_utc()} req={escape_field(request_id)} cmd={escape_field(cmd)} principal={escape_field(principal_id)} "
+            f"rc={exit_code} dur_ms={duration_ms:.2f}"
+        ))
 
     def log_error(self, message: str) -> None:
         """Write error log to meshd.log per plan §15.2 and checklist C11 without secrets."""
-        logs_dir = os.path.join(self.home, "logs")
-        os.makedirs(logs_dir, mode=0o700, exist_ok=True)
-        log_path = os.path.join(logs_dir, "meshd.log")
-        line = f"{now_iso_utc()} ERROR {redact(message)}\n"
-        try:
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(line)
-            os.chmod(log_path, 0o600)
-        except Exception:
-            pass
+        append_line(self.home, f"{now_iso_utc()} ERROR {message}")
 
     def setup_storage(self) -> None:
         """Check filesystem permissions, paths, and SQLite integrity."""
@@ -1197,7 +1224,37 @@ class DaemonServer:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        """Handle an incoming client request over Unix socket."""
+        """Handle an incoming client request over Unix socket.
+
+        Blind review P2: at most ``MAX_CONNECTIONS`` connections are served at once (a
+        connection over the limit gets a BUSY error and is closed), and a client must send
+        its request line within ``INITIAL_READ_TIMEOUT_S``."""
+        self.active_connections = getattr(self, "active_connections", 0) + 1
+        try:
+            max_conn, _ = _conn_limits()
+            if self.active_connections > max_conn:
+                try:
+                    writer.write((json.dumps({
+                        "ok": False,
+                        "error": {"code": c.CONCURRENCY_LIMIT, "message":
+                                  f"meshd is serving {max_conn} connections; retry shortly",
+                                  "details": {"max_connections": max_conn}},
+                        "exit_code": c.EXIT_BUSY, "request_id": None}) + "\n").encode("utf-8"))
+                    await writer.drain()
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                return
+            await self._handle_client(reader, writer)
+        finally:
+            self.active_connections -= 1
+
+    async def _handle_client(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
         sock = writer.get_extra_info("socket")
         start_mono = now_monotonic()
 
@@ -1220,12 +1277,19 @@ class DaemonServer:
 
         try:
             try:
-                line_bytes = await reader.readline()
+                line_bytes = await asyncio.wait_for(reader.readline(), timeout=_conn_limits()[1])
+            except asyncio.TimeoutError:
+                return  # idle client: closed in finally
             except (ValueError, asyncio.LimitOverrunError):
                 # Drain remaining line data up to newline or EOF so writer.close() does not send RST
+                # PR #40 r1: one overall deadline, so a slow sender cannot hold the slot.
+                drain_deadline = time.monotonic() + OVERSIZE_DRAIN_S
                 try:
                     while not reader.at_eof():
-                        chunk = await asyncio.wait_for(reader.read(65536), timeout=0.5)
+                        left = drain_deadline - time.monotonic()
+                        if left <= 0:
+                            break
+                        chunk = await asyncio.wait_for(reader.read(65536), timeout=min(0.5, left))
                         if not chunk or b"\n" in chunk:
                             break
                 except Exception:
@@ -1321,19 +1385,7 @@ class DaemonServer:
             )
 
             # Pre-validate before canonical hashing and idempotency check
-            if cmd == "config.set":
-                cur = self.db_conn.execute("SELECT key, value_json FROM settings;")
-                current_settings = {r["key"]: json.loads(r["value_json"]) for r in cur.fetchall()}
-                key = args.get("key")
-                raw_val = args.get("value")
-                validate_setting(
-                    key=key,
-                    val=raw_val,
-                    home=self.home,
-                    current_settings=current_settings,
-                    db_conn=self.db_conn,
-                )
-            elif cmd == "agent.create":
+            if cmd == "agent.create":
                 # Absent: 1 (the handler applies the default). Present (even null): validated.
                 if "max_concurrency" in args:
                     parse_positive_int(args["max_concurrency"], "max_concurrency")
@@ -1379,9 +1431,12 @@ class DaemonServer:
                     "SELECT request_hash, response_json, exit_code FROM idempotency WHERE principal_id = ? AND key = ?;",
                     (idem_pid, idempotency_key),
                 )
-                irow = cur.fetchone()
+                # Blind review P3: a dry run never replays a real execution's stored result.
+                irow = None if dry_run else cur.fetchone()
                 if irow:
-                    if irow["request_hash"] == req_hash:
+                    if irow["request_hash"] == req_hash or _start_replay_ok(
+                            cmd, args, req.get("approval"), idempotency_key,
+                            irow["request_hash"], irow["response_json"]):
                         # Return stored response
                         stored_envelope = json.loads(irow["response_json"])
                         stored_envelope["idempotent_replay"] = True
@@ -1395,6 +1450,19 @@ class DaemonServer:
                             exit_code=c.EXIT_CONFLICT,
                             message=f"Idempotency key '{idempotency_key}' reused with different request parameters",
                         )
+
+            # Blind review P2: state-dependent validation runs after the replay lookup, so a
+            # keyed request that already succeeded replays even if settings changed since.
+            if cmd == "config.set":
+                cur = self.db_conn.execute("SELECT key, value_json FROM settings;")
+                current_settings = {r["key"]: json.loads(r["value_json"]) for r in cur.fetchall()}
+                validate_setting(
+                    key=args.get("key"),
+                    val=args.get("value"),
+                    home=self.home,
+                    current_settings=current_settings,
+                    db_conn=self.db_conn,
+                )
 
             # Handler context
             ctx = HandlerContext(
@@ -1516,6 +1584,33 @@ class DaemonServer:
             # Transaction execution
             if True:
                 self.db_conn.execute("BEGIN IMMEDIATE;")
+
+                # Linear full review B1: the cache was read before the awaits above
+                # (workspace/git preparation); an identical keyed request may have finished
+                # meanwhile. Re-read it under the write lock and replay it, so overlapping
+                # retries get the original response instead of INVALID_TRANSITION.
+                if idempotency_key and not dry_run:
+                    irow = self.db_conn.execute(
+                        "SELECT request_hash, response_json, exit_code FROM idempotency "
+                        "WHERE principal_id = ? AND key = ?;",
+                        (idem_pid, idempotency_key),
+                    ).fetchone()
+                    if irow:
+                        self.db_conn.execute("ROLLBACK;")
+                        if irow["request_hash"] == req_hash or _start_replay_ok(
+                                cmd, args, req.get("approval"), idempotency_key,
+                                irow["request_hash"], irow["response_json"]):
+                            stored_envelope = json.loads(irow["response_json"])
+                            stored_envelope["idempotent_replay"] = True
+                            writer.write((json.dumps(stored_envelope) + "\n").encode("utf-8"))
+                            await writer.drain()
+                            exit_code = irow["exit_code"]
+                            return
+                        raise MeshError(
+                            code=c.IDEMPOTENCY_KEY_REUSED,
+                            exit_code=c.EXIT_CONFLICT,
+                            message=f"Idempotency key '{idempotency_key}' reused with different request parameters",
+                        )
 
                 # Dispatch
                 res: HandlerResult

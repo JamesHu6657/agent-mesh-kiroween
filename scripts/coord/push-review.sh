@@ -8,12 +8,16 @@ if [ "${1:-}" = "--delete" ]; then git push github --delete "review/${2:?run}"; 
 N="${1:?run}"; [[ "$N" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad run"; exit 2; }
 git fetch -q github main
 B="wt/$N"; git rev-parse -q --verify "$B" >/dev/null || { echo "no branch $B"; exit 2; }
-R="github/main..$B"
-GL=/tmp/gitleaks; [ -x $GL ] || { echo "REFUSED: gitleaks missing"; exit 2; }
+# Linear full review D2: resolve both ends once; scan and push exactly these SHAs, so a commit
+# landing on the branch during the scan is never pushed unscanned.
+S=$(git rev-parse "$B^{commit}"); BASE=$(git rev-parse github/main^{commit})
+R="$BASE..$S"
+GL=${GITLEAKS:-/tmp/gitleaks}; [ -x $GL ] || { echo "REFUSED: gitleaks missing"; exit 2; }
 if ! $GL git --no-banner --redact --log-opts="$R" --baseline-path scripts/coord/gitleaks-baseline.json . > /tmp/pr-gl.txt 2>&1; then
   echo "REFUSED: gitleaks hits:"; grep -E "RuleID|File|Commit" /tmp/pr-gl.txt | head -30; exit 3; fi
-P='[0-9]{8,10}:AA[A-Za-z0-9_-]{30,}|ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|AKIA[0-9A-Z]{16}|brd-customer-[a-z0-9_-]+|sk-(ant-|proj-)?[A-Za-z0-9_-]{24,}|(HOSTA_API_KEY|BRIGHTDATA_[A-Z_]+|HERMES_TELEGRAM_BOT_TOKEN|MWAPI_API_KEY|WECHAT_ROUTINE_WEBHOOK_KEY)=[^` "\\]{6,}|BEGIN (OPENSSH|EC|DSA) PRIVATE KEY'
+# Shared pattern (Sakana PR #4 P1-2: generic *_API_KEY=); fail closed if missing.
+. scripts/coord/secret-pattern.sh 2>/dev/null && [ -n "${P:-}" ] || { echo "REFUSED: scripts/coord/secret-pattern.sh missing"; exit 2; }
 H=$(git log -p $R | grep -E '^\+' | grep -cE "$P" || true)
 [ "$H" = 0 ] || { echo "REFUSED: $H pattern hits"; exit 3; }
-git push github "$B:refs/heads/review/$N"
-echo "branch review/$N base $(git merge-base github/main $B) (github main $(git rev-parse github/main)) head $(git rev-parse $B) commits $(git rev-list --count $R)"
+git push github "$S:refs/heads/review/$N"
+echo "branch review/$N base $(git merge-base $BASE $S) (github main $BASE) head $S commits $(git rev-list --count $R)"

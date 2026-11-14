@@ -85,8 +85,20 @@ def _handle_top(args: argparse.Namespace) -> Dict[str, Any]:
     raise NotImplementedInM1Error("top", milestone=None)
 
 
+def _refuse_dry_run(args: argparse.Namespace, what: str) -> None:
+    """Linear full review C1: local commands that write cannot simulate; refuse rather
+    than perform the change under --dry-run."""
+    if getattr(args, "dry_run", False):
+        import mesh.constants as _c
+        from mesh.errors import MeshError as _ME
+        raise _ME(_c.INVALID_ARGUMENT, exit_code=_c.EXIT_USAGE,
+                  message=f"{what} does not support --dry-run (it would change local state); run it without --dry-run",
+                  details={"param": "dry_run"})
+
+
 def handle_init(args: argparse.Namespace) -> Dict[str, Any]:
     """Handle mesh init command."""
+    _refuse_dry_run(args, "mesh init")
     from mesh.core.passphrase import read_passphrase
     passphrase = read_passphrase(args, "Enter user passphrase (>= 12 chars): ")
 

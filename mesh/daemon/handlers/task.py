@@ -38,6 +38,7 @@ from mesh.core.workspaces import (
     run_code_workspace_plan,
 )
 from mesh.daemon.handlers.base import Effect, HandlerContext, HandlerResult
+from mesh.daemon.handlers.inbox import _recheck_credential
 from mesh.daemon.scheduler import ack_window_now, compute_queue_info, fail_queued_task_t6, promote_tasks
 from mesh.errors import MeshError
 
@@ -214,6 +215,23 @@ def _format_task(
         "depended_on_by": depended_on_by if depended_on_by is not None else [],
         "history": history,
     }
+
+
+def _created_profile_override(conn: sqlite3.Connection, task: sqlite3.Row) -> Optional[str]:
+    """The profile `task assign` keeps for an unassigned task (blind review P2): the one
+    given at create time, or None (the assignee's default) when none was given. Tasks
+    created before ``profile_explicit`` was recorded keep their stored profile."""
+    row = conn.execute(
+        "SELECT payload_json FROM events WHERE task_id = ? AND type = 'task.created' ORDER BY seq ASC LIMIT 1;",
+        (task["id"],)).fetchone()
+    if row is not None:
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        if payload.get("profile_explicit") is False:
+            return None
+    return task["profile"]
 
 
 def _validate_profile_and_effort(profile_override: Optional[str], effort_override: Optional[str]) -> None:
@@ -722,6 +740,9 @@ def handle_task_create(ctx: HandlerContext) -> HandlerResult:
             "title": title,
             "assignee": agent_name,
             "profile": profile,
+            # Blind review P2: whether the profile was asked for, so a later `task assign`
+            # of an unassigned task uses the worker's default instead of the edit fallback.
+            "profile_explicit": bool(ctx.args.get("profile")),
             "model": model,
             "effort": effort,
         },
@@ -761,7 +782,17 @@ def handle_task_assign(ctx: HandlerContext) -> HandlerResult:
 
     check_authz(ctx.conn, "task.assign", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id, task_id=task_id)
 
-    # Check transition: T3 is from created to assigned
+    # Check transition: T3 is from created to assigned. Blind review P1: only T3; a
+    # failed/escalated/rework/merge_failed task goes back through `task retry` (attempt cap,
+    # approval) or `task reassign` (T20), never through assign.
+    if task["status"] != "created":
+        raise MeshError(
+            code=c.INVALID_TRANSITION,
+            exit_code=c.EXIT_CONFLICT,
+            message=(f"task assign only assigns a new (created) task; '{task_id}' is {task['status']}. "
+                     f"Use `mesh task reassign {task_id} --to <agent>` or `mesh task retry {task_id}`"),
+            details={"task_id": task_id, "from": task["status"], "to": "assigned"},
+        )
     check_task_transition(task["status"], "assigned")
 
     agent_row, profile, model, effort = _validate_assignment_guards(
@@ -769,7 +800,7 @@ def handle_task_assign(ctx: HandlerContext) -> HandlerResult:
         ctx=ctx,
         project_id=project_id,
         assignee_ident=to_agent,
-        profile_override=ctx.args.get("profile") or task["profile"],
+        profile_override=ctx.args.get("profile") or _created_profile_override(ctx.conn, task),
         model_override=ctx.args.get("model") or task["model"],
         effort_override=ctx.args.get("effort") or task["effort"],
         task_title=task["title"],
@@ -1522,7 +1553,9 @@ def handle_task_retry(ctx: HandlerContext) -> HandlerResult:
     resolved_effort = effort_override or task["effort"]
 
     if assignee_id and (model_override or effort_override):
-        cur_ag = ctx.conn.execute("SELECT * FROM agents WHERE id = ?;", (assignee_id,))
+        # Blind review P3: the validator names the agent in its errors (needs p.name).
+        cur_ag = ctx.conn.execute(
+            "SELECT a.*, p.name FROM agents a JOIN principals p ON a.id = p.id WHERE a.id = ?;", (assignee_id,))
         ag_row = cur_ag.fetchone()
         if ag_row:
             resolved_model, resolved_effort = _validate_model_and_effort(
@@ -1793,6 +1826,11 @@ async def handle_task_wait(server: Any, ctx: HandlerContext, reader: Any = None)
                     data={"items": []},
                 )
 
+            # Blind review P2: re-check the credential and access on every pass, so a revoke,
+            # disable or lost project access during the wait ends it before data is returned.
+            _recheck_credential(ctx)
+            check_authz(ctx.conn, "task.wait", ctx.principal, ctx.actor_kind, ctx.via,
+                        project_id=project_id, task_id=task_id)
             row = _get_task(ctx.conn, task_id)
             if match_fn(row["status"], row["kind"]):
                 cur_deps = ctx.conn.execute(

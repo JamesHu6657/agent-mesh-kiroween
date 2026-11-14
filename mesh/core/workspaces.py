@@ -190,6 +190,15 @@ def _existing_worktree_branch(plan: Mapping[str, Any], path: str) -> Optional[st
     return full[len("refs/heads/"):] if full.startswith("refs/heads/") else full
 
 
+def _common_dir(plan: Mapping[str, Any], path: str) -> Optional[str]:
+    """The canonical git common directory of the repo or worktree at ``path``."""
+    cp = _git(plan, "rev-parse --git-common-dir", ["rev-parse", "--git-common-dir"], path)
+    out = (cp.stdout or "").strip()
+    if cp.returncode != 0 or not out:
+        return None
+    return os.path.realpath(os.path.join(path, out))
+
+
 def _reuse(plan: Mapping[str, Any], path: str, branch: str, alt_branch: Optional[str] = None) -> str:
     """Reuse an existing worktree only if it is a worktree of the repo on `branch`
     (or on `alt_branch` when given). Returns the branch it is on."""
@@ -197,6 +206,15 @@ def _reuse(plan: Mapping[str, Any], path: str, branch: str, alt_branch: Optional
     if os.path.realpath((top.stdout or "").strip()) != os.path.realpath(path):
         raise _fail("workspace exists but is not a git worktree", plan, step="reuse", reason="not_a_worktree",
                     branch=branch)
+    repo = plan.get("repo")
+    if repo:
+        # Blind review P2: a separate repository with a same-named branch must not pass
+        # as a worktree of the project repo: compare the git common directories.
+        mine = _common_dir(plan, path)
+        theirs = _common_dir(plan, repo)
+        if mine is None or theirs is None or mine != theirs:
+            raise _fail("workspace exists but belongs to a different repository", plan, step="reuse",
+                        reason="foreign_repository", branch=branch)
     current = _existing_worktree_branch(plan, path)
     if current == branch or (alt_branch is not None and current == alt_branch):
         return current

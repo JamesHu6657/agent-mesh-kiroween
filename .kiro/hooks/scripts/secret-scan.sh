@@ -9,7 +9,7 @@
 #   1. gitleaks (/tmp/gitleaks, else gitleaks on PATH), --redact, baseline
 #      scripts/coord/gitleaks-baseline.json (it allowlists the known fake test fixtures by
 #      commit fingerprint, so it only matches committed history, not staged or dir scans).
-#   2. The coordinator's extra pattern scan (pattern copied verbatim from sync-github.sh).
+#   2. The coordinator's extra pattern scan (shared pattern, scripts/coord/secret-pattern.sh).
 #   3. Absolute home paths (/home/<user>/, the root home, /Users/<user>/): for the whole tree in
 #      --dir mode; in staged mode only for staged files under .kiro/ (nothing personal under .kiro/).
 # Findings are reported as file:line; matched secret text is never printed.
@@ -51,8 +51,8 @@ if [ ! -f "$BASELINE" ]; then
   exit 2
 fi
 
-# Verbatim from scripts/coord/sync-github.sh (variable P).
-P='[0-9]{8,10}:AA[A-Za-z0-9_-]{30,}|ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|AKIA[0-9A-Z]{16}|brd-customer-[a-z0-9_-]+|sk-(ant-|proj-)?[A-Za-z0-9_-]{24,}|(HOSTA_API_KEY|BRIGHTDATA_[A-Z_]+|HERMES_TELEGRAM_BOT_TOKEN|MWAPI_API_KEY|WECHAT_ROUTINE_WEBHOOK_KEY)=[^` "\\]{6,}|BEGIN (OPENSSH|EC|DSA) PRIVATE KEY'
+# Shared pattern (Sakana PR #4 P1-2: generic *_API_KEY=); fail closed if missing.
+. scripts/coord/secret-pattern.sh 2>/dev/null && [ -n "${P:-}" ] || { echo "secret-scan: REFUSED: scripts/coord/secret-pattern.sh missing"; exit 2; }
 # Written so that this file does not match itself.
 HOMEP='(/home/[A-Za-z0-9._-]+/|/roo[t]/|/Users/[A-Za-z0-9._-]+/)'
 
@@ -79,9 +79,15 @@ if [ "$MODE" = staged ]; then
   "$GL" git --staged --no-banner --redact --baseline-path "$BASELINE" . >"$OUT" 2>&1
   report_gitleaks "$?" "staged"
 
-  while IFS= read -r f; do
+  # Linear full review D8: NUL-delimited names (no C-quoting), and a staged blob that cannot
+  # be read is a finding, never an empty pass.
+  while IFS= read -r -d '' f; do
     [ -n "$f" ] || continue
-    lines="$(git show ":$f" 2>/dev/null | grep -nIE "$P" | cut -d: -f1 | tr '\n' ' ')"
+    if ! content="$(git show ":$f" 2>/dev/null)"; then
+      echo "secret-scan: cannot read staged $f"
+      findings=$((findings + 1)); continue
+    fi
+    lines="$(printf '%s\n' "$content" | grep -nIE "$P" | cut -d: -f1 | tr '\n' ' ')"
     if [ -n "$lines" ]; then
       echo "secret-scan: pattern hit in staged $f at line(s) $lines"
       findings=$((findings + 1))
@@ -89,14 +95,14 @@ if [ "$MODE" = staged ]; then
     case "$f" in
       .kiro/agents/*) ;;  # agent permission paths (allowedPaths) are not secrets
       .kiro/*)
-        homes="$(git show ":$f" 2>/dev/null | grep -nIoE "$HOMEP" | tr '\n' ' ')"
+        homes="$(printf '%s\n' "$content" | grep -nIoE "$HOMEP" | tr '\n' ' ')"
         if [ -n "$homes" ]; then
           echo "secret-scan: absolute home path in staged $f: $homes"
           findings=$((findings + 1))
         fi
         ;;
     esac
-  done < <(git diff --cached --name-only --diff-filter=ACMR)
+  done < <(git diff --cached --name-only -z --diff-filter=ACMR)
 else
   "$GL" dir --no-banner --redact --baseline-path "$BASELINE" "$DIR" >"$OUT" 2>&1
   report_gitleaks "$?" "dir $DIR"

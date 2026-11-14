@@ -2,7 +2,7 @@
 # Kiro planning: drafts the next agy dispatch prompt. Usage: bash scripts/coord/kiro-plan.sh <name> <goal...>
 #  Output: docs/coordination/plans/<name>.md (a ready-to-use agy prompt draft). The coordinator (Quest) vets it and
 #  copies it to prompts/agy-<...>.md before dispatch; Kiro never writes prompts/ itself.
-source "$(dirname "$0")/kiro-run-common.sh"
+source "$(dirname "$(readlink -f "$0")")/kiro-run-common.sh"
 N="${1:?name}"; shift; GOAL="${*:?goal}"
 [[ "$N" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad name"; exit 2; }
 OUT=docs/coordination/plans/$N.md

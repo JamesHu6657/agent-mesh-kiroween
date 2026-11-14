@@ -1,5 +1,6 @@
 """Agent resource commands: create, update, list, show, disable, enable, token."""
 
+import os
 import argparse
 from typing import Any, Dict
 
@@ -252,7 +253,7 @@ def handle_agent_create(args: argparse.Namespace) -> Dict[str, Any]:
         "capabilities": capabilities,
         "default_profile": args.default_profile or "edit",
         "max_unapproved_profile": args.max_unapproved_profile or "dev",
-        "binary": args.binary,
+        "binary": os.path.abspath(os.path.expanduser(args.binary)) if args.binary else args.binary,
         "options": options,
         "strict_models": args.strict_models,
         "no_intake": bool(getattr(args, "no_intake", False)),
@@ -509,7 +510,16 @@ def handle_agent_onboard(args: argparse.Namespace) -> Dict[str, Any]:
     try:
         import copy
         issue_args = copy.copy(args)  # keeps the resolved auth (one passphrase prompt)
-        issue_args.idempotency_key = None  # a second command must not replay the create
+        # A second command must not replay the create; a retried onboard with the same key
+        # must replay the issue too instead of minting another token (Linear full review C3).
+        key = getattr(args, "idempotency_key", None)
+        if key:
+            import hashlib
+            # Bounded: the daemon caps keys at 128 characters (PR #39 review).
+            issue_args.idempotency_key = (f"{key}:token" if len(key) <= 122
+                                          else "onboard-token:" + hashlib.sha256(key.encode("utf-8")).hexdigest())
+        else:
+            issue_args.idempotency_key = None
         issued = client.execute_cmd(issue_args, "agent.token.issue",
                                     {"name": args.name, "expires_in": args.expires_in}).get("data", {})
     except MeshError as exc:
@@ -519,6 +529,47 @@ def handle_agent_onboard(args: argparse.Namespace) -> Dict[str, Any]:
                         details={**(exc.details or {}), "agent_id": created.get("id")})
     token = issued.pop("token", None)
     cred = issued.get("credential_id")
+    if isinstance(token, str) and token.startswith("[REDACTED"):
+        # Replay of an earlier onboard: the token was shown (and written) once already.
+        # PR #39 review round 2: the file must hold THIS credential's token (its lookup part),
+        # not an older one that a failed --force replace left behind.
+        held = ""
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                held = fh.read().strip()
+        except OSError:
+            pass
+        parts = held.split("_")
+        lookup = issued.get("lookup")
+        genuine = bool(lookup and len(parts) >= 4 and parts[2] == lookup)
+        if genuine:
+            # PR #39 review round 3: the whole token must authenticate as this agent, not only
+            # carry the right lookup (a truncated or edited secret is not a usable token file).
+            try:
+                who_args = copy.copy(args)
+                who_args.idempotency_key = None
+                who = client.execute_cmd(who_args, "whoami", {},
+                                         auth_override={"type": "token", "token": held}).get("data", {})
+                genuine = who.get("name") == args.name
+            except MeshError:
+                genuine = False
+        if not genuine:
+            # The first attempt could not write it, and a replay cannot show it again.
+            raise MeshError(
+                code=c.INTERNAL_ERROR, exit_code=c.EXIT_INTERNAL,
+                message=(f"agent {args.name} and token {cred} were created by an earlier onboard with this key, "
+                         f"but the token file {path} does not hold that token and it cannot be shown again; "
+                         f"revoke it with `mesh agent token revoke {cred} --user` and run "
+                         f"`mesh agent token issue {args.name} --out {path} --user`"),
+                details={"agent_id": created.get("id"), "credential_id": cred, "token_file": path},
+            )
+        return {
+            "agent": {k: created.get(k) for k in ("id", "name", "adapter", "delivery", "max_concurrency",
+                                                   "capabilities", "ack_timeout_s", "ack_timeout_source")},
+            "credential_id": cred, "expires_at": issued.get("expires_at"), "token_file": path,
+            "written": False, "replayed": True,
+            "cheat_sheet": worker_cheat_sheet(args.name, path, created.get("ack_timeout_s"), args.home),
+        }
     try:
         if token is None:
             raise OSError("no token in the response")

@@ -12,6 +12,6 @@ source "$(dirname "$0")/coder-guard.sh"; coder_guard
 [ -e "logs/raw/agy-$N.jsonl" ] && { echo "REFUSED: run name exists"; exit 2; }
 mkdir -p logs/raw
 setsid nohup agy -p "$(cat "$P")" --model gemini-3.8-flash-high --output-format stream-json \
-  --settings prompts/agy-settings-m1c.json > "logs/raw/agy-$N.jsonl" 2> "logs/raw/agy-$N.err" < /dev/null &
+  --settings prompts/agy-settings-m1c.json > "logs/raw/agy-$N.jsonl" 2> "logs/raw/agy-$N.err" < /dev/null 9>&- &
 PID=$!; disown
 echo "dispatched agy run=$N pid=$PID log=logs/raw/agy-$N.jsonl model=gemini-3.8-flash-high"

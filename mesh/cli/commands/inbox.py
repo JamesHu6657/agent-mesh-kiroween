@@ -6,6 +6,7 @@ from typing import Any, Dict
 from mesh.client import MeshClient
 import mesh.constants as c
 from mesh.errors import MeshError, NotImplementedInM1Error
+from mesh.cli.render import align_rows, fit
 
 
 def register_inbox_commands(subparsers: argparse._SubParsersAction, parent_parser: argparse.ArgumentParser) -> None:
@@ -60,7 +61,7 @@ def register_inbox_commands(subparsers: argparse._SubParsersAction, parent_parse
 
 def _one_line(v: Any, limit: int = 60) -> str:
     s = " ".join(str(v).split()) if v is not None else "-"
-    return s if len(s) <= limit else s[: limit - 3] + "..."
+    return fit(s, limit)
 
 
 def short_project(pid: Any) -> str:
@@ -122,8 +123,7 @@ def inbox_table(items: Any) -> str:
                      mtype, str(m.get("status") or "-"),
                      short_project(m.get("project_id") or p.get("project_id")),
                      str(subject or "-"), _one_line(title, 48), _one_line(reason, 60)])
-    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
-    return "\n".join("  ".join(r[i].ljust(widths[i]) for i in range(len(r))).rstrip() for r in rows)
+    return "\n".join(align_rows(rows))
 
 
 def _text_view(args: argparse.Namespace, data: Any) -> Any:

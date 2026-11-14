@@ -79,6 +79,10 @@ def handle_config_set(args: argparse.Namespace) -> Dict[str, Any]:
     from mesh.core.settings import string_setting
 
     raw_val = args.value
+    if "value" in getattr(args, "_from_json", set()):
+        # Linear full review C5: --input already decoded a native JSON value.
+        client = MeshClient(home=args.home)
+        return client.execute_cmd(args, "config.set", {"key": args.key, "value": raw_val}).get("data", {})
     try:
         parsed_val = json.loads(raw_val)
     except json.JSONDecodeError as exc:

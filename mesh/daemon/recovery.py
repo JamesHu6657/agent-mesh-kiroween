@@ -50,13 +50,13 @@ import json
 import os
 import sqlite3
 import time
-from typing import Any, Dict, List, Mapping, Optional, Set
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 from mesh.core.clock import now_iso_utc, parse_utc
 from mesh.core.db import transaction
 from mesh.core.events import record_event
 from mesh.core.leases import get_lease_ttl_s
-from mesh.core.proc import get_proc_stat, is_tgid_alive
+from mesh.core.proc import ScanResult, get_proc_stat, is_tgid_alive
 from mesh.daemon import supervisor, terminate
 
 WRAPPER_WAIT_S = 5.0
@@ -95,17 +95,97 @@ def _identity_alive(wrapper: Optional[Mapping[str, Any]]) -> bool:
     return is_tgid_alive(pid, info)
 
 
-def _env_carriers(run_id: str, wrapper_starttime: Optional[int] = None) -> Dict[int, int]:
-    """Live processes whose environ carries ``MESH_RUN_ID=<run>`` (no group/session match)."""
-    return terminate.run_targets_or_recheck(run_id, None, None, wrapper_starttime)  # environ carriers only
+class _StillWaiting(Exception):
+    """Live (deferred) recovery: not settled yet without blocking; check next tick."""
+
+
+class _Live:
+    """PR #40 r3: state of a deferred run's live (supervisor-tick) recovery, kept in
+    DEFERRED between ticks so nothing is lost and nothing blocks.
+
+    ``found``: every carrier identity observed on any tick (pid -> starttime). Each
+    scan passes it as ``seen``, so descendants of a known carrier are picked up while
+    it lives, and a carrier that has exited is not forgotten (a re-parented empty-env
+    child seen earlier stays a target). ``empty_at``: when the first empty scan was
+    taken; "nothing left" is concluded only from a second empty scan on a later tick,
+    at least ``terminate.POLL_S`` after it (instead of sleeping on the event loop)."""
+
+    def __init__(self, wait_until: float) -> None:
+        self.wait_until = wait_until
+        self.found: Dict[int, int] = {}
+        self.empty_at: Optional[float] = None
+
+
+def _env_carriers(run_id: str, wrapper_starttime: Optional[int] = None,
+                  live: Optional[_Live] = None) -> Dict[int, int]:
+    """Live processes whose environ carries ``MESH_RUN_ID=<run>`` (no group/session match).
+    ``live``: one non-sleeping scan per tick (see ``_Live``); may raise ``_StillWaiting``."""
+    if live is None:
+        return terminate.run_targets_or_recheck(run_id, None, None, wrapper_starttime)  # environ carriers only
+    scan = terminate.run_targets(run_id, None, None, wrapper_starttime, dict(live.found))
+    live.found.update(scan)
+    alive = _live_members(live.found)
+    uncertain = bool(getattr(scan, "uncertain", False))
+    if alive or uncertain:
+        live.empty_at = None
+        return ScanResult(alive, uncertain=uncertain)
+    now = time.monotonic()
+    if live.empty_at is None or now - live.empty_at < terminate.POLL_S:
+        if live.empty_at is None:
+            live.empty_at = now
+        raise _StillWaiting(run_id)
+    return ScanResult({}, uncertain=False)
 
 
 def _reload_run(conn: sqlite3.Connection, run_id: str) -> Optional[sqlite3.Row]:
     return conn.execute("SELECT * FROM runs WHERE id = ?;", (run_id,)).fetchone()
 
 
+#: PR #40 r6: per run, the recovery-found identities whose persisting write committed.
+_HANDED_OVER: Dict[str, Set[Tuple[int, int]]] = {}
+
+
+class _HandOverFailed(Exception):
+    """PR #40 r5: recovery-found identities could not be persisted; recovery keeps the
+    run (and the identities) and retries."""
+
+    def __init__(self, run_id: str, found: Mapping[int, int]) -> None:
+        super().__init__(f"run {run_id}: recovery-found identities not persisted; retrying")
+        self.found = dict(found)
+
+
+def _hand_over(home: str, run: Optional[Mapping[str, Any]], found: Optional[Mapping[int, int]]) -> None:
+    """PR #40 r4: identities an earlier recovery scan found (pid -> starttime) join the
+    supervisor's recorded members of the run, so the watch terminates them and the
+    close-safety gate refuses to close while one is alive (a parent that exited before
+    adoption or exit handling must not orphan its empty-env child)."""
+    if run is None or not found or not run["pgid"] or not supervisor.is_adopted(run):
+        return
+    alive = _live_members(found)
+    if not alive:
+        return
+    supervisor.seen_for(run, home)  # load seen.json first: never shadow recorded members
+    merged = dict(supervisor._SEEN.get(run["id"]) or {})
+    durable = _HANDED_OVER.setdefault(run["id"], set())
+    if all((p, st) in durable for p, st in alive.items()):
+        return  # r6: skipped only once a write holding them has committed
+    merged.update(alive)
+    supervisor._SEEN[run["id"]] = merged
+    _log(home, f"run {run['id']}: recovery-found identities {sorted(alive)} handed to the supervisor")
+    if run["id"] in supervisor._SEEN_UNUSABLE:
+        # PR #40 r5: a held run keeps its hold; the identities go into the unusable
+        # marker's prior_members (durable across a restart), never a valid seen.json.
+        reason = supervisor._SEEN_REASON.get(run["id"]) or supervisor.ADOPT_SCAN_UNTRUSTED
+        ok = supervisor.write_unusable_marker(run, reason, home)
+    else:
+        ok = supervisor._persist_seen(run, merged, home)
+    if not ok:
+        raise _HandOverFailed(run["id"], alive)
+    durable.update(alive.items())
+
+
 def _adopt(conn: sqlite3.Connection, home: str, run: Mapping[str, Any], old_holder: Optional[str],
-           boot_id: str, wrapper: Mapping[str, Any]) -> str:
+           boot_id: str, wrapper: Mapping[str, Any], found: Optional[Mapping[int, int]] = None) -> str:
     pid = int(wrapper["pid"])
     starttime = int(wrapper["starttime"])
     from_spawn_window = run["status"] == "starting" or not run["wrapper_pid"]
@@ -154,8 +234,10 @@ def _adopt(conn: sqlite3.Connection, home: str, run: Mapping[str, Any], old_hold
             # run is held (seen state unusable, adopt_scan_untrusted) and the hold and
             # run.seen_unusable event are persisted now, not on a later tick.
             supervisor.report_seen_unusable(conn, fresh, home)
+            _hand_over(home, fresh, found)
             _log(home, f"adopted run {run['id']} uncertain: adoption scan not trusted; held")
             return "adopted_uncertain"
+        _hand_over(home, fresh, found)
     if run["deadline_at"] and time.time() > parse_utc(run["deadline_at"]).timestamp():
         if fresh is not None:
             supervisor._begin_termination(conn, home, fresh, "timeout",
@@ -215,7 +297,14 @@ def _terminate_group(conn: sqlite3.Connection, home: str, run: Mapping[str, Any]
                f"targets {t.initial_pids}")
 
 
-def _recover_run(conn: sqlite3.Connection, home: str, row: Mapping[str, Any], boot_id: str) -> str:
+def _recover_run(conn: sqlite3.Connection, home: str, row: Mapping[str, Any], boot_id: str,
+                 live: Optional[_Live] = None) -> str:
+    """``live`` (PR #40 r2/r3): set when the live supervisor retries a deferred run.
+    Nothing then blocks: process scans are single passes, the spawn-window wait is one
+    check per tick until ``live.wait_until`` (``_StillWaiting``), and an exited run is
+    left to the normal watch."""
+    live_wait_until = live.wait_until if live is not None else None
+    found_so_far = lambda: dict(live.found) if live is not None else None  # noqa: E731
     run_id = row["id"]
     old_holder = row["lease_holder"]
     run = _reload_run(conn, run_id)
@@ -226,7 +315,7 @@ def _recover_run(conn: sqlite3.Connection, home: str, row: Mapping[str, Any], bo
     exit_path = os.path.join(run_dir, "exit.json")
 
     if _identity_alive(wrapper):
-        return _adopt(conn, home, run, old_holder, boot_id, wrapper or {})
+        return _adopt(conn, home, run, old_holder, boot_id, wrapper or {}, found=found_so_far())
 
     if os.path.exists(exit_path):
         with transaction(conn):
@@ -251,11 +340,12 @@ def _recover_run(conn: sqlite3.Connection, home: str, row: Mapping[str, Any], bo
             return "skipped"
         if not fresh["wrapper_pid"]:
             # exit.json without any wrapper identity cannot come from runwrap; treat as lost.
-            return _lost(conn, home, fresh, "lost_on_restart", boot_id)
+            return _lost(conn, home, fresh, "lost_on_restart", boot_id, found=found_so_far(), live_ctx=live)
+        _hand_over(home, fresh, found_so_far())
         supervisor._watch_one(conn, home, fresh)
         after = _reload_run(conn, run_id)
         chk = supervisor._CLEAR.get(run_id)
-        if (after is not None and after["status"] in ("starting", "running")
+        if (live_wait_until is None and after is not None and after["status"] in ("starting", "running")
                 and chk is not None and chk.first_empty_at is not None):
             # Startup recovery (not the scheduler loop) has no next tick of its own:
             # take the confirming second empty scan one poll later in this call
@@ -273,16 +363,31 @@ def _recover_run(conn: sqlite3.Connection, home: str, row: Mapping[str, Any], bo
         return "exit_deferred"
 
     if wrapper:
-        return _lost(conn, home, run, "lost_on_restart", boot_id)
+        return _lost(conn, home, run, "lost_on_restart", boot_id, found=found_so_far(), live_ctx=live)
 
     # No wrapper.json: crash before or during the spawn (§11.7 step 2, last case).
+    if live is not None:
+        try:
+            carriers = _env_carriers(run_id, live=live)
+        except _StillWaiting:
+            wrapper = _read_json(os.path.join(run_dir, "wrapper.json"))
+            if wrapper and _identity_alive(wrapper):
+                return _adopt(conn, home, run, old_holder, boot_id, wrapper, found=dict(live.found))
+            raise
+        if carriers:
+            wrapper = _read_json(os.path.join(run_dir, "wrapper.json"))
+            if wrapper and _identity_alive(wrapper):
+                return _adopt(conn, home, run, old_holder, boot_id, wrapper, found=dict(live.found))
+            if time.monotonic() < live.wait_until:
+                raise _StillWaiting(run_id)
+        return _lost(conn, home, run, "lost_before_spawn", boot_id, found=dict(live.found), live_ctx=live)
     carriers = _env_carriers(run_id)
     if carriers:
         deadline = time.monotonic() + WRAPPER_WAIT_S
         while time.monotonic() < deadline:
             wrapper = _read_json(os.path.join(run_dir, "wrapper.json"))
             if wrapper and _identity_alive(wrapper):
-                return _adopt(conn, home, run, old_holder, boot_id, wrapper)
+                return _adopt(conn, home, run, old_holder, boot_id, wrapper, found=carriers)
             time.sleep(WRAPPER_POLL_S)
     # Review #20c (Linear): the carriers found above are handed on; a parent that exits
     # while we wait for wrapper.json must not lose its re-parented empty-env child.
@@ -290,7 +395,7 @@ def _recover_run(conn: sqlite3.Connection, home: str, row: Mapping[str, Any], bo
 
 
 def _lost(conn: sqlite3.Connection, home: str, run: Mapping[str, Any], end_reason: str, boot_id: str,
-          found: Optional[Dict[int, int]] = None) -> str:
+          found: Optional[Dict[int, int]] = None, live_ctx: Optional[_Live] = None) -> str:
     """``found``: identities an earlier scan of this recovery found (pid -> starttime);
     kept only while alive with the same starttime and handed to begin() with this scan's."""
     filled = False
@@ -325,7 +430,11 @@ def _lost(conn: sqlite3.Connection, home: str, run: Mapping[str, Any], end_reaso
         # r4d: one read of the seen state (snapshot) for the members and the hold.
         snap = supervisor.seen_snapshot(run, home)
         supervisor.report_seen_unusable(conn, run, home)
+        # r6: earlier scans' identities are made durable (marker / seen.json) first;
+        # a failed write raises and the retry keeps them.
+        _hand_over(home, run, found)
         live = _live_members(snap.members)
+        live.update(_live_members(found or {}))  # PR #40 r4: earlier recovery scans' identities
         for p, st in sorted(supervisor._load_prior_member_pairs(run)):
             if supervisor._identity_live(p, st):
                 live[p] = st
@@ -348,7 +457,7 @@ def _lost(conn: sqlite3.Connection, home: str, run: Mapping[str, Any], end_reaso
         if supervisor._identity_live(p, st):
             carriers[p] = st
     wst = supervisor.close_identity(run)[1]
-    env_scan = _env_carriers(run["id"], wst)
+    env_scan = _env_carriers(run["id"], wst, live=live_ctx)
     carriers.update(env_scan)
     if carriers or getattr(found, "uncertain", False) or getattr(env_scan, "uncertain", False):
         _terminate_carriers(conn, home, run, end_reason, carriers, wrapper_starttime=wst)
@@ -380,11 +489,114 @@ def _step_runs(conn: sqlite3.Connection, home: str, boot_id: str, counts: Dict[s
             still = _reload_run(conn, row["id"])
             if still is not None and still["status"] in ("starting", "running"):
                 kept_open.add(row["id"])
+                # Blind review P2: retried by the supervisor; the normal watch skips a
+                # run whose wrapper pid was never recorded.
+                if isinstance(exc, _HandOverFailed):
+                    keep = _Live(time.monotonic())
+                    keep.found.update(exc.found)  # r5: the identities stay with the retry
+                    DEFERRED[row["id"]] = (boot_id, 0.0, keep, None)
+                else:
+                    DEFERRED[row["id"]] = (boot_id, 0.0)
             continue
         if outcome.startswith("adopted") or outcome in ("terminating", "exit_deferred"):
             kept_open.add(row["id"])
         counts[outcome] = counts.get(outcome, 0) + 1
     return kept_open
+
+
+#: Runs whose recovery raised (a transient error): run id -> (boot id, next try at,
+#: monotonic). ``retry_deferred`` runs from the supervisor pass until each settles.
+DEFERRED: Dict[str, Tuple[Any, ...]] = {}
+DEFERRED_RETRY_S = 5.0
+DEFERRED_POLL_S = 0.5
+
+
+def retry_deferred(conn: sqlite3.Connection, home: str) -> List[str]:
+    """Retry recovery of the runs it could not settle (blind review P2). Returns the ids
+    that are no longer open. Never blocks (PR #40 r3): see ``_Live``.
+
+    Entry: ``(boot_id, due, live, state)``; state "await_close" means recovery handed the
+    run on (termination / watch) and only its closing is awaited. An entry is removed
+    only after a closed run's delivering messages were released (PR #40 r3), so a
+    failed release is retried on the next tick."""
+    import time
+
+    settled: List[str] = []
+    now = time.monotonic()
+    for run_id, entry in list(DEFERRED.items()):
+        boot_id, due = entry[0], entry[1]
+        live = entry[2] if len(entry) > 2 else None
+        state = entry[3] if len(entry) > 3 else None
+        if now < due:
+            continue
+        if live is None:
+            live = _Live(now + WRAPPER_WAIT_S)
+        try:
+            plain = _reload_run(conn, run_id)
+            if plain is None or plain["status"] not in ("starting", "running"):
+                _release_outbox(conn, run_id)
+                DEFERRED.pop(run_id, None)
+                settled.append(run_id)
+                continue
+        except Exception as exc:  # noqa: BLE001 - keep the entry; try again later
+            _log(home, f"deferred release of run {run_id} failed: {type(exc).__name__}: {exc}")
+            DEFERRED[run_id] = (boot_id, now + DEFERRED_RETRY_S, live, state)
+            continue
+        if state == "await_close":
+            DEFERRED[run_id] = (boot_id, now + DEFERRED_POLL_S, live, state)
+            continue
+        # PR #40 r1: the same row shape as _step_runs (with the lease holder).
+        row = conn.execute(
+            "SELECT r.*, l.holder AS lease_holder FROM runs r JOIN leases l ON l.run_id = r.id "
+            "WHERE r.id = ? AND l.holder_kind = 'meshd';", (run_id,)
+        ).fetchone()
+        if row is None:
+            DEFERRED.pop(run_id, None)  # no meshd lease any more: not recovery's run
+            continue
+        try:
+            try:
+                outcome = _recover_run(conn, home, row, boot_id, live=live)
+            except supervisor.CloseHeld as held:
+                supervisor.hold_close(conn, home, _reload_run(conn, run_id) or row, held)
+                outcome = "terminating"
+        except _StillWaiting:
+            DEFERRED[run_id] = (boot_id, now + WRAPPER_POLL_S, live, None)
+            continue
+        except Exception as exc:  # noqa: BLE001 - still transient: try again later
+            _log(home, f"deferred recovery of run {run_id} failed: {type(exc).__name__}: {exc}")
+            if isinstance(exc, _HandOverFailed) and live is not None:
+                live.found.update(exc.found)
+            DEFERRED[run_id] = (boot_id, now + DEFERRED_RETRY_S, live, None)
+            continue
+        _log(home, f"deferred recovery of run {run_id}: {outcome}")
+        if outcome.startswith("adopted"):
+            DEFERRED.pop(run_id, None)  # live again: its messages stay with it
+            continue
+        # Closed now or later: the next tick (or this check) releases its messages
+        # before the entry goes.
+        DEFERRED[run_id] = (boot_id, 0.0, live, "await_close")
+        try:
+            still = _reload_run(conn, run_id)
+            if still is None or still["status"] not in ("starting", "running"):
+                _release_outbox(conn, run_id)
+                DEFERRED.pop(run_id, None)
+                settled.append(run_id)
+            else:
+                DEFERRED[run_id] = (boot_id, now + DEFERRED_POLL_S, live, "await_close")
+        except Exception as exc:  # noqa: BLE001 - the entry stays; retried next tick
+            _log(home, f"deferred release of run {run_id} failed: {type(exc).__name__}: {exc}")
+    return settled
+
+
+def _release_outbox(conn: sqlite3.Connection, run_id: str) -> None:
+    """PR #40 r2: boot kept a deferred run's delivering messages (the run was still
+    open); once it closes they are requeued, as boot reconciliation (_step_outbox) does."""
+    with transaction(conn):
+        conn.execute(
+            "UPDATE outbox SET status = 'pending', attempts = attempts + 1, delivering_run_id = NULL "
+            "WHERE delivering_run_id = ? AND status = 'delivering';",
+            (run_id,),
+        )
 
 
 def _step_merge_runs(conn: sqlite3.Connection, home: str, counts: Dict[str, int]) -> None:

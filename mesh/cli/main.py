@@ -131,7 +131,7 @@ def create_parent_parser() -> argparse.ArgumentParser:
     """Create the parent parser holding every global flag."""
     parent = argparse.ArgumentParser(add_help=False)
     default_home = os.environ.get("MESH_HOME") or os.path.expanduser("~/.agent-mesh")
-    parent.add_argument("--home", default=argparse.SUPPRESS, help=f"Storage root directory (default: {default_home})")
+    parent.add_argument("--home", default=argparse.SUPPRESS, help="Storage root directory (default: %s)" % default_home.replace("%", "%%"))
     parent.add_argument("--format", choices=["json", "text"], default=argparse.SUPPRESS, help="Output format (default: json)")
     parent.add_argument("--user", action="store_true", default=argparse.SUPPRESS, help="Authenticate as direct human user")
     parent.add_argument("--passphrase-fd", type=int, default=argparse.SUPPRESS, help="File descriptor to read passphrase from")
@@ -324,6 +324,20 @@ def parse_and_apply_input_file(
                 flag_name = a[2:].split("=")[0].replace("-", "_")
                 cli_specified_flags.add(flag_name)
 
+    # Linear full review C2: a target given on the command line (a positional, or a flag
+    # through any of its spellings such as --proj) must not be silently replaced by JSON.
+    for action in active_sub._actions:
+        if action.dest in GLOBAL_FLAG_DESTS or action.dest == "help":
+            continue
+        if not action.option_strings:
+            if getattr(args, action.dest, None) not in (None, action.default):
+                cli_specified_flags.add(action.dest)
+            continue
+        # argparse also accepts unambiguous prefixes (--proj for --project): match those too.
+        if argv and any(a.startswith("--") and len(a.split("=", 1)[0]) > 2 and o.startswith(a.split("=", 1)[0])
+                        for a in argv for o in action.option_strings if o.startswith("--")):
+            cli_specified_flags.add(action.dest)
+
     from_json = set()
     for key, val in json_obj.items():
         if (key in GLOBAL_FLAG_DESTS and key not in valid_params) or key not in valid_params:
@@ -380,6 +394,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     setattr(args, "request_id", req_id)
     default_home = os.environ.get("MESH_HOME") or os.path.expanduser("~/.agent-mesh")
+    # Blind review P2: an explicit --home (even the default path) beats MESH_SOCKET.
+    from mesh import client as _client_mod
+    _client_mod.EXPLICIT_HOME = hasattr(args, "home")
     if not hasattr(args, "home"):
         setattr(args, "home", default_home)
     # m3-test-kdf round 3: --home / MESH_HOME is resolved once, here, for every verb.

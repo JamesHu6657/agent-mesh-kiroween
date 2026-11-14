@@ -4,7 +4,7 @@ Per plan §11.2:
 1. ``wrapper.json`` = ``{pid, starttime}`` written atomically on entry.
 2. The child starts in the same process group (no new session), with pipes for
    stdout/stderr and DEVNULL or a prompt file on stdin.
-3. Both streams are redacted line by line (§15.2) into ``stdout.log`` /
+3. Both streams are redacted as a stream (§15.2; secrets spanning lines too) into ``stdout.log`` /
    ``stderr.log`` (0600), each capped at 50 MiB and drained after the cap.
 4. ``activity`` (mtime) is touched at most once per second while bytes arrive.
 5. On child exit ``exit.json`` = ``{exit_code, signal, ended_at}`` is written
@@ -35,7 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from mesh.core.clock import now_iso_utc
 from mesh.core.proc import get_proc_stat
-from mesh.core.redact import collect_exact_values, redact
+from mesh.core.redact import StreamRedactor, collect_exact_values, redact
 
 DEFAULT_LOG_CAP_BYTES = 50 * 1024 * 1024
 ACTIVITY_TOUCH_INTERVAL_S = 1.0
@@ -69,52 +69,93 @@ def redaction_values(spec: Dict[str, Any], env: Dict[str, str]) -> List[Tuple[st
     return collect_exact_values(env=env, extra=extra)
 
 
+READ_CHUNK_BYTES = 64 * 1024
+
+
 def _pump_stream(
     pipe: Any,
     log_path: str,
     exact_values: List[Tuple[str, str]],
     activity_path: str,
     cap_bytes: int,
+    errors: Optional[List[str]] = None,
 ) -> None:
-    """Copy one child stream into its log, redacted line by line, capped."""
+    """Copy one child stream into its log, redacted, capped.
+
+    Blind review: reads are bounded (``read1``), so output without newlines neither
+    grows memory nor stalls activity; redaction is stateful (``StreamRedactor``), so a
+    secret spanning lines (a PEM key) is still redacted. A capture failure (the log can't
+    be opened or written) is recorded in ``errors`` and the stream is still drained, so
+    the child is never blocked on a full pipe."""
+    import codecs
+
     written = 0
     truncated = False
     last_touch = 0.0
-    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    redactor = StreamRedactor(exact_values)
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    log_file = None
     try:
+        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "wb", closefd=False) as log_file:
-            while True:
-                chunk = pipe.readline()
-                if not chunk:
-                    break
-                now = time.monotonic()
-                if now - last_touch >= ACTIVITY_TOUCH_INTERVAL_S:
-                    try:
-                        os.utime(activity_path, None)
-                    except OSError:
-                        pass
-                    last_touch = now
-                text = chunk.decode("utf-8", errors="replace")
-                data = redact(text, exact_values=exact_values).encode("utf-8")
-                if written >= cap_bytes:
-                    if not truncated:
-                        log_file.write(b"\n[runwrap] log cap reached; output truncated\n")
-                        log_file.flush()
-                        truncated = True
-                    continue
-                room = cap_bytes - written
-                if len(data) > room:
-                    data = data[:room] + b"\n[runwrap] log cap reached; output truncated\n"
-                    truncated = True
-                log_file.write(data)
-                log_file.flush()
-                written += len(data)
-    finally:
+        log_file = os.fdopen(fd, "wb")
+    except OSError as exc:
+        if errors is not None:
+            errors.append(f"{os.path.basename(log_path)}: {type(exc).__name__}: {exc.strerror or exc}")
+        log_file = None
+
+    def write(data: bytes) -> None:
+        nonlocal written, truncated, log_file
+        if log_file is None or not data:
+            return
+        if written >= cap_bytes:
+            if not truncated:
+                data = b"\n[runwrap] log cap reached; output truncated\n"
+                truncated = True
+            else:
+                return
+        else:
+            room = cap_bytes - written
+            if len(data) > room:
+                data = data[:room] + b"\n[runwrap] log cap reached; output truncated\n"
+                truncated = True
         try:
-            os.close(fd)
-        except OSError:
-            pass
+            log_file.write(data)
+            log_file.flush()
+        except OSError as exc:
+            if errors is not None:
+                errors.append(f"{os.path.basename(log_path)}: {type(exc).__name__}: {exc.strerror or exc}")
+            try:
+                log_file.close()
+            except OSError:
+                pass
+            log_file = None
+            return
+        written += len(data)
+
+    try:
+        while True:
+            chunk = pipe.read1(READ_CHUNK_BYTES) if hasattr(pipe, "read1") else os.read(pipe.fileno(), READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            now = time.monotonic()
+            if now - last_touch >= ACTIVITY_TOUCH_INTERVAL_S:
+                try:
+                    os.utime(activity_path, None)
+                except OSError:
+                    pass
+                last_touch = now
+            if log_file is None or (truncated and written >= cap_bytes):
+                continue  # drain only
+            write(redactor.feed(decoder.decode(chunk)).encode("utf-8"))
+        write(redactor.feed(decoder.decode(b"", final=True)).encode("utf-8"))
+        write(redactor.flush().encode("utf-8"))
+    finally:
+        if log_file is not None:
+            try:
+                log_file.close()
+            except OSError:
+                pass
 
 
 def run(run_dir: str) -> int:
@@ -200,10 +241,11 @@ def run(run_dir: str) -> int:
         streams = [(child.stdout, combined_log)]
     else:
         streams = [(child.stdout, "stdout.log"), (child.stderr, "stderr.log")]
+    capture_errors: List[str] = []
     threads = [
         threading.Thread(
             target=_pump_stream,
-            args=(pipe, os.path.join(run_dir, name), exact_values, activity_path, cap_bytes),
+            args=(pipe, os.path.join(run_dir, name), exact_values, activity_path, cap_bytes, capture_errors),
             daemon=True,
         )
         for pipe, name in streams
@@ -220,14 +262,16 @@ def run(run_dir: str) -> int:
 
     exit_code: Optional[int] = returncode if returncode >= 0 else None
     term_signal: Optional[int] = -returncode if returncode < 0 else None
-    atomic_write_json(
-        os.path.join(run_dir, "exit.json"),
-        {
-            "exit_code": exit_code,
-            "signal": term_signal,
-            "ended_at": now_iso_utc(),
-        },
-    )
+    exit_doc: Dict[str, Any] = {
+        "exit_code": exit_code,
+        "signal": term_signal,
+        "ended_at": now_iso_utc(),
+    }
+    if capture_errors:
+        # Blind review P2: output was lost; the supervisor must not accept the run as a
+        # clean success on exit code alone.
+        exit_doc["capture_error"] = "; ".join(capture_errors)[:500]
+    atomic_write_json(os.path.join(run_dir, "exit.json"), exit_doc)
     return 0
 
 

@@ -108,6 +108,24 @@ class SpawnedThenFailed(Exception):
         self.proc = proc
 
 
+#: After a timeout kill, how long `run_registered` still reads the child's output.
+POST_KILL_DRAIN_S = 5.0
+
+
+def _kill_after_timeout(proc: "subprocess.Popen[Any]", own_group: bool) -> None:
+    """SIGKILL the timed-out child, and its whole process group when it leads one."""
+    import signal as _signal
+    if own_group:
+        try:
+            os.killpg(proc.pid, _signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
 def run_registered(kind: str, argv: List[str], timeout: Optional[float] = None, **kwargs: Any) -> "subprocess.CompletedProcess[Any]":
     """Blocking ``subprocess.run`` equivalent for meshd-owned children (git, probes)."""
     input_data = kwargs.pop("input", None)
@@ -115,13 +133,39 @@ def run_registered(kind: str, argv: List[str], timeout: Optional[float] = None, 
     if kwargs.pop("capture_output", False):
         kwargs["stdout"] = subprocess.PIPE
         kwargs["stderr"] = subprocess.PIPE
-    proc = popen_registered(kind, argv, **kwargs)
+    try:
+        proc = popen_registered(kind, argv, **kwargs)
+    except SpawnedThenFailed as exc:
+        # Blind review P2: the child exists but was never registered; stop it (and its
+        # group when it leads one) instead of leaving it running, held and unbounded.
+        _kill_after_timeout(exc.proc, kwargs.get("start_new_session", False))
+        try:
+            exc.proc.communicate(timeout=POST_KILL_DRAIN_S)
+        except Exception:
+            pass
+        unhold(exc.proc.pid)
+        raise
     try:
         try:
             out, err = proc.communicate(input=input_data, timeout=timeout)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            out, err = proc.communicate()
+            _kill_after_timeout(proc, kwargs.get("start_new_session", False))
+            out, err = None, None
+            try:
+                out, err = proc.communicate(timeout=POST_KILL_DRAIN_S)
+            except subprocess.TimeoutExpired:
+                # Linear full review B4: a descendant still holds the output pipes; stop
+                # reading (the child itself is dead) instead of waiting for it forever.
+                for f in (proc.stdout, proc.stderr, proc.stdin):
+                    try:
+                        if f is not None:
+                            f.close()
+                    except OSError:
+                        pass
+                try:
+                    proc.wait(timeout=POST_KILL_DRAIN_S)
+                except subprocess.TimeoutExpired:
+                    pass
             raise subprocess.TimeoutExpired(argv, timeout, output=out, stderr=err)
     finally:
         unregister(proc.pid)

@@ -15,6 +15,6 @@ source "$(dirname "$0")/coder-guard.sh"; coder_guard
 mkdir -p logs/raw
 export PATH="$HOME/.npm-global/bin:$PATH"
 setsid nohup timeout 10800 command-code -p "$(cat "$P")" --yolo --trust --skip-onboarding --no-auto-update --no-session \
-  -m "$M" --max-turns 400 --output-format json > "logs/raw/cc-$N.jsonl" 2> "logs/raw/cc-$N.err" < /dev/null &
+  -m "$M" --max-turns 400 --output-format json > "logs/raw/cc-$N.jsonl" 2> "logs/raw/cc-$N.err" < /dev/null 9>&- &
 PID=$!; disown
 echo "dispatched commandcode run=$N pid=$PID model=$M log=logs/raw/cc-$N.jsonl"

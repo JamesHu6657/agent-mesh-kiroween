@@ -108,8 +108,14 @@ class TestRedactedSessionHint(unittest.TestCase):
 
 class TestBystanderSshdOnly(unittest.TestCase):
     # listener (root, old) -> parent (root, young) -> candidate (us, young)
-    def _check(self, comms, pid=901):
+    def _check(self, comms, pid=901, ruid=None, exe_bad=()):
         procs = {500: (1, 10), 900: (500, 2000), 901: (900, 2001)}
+        ruid = {500: 0, 900: 0, 901: __import__("os").geteuid()} if ruid is None else ruid
+
+        def real_uid(p):
+            if p not in ruid:
+                raise FileNotFoundError(p)
+            return ruid[p]
 
         def stat(p):
             v = procs.get(int(p))
@@ -123,11 +129,45 @@ class TestBystanderSshdOnly(unittest.TestCase):
             return real_stat(path, *a, **k)
 
         with mock.patch.object(terminate, "get_proc_stat", stat), mock.patch("os.stat", ostat), \
-                mock.patch.object(terminate, "_comm", lambda p: comms.get(p, "")):
+                mock.patch.object(terminate, "_comm", lambda p: comms.get(p, "")), \
+                mock.patch.object(terminate, "_real_uid", real_uid), \
+                mock.patch.object(terminate, "_exe_contradicts_sshd", lambda p: p in exe_bad):
             return terminate._foreign_spawned_bystander(stat(pid), 1000, pid)
 
+    SSH = {500: "sshd", 900: "sshd-session", 901: "sshd-session"}
+
+    def test_full_chain_is_bystander(self):
+        self.assertTrue(self._check(self.SSH))
+
+    def test_spoofed_setuid_parent_is_not(self):
+        # release follow-up (b): `ln -s /bin/su sshd-session; ./sshd-session` makes a root-euid
+        # parent named sshd-session, but its real uid stays ours.
+        me = __import__("os").geteuid()
+        self.assertFalse(self._check(self.SSH, ruid={500: 0, 900: me, 901: me}))
+
+    def test_readable_non_sshd_exe_is_not(self):
+        self.assertFalse(self._check(self.SSH, exe_bad={900}))
+        self.assertFalse(self._check(self.SSH, exe_bad={500}))
+
+    def test_listener_not_sshd_is_not(self):
+        self.assertFalse(self._check({500: "init", 900: "sshd-session", 901: "sshd-session"}))
+
+    def test_listener_not_root_is_not(self):
+        me = __import__("os").geteuid()
+        self.assertFalse(self._check(self.SSH, ruid={500: me, 900: 0, 901: me}))
+
+    def test_status_read_error_is_not(self):
+        self.assertFalse(self._check(self.SSH, ruid={901: 0}))
+
+    def test_helpers_on_real_proc(self):
+        import os
+        self.assertEqual(terminate._real_uid(os.getpid()), os.getuid())
+        self.assertTrue(terminate._exe_contradicts_sshd(os.getpid()))  # python, readable
+        with self.assertRaises(OSError):
+            terminate._real_uid(2 ** 30)
+
     def test_sshd_session_is_bystander(self):
-        self.assertTrue(self._check({900: "sshd-session", 901: "sshd-session"}))
+        self.assertTrue(self._check({500: "sshd", 900: "sshd-session", 901: "sshd-session"}))
 
     def test_foreign_subreaper_adoption_is_not(self):
         # review #1: a root subreaper adopted an escaped (non-dumpable) run process
@@ -138,6 +178,28 @@ class TestBystanderSshdOnly(unittest.TestCase):
 
     def test_unreadable_comm_is_not(self):
         self.assertFalse(self._check({}))
+
+
+class TestReleaseFollowups(unittest.TestCase):
+    def test_pre_upgrade_redacted_run_says_finish_or_restart(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);")
+        started = {"ts": "t0", "actor": "w", "request_id": "r", "session": "worker-[REDACTED]"}
+        for presented in (None, "worker-secret=alpha"):
+            with mock.patch.object(leases, "_run_event", return_value=started):
+                with self.assertRaises(MeshError) as cm:
+                    leases.check_run_session(conn, "tsk_a", "run_a", presented)
+            self.assertIn("run started before upgrade; finish or restart it", cm.exception.message)
+            self.assertEqual(cm.exception.code, c.FENCE_MISMATCH)
+            self.assertEqual(cm.exception.exit_code, c.EXIT_STALE)
+            self.assertTrue(cm.exception.details["pre_upgrade"])
+
+    def test_pre_upgrade_plain_session_still_matches(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);")
+        started = {"ts": "t0", "actor": "w", "request_id": "r", "session": "ses_plain"}
+        with mock.patch.object(leases, "_run_event", return_value=started):
+            leases.check_run_session(conn, "tsk_a", "run_a", "ses_plain")
 
 
 class TestMergeHeldText(unittest.TestCase):

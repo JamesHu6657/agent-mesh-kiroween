@@ -1,6 +1,7 @@
 """Handlers for config commands: config.list, config.get, config.set."""
 
 import json
+import os
 from typing import Any, Dict
 
 import mesh.constants as c
@@ -103,6 +104,25 @@ def handle_config_set(ctx: HandlerContext) -> HandlerResult:
         current_settings=current_settings,
         db_conn=ctx.conn,
     )
+
+    if key == "workspaces.root":
+        # Linear full review A4: integration worktrees live at <root>/<prj>/integration and
+        # the merge pipeline rebuilds that path from the current root, so moving the root
+        # under live repo projects would strand them. Refuse until they are finished.
+        old_root = get_workspaces_root(ctx.conn, ctx.home)
+        if isinstance(validated_val, str) and os.path.abspath(validated_val) != old_root:
+            live = [r["id"] for r in ctx.conn.execute(
+                "SELECT id FROM projects WHERE repo_path IS NOT NULL "
+                "AND status IN ('active','paused') ORDER BY id;").fetchall()]
+            if live:
+                raise MeshError(
+                    code=c.INVALID_SETTING,
+                    exit_code=c.EXIT_CONFLICT,
+                    message=(f"Cannot change workspaces.root while repo projects are active or paused "
+                             f"({', '.join(live[:5])}{', ...' if len(live) > 5 else ''}): their integration "
+                             f"worktrees are under {old_root}. Complete or cancel them first."),
+                    details={"key": key, "current_root": old_root, "projects": live},
+                )
 
     now = now_iso_utc()
     val_json = json.dumps(validated_val)

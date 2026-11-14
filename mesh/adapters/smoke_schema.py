@@ -248,15 +248,25 @@ def results_name(adapter: str, version: str, date: str, existing: Iterable[str])
     return f"{base}-{n}.json"
 
 
-def load_latest(results_dir: str, adapter: str) -> Optional[str]:
+def load_latest(results_dir: str, adapter: str, version: Optional[str] = None) -> Optional[str]:
     """Path of the latest results file for ``adapter``: highest date, then suffix (Q4).
-    Sidecars and other names are ignored; None if there is none."""
+    Sidecars and other names are ignored; None if there is none. With ``version`` (the
+    probed CLI version), files captured for that version win over any other version's
+    (Linear full review C7: a later capture of an older CLI must not shadow it)."""
+    if version:
+        same = _load_latest(results_dir, adapter, version)
+        if same:
+            return same
+    return _load_latest(results_dir, adapter, None)
+
+
+def _load_latest(results_dir: str, adapter: str, version: Optional[str]) -> Optional[str]:
     if not results_dir or not os.path.isdir(results_dir):
         return None
     best: Optional[Tuple[Tuple[str, int], str]] = None
     for name in os.listdir(results_dir):
         parsed = parse_results_name(adapter, name)
-        if parsed is None:
+        if parsed is None or (version is not None and parsed[0] != version):
             continue
         path = os.path.join(results_dir, name)
         if not os.path.isfile(path):

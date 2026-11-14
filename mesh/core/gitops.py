@@ -160,4 +160,7 @@ def run_git(
         check=check,
         capture_output=capture_output,
         text=text,
+        # PR #39 review: its own process group, so a timeout also kills hooks and helpers
+        # git started (run_registered SIGKILLs the whole group).
+        start_new_session=True,
     )

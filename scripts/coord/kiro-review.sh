@@ -2,7 +2,7 @@
 # Kiro review of agy work. Usage: bash scripts/coord/kiro-review.sh <name> <base-ref> [focus...]
 #  Reviews git diff <base-ref>..HEAD plus any uncommitted changes against requirements/plan/checklist.
 #  Output: docs/coordination/reviews/<name>.md, first line "VERDICT: ACCEPT" or "VERDICT: REVISE".
-source "$(dirname "$0")/kiro-run-common.sh"
+source "$(dirname "$(readlink -f "$0")")/kiro-run-common.sh"
 N="${1:?name}"; BASE="${2:?base ref}"; shift 2; FOCUS="${*:-the current plan step}"
 [[ "$N" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad name"; exit 2; }
 git rev-parse --verify -q "$BASE^{commit}" >/dev/null || { echo "bad base ref"; exit 2; }

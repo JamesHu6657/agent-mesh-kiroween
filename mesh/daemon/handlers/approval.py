@@ -14,6 +14,7 @@ from mesh.core.approvals import (
     HUMAN_CONFIRMED_MAX,
     compute_user_approval_mac,
     get_approval_mode,
+    get_delegated_self_approve,
     create_or_get_pending_approval,
     get_approval_policy,
 )
@@ -67,7 +68,8 @@ def _decision_channel(conn: sqlite3.Connection, ctx: HandlerContext, row: sqlite
     pid = row["project_id"]
     me = ctx.principal["id"]
     if (ctx.via == "token" and pid and get_approval_mode(conn) == "delegated"
-            and is_project_lead(conn, pid, me)):
+            and is_project_lead(conn, pid, me)
+            and (me != row["requested_by"] or get_delegated_self_approve(conn))):
         lead = get_project_active_lead(conn, pid)
         if lead and lead.get("delivery") == "inbox" and lead.get("can_lead"):
             return "delegated"
@@ -166,13 +168,26 @@ def _check_delegated_decision(ctx: HandlerContext, row: sqlite3.Row, human_confi
             message=f"Category '{row['category']}' requires direct user approval (passphrase), even in delegated mode",
             details={"category": row["category"], "policy": policy},
         )
+    if row["requested_by"] == ctx.principal["id"] and not get_delegated_self_approve(ctx.conn):
+        # Sakana PR #4 P1-1: the lead deciding its own request is allowed by default (it
+        # asked the human first) but can be turned off; then it is SELF_APPROVAL exactly
+        # as in direct/relayed mode.
+        raise MeshError(
+            code=c.SELF_APPROVAL,
+            exit_code=c.EXIT_FORBIDDEN,
+            message=("Requester cannot decide its own request: approval.delegated_self_approve is false. "
+                     "The user decides it directly (--user), or can allow it again: "
+                     "mesh config set approval.delegated_self_approve true --user"),
+            details={"requested_by": row["requested_by"], "caller": ctx.principal["id"],
+                     "setting": "approval.delegated_self_approve"},
+        )
 
 
 def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResult:
     """Decide (approve or reject) a pending approval request per plan §7.3 and §7.4."""
     approval_id = ctx.args.get("approval_id")
     op_hash = ctx.args.get("op_hash")
-    note = _redact_opt(ctx.args.get("note"))
+    note = _redact_opt(ctx.args.get("note"))  # blind review P2 / Carbon: never store a recognized secret
 
     if not approval_id:
         raise MeshError(
@@ -260,7 +275,12 @@ def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResu
     # First, verify stored op_json re-hash to detect DB corruption (defect d and plan §7.4 step 3)
     try:
         stored_op_doc = json.loads(row["op_json"])
-        recomputed_hash = "sha256:" + hashlib.sha256(canonical_json(stored_op_doc)).hexdigest()
+        if isinstance(stored_op_doc, dict) and stored_op_doc.get("_redacted") is True:
+            # PR #40 r1: a redacted copy (the operation held a secret) cannot be re-hashed;
+            # it carries the hash it was stored with.
+            recomputed_hash = stored_op_doc.get("op_hash")
+        else:
+            recomputed_hash = "sha256:" + hashlib.sha256(canonical_json(stored_op_doc)).hexdigest()
     except Exception:
         recomputed_hash = None
     if recomputed_hash != row["op_hash"]:
@@ -421,7 +441,9 @@ def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResu
             ),
         )
 
-    payload: Dict[str, Any] = {"decision": decision, "note": note, "op_hash": row["op_hash"]}
+    # Release-note follow-up (c): the requester can tell which approval this is without a lookup.
+    payload: Dict[str, Any] = {"decision": decision, "note": note, "approval_id": approval_id,
+                               "category": row["category"], "op": row["op_type"], "op_hash": row["op_hash"]}
     if delegated or ctx.via == "relayed":
         payload["user_statement"] = _redact_opt(human_confirmed if delegated else
                                              ctx.args.get("user_statement") or ctx.user_statement)
@@ -431,6 +453,9 @@ def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResu
     if delegated:
         payload["mode"] = "delegated"
         payload["human_confirmed"] = redact(human_confirmed)
+        # Sakana PR #4 P1-1: say plainly when the lead decided a request it raised itself.
+        # The approvals row records it too (relayed_by == requested_by), see self_requested.
+        payload["self_requested"] = row["requested_by"] == ctx.principal["id"]
     record_event(
         conn=ctx.conn,
         type_="approval.decided",
@@ -458,6 +483,7 @@ def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResu
     if delegated:
         data["delegated"] = True
         data["human_confirmed"] = redact(human_confirmed)
+        data["self_requested"] = payload["self_requested"]
     return HandlerResult(data=data)
 
 
@@ -524,7 +550,7 @@ def handle_approval_cancel(ctx: HandlerContext) -> HandlerResult:
         project_id=row["project_id"],
         approval_id=approval_id,
         payload={"approval_id": approval_id, "reason": ctx.args.get("reason") or "cancelled_by_requester",
-                 "from_status": status},
+                 "from_status": status, "category": row["category"], "op": row["op_type"]},
         request_id=ctx.request_id,
         k_user=ctx.k_user,
     )
@@ -734,7 +760,10 @@ def _format_approval_dict(conn: sqlite3.Connection, r: sqlite3.Row) -> Dict[str,
         ).fetchone()
         if ev and ev["via"] == "delegated":
             data["delegated"] = True
-            data["via"] = f"delegated (unverified; lead {relayer_name} on the human's word)"
+            # Sakana PR #4 P1-1: the row itself shows it (the deciding lead is the requester).
+            data["self_requested"] = bool(data.get("relayed_by")) and data.get("relayed_by") == data.get("requested_by")
+            suffix = ", its own request" if data["self_requested"] else ""
+            data["via"] = f"delegated (unverified; lead {relayer_name} on the human's word{suffix})"
         else:
             data["via"] = f"relayed (unverified; by {relayer_name})"
     else:
@@ -743,12 +772,18 @@ def _format_approval_dict(conn: sqlite3.Connection, r: sqlite3.Row) -> Dict[str,
 
     if "op_json" in data and data["op_json"]:
         try:
-            data["op"] = redact_value(json.loads(data["op_json"]))
+            stored = json.loads(data["op_json"])
+            if isinstance(stored, dict) and stored.get("_redacted") is True:
+                stored = stored.get("op")
+            data["op"] = redact_value(stored)
+            # PR #40 r1: op_json is re-serialized from the redacted decoded values (text
+            # redaction misses a secret whose quotes JSON escaped).
+            data["op_json"] = json.dumps(data["op"])
         except Exception:
-            pass
-    for field in ("summary", "decision_note", "user_statement", "evidence_ref", "op_json"):
-        if isinstance(data.get(field), str):
-            data[field] = redact(data[field])
+            data["op_json"] = redact(data["op_json"])
+    for k in ("summary", "decision_note", "user_statement", "evidence_ref"):
+        if isinstance(data.get(k), str):
+            data[k] = redact(data[k])
     return data
 
 
@@ -806,6 +841,18 @@ def handle_approval_request(ctx: HandlerContext) -> HandlerResult:
             code=c.INVALID_ARGUMENT,
             exit_code=c.EXIT_USAGE,
             message="--operation must be a JSON object",
+            details={"param": "operation"},
+        )
+
+    # Blind review P2: the operation is stored verbatim (its hash binds the approval), so
+    # it must not carry a secret; name the secret by reference (an env var or file) instead.
+    # PR #40 r1: checked on the decoded values (escaped quotes in JSON text hid a token).
+    if redact_value(operation) != operation:
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=("--operation contains what looks like a secret; it would be stored as is. "
+                     "Refer to the secret by name (an env var or a file path) instead"),
             details={"param": "operation"},
         )
 

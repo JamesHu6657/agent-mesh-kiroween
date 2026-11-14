@@ -162,6 +162,26 @@ def handle_inbox_ack(ctx: HandlerContext) -> HandlerResult:
     return HandlerResult(data={"acked": len(messages)})
 
 
+def _recheck_credential(ctx: HandlerContext) -> None:
+    """Raise rc 3 (TOKEN_REVOKED / TOKEN_EXPIRED / TOKEN_INVALID) when the request's
+    credential stopped being valid after authentication. No-op without a credential id."""
+    cred_id = (ctx.principal or {}).get("credential_id")
+    if not cred_id:
+        return
+    row = ctx.conn.execute(
+        "SELECT c.revoked_at, c.expires_at, p.disabled_at FROM credentials c "
+        "JOIN principals p ON c.principal_id = p.id WHERE c.id = ?;", (cred_id,)).fetchone()
+    if row is None or row["revoked_at"] is not None:
+        raise MeshError(code=c.TOKEN_REVOKED, exit_code=c.EXIT_UNAUTHENTICATED,
+                        message="Token has been revoked")
+    if row["expires_at"] is not None and row["expires_at"] < now_iso_utc():
+        raise MeshError(code=c.TOKEN_EXPIRED, exit_code=c.EXIT_UNAUTHENTICATED,
+                        message="Token has expired")
+    if row["disabled_at"] is not None:
+        raise MeshError(code=c.TOKEN_INVALID, exit_code=c.EXIT_UNAUTHENTICATED,
+                        message="Principal is disabled")
+
+
 async def handle_inbox_wait(server: Any, ctx: HandlerContext, reader: Any = None) -> HandlerResult:
     """Block waiting for new inbox messages (long-poll) per plan §12.3."""
     if ctx.args.get("user"):
@@ -224,6 +244,9 @@ async def handle_inbox_wait(server: Any, ctx: HandlerContext, reader: Any = None
         while True:
             if reader is not None and reader.at_eof():
                 return HandlerResult(data={"items": []})
+            # Linear full review B6: the credential was checked when the wait began; a
+            # revoke, expiry or disable during the wait ends it before anything is delivered.
+            _recheck_credential(ctx)
 
             cur = ctx.conn.execute(
                 """SELECT id, event_seq, recipient_id, channel, dedup_key, project_id,

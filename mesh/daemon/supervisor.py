@@ -2614,6 +2614,12 @@ def _finish_run(
             # A fenced `task fail` from the launched run; applied once its processes are gone (T8).
             _task_failed(conn, task, run, "reported", {"message": pending.get("message", "")}, reporter=pending)
             return "reported"
+        if exit_code == 0 and signo is None and exit_info.get("capture_error"):
+            # Blind review P2: the wrapper lost the run's output; never auto-submit that.
+            _task_failed(conn, task, run, "capture_failed",
+                         {"exit_code": exit_code, "capture_error": exit_info.get("capture_error")},
+                         stderr_tail(run["run_dir"]))
+            return "capture_failed"
         if exit_code == 0 and signo is None:
             meaning = vendor_failure_meaning(run["run_dir"], run["adapter"])
             if meaning is None:
@@ -2970,6 +2976,13 @@ def watch_launch_runs(conn: sqlite3.Connection, home: str) -> List[str]:
         closed.extend(retry_spawn_aborts(conn, home))
     except Exception as exc:
         _log_meshd(home, f"spawn abort retry failed: {type(exc).__name__}: {exc}")
+    try:
+        from mesh.daemon import recovery
+
+        if recovery.DEFERRED:
+            closed.extend(recovery.retry_deferred(conn, home))
+    except Exception as exc:
+        _log_meshd(home, f"deferred recovery retry failed: {type(exc).__name__}: {exc}")
     runs = conn.execute(
         "SELECT * FROM runs WHERE kind IN ('task', 'lead_turn') AND kind <> 'merge_test' "
         "AND status IN ('starting', 'running') "
@@ -3188,6 +3201,7 @@ def _watch_task_run(conn: sqlite3.Connection, home: str, run: Mapping[str, Any])
             and exit_info is not None
             and exit_info.get("exit_code") == 0
             and exit_info.get("signal") is None
+            and not exit_info.get("capture_error")  # PR #40 r1: lost output never submits
             and not _pending_failure(run)
             and vendor_failure_meaning(run["run_dir"], run["adapter"]) is None
         ):
@@ -3212,6 +3226,7 @@ def _needs_submit_git(run: Mapping[str, Any], task: Optional[Mapping[str, Any]],
         and exit_info is not None
         and exit_info.get("exit_code") == 0
         and exit_info.get("signal") is None
+        and not exit_info.get("capture_error")
         and not _pending_failure(run)
         and vendor_failure_meaning(run["run_dir"], run["adapter"]) is None
     )

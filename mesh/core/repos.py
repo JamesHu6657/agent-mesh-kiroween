@@ -52,14 +52,47 @@ def _git_failed(step: str, cp: Any, **details: Any) -> MeshError:
                      message=f"git {step} failed (rc {cp.returncode})", details=d)
 
 
-def _git(step: str, args: List[str], cwd: str, **details: Any) -> Any:
+#: Request-wide bound on the git work of one project create (PR #39 review, B5): the calls
+#: run inside the request transaction, so their total, not each call, is capped.
+SETUP_INTEGRATION_BUDGET_S = 30.0
+
+
+_budget = __import__("threading").local()
+
+
+class git_budget:
+    """Request-wide git deadline (PR #39 review round 2, B5): every `_git` call made while
+    it is active gets at most the time left, and none starts once it is spent. Nested
+    budgets keep the earlier deadline."""
+
+    def __init__(self, seconds: float) -> None:
+        self.seconds = seconds
+
+    def __enter__(self) -> "git_budget":
+        import time as _time
+        self._prev = getattr(_budget, "deadline", None)
+        mine = _time.monotonic() + self.seconds
+        _budget.deadline = mine if self._prev is None else min(self._prev, mine)
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        _budget.deadline = self._prev
+
+
+def _git(step: str, args: List[str], cwd: str, _timeout_s: float = 30.0, **details: Any) -> Any:
     """run_git, with a timeout (30 s in gitops) mapped to rc 1 `reason:"git_timeout"`.
 
     `details` (e.g. `branch`, `worktree`) go into the error, so a timeout after the
     branch step still names the branch (Q3; review m2-r3 finding 2).
     """
     try:
-        return run_git(args, cwd=cwd)
+        deadline = getattr(_budget, "deadline", None)
+        if deadline is not None:
+            import time as _time
+            _timeout_s = min(_timeout_s, deadline - _time.monotonic())
+        if _timeout_s <= 0:
+            raise subprocess.TimeoutExpired(args, 0)
+        return run_git(args, cwd=cwd, timeout_s=_timeout_s)
     except subprocess.TimeoutExpired as e:
         d: Dict[str, Any] = {"reason": "git_timeout", "step": step, "timeout_s": e.timeout}
         d.update(details)
@@ -170,9 +203,15 @@ def setup_integration(repo: str, project_id: str, base_commit: str, ws_root: str
     If the worktree step fails after the branch was created, the branch stays (§10.7: Mesh
     deletes nothing automatically) and the error names it in `details.branch`.
     """
+    import time as _time
+    deadline = _time.monotonic() + SETUP_INTEGRATION_BUDGET_S
+
+    def left() -> float:
+        return deadline - _time.monotonic()
+
     branch = integration_branch_name(project_id)
     cp = _git("show-ref", ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], repo,
-              branch=branch, repo=repo)
+              _timeout_s=left(), branch=branch, repo=repo)
     if cp.returncode == 0:
         raise MeshError(
             code=c.ALREADY_EXISTS,
@@ -180,12 +219,13 @@ def setup_integration(repo: str, project_id: str, base_commit: str, ws_root: str
             message=f"Branch '{branch}' already exists in '{repo}'",
             details={"branch": branch, "repo": repo},
         )
-    cp = _git("branch", ["branch", branch, base_commit], repo, branch=branch, repo=repo)
+    cp = _git("branch", ["branch", branch, base_commit], repo, _timeout_s=left(), branch=branch, repo=repo)
     if cp.returncode != 0:
         raise _git_failed("branch", cp, branch=branch, repo=repo)
     wt = integration_worktree_path(ws_root, project_id)
     ensure_workspace_dir(os.path.dirname(wt))
-    cp = _git("worktree add", ["worktree", "add", wt, branch], repo, branch=branch, repo=repo, worktree=wt)
+    cp = _git("worktree add", ["worktree", "add", wt, branch], repo, _timeout_s=left(),
+              branch=branch, repo=repo, worktree=wt)
     if cp.returncode != 0:
         raise _git_failed("worktree add", cp, branch=branch, repo=repo, worktree=wt)
     return {"integration_branch": branch, "integration_path": wt}
@@ -223,16 +263,41 @@ def project_repo_paths(conn: Any) -> List[str]:
 
 def _worktree_for_branch(repo: str, branch: str) -> Optional[str]:
     """The worktree path that has `refs/heads/<branch>` checked out, or None (§10.6 step 2)."""
-    cp = _git("worktree list --porcelain", ["worktree", "list", "--porcelain"], repo, repo=repo)
+    # Blind review P3: NUL-delimited (-z, git 2.36+), so a worktree path with a newline in
+    # it is read whole; fields are never stripped (a path may end in a space).
+    cp = _git("worktree list --porcelain -z", ["worktree", "list", "--porcelain", "-z"], repo, repo=repo)
     if cp.returncode != 0:
-        raise _git_failed("worktree list --porcelain", cp, repo=repo)
+        raise _git_failed("worktree list --porcelain -z", cp, repo=repo)
     current: Optional[str] = None
-    for line in (cp.stdout or "").splitlines():
-        if line.startswith("worktree "):
-            current = line[len("worktree "):].strip()
-        elif line.strip() == f"branch refs/heads/{branch}":
+    for field in (cp.stdout or "").split("\0"):
+        if field.startswith("worktree "):
+            current = field[len("worktree "):]
+        elif field == f"branch refs/heads/{branch}":
             return current
     return None
+
+
+def _require_worktree_on(worktree: str, base_branch: str, old: str, repo: str, new: str) -> None:
+    """Raise rc 6 VERSION_MISMATCH (reason worktree_switched; nothing changed) unless
+    ``worktree`` still has ``refs/heads/<base_branch>`` checked out. A base that moved
+    while checked out is left to the ff/CAS checks, which report it as base_moved."""
+    cp = _git("rev-parse HEAD ref", ["rev-parse", "--symbolic-full-name", "HEAD"], worktree, worktree=worktree)
+    head_ref = (cp.stdout or "").strip() if cp.returncode == 0 else ""
+    if head_ref == f"refs/heads/{base_branch}":
+        return
+    if head_ref == "HEAD":
+        head_ref = ""  # detached
+    cp = _git("rev-parse HEAD", ["rev-parse", "--verify", "HEAD"], worktree, worktree=worktree)
+    head = (cp.stdout or "").strip() if cp.returncode == 0 else ""
+    raise MeshError(
+        code=c.VERSION_MISMATCH,
+        exit_code=c.EXIT_CONFLICT,
+        message=(f"Worktree '{worktree}' no longer has '{base_branch}' checked out (it has "
+                 f"{head_ref or 'a detached HEAD'} at {head or '?'}); nothing was changed, retry the deliver"),
+        details={"repo": repo, "worktree": worktree, "base_branch": base_branch,
+                 "reason": "worktree_switched", "expected_ref": f"refs/heads/{base_branch}",
+                 "actual_ref": head_ref or None, "expected_old": old, "actual": head or None, "new": new},
+    )
 
 
 def deliver_to_base(repo: str, base_branch: str, integration_branch: str) -> Dict[str, Any]:
@@ -296,6 +361,10 @@ def deliver_to_base(repo: str, base_branch: str, integration_branch: str) -> Dic
                 message=f"Worktree '{worktree}' has '{base_branch}' checked out and is not clean",
                 details={"worktree": worktree, "base_branch": base_branch, "repo": repo},
             )
+        # Linear full review A3: the ff merge moves whatever that worktree has checked out,
+        # so confirm, right before it, that this is still the base branch at the expected
+        # commit (a concurrent `git switch` there must not advance an unrelated branch).
+        _require_worktree_on(worktree, base_branch, old, repo, new)
         # The resolved sha, never the branch name: a tag (or any other ref) with the same
         # short name as the integration branch must not be what gets merged (r8 N-1).
         cp = _git("merge --ff-only", ["merge", "--ff-only", new], worktree,

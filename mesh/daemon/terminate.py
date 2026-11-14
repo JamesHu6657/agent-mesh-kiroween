@@ -302,6 +302,57 @@ def _comm(pid: int) -> str:
         return ""
 
 
+#: OpenSSH executables: the listener/per-connection ``sshd``, the per-session
+#: ``sshd-session`` (OpenSSH 9.8+) and the pre-auth ``sshd-auth`` (OpenSSH 10).
+_SSHD_NAMES = ("sshd", "sshd-session", "sshd-auth")
+
+
+def _is_sshd_comm(name: str) -> bool:
+    """Sakana PR #4 P3-1: an OpenSSH process name, exactly. ``comm`` is the executable name
+    (``sshd``, ``sshd-session``, ``sshd-auth``); some kernels/ports show the privsep
+    proctitle instead (``sshd: user [priv]``, ``sshd: user@notty``), accepted only in that
+    ``sshd: `` form. A bare prefix such as ``sshdx`` or ``sshd-evil`` is not sshd."""
+    return name in _SSHD_NAMES or name.startswith("sshd: ")
+
+
+def _socket_activation_root(gpid: int) -> bool:
+    """Sakana PR #4 P3-1 (a): systemd socket activation (``sshd.socket``, ``sshd -i`` per
+    connection) has no listener process: the root per-connection sshd's parent is PID 1.
+    Accept only PID 1 itself, running as root and named ``systemd``; anything else (another
+    init, a container's PID 1 we cannot identify, a read error) stays unproven."""
+    if gpid != 1:
+        return False
+    try:
+        return _comm(1) == "systemd" and _real_uid(1) == 0
+    except (OSError, ValueError):
+        return False
+
+
+def _real_uid(pid: int) -> int:
+    """Real uid from /proc/<pid>/status (readable for every process). Raises OSError/ValueError.
+
+    The real uid, not the owner of /proc/<pid>: a setuid-root program started by the run
+    (e.g. a symlink named ``sshd`` pointing at su) has euid 0 but keeps the run's real uid."""
+    with open(f"/proc/{pid}/status", "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if line.startswith("Uid:"):
+                return int(line.split()[1])
+    raise ValueError(f"no Uid line for pid {pid}")
+
+
+def _exe_contradicts_sshd(pid: int) -> bool:
+    """True when /proc/<pid>/exe is readable and is not an sshd binary.
+
+    Root's exe is unreadable to an unprivileged daemon (EACCES; checked on the build hosts),
+    so an unreadable link is no evidence either way; the real-uid and ancestry checks carry
+    the proof. A readable link must name sshd/sshd-session and not be deleted."""
+    try:
+        target = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return False
+    return target.endswith(" (deleted)") or os.path.basename(target) not in _SSHD_NAMES
+
+
 def _foreign_spawned_bystander(info: Dict[str, int], eacces_from: Optional[int],
                                pid: Optional[int] = None) -> bool:
     """True for a young non-dumpable same-uid process a *pre-existing other-user daemon*
@@ -325,12 +376,17 @@ def _foreign_spawned_bystander(info: Dict[str, int], eacces_from: Optional[int],
             return False
         # PR #37 review #1: only sshd's own session processes. Any other foreign parent
         # (e.g. a root subreaper that adopted an escaped run process) stays uncertain.
-        if not _comm(ppid).startswith("sshd"):
+        if not _is_sshd_comm(_comm(ppid)):
             return False
-        if pid is not None and not _comm(pid).startswith("sshd"):
+        if pid is not None and not _is_sshd_comm(_comm(pid)):
             return False
         pinfo = get_proc_stat(ppid)
         if pinfo is None or os.stat(f"/proc/{ppid}").st_uid == os.geteuid():
+            return False
+        # Release-note follow-up (b): comm alone can be spoofed. The parent must really be
+        # root (real uid 0, which no process of ours can get), its exe must not contradict
+        # sshd, and its parent must be a root sshd listener that predates the run.
+        if _real_uid(ppid) != 0 or _exe_contradicts_sshd(ppid):
             return False
         gpid = int(pinfo["ppid"])
         if gpid < 1:
@@ -338,6 +394,10 @@ def _foreign_spawned_bystander(info: Dict[str, int], eacces_from: Optional[int],
         ginfo = get_proc_stat(gpid)
         if ginfo is None or int(ginfo["starttime"]) >= int(eacces_from):
             return False
+        if not _socket_activation_root(gpid):
+            # Classic: a root sshd listener that predates the run.
+            if not _is_sshd_comm(_comm(gpid)) or _real_uid(gpid) != 0 or _exe_contradicts_sshd(gpid):
+                return False
         # Re-check the parent is still the same process (pid reuse between reads).
         again = get_proc_stat(ppid)
         return bool(again and int(again["starttime"]) == int(pinfo["starttime"]))
@@ -547,9 +607,12 @@ def _run_targets_inner(
             found[pid] = st
             if is_unknown and unknown is not None:
                 unknown[pid] = st
-        elif is_unknown or _in_run_group(info, pgid):
+        elif is_unknown or _in_run_group(info, pgid) or (env and _same_uid(pid)):
             # A raw pgid/sid match after the wrapper is gone is not enough (pid/group
             # reuse); such a process, and any UNKNOWN one, needs descent from an anchor.
+            # Linear full review B3: so does a same-uid process with a readable but
+            # sanitized environment (no MESH_RUN_ID) that left the run group/session:
+            # ancestry proven from an anchor is ownership, whatever its environment says.
             candidates.append(pid)
 
     anchors = dict(seen)

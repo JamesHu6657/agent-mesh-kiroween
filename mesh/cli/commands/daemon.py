@@ -66,7 +66,19 @@ def register_daemon_commands(subparsers: argparse._SubParsersAction, parent_pars
     status_parser.set_defaults(func=handle_daemon_status)
 
 
+def _refuse_dry_run(args: argparse.Namespace, what: str) -> None:
+    """Linear full review C1: local commands that write cannot simulate; refuse rather
+    than perform the change under --dry-run."""
+    if getattr(args, "dry_run", False):
+        import mesh.constants as _c
+        from mesh.errors import MeshError as _ME
+        raise _ME(_c.INVALID_ARGUMENT, exit_code=_c.EXIT_USAGE,
+                  message=f"{what} does not support --dry-run (it would change local state); run it without --dry-run",
+                  details={"param": "dry_run"})
+
+
 def handle_daemon_start(args: argparse.Namespace) -> Dict[str, Any]:
+    _refuse_dry_run(args, "mesh daemon start")
     """Start meshd as a detached background service and wait up to DAEMON_START_WAIT_S (30 s) for the socket."""
     client = MeshClient(home=args.home, timeout=1.0)
     # If --user was provided, validate / read passphrase client-side exactly once
@@ -138,6 +150,7 @@ def handle_daemon_start(args: argparse.Namespace) -> Dict[str, Any]:
 
 def handle_daemon_run(args: argparse.Namespace) -> Dict[str, Any]:
     """Run meshd in the foreground."""
+    _refuse_dry_run(args, "mesh daemon run")
     # Imported here: every other CLI verb skips asyncio and the daemon (startup cost, A1).
     import asyncio
 
