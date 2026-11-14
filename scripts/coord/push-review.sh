@@ -13,9 +13,9 @@ B="wt/$N"; git rev-parse -q --verify "$B" >/dev/null || { echo "no branch $B"; e
 S=$(git rev-parse "$B^{commit}"); BASE=$(git rev-parse github/main^{commit})
 R="$BASE..$S"
 # Full review P1: never prefer a /tmp binary another user could plant; GITLEAKS env,
-# then PATH, then /tmp/gitleaks only if owned by us.
+# then PATH, then /tmp/gitleaks only if owned by us and not a symlink (PR41 r2 P3).
 GL="${GITLEAKS:-$(command -v gitleaks 2>/dev/null || true)}"
-if [ -z "$GL" ] && [ -x /tmp/gitleaks ] && [ -O /tmp/gitleaks ]; then GL=/tmp/gitleaks; fi
+if [ -z "$GL" ] && [ ! -L /tmp/gitleaks ] && [ -f /tmp/gitleaks ] && [ -x /tmp/gitleaks ] && [ -O /tmp/gitleaks ]; then GL=/tmp/gitleaks; fi
 GLOUT=$(mktemp) || exit 2; trap 'rm -f "$GLOUT"' EXIT
 [ -n "$GL" ] && [ -x "$GL" ] || { echo "REFUSED: gitleaks missing"; exit 2; }
 if ! "$GL" git --no-banner --redact --log-opts="$R" --baseline-path scripts/coord/gitleaks-baseline.json . > "$GLOUT" 2>&1; then

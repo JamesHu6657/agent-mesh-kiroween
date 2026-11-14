@@ -12,9 +12,9 @@ R="$BASE..$S"
 git merge-base --is-ancestor "$BASE" "$S" || { echo "REFUSED: not a fast-forward"; exit 2; }
 N=$(git rev-list --count $R); [ "$N" -gt 0 ] || { echo "nothing to push"; exit 0; }
 # Full review P1: never prefer a /tmp binary another user could plant; GITLEAKS env,
-# then PATH, then /tmp/gitleaks only if owned by us.
+# then PATH, then /tmp/gitleaks only if owned by us and not a symlink (PR41 r2 P3).
 GL="${GITLEAKS:-$(command -v gitleaks 2>/dev/null || true)}"
-if [ -z "$GL" ] && [ -x /tmp/gitleaks ] && [ -O /tmp/gitleaks ]; then GL=/tmp/gitleaks; fi
+if [ -z "$GL" ] && [ ! -L /tmp/gitleaks ] && [ -f /tmp/gitleaks ] && [ -x /tmp/gitleaks ] && [ -O /tmp/gitleaks ]; then GL=/tmp/gitleaks; fi
 GLOUT=$(mktemp) || exit 2; trap 'rm -f "$GLOUT"' EXIT
 [ -n "$GL" ] && [ -x "$GL" ] || { echo "REFUSED: gitleaks missing at $GL"; exit 2; }
 # Known fake test fixtures are allowlisted by fingerprint in scripts/coord/gitleaks-baseline.json

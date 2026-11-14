@@ -2111,6 +2111,10 @@ async def run_task_merge(server: Any, ctx: HandlerContext) -> HandlerResult:
         return {"result": result, "final": fin, "response": response}
 
     job = asyncio.ensure_future(_pipeline_and_finish())
+    # Full review P1: meshd shutdown awaits the job before it releases the lock / DB.
+    track = getattr(server, "track_merge_job", None)
+    if callable(track):
+        track(job)
     try:
         done = await asyncio.shield(job)
     except asyncio.CancelledError:

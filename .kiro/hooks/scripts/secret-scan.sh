@@ -6,7 +6,7 @@
 #   bash .kiro/hooks/scripts/secret-scan.sh --dir .kiro  # a directory tree, e.g. the Kiro config
 #
 # Layers (same tool, baseline and patterns as scripts/coord/sync-github.sh and push-review.sh):
-#   1. gitleaks (/tmp/gitleaks, else gitleaks on PATH), --redact, baseline
+#   1. gitleaks ($GITLEAKS, else PATH, else an own non-symlink /tmp/gitleaks), --redact, baseline
 #      scripts/coord/gitleaks-baseline.json (it allowlists the known fake test fixtures by
 #      commit fingerprint, so it only matches committed history, not staged or dir scans).
 #   2. The coordinator's extra pattern scan (shared pattern, scripts/coord/secret-pattern.sh).
@@ -36,11 +36,11 @@ case "${1:-}" in
 esac
 
 # Full review P1: never prefer a /tmp binary another user could plant; GITLEAKS env,
-# then PATH, then /tmp/gitleaks only if owned by us.
+# then PATH, then /tmp/gitleaks only if owned by us and not a symlink (PR41 r2 P3).
 GL="${GITLEAKS:-$(command -v gitleaks 2>/dev/null || true)}"
-if [ -z "$GL" ] && [ -x /tmp/gitleaks ] && [ -O /tmp/gitleaks ]; then GL=/tmp/gitleaks; fi
+if [ -z "$GL" ] && [ ! -L /tmp/gitleaks ] && [ -f /tmp/gitleaks ] && [ -x /tmp/gitleaks ] && [ -O /tmp/gitleaks ]; then GL=/tmp/gitleaks; fi
 if [ -z "$GL" ] || [ ! -x "$GL" ]; then
-  echo "secret-scan: REFUSED: gitleaks not found (/tmp/gitleaks or PATH)"
+  echo "secret-scan: REFUSED: gitleaks not found (GITLEAKS env, PATH or own /tmp/gitleaks)"
   exit 2
 fi
 BASELINE=scripts/coord/gitleaks-baseline.json
