@@ -149,6 +149,13 @@ INITIAL_READ_TIMEOUT_S = 30.0
 OVERSIZE_DRAIN_S = 2.0
 
 
+
+def _redact_msg(text: str) -> str:
+    """Full review: unexpected-error text is redacted like MeshError envelopes (§15.2)."""
+    from mesh.core.redact import redact
+
+    return redact(text)
+
 def _conn_limits() -> Tuple[int, float]:
     """(max connections, initial read timeout); tests may lower them (MESH_TESTING only)."""
     if os.environ.get("MESH_TESTING") == "1":
@@ -334,7 +341,7 @@ def dispatch_internal_request(ctx: HandlerContext, idempotency_key: Optional[str
         conn.execute("RELEASE internal_request;")
         return {
             "ok": False,
-            "error": {"code": c.INTERNAL_ERROR, "message": f"Daemon unexpected error: {exc}", "details": {}},
+            "error": {"code": c.INTERNAL_ERROR, "message": _redact_msg(f"Daemon unexpected error: {exc}"), "details": {}},
             "exit_code": c.EXIT_INTERNAL,
             "request_id": ctx.request_id,
         }
@@ -367,7 +374,7 @@ def _queue_internal_merge(ctx: HandlerContext) -> Dict[str, Any]:
         conn.execute("RELEASE internal_request;")
         return {
             "ok": False,
-            "error": {"code": c.INTERNAL_ERROR, "message": f"Daemon unexpected error: {exc}", "details": {}},
+            "error": {"code": c.INTERNAL_ERROR, "message": _redact_msg(f"Daemon unexpected error: {exc}"), "details": {}},
             "exit_code": c.EXIT_INTERNAL,
             "request_id": ctx.request_id,
         }
@@ -1199,7 +1206,7 @@ class DaemonServer:
             error = exc
         except Exception as exc:  # noqa: BLE001 - reported like handle_client's rc 1
             error = MeshError(code=c.INTERNAL_ERROR, exit_code=c.EXIT_INTERNAL,
-                              message=f"Daemon unexpected error: {exc}")
+                              message=_redact_msg(f"Daemon unexpected error: {exc}"))
         if self.db_conn.in_transaction:
             try:
                 self.db_conn.execute("ROLLBACK;")
@@ -1880,7 +1887,7 @@ class DaemonServer:
                 "ok": False,
                 "error": {
                     "code": c.INTERNAL_ERROR,
-                    "message": f"Daemon unexpected error: {exc}",
+                    "message": _redact_msg(f"Daemon unexpected error: {exc}"),
                     "details": {},
                 },
                 "exit_code": c.EXIT_INTERNAL,

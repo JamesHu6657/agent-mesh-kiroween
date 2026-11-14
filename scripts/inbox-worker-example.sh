@@ -162,7 +162,7 @@ worker_pid=$$
       last_ok=$(date +%s); pause="$every"; continue
     fi
     if [ "$rc" -eq 9 ] || [ $(( $(date +%s) - last_ok )) -ge "$ttl" ]; then
-      : > "$lost"; kill -TERM "$worker_pid" 2>/dev/null; exit 0
+      : > "$lost"; kill -USR1 "$worker_pid" 2>/dev/null; exit 0
     fi
     echo "inbox-worker-example: heartbeat failed (exit $rc), retrying" >&2
     pause=$(( every < 5 ? every : 5 ))
@@ -176,9 +176,13 @@ export MESH_TASK_ID="$task_id" MESH_RUN_ID="$run_id" MESH_FENCE="$fence"
 export MESH_WORKSPACE="$workspace" MESH_BRANCH="$branch" MESH_TASK_SPEC_FILE="$tmp/spec.txt"
 ( cd "$workspace" && exec python3 -c 'import os, sys; os.setpgid(0, 0); os.execvp(sys.argv[1], sys.argv[1:])' "$@" ) &
 cmd_pid=$!
-trap '[ -n "$cmd_pid" ] && kill -TERM -- "-$cmd_pid" 2>/dev/null' TERM
+# Full review P1: the heartbeat loop wakes us with USR1 (lease lost); an external
+# TERM/INT stops the worker cleanly and never reports the task failed.
+stopping=""
+trap '[ -n "$cmd_pid" ] && kill -TERM -- "-$cmd_pid" 2>/dev/null' USR1
+trap 'stopping=1; [ -n "$cmd_pid" ] && kill -TERM "$cmd_pid" -- "-$cmd_pid" 2>/dev/null' INT TERM
 wait "$cmd_pid"; cmd_rc=$?
-if [ -e "$lost" ]; then
+if [ -e "$lost" ] || [ -n "$stopping" ] || kill -0 -- "-$cmd_pid" 2>/dev/null; then
   # A TERM from the heartbeat loop interrupts the first wait. Give the command group a bounded
   # grace, then SIGKILL it, so nothing keeps writing after the lease is gone (Linear full review D7).
   i=0
@@ -191,6 +195,10 @@ trap 'exit 130' INT TERM
 cmd_pid=""
 
 kill "$hb_pid" 2>/dev/null; wait "$hb_pid" 2>/dev/null; hb_pid=""
+if [ -n "$stopping" ]; then
+  echo "inbox-worker-example: stopped by signal; task left running for its lease to expire" >&2
+  exit 143
+fi
 
 # 6. Submit or fail. Skip both when the lease was lost: the writes would be refused.
 if [ -e "$lost" ]; then

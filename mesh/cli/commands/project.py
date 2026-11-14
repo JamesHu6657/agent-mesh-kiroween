@@ -301,7 +301,16 @@ def handle_project_set_lead(args: argparse.Namespace) -> Dict[str, Any]:
 
 def handle_project_complete(args: argparse.Namespace) -> Dict[str, Any]:
     report_arg = getattr(args, "report", "")
-    if report_arg == "-":
+    if "report" in getattr(args, "_from_json", set()) and isinstance(report_arg, dict):
+        # Full review: a structured --input report goes straight to the daemon.
+        report_raw = report_arg
+    elif not isinstance(report_arg, str) or not report_arg:
+        raise MeshError(code=c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
+                        message="--report must be a file path or '-'", details={"param": "report"})
+    elif report_arg == "-" and "report" in getattr(args, "_from_json", set()):
+        raise MeshError(code=c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
+                        message="report '-' (stdin) is only valid as a CLI flag", details={"param": "report"})
+    elif report_arg == "-":
         from mesh.cli.stdin import read_stdin
         report_raw = read_stdin("--report")
     else:

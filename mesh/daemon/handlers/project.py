@@ -315,6 +315,20 @@ def _handle_intake_submit(ctx: HandlerContext) -> HandlerResult:
         criteria_records.append({"id": crit_id, "ordinal": idx + 1, "text": clean_text})
 
     deps = ctx.args.get("depends_on_project") or []
+    # Full review: a list of existing project ids, deduplicated (no INTERNAL_ERROR).
+    if isinstance(deps, str):
+        deps = [deps]
+    if not isinstance(deps, list) or not all(isinstance(d, str) and d for d in deps):
+        raise MeshError(code=c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
+                        message="depends_on_project must be a list of project ids",
+                        details={"param": "depends_on_project"})
+    deps = list(dict.fromkeys(deps))
+    for dep_id in deps:
+        if dep_id != prj_id and ctx.conn.execute(
+                "SELECT 1 FROM projects WHERE id = ?;", (dep_id,)).fetchone() is None:
+            raise MeshError(code=c.NOT_FOUND, exit_code=c.EXIT_NOT_FOUND,
+                            message=f"Project '{dep_id}' not found",
+                            details={"project_id": dep_id})
     for dep_id in deps:
         if dep_id == prj_id:
             raise MeshError(
@@ -674,7 +688,8 @@ def handle_project_set_lead(ctx: HandlerContext) -> HandlerResult:
     tcur = ctx.conn.execute(
         """SELECT id FROM tasks
            WHERE project_id = ? AND assignee_agent_id = ?
-             AND status NOT IN ('merged', 'accepted', 'cancelled');""",
+             AND status NOT IN ('merged', 'cancelled')
+             AND NOT (status = 'accepted' AND COALESCE(kind, 'general') = 'general');""",
         (project_id, new_lead_id),
     )
     active_tasks = [r["id"] for r in tcur.fetchall()]

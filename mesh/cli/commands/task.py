@@ -949,13 +949,30 @@ def handle_task_submit(args: argparse.Namespace) -> Dict[str, Any]:
     summary_arg = getattr(args, "summary", None)
 
     deliverable_data = None
+    if deliverable_arg is not None and "deliverable" in getattr(args, "_from_json", set()) \
+            and not isinstance(deliverable_arg, str):
+        # Full review: an --input JSON deliverable is already structured; never probe
+        # it as a path or an fd (bool/int would open stdout).
+        if not isinstance(deliverable_arg, dict):
+            raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="Deliverable must be a JSON object", details={"param": "deliverable"})
+        deliverable_data = deliverable_arg
+        if len(json.dumps(deliverable_data).encode("utf-8")) > 200 * 1024:
+            raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="Deliverable exceeds 200 KB limit", details={"param": "deliverable", "bytes": len(json.dumps(deliverable_data).encode("utf-8")), "limit": 204800})
+        deliverable_arg = None
+    if deliverable_arg is not None and not isinstance(deliverable_arg, str):
+        raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="Deliverable must be a JSON object", details={"param": "deliverable"})
     if deliverable_arg is not None:
         if deliverable_arg == "-":
             from mesh.cli.stdin import read_stdin
             raw_content = read_stdin("--deliverable")
         elif os.path.exists(deliverable_arg):
-            with open(deliverable_arg, "r", encoding="utf-8") as fp:
-                raw_content = fp.read()
+            try:
+                with open(deliverable_arg, "r", encoding="utf-8") as fp:
+                    raw_content = fp.read()
+            except (OSError, UnicodeDecodeError) as exc:
+                raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
+                                message=f"--deliverable: cannot read {deliverable_arg}: {type(exc).__name__}",
+                                details={"param": "deliverable", "path": deliverable_arg, "reason": "unreadable"})
         else:
             raw_content = deliverable_arg
         try:
@@ -976,13 +993,15 @@ def handle_task_submit(args: argparse.Namespace) -> Dict[str, Any]:
             raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="Deliverable must be a JSON object", details={"param": "deliverable"})
         if len(json.dumps(deliverable_data).encode("utf-8")) > 200 * 1024:
             raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="Deliverable exceeds 200 KB limit", details={"param": "deliverable", "bytes": len(json.dumps(deliverable_data).encode("utf-8")), "limit": 204800})
-    elif summary_arg is not None:
+    elif deliverable_data is None and summary_arg is not None:
         deliverable_data = {"summary": summary_arg}
-    else:
+    elif deliverable_data is None:
         deliverable_data = {}
 
     # Both given: merge the summary into the deliverable instead of dropping it.
-    if deliverable_arg is not None and summary_arg is not None:
+    # (PR41 r1 P1: also when the deliverable came structured from --input.)
+    if (deliverable_arg is not None or "deliverable" in getattr(args, "_from_json", set())) \
+            and summary_arg is not None:
         deliverable_data = dict(deliverable_data)
         deliverable_data.setdefault("summary", summary_arg)
 

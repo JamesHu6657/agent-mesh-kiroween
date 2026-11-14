@@ -12,12 +12,19 @@ B="wt/$N"; git rev-parse -q --verify "$B" >/dev/null || { echo "no branch $B"; e
 # landing on the branch during the scan is never pushed unscanned.
 S=$(git rev-parse "$B^{commit}"); BASE=$(git rev-parse github/main^{commit})
 R="$BASE..$S"
-GL=${GITLEAKS:-/tmp/gitleaks}; [ -x $GL ] || { echo "REFUSED: gitleaks missing"; exit 2; }
-if ! $GL git --no-banner --redact --log-opts="$R" --baseline-path scripts/coord/gitleaks-baseline.json . > /tmp/pr-gl.txt 2>&1; then
-  echo "REFUSED: gitleaks hits:"; grep -E "RuleID|File|Commit" /tmp/pr-gl.txt | head -30; exit 3; fi
+# Full review P1: never prefer a /tmp binary another user could plant; GITLEAKS env,
+# then PATH, then /tmp/gitleaks only if owned by us.
+GL="${GITLEAKS:-$(command -v gitleaks 2>/dev/null || true)}"
+if [ -z "$GL" ] && [ -x /tmp/gitleaks ] && [ -O /tmp/gitleaks ]; then GL=/tmp/gitleaks; fi
+GLOUT=$(mktemp) || exit 2; trap 'rm -f "$GLOUT"' EXIT
+[ -n "$GL" ] && [ -x "$GL" ] || { echo "REFUSED: gitleaks missing"; exit 2; }
+if ! "$GL" git --no-banner --redact --log-opts="$R" --baseline-path scripts/coord/gitleaks-baseline.json . > "$GLOUT" 2>&1; then
+  echo "REFUSED: gitleaks hits:"; grep -E "RuleID|File|Commit" "$GLOUT" | head -30; exit 3; fi
 # Shared pattern (Sakana PR #4 P1-2: generic *_API_KEY=); fail closed if missing.
 . scripts/coord/secret-pattern.sh 2>/dev/null && [ -n "${P:-}" ] || { echo "REFUSED: scripts/coord/secret-pattern.sh missing"; exit 2; }
-H=$(git log -p $R | grep -E '^\+' | grep -cE "$P" || true)
+# Full review P1: merge diffs too (-m), binary-as-text, and fail closed if git log fails.
+PATCH=$(git log -p -m --text "$R") || { echo "REFUSED: git log failed"; exit 2; }
+H=$(printf '%s\n' "$PATCH" | { grep -E '^\+' || [ $? -eq 1 ]; } | { grep -cE "$P" || [ $? -eq 1 ]; }) || { echo "REFUSED: pattern scan failed"; exit 2; }
 [ "$H" = 0 ] || { echo "REFUSED: $H pattern hits"; exit 3; }
 git push github "$S:refs/heads/review/$N"
 echo "branch review/$N base $(git merge-base $BASE $S) (github main $BASE) head $S commits $(git rev-list --count $R)"

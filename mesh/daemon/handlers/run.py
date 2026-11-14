@@ -583,6 +583,16 @@ def handle_workspace_delete(ctx: HandlerContext) -> HandlerResult:
             actor_kind=ctx.actor_kind, via=ctx.via, k_user=ctx.k_user,
         )
 
+    if task["status"] == "merging" or ctx.conn.execute(
+        "SELECT 1 FROM leases WHERE key = ?;", (f"merge:{task['project_id']}",)
+    ).fetchone():
+        # Full review P1: never remove a worktree while the project's merge runs.
+        raise MeshError(
+            code=c.RUN_STILL_ACTIVE,
+            exit_code=c.EXIT_CONFLICT,
+            message=f"Cannot delete the workspace of task '{task_id}': a merge is in progress",
+            details={"task_id": task_id, "reason": "merge_in_progress"},
+        )
     if ctx.conn.execute("SELECT 1 FROM leases WHERE key = ?;", (f"task:{task_id}",)).fetchone():
         raise MeshError(
             code=c.RUN_STILL_ACTIVE,

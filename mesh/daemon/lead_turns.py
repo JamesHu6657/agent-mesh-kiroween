@@ -195,13 +195,13 @@ def _criteria(conn: sqlite3.Connection, project_id: str) -> List[Dict[str, Any]]
 
 def _tasks(conn: sqlite3.Connection, project_id: str) -> List[Dict[str, Any]]:
     rows = conn.execute(
-        """SELECT t.id, t.title, t.status, p.name AS assignee
+        """SELECT t.id, t.title, t.status, t.kind, p.name AS assignee
            FROM tasks t LEFT JOIN principals p ON t.assignee_agent_id = p.id
            WHERE t.project_id = ?
            ORDER BY t.created_at ASC, t.id ASC;""",
         (project_id,),
     ).fetchall()
-    return [{"id": r["id"], "title": r["title"], "status": r["status"], "assignee": r["assignee"]}
+    return [{"id": r["id"], "title": r["title"], "status": r["status"], "kind": r["kind"], "assignee": r["assignee"]}
             for r in rows]
 
 

@@ -35,13 +35,11 @@ case "${1:-}" in
   *) usage; exit 2 ;;
 esac
 
-GL=""
-if [ -x /tmp/gitleaks ]; then
-  GL=/tmp/gitleaks
-elif command -v gitleaks >/dev/null 2>&1; then
-  GL="$(command -v gitleaks)"
-fi
-if [ -z "$GL" ]; then
+# Full review P1: never prefer a /tmp binary another user could plant; GITLEAKS env,
+# then PATH, then /tmp/gitleaks only if owned by us.
+GL="${GITLEAKS:-$(command -v gitleaks 2>/dev/null || true)}"
+if [ -z "$GL" ] && [ -x /tmp/gitleaks ] && [ -O /tmp/gitleaks ]; then GL=/tmp/gitleaks; fi
+if [ -z "$GL" ] || [ ! -x "$GL" ]; then
   echo "secret-scan: REFUSED: gitleaks not found (/tmp/gitleaks or PATH)"
   exit 2
 fi

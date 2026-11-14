@@ -23,6 +23,8 @@ def now_iso_utc(ts: Union[float, int, datetime.datetime, None] = None) -> str:
     """Return UTC time formatted as ISO-8601 with milliseconds and 'Z' suffix."""
     if ts is None:
         return now_utc()
+    if isinstance(ts, bool):
+        raise ValueError("Expected a timestamp, got bool")
     if isinstance(ts, (int, float)):
         dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
         return format_utc(dt)
@@ -89,6 +91,8 @@ def parse_duration(val: Union[str, int]) -> int:
     Raises:
         ValueError if input is invalid or negative.
     """
+    if isinstance(val, bool):
+        raise ValueError("Expected duration string or integer, got bool")
     if isinstance(val, int):
         if val < 0:
             raise ValueError(f"Duration cannot be negative, got {val}")
@@ -119,6 +123,8 @@ def parse_duration(val: Union[str, int]) -> int:
 
 def format_duration(seconds: int) -> str:
     """Format an integer number of seconds into a human-readable duration string."""
+    if isinstance(seconds, bool):
+        raise ValueError("Expected integer seconds, got bool")
     if seconds < 0:
         raise ValueError(f"Duration cannot be negative, got {seconds}")
 
