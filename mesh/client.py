@@ -12,6 +12,11 @@ from mesh.errors import MeshError
 from mesh.core.paths import check_token_file_secure
 
 
+#: Set by the CLI when --home was given on the command line (blind review P2): then
+#: MESH_SOCKET never redirects the request, even when --home names the default path.
+EXPLICIT_HOME = False
+
+
 class MeshClient:
     """Client connecting to meshd over the local Unix socket."""
 
@@ -21,7 +26,8 @@ class MeshClient:
         # It applies only when neither --home nor MESH_HOME chose a home.
         default_home = os.path.realpath(os.path.expanduser("~/.agent-mesh"))
         mesh_socket = os.environ.get("MESH_SOCKET")
-        if mesh_socket and not os.environ.get("MESH_HOME") and self.home == default_home:
+        if (mesh_socket and not os.environ.get("MESH_HOME") and not EXPLICIT_HOME
+                and self.home == default_home):
             self.socket_path = mesh_socket
         else:
             self.socket_path = os.path.join(self.home, "run", "mesh.sock")
@@ -247,7 +253,8 @@ class MeshClient:
             sock.sendall(req_data)
 
             f = sock.makefile("r", encoding="utf-8")
-            items = []
+            # Blind review P3: a live tail can run for days; count events, never keep them.
+            count = 0
             for line in f:
                 line_str = line.strip()
                 if not line_str:
@@ -266,11 +273,11 @@ class MeshClient:
                         details=err.get("details", {}),
                     )
 
-                items.append(data)
+                count += 1
                 sys.stdout.write(line_str + "\n")
                 sys.stdout.flush()
 
-            return {"items": items}
+            return {"count": count}
         except socket.timeout as exc:
             raise MeshError(
                 code=c.DAEMON_UNAVAILABLE,

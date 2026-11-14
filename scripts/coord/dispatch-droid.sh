@@ -21,6 +21,6 @@ mkdir -p logs/raw
 G="prompts/.session-$N.md"; cat "$SD/session-budget.txt" "$P" > "$G"; P="$G"
 S="$(cd "$(dirname "$0")" && pwd)/droid-settings.json"
 setsid nohup timeout 5400 droid exec -f "$P" -m "$M" --auto medium --settings "$S" --cwd "$(pwd -P)" -o json \
-  > "logs/raw/droid-$N.jsonl" 2> "logs/raw/droid-$N.err" < /dev/null &
+  > "logs/raw/droid-$N.jsonl" 2> "logs/raw/droid-$N.err" < /dev/null 9>&- &
 PID=$!; disown
 echo "dispatched droid run=$N pid=$PID model=$M log=logs/raw/droid-$N.jsonl"

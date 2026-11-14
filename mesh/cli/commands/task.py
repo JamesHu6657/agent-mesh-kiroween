@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 from mesh.client import MeshClient
 import mesh.constants as c
 from mesh.errors import MeshError, NotImplementedInM1Error
+from mesh.cli.render import align_rows, fit
 
 
 def register_task_commands(subparsers: argparse._SubParsersAction, parent_parser: argparse.ArgumentParser) -> None:
@@ -429,9 +430,8 @@ def task_list_table(items: Any, now: Optional[float] = None) -> str:
         rows.append([str(t.get("id")), str(t.get("status")), str(t.get("assignee") or "-"),
                      _ago(t.get("created_at"), now), _ago(t.get("updated_at"), now),
                      f"{t.get('attempt') or 0}/{t.get('max_attempts') or '-'}",
-                     title if len(title) <= 48 else title[:45] + "..."])
-    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
-    return "\n".join("  ".join(r[i].ljust(widths[i]) for i in range(len(r))).rstrip() for r in rows)
+                     fit(title, 48)])
+    return "\n".join(align_rows(rows))
 
 
 def handle_task_show(args: argparse.Namespace) -> Dict[str, Any]:
@@ -553,14 +553,23 @@ def handle_task_merge_all(args: argparse.Namespace) -> Dict[str, Any]:
         try:
             data = _merge_one(sub)
         except MeshError as e:
+            rest = queue[n + 1:]
+            step = _merge_all_next_step(e.code, tsk, args.project, bool(rest))
             summary = {"project": args.project, "merged": merged, "failed": {"task_id": tsk, "code": e.code,
-                       "message": e.message, "details": e.details}, "not_attempted": queue[n + 1:]}
+                       "message": e.message, "details": e.details}, "not_attempted": rest,
+                       "next_step": step}
+            if text:
+                print(f"  failed {tsk}: {e.code}", file=sys.stderr, flush=True)
+                for t in rest:
+                    print(f"  not attempted {t}", file=sys.stderr, flush=True)
             raise MeshError(e.code, exit_code=e.exit_code,
                             message=(f"merge --all-accepted stopped at {tsk} ({n + 1}/{len(queue)}): {e.message} "
-                                     f"[merged {len(merged)}, not attempted {len(queue) - n - 1}]"),
+                                     f"[merged {len(merged)}, not attempted {len(rest)}] Next: {step}"),
                             details=summary, data=e.data) from e
         merged.append({"task_id": tsk, "merge_commit": data.get("merge_commit") or data.get("commit"),
                        "status": data.get("status")})
+        if text:
+            print(f"  merged {tsk} {merged[-1]['merge_commit'] or '-'}", file=sys.stderr, flush=True)
     out = {"project": args.project, "merged": merged, "failed": None, "not_attempted": []}
     if text:
         lines = [f"merged {len(merged)} accepted task(s) in {args.project}" if merged
@@ -568,6 +577,31 @@ def handle_task_merge_all(args: argparse.Namespace) -> Dict[str, Any]:
         lines += [f"  {m['task_id']}  {m.get('merge_commit') or '-'}" for m in merged]
         return {"text": "\n".join(lines)}
     return out
+
+
+def _merge_all_next_step(code: str, tsk: str, project: str, more: bool) -> str:
+    """What to do after `merge --all-accepted` stopped at ``tsk`` (Sakana P2-1). The batch
+    always stops at the first failure: a failed merge leaves the integration tree clean and
+    the project merge lock free (the daemon restores both), except MERGE_HELD, which keeps
+    the lock on purpose until the held run is resolved. A failed merge leaves the task
+    merge_failed: from there `task merge` reruns the merge, `task reject` sends it to
+    rework and `task close --superseded-by` closes it (`task retry` is only for failed or
+    escalated tasks, so it is never suggested here; PR #38 review)."""
+    again = f"mesh task merge --all-accepted --project {project}"
+    if code == c.MERGE_HELD:
+        return (f"the project merge lock stays held, so no merge in {project} can run: stop the leftover "
+                f"processes of the held merge test run, restart meshd (boot recovery decides {tsk}), "
+                f"then run {again}")
+    if code == c.TESTS_FAILED:
+        return (f"see the failing tests in `mesh task show {tsk}`; send it back for a fix "
+                f"(mesh task reject {tsk} --reason \"<what failed>\"), or, if the failure was not the "
+                f"task's own (a flaky test), rerun just its merge (mesh task merge {tsk}); then run {again}")
+    if code == c.MERGE_CONFLICT:
+        return (f"{tsk} conflicts with the integration branch: send it back to be redone on top of it "
+                f"(mesh task reject {tsk} --reason \"rebase on the integration branch\"), or, if its work "
+                f"already landed through another task, close it (mesh task close {tsk} --superseded-by <task>); "
+                f"then run {again}")
+    return f"fix the cause shown for {tsk}, then run {again}"
 
 
 def handle_task_merge(args: argparse.Namespace) -> Dict[str, Any]:
@@ -642,9 +676,9 @@ def new_session_id() -> str:
 
 
 def session_for_key(key: str) -> str:
-    import hashlib
+    from mesh.core.leases import session_for_idempotency_key
 
-    return "ses_" + hashlib.sha256(("mesh-task-start-session\0" + str(key)).encode("utf-8")).hexdigest()[:16]
+    return session_for_idempotency_key(key)
 
 
 def handle_task_start(args: argparse.Namespace) -> Dict[str, Any]:
@@ -727,6 +761,14 @@ def _keepalive_args(args: argparse.Namespace) -> argparse.Namespace:
     return a
 
 
+#: Upper bound for one keepalive daemon call (heartbeat, task.show), in seconds.
+KEEPALIVE_CALL_TIMEOUT_S = 10.0
+
+
+class _KeepaliveStop(BaseException):
+    """SIGTERM/SIGINT during `task keepalive`: unwind out of a blocked daemon call."""
+
+
 def handle_task_keepalive(args: argparse.Namespace) -> Dict[str, Any]:
     """Heartbeat until the run ends (CLI-side loop over `task.heartbeat`)."""
     import signal
@@ -745,12 +787,27 @@ def handle_task_keepalive(args: argparse.Namespace) -> Dict[str, Any]:
         raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="--dry-run is not supported by task keepalive",
                         details={"param": "dry_run"})
 
-    client = MeshClient(home=args.home)
+    # Each daemon call is bounded (Sakana P2-2): a hung daemon cannot hold a beat for the
+    # default 30 s client timeout; a timed-out beat is a transient failure and is retried.
+    client = MeshClient(home=args.home, timeout=KEEPALIVE_CALL_TIMEOUT_S)
     payload = _with_session({"task_id": args.task_id, "run": args.run, "fence": args.fence})
-    stop = {"signal": None}
+    stop = {"signal": None, "in_call": False}
 
     def _on_signal(signum, _frame):  # pragma: no cover - exercised by integration test
         stop["signal"] = signum
+        if stop["in_call"]:
+            # A daemon call is blocked on its socket: Python resumes the read after a
+            # handler that returns (PEP 475), so leave the call now. Quiet exit below.
+            raise _KeepaliveStop()
+
+    def _call(cmd: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        if stop["signal"] is not None:
+            raise _KeepaliveStop()
+        stop["in_call"] = True
+        try:
+            return client.execute_cmd(_keepalive_args(args), cmd, body)
+        finally:
+            stop["in_call"] = False
 
     old = {sig: signal.signal(sig, _on_signal) for sig in (signal.SIGTERM, signal.SIGINT)}
     beats = 0
@@ -759,12 +816,12 @@ def handle_task_keepalive(args: argparse.Namespace) -> Dict[str, Any]:
     try:
         while stop["signal"] is None:
             try:
-                resp = client.execute_cmd(_keepalive_args(args), "task.heartbeat", payload)
+                resp = _call("task.heartbeat", payload)
                 beats += 1
                 last_ok = _t.monotonic()
                 expires = (resp.get("data") or {}).get("expires_at")
                 if every is None or ttl_s is None:
-                    live = _keepalive_live_run(client, args)
+                    live = _keepalive_live_run(_call, args.task_id)
                     if live:
                         ttl_s = live.get("lease_ttl_s")
                         if every is None:
@@ -774,6 +831,8 @@ def handle_task_keepalive(args: argparse.Namespace) -> Dict[str, Any]:
                     if ttl_s and every >= ttl_s:
                         _keepalive_log(f"warning: --every {every}s is not shorter than lease_ttl_s {ttl_s}s; the lease may expire between beats")
                 _keepalive_log(f"heartbeat {beats} ok, lease expires at {expires}; next in {every}s")
+            except _KeepaliveStop:
+                break
             except MeshError as exc:
                 if exc.code in _LEASE_LOST_CODES:
                     return _keepalive_end(client, args, exc, beats)
@@ -795,6 +854,8 @@ def handle_task_keepalive(args: argparse.Namespace) -> Dict[str, Any]:
             while slept < every and stop["signal"] is None:
                 _t.sleep(step)
                 slept += step
+    except _KeepaliveStop:
+        pass  # a signal arrived between the loop's own checks
     finally:
         for sig, handler in old.items():
             signal.signal(sig, handler)
@@ -803,9 +864,9 @@ def handle_task_keepalive(args: argparse.Namespace) -> Dict[str, Any]:
             "ended": "stopped", "signal": stop["signal"]}
 
 
-def _keepalive_live_run(client: "MeshClient", args: argparse.Namespace) -> Optional[Dict[str, Any]]:
+def _keepalive_live_run(call: Any, task_id: str) -> Optional[Dict[str, Any]]:
     try:
-        shown = client.execute_cmd(_keepalive_args(args), "task.show", {"task_id": args.task_id})
+        shown = call("task.show", {"task_id": task_id})
     except MeshError:
         return None
     return (shown.get("data") or {}).get("live_run")
@@ -836,7 +897,13 @@ def _keepalive_end(client: "MeshClient", args: argparse.Namespace, exc: MeshErro
                                 f"{args.run} was ended (task is now {task.get('status') or 'unknown'}). Stop working "
                                 f"on this run; its writes will be refused. Ask the lead to retry the task.",
                         details={**result, "reason": "lease_expired"})
-    if run.get("status") in ("starting", "running") or exc.code == c.FENCE_MISMATCH and not run.get("ended_at"):
+    try:
+        newer_fence = int(task.get("fence_seq")) > int(args.fence)
+    except (TypeError, ValueError):
+        newer_fence = False
+    # Linear full review C8: a newer fence (a retry started) is supersession, exit 9,
+    # even when this run itself ended normally earlier.
+    if newer_fence or run.get("status") in ("starting", "running") or exc.code == c.FENCE_MISMATCH and not run.get("ended_at"):
         # Our run still looks live but the lease belongs to another run/fence.
         _keepalive_log(f"run superseded: {exc.message}")
         raise MeshError(c.FENCE_MISMATCH, exit_code=c.EXIT_STALE,

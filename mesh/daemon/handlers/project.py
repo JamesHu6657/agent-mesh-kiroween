@@ -34,6 +34,7 @@ from mesh.core.repos import (
 )
 from mesh.core.workspaces import compute_lead_workspace_path, get_workspaces_root
 from mesh.daemon.handlers.base import Effect, HandlerContext, HandlerResult
+from mesh.daemon.handlers.inbox import _recheck_credential
 from mesh.errors import MeshError
 
 
@@ -102,6 +103,14 @@ def _prepare_repo_project(ctx: HandlerContext) -> Optional[Dict[str, Any]]:
 
 
 def handle_intake_submit(ctx: HandlerContext) -> HandlerResult:
+    # PR #39 review round 3 (B5): intake with --repo validates and sets up the repo inside
+    # the request transaction too; same request-wide git deadline as project.create.
+    from mesh.core import repos as _repos
+    with _repos.git_budget(_repos.SETUP_INTEGRATION_BUDGET_S):
+        return _handle_intake_submit(ctx)
+
+
+def _handle_intake_submit(ctx: HandlerContext) -> HandlerResult:
     """Handle intake submit (both new project creation and follow-up message)."""
     now = now_iso_utc()
 
@@ -388,6 +397,14 @@ def _repo_view(cols: Any) -> Dict[str, Any]:
 
 
 def handle_project_create(ctx: HandlerContext) -> HandlerResult:
+    # PR #39 review round 2 (B5): repo validation and integration setup run inside the
+    # request transaction; their git calls share one request-wide deadline.
+    from mesh.core import repos as _repos
+    with _repos.git_budget(_repos.SETUP_INTEGRATION_BUDGET_S):
+        return _handle_project_create(ctx)
+
+
+def _handle_project_create(ctx: HandlerContext) -> HandlerResult:
     """Project create is an alias for intake submit."""
     return handle_intake_submit(ctx)
 
@@ -1939,6 +1956,9 @@ async def handle_project_wait(server: Any, ctx: HandlerContext, reader: Any = No
                     data={"items": []},
                 )
 
+            # Blind review P2: re-check credential and access on every pass of the wait.
+            _recheck_credential(ctx)
+            check_authz(ctx.conn, "project.wait", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id)
             cur = ctx.conn.execute(
                 """SELECT pr.id, pr.name, pr.goal, pr.status, pr.created_via,
                           pr.created_at, pr.updated_at, pr.completed_at, pr.origin_ref,

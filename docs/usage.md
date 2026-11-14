@@ -257,6 +257,24 @@ counts delegated decisions with the relayed ones (per lead and credential). Cate
 others to `direct_only` to keep them for yourself. Your own `--user` approvals keep
 working in delegated mode.
 
+**The lead can approve its own requests.** When the lead itself ran the gated op (for
+example it raised a `spend_money` request), it may still decide that approval with
+`--human-confirmed`: this is the intended flow (the lead asks you, then records your
+answer), and it is the one exception to "a requester cannot decide its own request".
+Mesh makes it visible: the `approval.decided` event payload and the approve/reject
+response carry `self_requested: true`, and `mesh approval show <apr>` prints
+`self_requested: true` and `via: delegated (…, its own request)` (the approvals row keeps
+the lead as both `requested_by` and `relayed_by`). To forbid it, so that a lead's own
+requests need your passphrase, run:
+
+```sh
+mesh config set approval.delegated_self_approve false --user    # default: true
+```
+
+Then a lead deciding its own request gets rc 4 `SELF_APPROVAL`, and `approval pending`
+lists such items as `user_only`. Requests raised by others (workers, other agents) are
+unaffected.
+
 What Mesh cannot do: check that you really said it. Delegated mode **trusts the lead**,
 and anything that can read the lead's token file (any process of your user) can approve
 in your name for that lead's projects. Decisions are recorded as unverified
@@ -336,7 +354,10 @@ Mesh has no magic push. The following table is the concrete delivery mechanism.
   attempt and title. `mesh task merge --all-accepted --project P` (lead) merges the
   project's accepted code tasks one at a time in creation order, each an ordinary
   `task merge` with its full gate, stops at the first failure and reports merged /
-  failed / not attempted.
+  failed / not attempted plus `next_step` (in text mode, one stderr line per task). A
+  failed merge (`TESTS_FAILED`, `MERGE_CONFLICT`) leaves the integration worktree clean
+  and the project merge lock free, so the next run continues with the rest;
+  `MERGE_HELD` keeps the lock until the held merge test run is resolved (see its message).
 - **Scheduler errors.** A failing scheduler step is logged with its traceback in
   `logs/meshd.log`, counted, and does not stop the other steps; `mesh daemon status`
   (`scheduler.sweep_errors`, `last_sweep_error`, per step) and `mesh doctor`
@@ -346,7 +367,9 @@ Mesh has no magic push. The following table is the concrete delivery mechanism.
   background after `task start`. It exits 0 with the final task state when the run
   ends normally (submit, fail, cancel) and 9 when the lease was lost (`LEASE_EXPIRED`)
   or the task was restarted with a newer fence (`FENCE_MISMATCH`). SIGINT/SIGTERM stop
-  it (exit 0); the lease then runs out after `lease.ttl_s`.
+  it at once, also while a heartbeat is waiting on meshd (exit 0, `ended: stopped`, no
+  traceback); the lease then runs out after `lease.ttl_s`. Each daemon call it makes
+  times out after 10 s and counts as a failed beat, retried until the lease could expire.
 - **Roster for leads.** `mesh agent list` / `mesh agent show NAME` work with an agent
   token for an enabled agent with `can_lead` or the current lead of an active project.
   Leads get the roster view: id, name, adapter, delivery, can_lead, max concurrency,
@@ -445,7 +468,8 @@ passphrase.** It cannot detect either.
   5 not found, 6 conflict, 7 approval required, 8 wait timeout, 9 stale, 10 daemon
   unavailable, 11 busy, 12 approval invalid, 13 adapter unavailable, 14 merge failed.
   `mesh help exit-codes` prints the full table.
-- Default output is one JSON envelope. Use `--format text` for tables.
+- Default output is one JSON envelope. Use `--format text` for tables; columns are cut and
+  padded by display width, so CJK (East Asian wide) text stays aligned.
 - `mesh config set KEY VALUE` takes VALUE as JSON (`600`, `null`, `'"text"'`,
   `'["a"]'`). String settings (`lead.default_agent`, `lead.profile`, `workspaces.root`,
   `adapter.evidence_mode`, `approval.mode`, `approval.policy.*`) also take a bare word

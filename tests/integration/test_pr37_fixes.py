@@ -123,6 +123,15 @@ class TestPR37(unittest.TestCase):
         self.assertTrue(dec, out["raw_stdout"])
         self.assertIn("rejected: not now please", dec[0])
         self.assertIn(short, dec[0])
+        # Release follow-up (c): the decided payload names the approval and its kind.
+        self.assertIn(apr, dec[0])
+        self.assertRegex(dec[0], r"\w+/\S+")
+        rc, js = self.harness.cli("inbox", "list", "--peek", token=self.tok_lead1)
+        decided = [m for m in js["data"]["items"] if m["type"] == "approval.decided"]
+        self.assertTrue(decided, js)
+        self.assertEqual(decided[0]["payload"]["approval_id"], apr)
+        self.assertTrue(decided[0]["payload"]["category"])
+        self.assertTrue(decided[0]["payload"]["op"])
 
 
 if __name__ == "__main__":

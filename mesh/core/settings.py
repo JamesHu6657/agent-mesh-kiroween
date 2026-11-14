@@ -58,6 +58,11 @@ def get_default_settings(home: str) -> Dict[str, Any]:
         # decides approvals. "delegated": the project's current inbox lead asks the human
         # and records the decision with the human's own words (--human-confirmed).
         "approval.mode": "passphrase",
+        # Delegated mode only (Sakana PR #4 P1-1): may the lead decide, on the human's
+        # word, an approval it requested itself? true (default) is the intended flow ("the
+        # lead asks the human, then decides for them"); false refuses it with SELF_APPROVAL
+        # as in direct/relayed mode. Every such decision is recorded with self_requested.
+        "approval.delegated_self_approve": True,
         "notify.command": None,
         # Productize: "warn" lets a vendor adapter launch without matching committed smoke
         # evidence (the gap is reported by probe/doctor and in the assign response);
@@ -248,6 +253,19 @@ def validate_setting(
                 message=f"Setting '{key}' must be an absolute path",
                 details={"key": key, "expected": "absolute path", "got": val},
             )
+        # Linear full review A1: runtime uses os.path.abspath(val.strip()) (lexical: it
+        # collapses "..", "." and "//" and drops surrounding spaces), while the checks below
+        # follow the filesystem. Only a path already in that normal form is accepted, so the
+        # directory checked here is exactly the one workspaces are created in.
+        if val != os.path.abspath(val.strip()):
+            raise MeshError(
+                code=c.INVALID_SETTING,
+                exit_code=c.EXIT_USAGE,
+                message=(f"Setting '{key}' must be a normalized absolute path (no '..', '.', "
+                         f"repeated '/', trailing '/' or surrounding spaces): use "
+                         f"'{os.path.abspath(val.strip())}' after checking it is the directory you mean"),
+                details={"key": key, "expected": "normalized absolute path", "got": val},
+            )
         # Check bidirectional install-path check (review-r3 minor 4)
         if install_root is None:
             install_root = get_install_root()
@@ -320,6 +338,17 @@ def validate_setting(
                 exit_code=c.EXIT_USAGE,
                 message=f"Setting '{key}' must be \"passphrase\" or \"delegated\"",
                 details={"key": key, "expected": ["passphrase", "delegated"], "got": val},
+            )
+        return val
+
+    # 5d. approval.delegated_self_approve (bool)
+    if key == "approval.delegated_self_approve":
+        if not isinstance(val, bool):
+            raise MeshError(
+                code=c.INVALID_SETTING,
+                exit_code=c.EXIT_USAGE,
+                message=f"Setting '{key}' must be true or false",
+                details={"key": key, "expected": [True, False], "got": val},
             )
         return val
 
@@ -421,6 +450,19 @@ def validate_setting(
                 message=f"Setting '{key}' out of range: got {val}",
                 details={"key": key, "expected": f"{min_v}..{max_v}", "got": val},
             )
+        if key == "task.max_attempts_cap" and current_settings is not None:
+            # Linear full review A2: the cap may not drop below the default, or tasks
+            # created without --max-attempts would get more attempts than the cap allows.
+            default_attempts = current_settings.get("task.default_max_attempts", 3)
+            if isinstance(default_attempts, int) and default_attempts > val:
+                raise MeshError(
+                    code=c.INVALID_SETTING,
+                    exit_code=c.EXIT_USAGE,
+                    message=(f"Setting '{key}' ({val}) is below task.default_max_attempts "
+                             f"({default_attempts}); lower task.default_max_attempts first"),
+                    details={"key": key, "expected": f">= {default_attempts} (task.default_max_attempts)",
+                             "got": val},
+                )
         return val
 
     if key == "task.default_max_attempts":

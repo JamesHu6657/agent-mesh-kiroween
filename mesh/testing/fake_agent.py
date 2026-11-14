@@ -123,11 +123,16 @@ def execute_behavior(behavior: str, params: Dict[str, Any]) -> None:
         code = f"import time; time.sleep({seconds})"
         if params.get("ignore_sigterm"):
             code = "import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); " + code
+        # "env": {...} replaces the environment (a sanitized child without MESH_RUN_ID).
+        env = {str(k): str(v) for k, v in params["env"].items()} if isinstance(params.get("env"), dict) else None
         proc = subprocess.Popen(
             [sys.executable, "-c", code],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            start_new_session=True, env=env,
         )
+        if params.get("path"):
+            with open(str(params["path"]), "w", encoding="utf-8") as f:
+                f.write(f"{proc.pid}\n")
         print(f"grandchild_pid={proc.pid}")
         sys.stdout.flush()
 

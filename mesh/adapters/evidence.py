@@ -172,7 +172,7 @@ def load_evidence(adapter_id: str, testing_mode: bool, probed_version: Optional[
     ev = Evidence(ok=False, probed_version=probed_version)
     rdir = results_dir(testing_mode, env)
     try:
-        path = smoke_schema.load_latest(str(rdir), adapter_id) if rdir else None
+        path = smoke_schema.load_latest(str(rdir), adapter_id, probed_version) if rdir else None
     except OSError as exc:
         # Linear round 5 P3: unreadable evidence is an evidence failure, not an internal error.
         ev.reason, ev.errors = "evidence_invalid", [f"cannot list smoke results: {exc}"]

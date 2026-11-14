@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Kiro single review pass of an externally drafted plan (ChatPRD). Usage: bash scripts/coord/kiro-plan-review.sh <name> <plan-file>
-source "$(dirname "$0")/kiro-run-common.sh"
+source "$(dirname "$(readlink -f "$0")")/kiro-run-common.sh"
 N="${1:?name}"; F="${2:?plan file}"
 OUT=docs/coordination/reviews/plan-$N.md
 P="You are the PLAN REVIEWER for Agent Mesh v1. Do not modify any file except writing your review to $OUT. Do not write code, commit or dispatch.

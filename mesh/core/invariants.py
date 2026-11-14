@@ -259,7 +259,9 @@ def check_i3_concurrency_and_limits(conn: sqlite3.Connection) -> List[Violation]
                     diff = total_count - max_total
                     grandfathered_total = sum(
                         1 for l in all_leases
-                        if l["total_limit_at_acquire"] is not None and l["total_limit_at_acquire"] > max_total
+                        # Linear full review A5: NULL = acquired while unlimited, which
+                        # is above any cap set later, so it is grandfathered too.
+                        if l["total_limit_at_acquire"] is None or l["total_limit_at_acquire"] > max_total
                     )
                     if grandfathered_total < diff:
                         violations.append(

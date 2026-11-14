@@ -137,6 +137,39 @@ def _run_event(conn: sqlite3.Connection, task_id: str, run_id: Optional[str],
             "session": payload.get("session") if isinstance(payload, dict) else None}
 
 
+def session_for_idempotency_key(key: str) -> str:
+    """The default `task start` session for an idempotency key (PR #37 D2): a retry with
+    the same key and no MESH_SESSION derives the same id, so the request is identical."""
+    return "ses_" + hashlib.sha256(("mesh-task-start-session\0" + str(key)).encode("utf-8")).hexdigest()[:16]
+
+
+def task_start_replay_matches(args: Dict[str, Any], idempotency_key: Optional[str],
+                              stored_response: Dict[str, Any], matches_stored) -> bool:
+    """Sakana PR #4 P2-3: may a `task.start` retry replay a stored start whose hash differs?
+
+    Only when the retry carries no explicit session (its session is the default derived
+    from the idempotency key) and the stored request differs from it in the session alone:
+    the first call set MESH_SESSION, the retry (a fresh shell after a lost response) did
+    not. The stored response names the original session, so the args are rebuilt with it
+    and hashed the way the caller hashes requests (``matches_stored(args)`` compares that
+    hash with the stored one); equal ->
+    replay the original start, which hands back that session. An explicit different
+    session, any other changed argument, or a stored error response (no session in it,
+    or one redacted for display) is still IDEMPOTENCY_KEY_REUSED.
+    """
+    if not idempotency_key or not isinstance(args, dict):
+        return False
+    if args.get("session") != session_for_idempotency_key(idempotency_key):
+        return False
+    data = stored_response.get("data") if isinstance(stored_response, dict) else None
+    original = data.get("session") if isinstance(data, dict) else None
+    if not isinstance(original, str) or not original or "[REDACTED" in original:
+        return False
+    if original == args.get("session"):
+        return False  # same session already; a hash difference is something else
+    return bool(matches_stored(dict(args, session=original)))
+
+
 def _session_key(run_id: Optional[str]) -> str:
     return f"run_session:{run_id}"
 
@@ -182,8 +215,24 @@ def check_run_session(conn: sqlite3.Connection, task_id: str, run_id: Optional[s
     if digest is not None:
         if session and session_digest(session) == digest:
             return
-    elif started["session"] == session:
-        return  # run started before digests were stored
+    elif started["session"] == session and "[REDACTED" not in str(started["session"]):
+        # Run started before digests were stored. Sakana PR #4 (uncertain item): a redacted
+        # stored copy is display text, not the session; presenting that text never matches.
+        return
+    if digest is None and "[REDACTED" in str(started["session"]):
+        # Release-note follow-up (a): started before the session-digest upgrade with a
+        # secret-looking session; only the redacted copy was kept, so no session can match.
+        raise MeshError(
+            code=c.FENCE_MISMATCH,
+            exit_code=c.EXIT_STALE,
+            message=(f"Run '{run_id}' of task '{task_id}' was started before the session-digest upgrade "
+                     f"(at {started['ts']}) and its session was only stored redacted, so no session can "
+                     f"match it: run started before upgrade; finish or restart it."),
+            details={"task_id": task_id, "run_id": run_id,
+                     "reason": "session_missing" if not session else "session_mismatch",
+                     "run_session": started["session"], "started_at": started["ts"],
+                     "pre_upgrade": True},
+        )
     if not session:
         stored = str(started["session"])
         if "[REDACTED" in stored:

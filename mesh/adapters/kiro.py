@@ -62,6 +62,9 @@ class KiroAdapter(Adapter):
 
     def build(self, req: RunRequest) -> CommandSpec:
         binary = req.options.get("binary") or self.binary_names[0]
+        if req.options.get("binary"):
+            # Linear full review C9: run the path validation resolved (~, relative), not the raw string.
+            binary = self.resolve_binary(binary) or os.path.abspath(os.path.expanduser(binary))
         argv = [
             binary,
             "chat",
@@ -134,6 +137,11 @@ class KiroAdapter(Adapter):
             alt = _scan_stream(os.path.join(run_dir, "effort-high-run-metadata.jsonl"))
             scan["session_id"] = alt["session_id"]
         final_text = scan["final_text"] if scan["final_text"] else scan["message_text"]
+        # Linear full review C6: a finalText that is only a truncated prefix of the streamed
+        # message text loses the end of the answer; keep the complete stream instead.
+        streamed = scan["message_text"] or ""
+        if final_text and len(streamed) > len(final_text) and streamed.startswith(final_text.rstrip().rstrip(".…")):
+            final_text = streamed
         return RunResult(
             final_text=final_text or "",
             session_id=scan["session_id"],

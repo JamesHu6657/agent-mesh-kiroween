@@ -48,7 +48,9 @@ class TestForeignSpawnedBystander(unittest.TestCase):
     def _check(self, procs, pid):
         stat, ostat = _fake(procs)
         with mock.patch.object(terminate, "get_proc_stat", stat), mock.patch("os.stat", ostat), \
-                mock.patch.object(terminate, "_comm", lambda p: "sshd-session"):
+                mock.patch.object(terminate, "_comm", lambda p: "sshd-session"), \
+                mock.patch.object(terminate, "_real_uid", lambda p: procs[p][2]), \
+                mock.patch.object(terminate, "_exe_contradicts_sshd", lambda p: False):
             return terminate._foreign_spawned_bystander(stat(pid), WRAP_ST)
 
     def test_sshd_session_is_bystander(self):

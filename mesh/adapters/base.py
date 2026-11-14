@@ -103,6 +103,112 @@ class ReadonlyCmdResult(tuple):
         self.sha256 = help_sha256
 
 
+#: After a probe timeout kill, how long its output pipes are still read.
+PROBE_KILL_DRAIN_S = 1.0
+
+
+def _run_probe_bounded(argv: List[str], timeout_s: float, max_output_bytes: int,
+                       env: Dict[str, str]) -> Tuple[bytes, bytes, int]:
+    """Blind review P2: run a probe in its own process group, keep at most
+    ``max_output_bytes`` of each stream while draining the rest, and on timeout kill the
+    whole group (descendants too). Raises ``subprocess.TimeoutExpired`` on timeout."""
+    import signal
+    import time
+
+    from mesh.daemon import children
+
+    try:
+        proc = children.popen_registered(
+            "probe", argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=env, shell=False, start_new_session=True,
+        )
+    except children.SpawnedThenFailed as exc:
+        try:
+            os.killpg(exc.proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            exc.proc.wait(timeout=PROBE_KILL_DRAIN_S)
+        except Exception:
+            pass
+        children.unhold(exc.proc.pid)
+        raise
+    # PR #40 r1: no reader threads. A descendant that left the group (setsid) may keep
+    # the pipes open forever; reads are non-blocking with an overall deadline, and the
+    # pipe fds are closed directly (closing a file object another thread reads blocks).
+    import selectors
+
+    bufs = {proc.stdout.fileno(): bytearray(), proc.stderr.fileno(): bytearray()}
+    sel = selectors.DefaultSelector()
+    for fd in bufs:
+        os.set_blocking(fd, False)
+        sel.register(fd, selectors.EVENT_READ)
+    timed_out = False
+    deadline = time.monotonic() + timeout_s
+    drain_until: Optional[float] = None
+    try:
+        while True:
+            now = time.monotonic()
+            # PR #40 r2: process exit is tracked apart from pipe EOF; a probe that closes
+            # its output and keeps running is waited for, and killed only at the deadline.
+            exited = proc.poll() is not None
+            if exited and drain_until is None:
+                drain_until = now + PROBE_KILL_DRAIN_S
+            if exited and not sel.get_map():
+                break
+            if drain_until is not None and now >= drain_until:
+                break
+            if drain_until is None and now >= deadline:
+                timed_out = True
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                drain_until = now + PROBE_KILL_DRAIN_S
+                continue
+            limit = drain_until if drain_until is not None else deadline
+            wait = max(0.0, min(0.05, limit - now))
+            if not sel.get_map():
+                time.sleep(wait)
+                continue
+            for key, _ in sel.select(timeout=wait):
+                fd = key.fd
+                try:
+                    chunk = os.read(fd, 65536)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    sel.unregister(fd)
+                    continue
+                room = max_output_bytes - len(bufs[fd])
+                if room > 0:
+                    bufs[fd].extend(chunk[:room])
+        # The group is killed either way: a probe never leaves descendants behind.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=PROBE_KILL_DRAIN_S)
+        except subprocess.TimeoutExpired:
+            pass
+    finally:
+        sel.close()
+        out_b = bytes(bufs[proc.stdout.fileno()])
+        err_b = bytes(bufs[proc.stderr.fileno()])
+        for f in (proc.stdout, proc.stderr):
+            try:
+                f.close()
+            except OSError:
+                pass
+        children.unregister(proc.pid)
+    if timed_out:
+        raise subprocess.TimeoutExpired(argv, timeout_s)
+    return out_b, err_b, proc.returncode if proc.returncode is not None else -1
+
+
 def run_readonly_cmd(
     argv: List[str],
     timeout_s: float = 5.0,
@@ -124,24 +230,12 @@ def run_readonly_cmd(
     """
     env = build_external_env()
     try:
-        from mesh.daemon.children import run_registered  # meshd child registry (§11.4)
-
-        proc = run_registered(
-            "probe",
-            argv,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=timeout_s,
-            env=env,
-            shell=False,
-        )
-        raw_stdout = proc.stdout or b""
-        raw_stderr = proc.stderr or b""
+        raw_stdout, raw_stderr, returncode = _run_probe_bounded(argv, timeout_s, max_output_bytes, env)
         stdout_str = raw_stdout[:max_output_bytes].decode("utf-8", errors="replace")
         stderr_str = raw_stderr[:max_output_bytes].decode("utf-8", errors="replace")
         help_text = normalize_help_text(stdout_str, stderr_str)
         help_sha256 = hashlib.sha256(help_text.encode("utf-8")).hexdigest()
-        return ReadonlyCmdResult(proc.returncode, stdout_str, stderr_str, help_sha256, help_text)
+        return ReadonlyCmdResult(returncode, stdout_str, stderr_str, help_sha256, help_text)
     except subprocess.TimeoutExpired:
         return ReadonlyCmdResult(-1, "", f"Command timed out after {timeout_s}s", "", "")
     except FileNotFoundError:

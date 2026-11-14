@@ -468,6 +468,22 @@ def handle_agent_update(ctx: HandlerContext) -> HandlerResult:
                 details={"name": name, "version": row["version"], "if_version": if_version_int},
             )
 
+    # Linear full review C4: these are fixed at create time; refuse them instead of
+    # reporting success while ignoring them.
+    fixed = [k for k in ("adapter", "delivery", "binary") if ctx.args.get(k) is not None]
+    if ctx.args.get("options") is not None:
+        fixed.append("options")
+    if ctx.args.get("strict_models") is not None:
+        fixed.append("strict_models")
+    if fixed:
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=(f"agent update cannot change {', '.join(fixed)}; these are set when the agent is "
+                     f"created (disable this agent and create a new one)"),
+            details={"param": fixed[0], "unsupported": fixed},
+        )
+
     # Concurrency
     max_concurrency = row["max_concurrency"]
     if "max_concurrency" in ctx.args and ctx.args["max_concurrency"] is not None:
@@ -514,6 +530,17 @@ def handle_agent_update(ctx: HandlerContext) -> HandlerResult:
     default_effort = row["default_effort"]
     if "default_effort" in ctx.args and ctx.args["default_effort"] is not None:
         default_effort = ctx.args["default_effort"]
+
+    # Blind review P2: validate the resolved pair, not only the changed field; narrowing
+    # allowed_efforts must not leave a default outside it.
+    if default_effort and allowed_efforts and default_effort not in allowed_efforts:
+        raise MeshError(
+            code=c.EFFORT_NOT_ALLOWED,
+            exit_code=c.EXIT_USAGE,
+            message=(f"Default effort '{default_effort}' is not in allowed efforts list "
+                     f"(set --default-effort too)"),
+            details={"default_effort": default_effort, "allowed": allowed_efforts},
+        )
 
     # AGY model effort encoding rule (D17, §14.4)
     if row["adapter"] == "agy" and default_effort and default_model:

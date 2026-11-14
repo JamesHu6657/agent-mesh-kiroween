@@ -64,6 +64,9 @@ class VibeAdapter(Adapter):
             raise EffortUnsupported(self.id)
 
         binary = req.options.get("binary") or self.binary_names[0]
+        if req.options.get("binary"):
+            # Linear full review C9: run the path validation resolved (~, relative), not the raw string.
+            binary = self.resolve_binary(binary) or os.path.abspath(os.path.expanduser(binary))
         argv = [
             binary,
             "--prompt-file",

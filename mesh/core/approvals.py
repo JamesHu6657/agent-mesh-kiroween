@@ -10,6 +10,7 @@ import mesh.constants as c
 from mesh.core.canonical import canonical_json, compute_op_hash
 from mesh.core.clock import now_iso_utc, now_utc
 from mesh.core.events import record_event
+from mesh.core.redact import redact, redact_value
 from mesh.core.ids import generate_id
 from mesh.core.redact import redact
 from mesh.errors import MeshError
@@ -66,10 +67,36 @@ def get_approval_mode(conn: sqlite3.Connection) -> str:
     return "passphrase"
 
 
+def get_delegated_self_approve(conn: sqlite3.Connection) -> bool:
+    """Effective ``approval.delegated_self_approve`` (default true): in delegated mode, may
+    the lead decide an approval it requested itself? Anything but a stored JSON ``false``
+    keeps the default."""
+    cur = conn.execute("SELECT value_json FROM settings WHERE key = 'approval.delegated_self_approve';")
+    row = cur.fetchone()
+    if row and row["value_json"]:
+        try:
+            val = json.loads(row["value_json"])
+        except Exception:
+            val = None
+        if isinstance(val, bool):
+            return val
+    return True
+
+
 def compute_user_approval_mac(k_user: bytes, approval_id: str, op_hash: str, decision: str, decided_at: str) -> str:
     """Compute HMAC-SHA256 user MAC for direct approval decisions per plan §7.4."""
     msg = f"mesh-approval-v1\n{approval_id}\n{op_hash}\n{decision}\n{decided_at}".encode("utf-8")
     return hmac.new(k_user, msg, hashlib.sha256).hexdigest()
+
+
+def stored_op_json(op_doc: Any, op_hash: str) -> str:
+    """The op_json column (PR #40 r1 P2): the operation itself, or, when any decoded
+    value holds a recognized secret, ``{"_redacted": true, "op": <redacted>, "op_hash":
+    ...}``. The hash still binds the full operation; only the stored copy is redacted."""
+    red = redact_value(op_doc)
+    if red == op_doc:
+        return json.dumps(op_doc)
+    return json.dumps({"_redacted": True, "op": red, "op_hash": op_hash})
 
 
 def create_or_get_pending_approval(
@@ -157,6 +184,11 @@ def create_or_get_pending_approval(
         else:
             ttl_seconds = 86400
 
+    # Blind review P2: the stored summary never keeps a recognized secret (events were
+    # already redacted; the row and `approval show` were not).
+    if isinstance(summary, str):
+        summary = redact(summary)
+
     import time
     now_ts = time.time()
     requested_at = now_iso_utc(now_ts)
@@ -174,7 +206,7 @@ def create_or_get_pending_approval(
             task_id,
             category,
             op,
-            json.dumps(op_doc),
+            stored_op_json(op_doc, op_hash),
             op_hash,
             summary,
             requested_by,

@@ -521,7 +521,20 @@ def _read_home_state(db_path: str) -> Dict[str, Any]:
     return {"kdf_raw": kdf_raw, "workspaces_root": configured_ws, "repo_paths": repo_paths}
 
 
+def _refuse_dry_run(args: argparse.Namespace, what: str) -> None:
+    """Linear full review C1: local commands that write cannot simulate; refuse rather
+    than perform the change under --dry-run."""
+    if getattr(args, "dry_run", False):
+        import mesh.constants as _c
+        from mesh.errors import MeshError as _ME
+        raise _ME(_c.INVALID_ARGUMENT, exit_code=_c.EXIT_USAGE,
+                  message=f"{what} does not support --dry-run (it would change local state); run it without --dry-run",
+                  details={"param": "dry_run"})
+
+
 def handle_doctor(args: argparse.Namespace) -> Dict[str, Any]:
+    if getattr(args, "fix_perms", False):
+        _refuse_dry_run(args, "mesh doctor --fix-perms")
     # Round 4: only a missing home falls back to MESH_HOME / the default; an empty
     # --home is passed on so resolve_home refuses it. An EMPTY MESH_HOME (MESH_HOME="")
     # counts as unset and falls back to the default ~/.agent-mesh, as in mesh/cli/main.py

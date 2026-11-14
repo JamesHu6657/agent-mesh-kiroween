@@ -34,15 +34,9 @@ def _log_to_meshd(home: str, msg: str) -> None:
     """Log an error message to meshd.log if home is provided."""
     if not home:
         return
-    logs_dir = os.path.join(home, "logs")
-    os.makedirs(logs_dir, mode=0o700, exist_ok=True)
-    log_path = os.path.join(logs_dir, "meshd.log")
-    try:
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"{now_iso_utc()} ERROR {redact(msg)}\n")
-        os.chmod(log_path, 0o600)
-    except Exception:
-        pass
+    from mesh.core.logfile import append_line
+
+    append_line(home, f"{now_iso_utc()} ERROR {msg}")
 
 
 #: Scheduler errors since this meshd started (batch 5): count and the latest one. Also

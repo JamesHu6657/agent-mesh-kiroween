@@ -100,7 +100,8 @@ offer = None
 for item in items:
     if item.get("type") == "task.offered" and offer is None:
         offer = item
-    elif item.get("id"):
+    elif item.get("id") and item.get("type") != "task.offered":
+        # Further offers stay un-acked: a later wait returns them again (Linear full review D6).
         # Not an offer (rejection notice, project message...): show it and ack it below,
         # otherwise ten of them would fill every wait and hide later offers.
         print("other", item["id"], item.get("type", ""))
@@ -177,7 +178,14 @@ export MESH_WORKSPACE="$workspace" MESH_BRANCH="$branch" MESH_TASK_SPEC_FILE="$t
 cmd_pid=$!
 trap '[ -n "$cmd_pid" ] && kill -TERM -- "-$cmd_pid" 2>/dev/null' TERM
 wait "$cmd_pid"; cmd_rc=$?
-[ -e "$lost" ] && wait "$cmd_pid" 2>/dev/null   # a TERM from the heartbeat loop interrupts the first wait
+if [ -e "$lost" ]; then
+  # A TERM from the heartbeat loop interrupts the first wait. Give the command group a bounded
+  # grace, then SIGKILL it, so nothing keeps writing after the lease is gone (Linear full review D7).
+  i=0
+  while kill -0 -- "-$cmd_pid" 2>/dev/null && [ "$i" -lt "${KILL_GRACE_S:-10}" ]; do sleep 1; i=$((i + 1)); done
+  kill -KILL -- "-$cmd_pid" 2>/dev/null
+  wait "$cmd_pid" 2>/dev/null
+fi
 kill -TERM -- "-$cmd_pid" 2>/dev/null           # leftovers of the command's process group
 trap 'exit 130' INT TERM
 cmd_pid=""

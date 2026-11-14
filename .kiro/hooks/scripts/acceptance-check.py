@@ -43,6 +43,28 @@ TEST_PATH = re.compile(r"(?<![A-Za-z0-9_./-])(tests/[A-Za-z0-9_./-]+\.py)\b")
 DEF_TEST = re.compile(r"^\s*(?:async\s+)?def\s+(test_[A-Za-z0-9_]+)\s*\(", re.M)
 MESH_IDENT = re.compile(r"\b(test_[A-Za-z0-9_]+)")
 PLANNED = re.compile(r"\(planned\b")
+QUALIFIED = re.compile(r"(?<![A-Za-z0-9_./-])(tests/[A-Za-z0-9_./-]+\.py)::(?:([A-Za-z_][A-Za-z0-9_]*)::)?(test_[A-Za-z0-9_]+)")
+INLINE_FMT = re.compile(r"\*\*|`")
+
+
+def module_tests(path, cache={}):
+    """{(class or None, name)} of the test functions defined in one test module."""
+    if path not in cache:
+        import ast
+        found = set()
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, SyntaxError):
+            tree = None
+        for node in (tree.body if tree else []):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                found.add((None, node.name))
+            elif isinstance(node, ast.ClassDef):
+                for sub in node.body:
+                    if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        found.add((node.name, sub.name))
+        cache[path] = found
+    return cache[path]
 
 
 def load_ids():
@@ -95,6 +117,8 @@ def ids_in_span(span, letters):
 
 
 def cited_ids(line, letters, row_ids=True):
+    # Linear full review D9: **K4** and `K4` are the same citation as K4.
+    line = INLINE_FMT.sub("", line)
     found = []
     m = ROW_ID.match(line)
     if row_ids and m and m.group(1) in letters:
@@ -177,6 +201,17 @@ def main(argv):
                     ok = name in test_names or name in test_modules
                 if not ok:
                     msg = f"{lineno}: test {name}{star} not found under tests/"
+                    (file_warnings if planned else file_errors).append(msg + (" (planned)" if planned else ""))
+            # Linear full review D10: path::[Class::]test_name must name a test of that module.
+            for qpath, qcls, qname in QUALIFIED.findall(line):
+                mod = ROOT / qpath
+                if not mod.is_file():
+                    continue  # reported as a missing path below
+                defs = module_tests(mod)
+                ok = (qcls, qname) in defs if qcls else any(n == qname for _, n in defs)
+                if not ok:
+                    where = f"{qpath}::{qcls + '::' if qcls else ''}{qname}"
+                    msg = f"{lineno}: test {where} is not defined in that module"
                     (file_warnings if planned else file_errors).append(msg + (" (planned)" if planned else ""))
             for tpath in TEST_PATH.findall(line):
                 if "*" in tpath or "<" in tpath:

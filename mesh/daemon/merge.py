@@ -1083,6 +1083,9 @@ def run_test_step(plan: Mapping[str, Any]) -> Dict[str, Any]:
         out.update({"exit_code": exit_info.get("exit_code"), "signal": exit_info.get("signal")})
         if exit_info.get("error"):
             out["error"] = exit_info["error"]
+        elif exit_info.get("capture_error"):
+            # Blind review P2: the test log could not be written; don't pass blind.
+            out["error"] = "capture_error: " + str(exit_info["capture_error"])
     out["passed"] = (not out["timeout"]) and out["exit_code"] == 0 and "error" not in out
     return out
 
@@ -1272,6 +1275,18 @@ def _run_merge_pipeline(plan: Mapping[str, Any]) -> Dict[str, Any]:
     branch = plan["branch"]
     pre_head: Optional[str] = plan.get("pre_head")
     try:
+        # Blind review P2: the integration worktree must be on the project's integration
+        # branch; on any other branch the merge would advance the wrong ref.
+        want = plan.get("integration_branch")
+        if want:
+            cp = _git("rev-parse integration branch", ["rev-parse", "--symbolic-full-name", "HEAD"], integ)
+            if cp.returncode != 0:
+                raise _GitFailed("rev-parse integration branch", cp)
+            on = (cp.stdout or "").strip()
+            if on != f"refs/heads/{want}":
+                return {"outcome": "failed", "reason": "integration_dirty", "pre_head": pre_head,
+                        "details": {"integration": integ, "wrong_branch": True, "expected_branch": want,
+                                    "current": on[len("refs/heads/"):] if on.startswith("refs/heads/") else on}}
         # The lease is held now, so this read is the authoritative pre_head.
         pre_head = _head(integ, "rev-parse integration HEAD")
         dirty = _dirty_paths(wt, "status task worktree")
@@ -1354,8 +1369,18 @@ def _run_merge_pipeline(plan: Mapping[str, Any]) -> Dict[str, Any]:
                 pass
         return out
     except Exception as exc:  # never leave the task in `merging` because of a bug here
-        return {"outcome": "failed", "reason": "git_failed", "pre_head": pre_head,
-                "details": {"error": f"{type(exc).__name__}: {exc}"}}
+        out = {"outcome": "failed", "reason": "git_failed", "pre_head": pre_head,
+               "details": {"error": f"{type(exc).__name__}: {exc}"}}
+        # Linear full review B2: an unexpected error after `merge --no-commit` (e.g. the
+        # test wrapper failing to spawn) must not leave MERGE_HEAD and staged changes
+        # behind, or every later merge fails INTEGRATION_DIRTY. Same cleanup as git errors.
+        if pre_head:
+            try:
+                if _merge_head_present(integ):
+                    out["details"].update(_abort_and_verify(integ, pre_head))
+            except Exception as cleanup_exc:
+                out["details"]["cleanup_error"] = f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+        return out
 
 
 # ---------------------------------------------------------------------------

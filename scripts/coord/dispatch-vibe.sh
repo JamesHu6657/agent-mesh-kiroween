@@ -17,6 +17,6 @@ mkdir -p logs/raw
 # Session budget (James 2026-11-09 18:49): short sessions; coder writes a handoff note and stops; fresh session continues.
 G="prompts/.session-$N.md"; cat "$SD/session-budget.txt" "$P" > "$G"; P="$G"
 setsid nohup "$HOME/.local/bin/vibe" --workdir "$PWD" --trust --add-dir /tmp --model "$M" --prompt-file "$P" --output streaming --output-dir "logs/raw/vibe-$N-export" \
-  --time-limit 5400 --max-turns 200 > "logs/raw/vibe-$N.jsonl" 2> "logs/raw/vibe-$N.err" < /dev/null &
+  --time-limit 5400 --max-turns 200 > "logs/raw/vibe-$N.jsonl" 2> "logs/raw/vibe-$N.err" < /dev/null 9>&- &
 PID=$!; disown
 echo "dispatched vibe run=$N pid=$PID model=$M log=logs/raw/vibe-$N.jsonl"

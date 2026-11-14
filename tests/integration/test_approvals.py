@@ -656,6 +656,15 @@ class TestApprovalsIntegration(unittest.TestCase):
         rc_c_ok, resp_c_ok = self.harness.cli("approval", "cancel", apr_c, token=self.tok_grok)
         self.assertEqual(rc_c_ok, 0)
         self.assertEqual(resp_c_ok["data"]["status"], "cancelled")
+        # Release follow-up (c): the cancelled event payload names the approval and its kind.
+        conn = self.harness.db()
+        ev = conn.execute("SELECT payload_json FROM events WHERE type = 'approval.cancelled' AND approval_id = ?;",
+                          (apr_c,)).fetchone()
+        conn.close()
+        cpay = json.loads(ev["payload_json"])
+        self.assertEqual(cpay["approval_id"], apr_c)
+        self.assertTrue(cpay["category"])
+        self.assertTrue(cpay["op"])
 
         # Cancel already cancelled approval -> rc 6 INVALID_TRANSITION
         rc_c_again, resp_c_again = self.harness.cli("approval", "cancel", apr_c, token=self.tok_grok)
