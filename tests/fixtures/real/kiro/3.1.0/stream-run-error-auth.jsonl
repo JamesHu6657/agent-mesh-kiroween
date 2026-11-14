@@ -1,0 +1,14 @@
+{"type":"runStarted","data":{"payloadSchema":"acp","acpProtocolVersion":1,"engine":"v2"}}
+{"type":"metadata","data":{"sessionId":"05dfa9fa-cbf5-41d3-86bf-75d59203a829","contextUsagePercentage":3.6635000705718994,"reasoning":{"support":"unavailable","effortLevels":[]}}}
+{"type":"metadata","data":{"sessionId":"05dfa9fa-cbf5-41d3-86bf-75d59203a829","reasoning":{"support":"alwaysOn","effort":"high","effortLevels":["low","medium","high","xhigh","max"]}}}
+{"type":"sessionUpdate","data":{"sessionId":"05dfa9fa-cbf5-41d3-86bf-75d59203a829","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"I'll start by reading"}}}}
+{"type":"sessionUpdate","data":{"sessionId":"05dfa9fa-cbf5-41d3-86bf-75d59203a829","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" the authoritative docs and"}}}}
+{"type":"sessionUpdate","data":{"sessionId":"05dfa9fa-cbf5-41d3-86bf-75d59203a829","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" the existing draft."}}}}
+{"type":"metadata","data":{"sessionId":"05dfa9fa-cbf5-41d3-86bf-75d59203a829","contextUsagePercentage":0.6651999950408936,"reasoning":{"support":"alwaysOn","effort":"high","effortLevels":["low","medium","high","xhigh","max"]}}}
+{"type":"metadata","data":{"sessionId":"05dfa9fa-cbf5-41d3-86bf-75d59203a829","contextUsagePercentage":0.676800012588501,"reasoning":{"support":"alwaysOn","effort":"high","effortLevels":["low","medium","high","xhigh","max"]}}}
+{"type":"metadata","data":{"sessionId":"05dfa9fa-cbf5-41d3-86bf-75d59203a829","contextUsagePercentage":4.188700199127197,"reasoning":{"support":"alwaysOn","effort":"high","effortLevels":["low","medium","high","xhigh","max"]}}}
+{"type":"metadata","data":{"sessionId":"05dfa9fa-cbf5-41d3-86bf-75d59203a829","contextUsagePercentage":5.634000301361084,"reasoning":{"support":"alwaysOn","effort":"high","effortLevels":["low","medium","high","xhigh","max"]}}}
+{"type":"metadata","data":{"sessionId":"05dfa9fa-cbf5-41d3-86bf-75d59203a829","contextUsagePercentage":5.66510009765625,"reasoning":{"support":"alwaysOn","effort":"high","effortLevels":["low","medium","high","xhigh","max"]}}}
+{"type":"metadata","data":{"sessionId":"05dfa9fa-cbf5-41d3-86bf-75d59203a829","contextUsagePercentage":5.7555999755859375,"reasoning":{"support":"alwaysOn","effort":"high","effortLevels":["low","medium","high","xhigh","max"]}}}
+{"type":"metadata","data":{"sessionId":"05dfa9fa-cbf5-41d3-86bf-75d59203a829","contextUsagePercentage":6.069900035858154,"reasoning":{"support":"alwaysOn","effort":"high","effortLevels":["low","medium","high","xhigh","max"]}}}
+{"type":"runError","data":{"sessionId":"05dfa9fa-cbf5-41d3-86bf-75d59203a829","stage":"prompt","message":"Internal error (code -32603): Encountered an error in the response stream: The bearer token included in the request is invalid. (request_id: 7e6c36ff-9c30-447b-8d1b-b690276da111)"}}

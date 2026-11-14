@@ -1,0 +1,119 @@
+{
+  "adapter": "droid",
+  "binary": "/home/node/.local/bin/droid",
+  "captured_at_utc": "2026-11-09T14:53:21Z",
+  "cases": [
+    {
+      "carried_from": null,
+      "duration_s": 3.858,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/droid/1.6.0/smoke-S-X-1-stdout.jsonl",
+      "fixture_sha256": "60e7af9a5cbd8ad97bbf79cf746161fe4cb36167dfd161572f53bd7dabf37dfa",
+      "id": "S-X-1",
+      "observation": {
+        "raw_token_seen": true
+      },
+      "rc": 0,
+      "reason": "parse_pending",
+      "status": "fail"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 3.858,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/droid/1.6.0/smoke-S-X-1-stdout.jsonl",
+      "fixture_sha256": "60e7af9a5cbd8ad97bbf79cf746161fe4cb36167dfd161572f53bd7dabf37dfa",
+      "id": "S-X-2",
+      "observation": {
+        "init_cwd": "/tmp/mh-smoke-d7822px0",
+        "session_id": "9e176d53-937b-458d-997f-71b470bb2b9c",
+        "workspace": "/tmp/mh-smoke-d7822px0"
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 0.0,
+      "evaluated_from": null,
+      "fixture": null,
+      "fixture_sha256": null,
+      "id": "S-X-3",
+      "observation": null,
+      "rc": null,
+      "reason": "not_selected",
+      "status": "not_run"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 3.858,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/droid/1.6.0/smoke-S-X-1-stdout.jsonl",
+      "fixture_sha256": "60e7af9a5cbd8ad97bbf79cf746161fe4cb36167dfd161572f53bd7dabf37dfa",
+      "id": "S-X-4",
+      "observation": {
+        "init_model": "claude-sonnet-5-5"
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 0.0,
+      "evaluated_from": null,
+      "fixture": null,
+      "fixture_sha256": null,
+      "id": "S-X-5",
+      "observation": null,
+      "rc": null,
+      "reason": "not_selected",
+      "status": "not_run"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 0.0,
+      "evaluated_from": null,
+      "fixture": null,
+      "fixture_sha256": null,
+      "id": "S-X-6",
+      "observation": null,
+      "rc": null,
+      "reason": "not_selected",
+      "status": "not_run"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 0.0,
+      "evaluated_from": null,
+      "fixture": null,
+      "fixture_sha256": null,
+      "id": "S-X-7",
+      "observation": null,
+      "rc": null,
+      "reason": "not_selected",
+      "status": "not_run"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 0.0,
+      "evaluated_from": null,
+      "fixture": null,
+      "fixture_sha256": null,
+      "id": "S-DROID-8",
+      "observation": null,
+      "rc": null,
+      "reason": "not_selected",
+      "status": "not_run"
+    }
+  ],
+  "consent_ref": "James 2026-11-09 12:44",
+  "effort": null,
+  "mesh_commit": "d3e405f678ae08938f820b4f40f99881bf8a30f0",
+  "model": "claude-sonnet-5-5",
+  "profile": "readonly",
+  "schema": "mesh.smoke.v1",
+  "timeout_s": 180.0,
+  "version": "1.6.0"
+}

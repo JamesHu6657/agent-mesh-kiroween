@@ -1,0 +1,7 @@
+#!/bin/sh
+TRIPWIRE="${MESH_TRIPWIRE_FILE:-/tmp/mesh-tripwire-hit.log}"
+printf "%s called with: %s\n" "$0" "$*" >> "$TRIPWIRE"
+if [ -n "$MESH_SUITE_TRIPWIRE_FILE" ] && [ "$MESH_SUITE_TRIPWIRE_FILE" != "$TRIPWIRE" ]; then
+  printf "%s called with: %s\n" "$0" "$*" >> "$MESH_SUITE_TRIPWIRE_FILE"
+fi
+exit 99

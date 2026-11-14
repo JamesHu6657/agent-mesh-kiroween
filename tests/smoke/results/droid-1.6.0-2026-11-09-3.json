@@ -1,0 +1,143 @@
+{
+  "adapter": "droid",
+  "binary": "/home/node/.local/bin/droid",
+  "captured_at_utc": "2026-11-09T14:55:28Z",
+  "cases": [
+    {
+      "carried_from": null,
+      "duration_s": 3.858,
+      "evaluated_from": "tests/smoke/results/droid-1.6.0-2026-11-09-2.json",
+      "fixture": "tests/fixtures/real/droid/1.6.0/smoke-S-X-1-stdout.jsonl",
+      "fixture_sha256": "60e7af9a5cbd8ad97bbf79cf746161fe4cb36167dfd161572f53bd7dabf37dfa",
+      "id": "S-X-1",
+      "observation": {
+        "raw_token_seen": true
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 3.858,
+      "evaluated_from": "tests/smoke/results/droid-1.6.0-2026-11-09-2.json",
+      "fixture": "tests/fixtures/real/droid/1.6.0/smoke-S-X-1-stdout.jsonl",
+      "fixture_sha256": "60e7af9a5cbd8ad97bbf79cf746161fe4cb36167dfd161572f53bd7dabf37dfa",
+      "id": "S-X-2",
+      "observation": {
+        "session_id": "9e176d53-937b-458d-997f-71b470bb2b9c"
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": "tests/smoke/results/droid-1.6.0-2026-11-09-2.json",
+      "duration_s": 3.552,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/droid/1.6.0/smoke-S-X-3-stdout.jsonl",
+      "fixture_sha256": "5b112bd6b5cafd136759a16cbb381f09e5570e0e999e1ff028ca82c71b06f22f",
+      "id": "S-X-3",
+      "observation": {
+        "cwd": "/tmp/mh-smoke-ff6yzomm",
+        "parsed_token_seen": false,
+        "raw_token_seen": true,
+        "resumed_session_id": "9e176d53-937b-458d-997f-71b470bb2b9c"
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 3.858,
+      "evaluated_from": "tests/smoke/results/droid-1.6.0-2026-11-09-2.json",
+      "fixture": "tests/fixtures/real/droid/1.6.0/smoke-S-X-1-stdout.jsonl",
+      "fixture_sha256": "60e7af9a5cbd8ad97bbf79cf746161fe4cb36167dfd161572f53bd7dabf37dfa",
+      "id": "S-X-4",
+      "observation": {
+        "init_model": "claude-sonnet-5-5"
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 3.415,
+      "evaluated_from": "tests/smoke/results/droid-1.6.0-2026-11-09-2.json",
+      "fixture": "tests/fixtures/real/droid/1.6.0/smoke-S-X-5-stdout.jsonl",
+      "fixture_sha256": "27904e9c36a1e8b4c63437351efb81bd80bf9251b4f090c0ad87895563d09d41",
+      "id": "S-X-5",
+      "observation": {
+        "echoed": "low",
+        "requested_effort": "low"
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": "tests/smoke/results/droid-1.6.0-2026-11-09-2.json",
+      "duration_s": 2.377,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/droid/1.6.0/smoke-S-X-6-stdout.jsonl",
+      "fixture_sha256": "dd12bdfc5a06b81571bf7a7b483b3addad65f68e27747a6ae41eac2efcf229e7",
+      "id": "S-X-6",
+      "observation": {
+        "alive_at_term": true,
+        "first_byte": true,
+        "group_gone_after_term": true,
+        "lines_at_term": 2,
+        "rc": 143,
+        "seconds_to_gone": 1.669,
+        "term_after_s": 0.706
+      },
+      "rc": 143,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": "tests/smoke/results/droid-1.6.0-2026-11-09-2.json",
+      "duration_s": 3.809,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/droid/1.6.0/smoke-S-X-7-stdout.jsonl",
+      "fixture_sha256": "ea177a20def0910ee0265fd5be06c3868f1f52a2982021de7e2b64746c8ee1d5",
+      "id": "S-X-7",
+      "observation": {
+        "file_created": false,
+        "rc": 1,
+        "stderr_excerpt": "",
+        "timed_out": false
+      },
+      "rc": 1,
+      "reason": null,
+      "status": "observed"
+    },
+    {
+      "carried_from": "tests/smoke/results/droid-1.6.0-2026-11-09-2.json",
+      "duration_s": 3.806,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/droid/1.6.0/smoke-S-DROID-8-stdout.jsonl",
+      "fixture_sha256": "1a2b4df93cbfb30fee1791e2e2fe067015b7da4041eb1a393d2efe1326d130a6",
+      "id": "S-DROID-8",
+      "observation": {
+        "outcome": "fail",
+        "rc": 1,
+        "stderr_excerpt": "",
+        "y_txt_exists": false
+      },
+      "rc": 1,
+      "reason": null,
+      "status": "observed"
+    }
+  ],
+  "consent_ref": "James 2026-11-09 12:44",
+  "effort": null,
+  "mesh_commit": "d3e405f678ae08938f820b4f40f99881bf8a30f0",
+  "model": "claude-sonnet-5-5",
+  "profile": "readonly",
+  "schema": "mesh.smoke.v1",
+  "timeout_s": 180.0,
+  "version": "1.6.0"
+}

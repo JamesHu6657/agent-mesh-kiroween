@@ -1,0 +1,84 @@
+{
+  "name": "mesh-specwriter",
+  "description": "Agent Mesh v1 spec/steering writer (Kiro). Writes only .kiro/specs, .kiro/steering, .kiro/hooks/*.kiro.hook and docs/kiro-usage-log.md; never hook scripts or agent configs (those change only with coordinator review).",
+  "prompt": "You are the Agent Mesh v1 SPEC WRITER in this repository. You write Kiro specs, steering and hooks under .kiro/ (and append to docs/kiro-usage-log.md) from the existing authoritative docs. You never edit product code, tests, prompts/, scripts/, docs/requirements.md, docs/plan.md, docs/acceptance-checklist.md or anything under docs/coordination/. Never commit, push or dispatch. Never invent history: everything must be traceable to a file in the repo.",
+  "model": "claude-opus-5.5",
+  "tools": [
+    "fs_read",
+    "fs_write",
+    "execute_bash",
+    "grep",
+    "glob"
+  ],
+  "allowedTools": [
+    "fs_read",
+    "grep",
+    "glob"
+  ],
+  "hooks": {
+    "postToolUse": [
+      {
+        "matcher": "fs_write",
+        "command": "bash .kiro/hooks/scripts/affected-tests.sh",
+        "timeout_ms": 300000
+      }
+    ],
+    "stop": [
+      {
+        "command": "python3 .kiro/hooks/scripts/acceptance-check.py",
+        "timeout_ms": 60000
+      }
+    ]
+  },
+  "toolsSettings": {
+    "execute_bash": {
+      "allowedCommands": [
+        "python3 -m unittest tests\\.unit\\.[A-Za-z0-9_.]+",
+        "git (status|rev-parse|ls-files)( --short| --verify| --abbrev-ref)?( [A-Za-z0-9_./^~:@][A-Za-z0-9_./^~:@-]*)*",
+        "git (log|show|diff)( --oneline| --stat| --name-only| --name-status| -[0-9]+)*( [A-Za-z0-9_./^~:@][A-Za-z0-9_./^~:@-]*)*",
+        "(ls|cat|head|tail|wc|grep|sha256sum|stat)( -[A-Za-z0-9]+)*( [A-Za-z0-9_./^~:@][A-Za-z0-9_./^~:@-]*)*",
+        "bash \\.kiro/hooks/scripts/affected-tests\\.sh( [A-Za-z0-9_./^~:@][A-Za-z0-9_./^~:@-]*)*",
+        "bash \\.kiro/hooks/scripts/secret-scan\\.sh( --dir [A-Za-z0-9_./-]+)?",
+        "python3 \\.kiro/hooks/scripts/acceptance-check\\.py( [A-Za-z0-9_./^~:@][A-Za-z0-9_./^~:@-]*)*",
+        "date"
+      ],
+      "deniedCommands": [
+        ".*--trust-all.*",
+        ".*git push.*",
+        ".*git remote.*",
+        ".*git (add|commit|reset|checkout|restore|stash|clean).*",
+        ".*dispatch-agy.*",
+        ".*FACTORY_API_KEY.*",
+        "sudo.*"
+      ],
+      "denyByDefault": true,
+      "autoAllowReadonly": false
+    },
+    "fs_write": {
+      "allowedPaths": [
+        ".kiro/specs/**",
+        ".kiro/steering/**",
+        ".kiro/hooks/*.kiro.hook",
+        "docs/kiro-usage-log.md"
+      ],
+      "deniedPaths": [
+        ".kiro/hooks/scripts/**",
+        ".kiro/agents/**",
+        ".kiro/settings/**"
+      ]
+    },
+    "fs_read": {
+      "allowedPaths": [
+        "/workspace/mesh-fresh-v1/**",
+        "/workspace/mesh-m1a-acceptance-r2.md",
+        "/workspace/mesh-m1a-independent-review.md",
+        "/tmp/**",
+        "/workspace/mesh-wt-*/**"
+      ],
+      "deniedPaths": [
+        "**/.env",
+        "**/credentials*"
+      ]
+    }
+  }
+}

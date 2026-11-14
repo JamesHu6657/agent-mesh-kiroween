@@ -1,0 +1,88 @@
+{
+  "name": "mesh-coder-r6",
+  "description": "Agent Mesh v1 Kiro implementer for run m3-r6 (real droid parse). Writes only the m3-r6 FILES; never commits; coordinator commits. Permissions are a soft guard, not a sandbox: the agent can run the tests it writes. The real boundaries are coordinator commits, the Linear review and merge.sh with a green suite. kiro.py: line 43 only (D6).",
+  "prompt": "You are the Agent Mesh v1 CODER for run m3-r6, implementing .kiro/specs/m3-r6-droid-parse/ in this worktree. Write only the files listed in that spec (mesh/adapters/droid.py, mesh/adapters/kiro.py line 43 only (the write grant is file-wide; anything beyond line 43 is out of scope), tests/unit/test_adapters_droid_real.py, tests/fixtures/synthetic/droid/*, tests/unit/test_adapters.py named reasoning_effort pin only, docs/impl-notes-m3-r6.md) and tick tasks in its tasks.md. Never weaken or delete an assertion outside the named supersession. Offline only: never start droid or any vendor CLI. Never commit, push, fetch or branch.",
+  "model": "claude-opus-5.5",
+  "tools": [
+    "fs_read",
+    "fs_write",
+    "execute_bash",
+    "grep",
+    "glob"
+  ],
+  "allowedTools": [
+    "fs_read",
+    "grep",
+    "glob"
+  ],
+  "toolsSettings": {
+    "execute_bash": {
+      "allowedCommands": [
+        "python3 -m unittest( -v)?( tests\\.(unit|integration|recovery)\\.[A-Za-z0-9_.]+)+",
+        "bash scripts/test\\.sh",
+        "git (status|diff|log|show)( --oneline| --stat| --short| -[0-9]+)*( [A-Za-z0-9_./^~:@][A-Za-z0-9_./^~:@-]*)*",
+        "(ls|cat|head|tail|wc|grep|sha256sum)( -[A-Za-z0-9]+)*( [A-Za-z0-9_./^~:@][A-Za-z0-9_./^~:@-]*)*",
+        "python3 \\.kiro/hooks/scripts/acceptance-check\\.py( [A-Za-z0-9_./^~:@][A-Za-z0-9_./^~:@-]*)*",
+        "bash \\.kiro/hooks/scripts/affected-tests\\.sh( [A-Za-z0-9_./^~:@][A-Za-z0-9_./^~:@-]*)*",
+        "date"
+      ],
+      "deniedCommands": [
+        ".*--trust-all.*",
+        ".*git push.*",
+        ".*git remote.*",
+        ".*git (add|commit|reset|checkout|restore|stash|clean).*",
+        ".*dispatch-agy.*",
+        ".*FACTORY_API_KEY.*",
+        "sudo.*",
+        ".*\\bdroid\\b.*exec.*",
+        ".*MESH_SMOKE.*"
+      ],
+      "denyByDefault": true,
+      "autoAllowReadonly": false
+    },
+    "fs_write": {
+      "allowedPaths": [
+        "mesh/adapters/droid.py",
+        "mesh/adapters/kiro.py",
+        "tests/unit/test_adapters_droid_real.py",
+        "tests/fixtures/synthetic/droid/**",
+        "tests/unit/test_adapters.py",
+        "docs/impl-notes-m3-r6.md",
+        ".kiro/specs/m3-r6-droid-parse/tasks.md"
+      ],
+      "deniedPaths": [
+        ".kiro/hooks/**",
+        ".kiro/agents/**",
+        ".kiro/settings/**",
+        "tests/fixtures/real/**",
+        "docs/acceptance-checklist.md",
+        "docs/plan.md",
+        "docs/requirements.md",
+        "docs/coordination/**",
+        "prompts/**",
+        "scripts/**"
+      ]
+    },
+    "fs_read": {
+      "allowedPaths": [
+        "/workspace/mesh-fresh-v1/**",
+        "/workspace/mesh-m1a-acceptance-r2.md",
+        "/workspace/mesh-m1a-independent-review.md",
+        "/tmp/**",
+        "/workspace/mesh-wt-*/**"
+      ],
+      "deniedPaths": [
+        "**/.env",
+        "**/credentials*"
+      ]
+    }
+  },
+  "hooks": {
+    "stop": [
+      {
+        "command": "python3 .kiro/hooks/scripts/acceptance-check.py .kiro/specs/m3-r6-droid-parse",
+        "timeout_ms": 60000
+      }
+    ]
+  }
+}

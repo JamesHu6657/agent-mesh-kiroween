@@ -1,0 +1,37 @@
+{
+"permissions": {
+"allow": [
+"read_file(/workspace/mesh-fresh-v1)",
+"write_file(/workspace/mesh-fresh-v1)",
+"write_file(/home/user/workspace/mesh-fresh-v1)",
+"read_file(/home/user/workspace/mesh-fresh-v1)",
+"read_file(/tmp)",
+"write_file(/tmp)",
+"command(python3)",
+"command(bin/mesh)",
+"command(./bin/mesh)",
+"command(bash scripts/test.sh)",
+"command(scripts/test.sh)",
+"command(./scripts/test.sh)",
+"command(chmod +x bin/mesh)",
+"command(chmod +x scripts/test.sh)",
+"command(mkdir -p)",
+"command(ls)",
+"command(grep)",
+"command(sha256sum)",
+"command(find .)",
+"command(cat)",
+"command(head)",
+"command(tail)",
+"command(wc)",
+"command(pwd)",
+"command(sed -n)",
+"command(git status)",
+"command(git diff)",
+"command(git log)",
+"command(git add)",
+"command(git commit)",
+"command(git show)"
+]
+}
+}

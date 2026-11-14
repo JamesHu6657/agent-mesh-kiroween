@@ -1,0 +1,127 @@
+{
+  "adapter": "kiro",
+  "binary": "/home/node/.local/bin/kiro-cli",
+  "captured_at_utc": "2026-11-10T01:59:30Z",
+  "cases": [
+    {
+      "carried_from": "tests/smoke/results/kiro-3.1.0-2026-11-10.json",
+      "duration_s": 1.637,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/kiro/3.1.0/smoke-S-X-1-stdout.jsonl",
+      "fixture_sha256": "2973eb2c0e27407d7630bd21310188e60f2a7eca3ccf86661c3b6134a40d2fd5",
+      "id": "S-X-1",
+      "observation": {
+        "raw_token_seen": true
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": "tests/smoke/results/kiro-3.1.0-2026-11-10.json",
+      "duration_s": 1.637,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/kiro/3.1.0/smoke-S-X-1-stdout.jsonl",
+      "fixture_sha256": "2973eb2c0e27407d7630bd21310188e60f2a7eca3ccf86661c3b6134a40d2fd5",
+      "id": "S-X-2",
+      "observation": {
+        "init_cwd": null,
+        "session_id": "22638935-0d0a-4e60-98b9-3ac1d62753cc",
+        "workspace": "/tmp/mh-smoke-juuornqs"
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": "tests/smoke/results/kiro-3.1.0-2026-11-10.json",
+      "duration_s": 0.0,
+      "evaluated_from": null,
+      "fixture": null,
+      "fixture_sha256": null,
+      "id": "S-X-3",
+      "observation": null,
+      "rc": null,
+      "reason": "not_selected",
+      "status": "not_run"
+    },
+    {
+      "carried_from": "tests/smoke/results/kiro-3.1.0-2026-11-10.json",
+      "duration_s": 1.637,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/kiro/3.1.0/smoke-S-X-1-stdout.jsonl",
+      "fixture_sha256": "2973eb2c0e27407d7630bd21310188e60f2a7eca3ccf86661c3b6134a40d2fd5",
+      "id": "S-X-4",
+      "observation": {
+        "init_model": null
+      },
+      "rc": 0,
+      "reason": "not_observable",
+      "status": "observed"
+    },
+    {
+      "carried_from": "tests/smoke/results/kiro-3.1.0-2026-11-10.json",
+      "duration_s": 0.0,
+      "evaluated_from": null,
+      "fixture": null,
+      "fixture_sha256": null,
+      "id": "S-X-5",
+      "observation": null,
+      "rc": null,
+      "reason": "not_selected",
+      "status": "not_run"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 3.259,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/kiro/3.1.0/smoke-S-X-6-stdout.jsonl",
+      "fixture_sha256": "344088c51b0d11878c718d25053ec6ef9c78c668b781de84a6c8fa15d2eff947",
+      "id": "S-X-6",
+      "observation": {
+        "alive_at_term": true,
+        "first_byte": true,
+        "group_gone_after_term": true,
+        "lines_at_term": 73,
+        "rc": -15,
+        "seconds_to_gone": 0.054,
+        "term_after_s": 3.204
+      },
+      "rc": -15,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": "tests/smoke/results/kiro-3.1.0-2026-11-10.json",
+      "duration_s": 0.0,
+      "evaluated_from": null,
+      "fixture": null,
+      "fixture_sha256": null,
+      "id": "S-X-7",
+      "observation": null,
+      "rc": null,
+      "reason": "not_selected",
+      "status": "not_run"
+    },
+    {
+      "carried_from": "tests/smoke/results/kiro-3.1.0-2026-11-10.json",
+      "duration_s": 0.0,
+      "evaluated_from": null,
+      "fixture": null,
+      "fixture_sha256": null,
+      "id": "S-KIRO-8",
+      "observation": null,
+      "rc": null,
+      "reason": "not_selected",
+      "status": "not_run"
+    }
+  ],
+  "consent_ref": "James 2026-11-10 09:46/09:49 haiku",
+  "effort": null,
+  "mesh_commit": "78f173bb0920451d7d56b9b699ae92204a53b562",
+  "model": "claude-haiku-5.5",
+  "profile": "readonly",
+  "schema": "mesh.smoke.v1",
+  "timeout_s": 180.0,
+  "version": "3.1.0"
+}

@@ -1,0 +1,30 @@
+logs/raw/
+__pycache__/
+*.pyc
+
+# agent tool settings (may hold approved commands with secrets). /.kiro is never ignored (Kiroween rule); secrets must never be placed under .kiro/
+.claude/
+.vibe/
+.commandcode/
+.cursor/
+.codex/
+.gemini/
+**/settings.local.json
+prompts/.session-*.md
+.env
+.env.*
+.factory/
+.qoder/
+.antigravity/
+*.pem
+id_*
+
+# Kiroween rule: nothing under /.kiro may be ignored (overrides the generic rules above)
+!.kiro/
+!.kiro/**
+
+# packaging artefacts
+build/
+dist/
+*.egg-info/
+.venv/
