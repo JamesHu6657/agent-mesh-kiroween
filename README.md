@@ -267,7 +267,6 @@ Known security and operational limits are described in [the usage guide](docs/us
 - Container-per-agent mode: launch each agent run in its own container with only its
   worktree mounted.
 - Vendor CLIs as launch-mode leads.
-- Committed smoke evidence for the codex, claude, agy and vibe adapters.
 - Command builders for hermes and openclaw.
 - A read-only local status page.
 - Optional decision-model plugin (approved idea, not built): Jev, TypeSafe AI's "System One"
