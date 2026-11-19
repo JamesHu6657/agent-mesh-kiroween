@@ -14,7 +14,11 @@ from mesh.adapters.base import (
     ProfileUnsupported,
     RunRequest,
     RunResult,
+    is_safe_cli_token,
+    read_run_file_nofollow,
     record_adapter_probe,
+    validate_adapter_options,
+    validate_run_request_tokens,
 )
 
 
@@ -49,6 +53,8 @@ class FakeAdapter(Adapter):
         raise ProfileUnsupported(self.id, profile)
 
     def build(self, req: RunRequest) -> CommandSpec:
+        validate_run_request_tokens(req)
+        validate_adapter_options(self.id, req.options, strict_keys=False)
         argv = [
             req.options.get("binary") or sys.executable,
             "-P",
@@ -65,8 +71,9 @@ class FakeAdapter(Adapter):
     def parse(self, run_dir: str) -> RunResult:
         session_id = None
         try:
-            with open(os.path.join(run_dir, "stdout.log"), encoding="utf-8", errors="replace") as f:
-                text = f.read()
+            text = read_run_file_nofollow(
+                os.path.join(run_dir, "stdout.log"), encoding="utf-8", errors="replace"
+            )
         except OSError:
             return RunResult()
         for line in text.splitlines():
@@ -74,7 +81,7 @@ class FakeAdapter(Adapter):
                 value = json.loads(line)
             except ValueError:
                 continue
-            if isinstance(value, dict) and "session_id" in value:
+            if isinstance(value, dict) and is_safe_cli_token(value.get("session_id")):
                 session_id = value["session_id"]
         return RunResult(final_text=text, session_id=session_id)
 

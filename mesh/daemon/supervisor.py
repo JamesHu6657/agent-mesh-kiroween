@@ -6,6 +6,7 @@ project cancel, leftovers at exit) are advanced by the watch pass and by
 meshd's 200 ms termination loop (``advance_terminations``).
 """
 
+import asyncio
 import json
 import os
 import signal
@@ -17,7 +18,7 @@ import time
 from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Set, Tuple
 
 import mesh.constants as c
-from mesh.adapters.base import CommandSpec, RunRequest
+from mesh.adapters.base import CommandSpec, RunRequest, is_safe_cli_token
 from mesh.adapters.registry import get_adapter
 from mesh.core.auth import generate_run_token
 from mesh.core.clock import now_iso_utc
@@ -25,7 +26,8 @@ from mesh.core.db import transaction
 from mesh.core.events import record_event
 from mesh.core.ids import generate_id
 from mesh.core.leases import get_lease_ttl_s
-from mesh.core.paths import get_mesh_bin_dir, get_install_root
+from mesh.core.paths import get_mesh_bin_dir, get_install_root, is_site_packages_dir
+from mesh.core.policy import resolve_model_and_effort
 from mesh.core.clock import parse_utc
 from mesh.core.proc import ScanResult, get_proc_stat, is_tgid_alive
 from mesh.core.prompts import (
@@ -45,7 +47,9 @@ from mesh.core.workspaces import (
     compute_task_workspace_path,
     ensure_run_dir,
     ensure_workspace_dir,
+    require_task_worktree,
     get_workspaces_root,
+    has_task_ws_reservation,
 )
 from mesh.daemon import children, terminate
 
@@ -140,7 +144,10 @@ def build_child_env(
     env["MESH_SOCKET"] = socket_path
     install_root = get_install_root()
     env["PATH"] = get_mesh_bin_dir() + os.pathsep + env.get("PATH", "")
-    env["PYTHONPATH"] = install_root
+    if is_site_packages_dir(install_root):
+        env.pop("PYTHONPATH", None)
+    else:
+        env["PYTHONPATH"] = install_root
     return env
 
 
@@ -163,7 +170,10 @@ def build_lead_child_env(
     env["MESH_SOCKET"] = socket_path
     install_root = get_install_root()
     env["PATH"] = get_mesh_bin_dir() + os.pathsep + env.get("PATH", "")
-    env["PYTHONPATH"] = install_root
+    if is_site_packages_dir(install_root):
+        env.pop("PYTHONPATH", None)
+    else:
+        env["PYTHONPATH"] = install_root
     return env
 
 
@@ -293,10 +303,43 @@ def build_run_options(agent: Mapping[str, Any], run_id: str) -> Dict[str, Any]:
     return options
 
 
-def verified_resume_session(adapter: Any, session_id: Optional[str]) -> Optional[str]:
+def verified_resume_session(
+    adapter: Any,
+    session_id: Optional[str],
+    conn: Optional[sqlite3.Connection] = None,
+    testing_mode: Optional[bool] = None,
+    binary_path: Optional[str] = None,
+) -> Optional[str]:
     """Resume only a captured id on an adapter with smoke-verified resume support."""
+    if not session_id or not is_safe_cli_token(session_id):
+        return None
     cap = adapter.capabilities.get("resume")
-    if cap and cap.supported == "yes" and cap.verification == "smoke":
+    if not cap or cap.supported != "yes":
+        return None
+    if cap.verification == "smoke":
+        return session_id
+    if getattr(adapter, "kind", None) != "vendor":
+        return None
+    from mesh.adapters import evidence, smoke_schema
+
+    tmode = _testing_mode() if testing_mode is None else bool(testing_mode)
+    binary = evidence._binary_for(adapter, binary_path)
+    version, probed_at = evidence.latest_probe(conn, adapter.id, binary)
+    ev = evidence.load_evidence(
+        adapter.id,
+        tmode,
+        version,
+        binary_changed=bool(version) and evidence.binary_changed_since(binary, probed_at),
+    )
+    if (
+        not ev.results_path
+        or not ev.probed_version
+        or ev.results_version != ev.probed_version
+        or ev.reason in ("evidence_invalid", "evidence_stale")
+    ):
+        return None
+    mapped = smoke_schema.cases_for_capability("resume")
+    if mapped and all((ev.cases.get(cid) or {}).get("status") == "pass" for cid in mapped):
         return session_id
     return None
 
@@ -321,8 +364,12 @@ def start_launch_run(
     project_id = task["project_id"]
     adapter_id = agent["adapter"]
     profile = task["profile"] or agent["default_profile"] or "dev"
-    model = task["model"] or agent["default_model"]
-    effort = task["effort"] or agent["default_effort"]
+    model, effort = resolve_model_and_effort(
+        model=task["model"],
+        default_model=agent["default_model"],
+        effort=task["effort"],
+        default_effort=agent["default_effort"],
+    )
 
     adapter = get_adapter(adapter_id, testing_mode=testing_mode,
                           options=json.loads(agent["adapter_options_json"] or "{}"))
@@ -373,7 +420,7 @@ def start_launch_run(
 
     return _spawn_run(conn, home, task, agent, adapter, adapter_id, profile, model, effort,
                       fence, attempt, max_attempts, run_id, run_dir, ws_path, prompt_text, strategy,
-                      branch=branch, base_commit=base_commit)
+                      branch=branch, base_commit=base_commit, testing_mode=testing_mode)
 
 
 def _fail_prompt_too_long(conn, task, details, failure, now) -> None:
@@ -483,13 +530,14 @@ class _SpawnAbort:
 
     def __init__(self, proc: "subprocess.Popen[Any]", run_id: str, fail_args: Tuple[Any, ...],
                  run_dir: Optional[str] = None, home: Optional[str] = None,
-                 kind: str = "task") -> None:
+                 kind: str = "task", testing_mode: Optional[bool] = None) -> None:
         self.proc = proc
         self.run_id = run_id
         self.fail_args = fail_args
         self.run_dir = run_dir
         self.home = home
         self.kind = kind
+        self.testing_mode = testing_mode
         self.out: Dict[str, Any] = {}
         self.known: _IdentitySet = _IdentitySet()
         self.persisted: Set[Tuple[int, int]] = set()
@@ -498,6 +546,8 @@ class _SpawnAbort:
         self.wrapper_starttime: Optional[int] = None
         self.kill_done = False
         self.retries = 0
+        self.started_at: float = time.monotonic()
+        self.kill_failed_emitted: bool = False
 
 
 #: run id -> pending spawn abort (round 8). In memory: after a meshd restart the open run
@@ -525,10 +575,12 @@ def _reap_aborted_wrapper(ab: _SpawnAbort) -> None:
         _SPAWN_ABORTS.pop(ab.run_id, None)
 
 
-def _close_spawn_abort_db(conn: sqlite3.Connection, ab: _SpawnAbort, details: Dict[str, Any]) -> None:
+def _close_spawn_abort_db(conn: sqlite3.Connection, ab: _SpawnAbort, details: Dict[str, Any],
+                          testing_mode: Optional[bool] = None) -> None:
     """Commit the closing ``spawn_failed`` transition of an aborted spawn."""
     from mesh.daemon import lead_turns
 
+    tmode = ab.testing_mode if testing_mode is None else testing_mode
     with transaction(conn):
         conn.execute(
             "UPDATE runs SET wrapper_pid = COALESCE(wrapper_pid, ?), pgid = COALESCE(pgid, ?), "
@@ -539,6 +591,7 @@ def _close_spawn_abort_db(conn: sqlite3.Connection, ab: _SpawnAbort, details: Di
             project_id, message = ab.fail_args
             lead_turns._fail_lead_turn_spawn(
                 conn, ab.run_id, project_id, message, after_popen=details or None,
+                testing_mode=tmode,
             )
         else:
             task_id, project_id, fence, attempt, max_attempts, message = ab.fail_args
@@ -627,12 +680,20 @@ def _abort_spawned(ab: _SpawnAbort) -> bool:
         ab.wrapper_starttime = st0
     ab.out = {"pid": pid, "starttime": st0}
     _abort_collect(ab)  # persisted before the first signal
-    deadline = time.monotonic() + SPAWN_ABORT_WAIT_S
-    while True:
+    try:
+        in_event_loop = asyncio.get_running_loop().is_running()
+    except RuntimeError:
+        in_event_loop = False
+    if in_event_loop:
+        # Never block the main asyncio event loop for up to 5 s; _SPAWN_ABORTS retries asynchronously.
         done, live = _abort_kill_pass(ab)
-        if done or time.monotonic() >= deadline:
-            break
-        time.sleep(0.02)
+    else:
+        deadline = time.monotonic() + SPAWN_ABORT_WAIT_S
+        while True:
+            done, live = _abort_kill_pass(ab)
+            if done or time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
     ab.survivors = live
     if ab.outside:
         ab.out["escapees"] = sorted(ab.outside)
@@ -644,13 +705,30 @@ def _abort_spawned(ab: _SpawnAbort) -> bool:
     return done
 
 
-def retry_spawn_aborts(conn: sqlite3.Connection, home: str) -> List[str]:
+def _emit_spawn_kill_failed(conn: sqlite3.Connection, ab: _SpawnAbort, pids: List[int]) -> None:
+    """Record the immutable ``run.kill_failed`` event for a persistent spawn abort (caller owns tx)."""
+    if ab.kind == "lead_turn":
+        project_id = ab.fail_args[0]
+        task_id = None
+    else:
+        task_id, project_id = ab.fail_args[0], ab.fail_args[1]
+    record_event(
+        conn=conn, type_="run.kill_failed", actor_id="system", actor_kind="system", via="system",
+        project_id=project_id, task_id=task_id, run_id=ab.run_id,
+        payload={"run_id": ab.run_id, "task_id": task_id, "end_reason": "spawn_failed",
+                 "pids": pids, "lease_released": False,
+                 "retrying": True, "after_popen": True},
+    )
+
+
+def retry_spawn_aborts(conn: sqlite3.Connection, home: str, testing_mode: Optional[bool] = None) -> List[str]:
     """Round 8-11: watch-pass retry of pending spawn aborts (task runs and lead turns).
     Once every known ``(pid, starttime)`` identity is gone AND the closing DB transaction
     commits, the wrapper is reaped and the run closes ``spawn_failed`` (lease released)."""
     closed: List[str] = []
     for run_id, a in list(_SPAWN_ABORTS.items()):
         a.retries += 1
+        eff_tmode = a.testing_mode if testing_mode is None else testing_mode
         try:
             done, live = _abort_kill_pass(a)
         except Exception as exc:  # round 9 (P1-c): keep the pending abort, retry later
@@ -661,11 +739,19 @@ def retry_spawn_aborts(conn: sqlite3.Connection, home: str) -> List[str]:
             a.survivors = live
             try:
                 if a.kind == "lead_turn":
-                    _renew_lead_turn_lease(conn, {"id": run_id, "project_id": a.fail_args[0]})
+                    _call_renew_lead_turn_lease(conn, {"id": run_id, "project_id": a.fail_args[0]}, eff_tmode)
                 else:
-                    _renew_meshd_lease(conn, a.fail_args[0], run_id)
+                    _call_renew_meshd_lease(conn, a.fail_args[0], run_id, eff_tmode)
             except Exception:
                 pass
+            if not a.kill_failed_emitted and (time.monotonic() - a.started_at >= SPAWN_ABORT_WAIT_S):
+                try:
+                    with transaction(conn):
+                        _emit_spawn_kill_failed(conn, a, sorted(live))
+                    a.kill_failed_emitted = True
+                except Exception as db_exc:  # noqa: BLE001
+                    if home:
+                        _log_meshd(home, f"run {run_id}: kill_failed event deferred: {type(db_exc).__name__}: {db_exc}")
             continue
         a.kill_done = True
         out = dict(a.out)
@@ -676,11 +762,12 @@ def retry_spawn_aborts(conn: sqlite3.Connection, home: str) -> List[str]:
         if a.outside:
             out["escapees"] = sorted(a.outside)
         try:
-            _close_spawn_abort_db(conn, a, out)
+            _close_spawn_abort_db(conn, a, out, testing_mode=eff_tmode)
         except Exception as db_exc:
             _log_meshd(home, f"run {run_id}: spawn abort close deferred: {type(db_exc).__name__}: {db_exc}")
             continue
         _reap_aborted_wrapper(a)
+        _redact_aborted_run_output(a.run_dir)
         _log_meshd(home, f"run {run_id}: spawn abort finished after {a.retries} retries; lease released")
         closed.append(run_id)
     return closed
@@ -710,6 +797,7 @@ def handle_spawn_failure(
     *,
     kind: str,
     fail_args: Tuple[Any, ...],
+    testing_mode: Optional[bool] = None,
 ) -> None:
     """Shared pre-Popen and post-Popen failure handler for task runs and lead turns.
 
@@ -720,6 +808,7 @@ def handle_spawn_failure(
     """
     from mesh.daemon import lead_turns
 
+    tmode = _testing_mode() if testing_mode is None else bool(testing_mode)
     message = f"{type(exc).__name__}: {exc}"
     if kind == "lead_turn":
         full_fail_args: Tuple[Any, ...] = (fail_args[0], message)
@@ -730,7 +819,10 @@ def handle_spawn_failure(
         full_fail_args = (task_id, project_id, fence, attempt, max_attempts, message)
 
     if spawned is not None:
-        ab = _SpawnAbort(spawned, run_id, full_fail_args, run_dir=run_dir, home=home, kind=kind)
+        ab = _SpawnAbort(
+            spawned, run_id, full_fail_args, run_dir=run_dir, home=home, kind=kind,
+            testing_mode=tmode,
+        )
         children.hold(spawned.pid)
         _WRAPPERS[run_id] = spawned
         unregister_secret(f"run_token:{run_id}")
@@ -762,7 +854,7 @@ def handle_spawn_failure(
         details = ab.out
         if done:
             try:
-                _close_spawn_abort_db(conn, ab, details)
+                _close_spawn_abort_db(conn, ab, details, testing_mode=tmode)
             except Exception as db_exc:  # noqa: BLE001 - keep held in _SPAWN_ABORTS; retry_spawn_aborts closes
                 ab.kill_done = True
                 _SPAWN_ABORTS[run_id] = ab
@@ -772,10 +864,15 @@ def handle_spawn_failure(
                 return None
             _WRAPPERS.pop(run_id, None)
             _reap_aborted_wrapper(ab)
+            _redact_aborted_run_output(run_dir)
             return None
         _SPAWN_ABORTS[run_id] = ab
         _WRAPPERS.pop(run_id, None)
         try:
+            should_emit_kf = (
+                not ab.kill_failed_emitted
+                and (time.monotonic() - ab.started_at >= SPAWN_ABORT_WAIT_S)
+            )
             with transaction(conn):
                 conn.execute(
                     "UPDATE runs SET wrapper_pid = ?, pgid = ?, "
@@ -783,13 +880,10 @@ def handle_spawn_failure(
                     (spawned.pid, spawned.pid, ab.wrapper_starttime, run_id),
                 )
                 revoke_run_token(conn, run_id)
-                record_event(
-                    conn=conn, type_="run.kill_failed", actor_id="system", actor_kind="system", via="system",
-                    project_id=project_id, task_id=task_id, run_id=run_id,
-                    payload={"run_id": run_id, "task_id": task_id, "end_reason": "spawn_failed",
-                             "pids": details.get("survivors", []), "lease_released": False,
-                             "retrying": True, "after_popen": True},
-                )
+                if should_emit_kf:
+                    _emit_spawn_kill_failed(conn, ab, details.get("survivors", []))
+            if should_emit_kf:
+                ab.kill_failed_emitted = True
         except Exception as db_exc:  # noqa: BLE001 - keep pending in _SPAWN_ABORTS; retry_spawn_aborts retries
             if home:
                 _log_meshd(home, f"run {run_id}: kill_failed event deferred: {type(db_exc).__name__}: {db_exc}")
@@ -797,7 +891,7 @@ def handle_spawn_failure(
 
     with transaction(conn):
         if kind == "lead_turn":
-            lead_turns._fail_lead_turn_spawn(conn, run_id, project_id, message)
+            lead_turns._fail_lead_turn_spawn(conn, run_id, project_id, message, testing_mode=tmode)
         else:
             task_id, project_id, fence, attempt, max_attempts, message = full_fail_args
             _fail_task_spawn(
@@ -807,20 +901,31 @@ def handle_spawn_failure(
             revoke_run_token(conn, run_id)
     _WRAPPERS.pop(run_id, None)
     unregister_secret(f"run_token:{run_id}")
+    _redact_aborted_run_output(run_dir)
     return None
 
 
 def _spawn_run(conn, home, task, agent, adapter, adapter_id, profile, model, effort,
                fence, attempt, max_attempts, run_id, run_dir, ws_path, prompt_text, strategy,
-               branch: Optional[str] = None, base_commit: Optional[str] = None) -> Optional[str]:
+               branch: Optional[str] = None, base_commit: Optional[str] = None,
+               testing_mode: Optional[bool] = None) -> Optional[str]:
     """TX A, effect, TX B / spawn_failed (plan §11.1), each transaction committed on its own."""
     task_id = task["id"]
     project_id = task["project_id"]
+    resume_candidate = task["last_session_id"]
+    if resume_candidate:
+        prev_run = conn.execute(
+            "SELECT agent_id, model FROM runs WHERE task_id = ? AND session_id = ? ORDER BY rowid DESC LIMIT 1;",
+            (task_id, resume_candidate),
+        ).fetchone()
+        if prev_run is not None and (prev_run["agent_id"] != agent["id"] or prev_run["model"] != model):
+            resume_candidate = None
 
     # --- TX A: lease, fence, attempt, run row, run token, task running, events ---
     now = now_iso_utc()
     now_ts = time.time()
-    lease_ttl_s = get_lease_ttl_s(conn)
+    tmode = _testing_mode() if testing_mode is None else bool(testing_mode)
+    lease_ttl_s = get_lease_ttl_s(conn, testing_mode=tmode)
     timeout_s = task["timeout_s"] or get_run_timeout_s(conn)
     deadline_at = now_iso_utc(now_ts + timeout_s)
     token_expires_at = now_iso_utc(now_ts + timeout_s + RUN_TOKEN_EXPIRY_GRACE_S)
@@ -834,6 +939,9 @@ def _spawn_run(conn, home, task, agent, adapter, adapter_id, profile, model, eff
             dis = conn.execute("SELECT disabled_at FROM principals WHERE id = ?;", (agent["id"],)).fetchone()
             if dis is None or dis["disabled_at"] is not None:
                 raise sqlite3.IntegrityError(f"agent {agent['id']} is disabled")
+            res_key = has_task_ws_reservation(conn, task_id, project_id)
+            if res_key:
+                raise sqlite3.IntegrityError(f"workspace reservation active: {res_key}")
             slots = count_active_runs(conn, agent["id"])
             total_slots = count_active_runs(conn)
             global_cap = get_global_run_cap(conn)
@@ -933,7 +1041,10 @@ def _spawn_run(conn, home, task, agent, adapter, adapter_id, profile, model, eff
     proc: Optional["subprocess.Popen[Any]"] = None
     try:
         ensure_run_dir(run_dir)
-        ensure_workspace_dir(ws_path)
+        if branch:
+            require_task_worktree(ws_path)  # r2 P1-C: never an empty dir in a worktree slot
+        else:
+            ensure_workspace_dir(ws_path)
         _write_text(os.path.join(run_dir, "prompt.md"), prompt_text)
         if strategy == "pointer":
             argv_prompt = pointer_prompt(run_dir)
@@ -946,7 +1057,13 @@ def _spawn_run(conn, home, task, agent, adapter, adapter_id, profile, model, eff
             effort=effort,
             profile=profile,
             timeout_s=timeout_s,
-            resume_session_id=verified_resume_session(adapter, task["last_session_id"]),
+            resume_session_id=verified_resume_session(
+                adapter,
+                resume_candidate,
+                conn=conn,
+                testing_mode=tmode,
+                binary_path=agent["binary_path"],
+            ),
             options=build_run_options(agent, run_id),
         )
         spec_cmd: CommandSpec = adapter.build(request)
@@ -1010,15 +1127,23 @@ def _spawn_run(conn, home, task, agent, adapter, adapter_id, profile, model, eff
             conn, home, run_id, run_dir, spawned, exc,
             kind="task",
             fail_args=(task_id, project_id, fence, attempt, max_attempts),
+            testing_mode=tmode,
         )
     return run_id
 
 
-def parse_run_output(conn: sqlite3.Connection, run_id: str, run_dir: str, adapter_id: str) -> Dict[str, Any]:
+def parse_run_output(
+    conn: sqlite3.Connection,
+    run_id: str,
+    run_dir: str,
+    adapter_id: str,
+    testing_mode: Optional[bool] = None,
+) -> Dict[str, Any]:
     """Parse a finished run's output into a deliverable (plan §11.3, §12.5)."""
+    tmode = _testing_mode() if testing_mode is None else bool(testing_mode)
     final_text = ""
     try:
-        adapter = get_adapter(adapter_id, testing_mode=_testing_mode())
+        adapter = get_adapter(adapter_id, testing_mode=tmode)
         result = adapter.parse(run_dir)
         final_text = result.final_text or ""
     except Exception:
@@ -1045,7 +1170,8 @@ VENDOR_FAILURE_REASON = "vendor_error"
 #: changed file is parsed again. Entries of runs no longer active are dropped with the git cache.
 _VENDOR_MEANING: Dict[str, Tuple[Any, Optional[str], Optional[str]]] = {}
 _VENDOR_MEANING_MAX = 1024
-_VENDOR_OUTPUTS = ("stdout.log", os.path.join("vibe-out", "export.json"))
+#: stderr.log too: devin's failure meaning comes from its stderr ``Error:`` lines.
+_VENDOR_OUTPUTS = ("stdout.log", "stderr.log", os.path.join("vibe-out", "export.json"))
 
 
 def _output_signature(run_dir: str) -> Tuple[Any, ...]:
@@ -1059,24 +1185,29 @@ def _output_signature(run_dir: str) -> Tuple[Any, ...]:
     return tuple(sig)
 
 
-def vendor_failure_meaning(run_dir: str, adapter_id: Optional[str]) -> Optional[str]:
+def vendor_failure_meaning(
+    run_dir: str,
+    adapter_id: Optional[str],
+    testing_mode: Optional[bool] = None,
+) -> Optional[str]:
     """The parsed ``vendor_exit_meaning`` of a finished run, or None (normal finish).
 
     A parse that raises or an unknown adapter is not a vendor failure: the exit code decides,
-    as before this rule. Cached per run dir while its outputs are unchanged (two stats per call)."""
+    as before this rule. Cached per run dir while its outputs are unchanged (one stat per output file per call)."""
+    tmode = _testing_mode() if testing_mode is None else bool(testing_mode)
     sig = _output_signature(run_dir)
     hit = _VENDOR_MEANING.get(run_dir)
-    if hit is not None and hit[0] == sig and hit[1] == adapter_id:
+    if hit is not None and hit[0] == sig and hit[1] == (adapter_id, tmode):
         return hit[2]
     try:
-        adapter = get_adapter(adapter_id or "", testing_mode=_testing_mode())
+        adapter = get_adapter(adapter_id or "", testing_mode=tmode)
         meaning = adapter.parse(run_dir).vendor_exit_meaning
         meaning = meaning if isinstance(meaning, str) and meaning else None
     except Exception:
         meaning = None
     if len(_VENDOR_MEANING) >= _VENDOR_MEANING_MAX:
         _VENDOR_MEANING.clear()
-    _VENDOR_MEANING[run_dir] = (sig, adapter_id, meaning)
+    _VENDOR_MEANING[run_dir] = (sig, (adapter_id, tmode), meaning)
     return meaning
 
 
@@ -1088,6 +1219,96 @@ def stderr_tail(run_dir: str, lines: int = STDERR_TAIL_LINES) -> List[str]:
     except OSError:
         return []
     return content[-lines:]
+
+
+_NONFATAL_STDERR_REASONS = frozenset({"tool_denied"})
+#: Stream meanings a non-zero exit may take as its reason, only for adapters that opt in with
+#: ``nonzero_exit_uses_stream_meaning = True`` (codex, claude). ``incomplete`` (no final event:
+#: stopped, killed, never started) is not here, so the exit code still decides those runs.
+_NONZERO_STREAM_MEANINGS = frozenset({
+    "auth_failed", "quota_exhausted", "rate_limited", "network_error", "run_error",
+    "output_truncated", "turn_limit", "budget_exceeded",
+})
+_STDERR_DETAIL_MAX_CHARS = 2000
+
+
+def _bound_stderr_text(text: str, max_chars: int = _STDERR_DETAIL_MAX_CHARS) -> str:
+    if len(text) <= max_chars:
+        return text
+    prefix = "...[truncated]\n"
+    budget = max(0, max_chars - len(prefix))
+    tail = text[-budget:] if budget > 0 else ""
+    if "\n" in tail:
+        after_nl = tail.split("\n", 1)[1]
+        if after_nl:
+            tail = after_nl
+    return (prefix + tail)[:max_chars]
+
+
+def _bound_vendor_value(value: Any, max_chars: int = _STDERR_DETAIL_MAX_CHARS) -> Any:
+    if isinstance(value, str):
+        return _bound_stderr_text(value, max_chars=max_chars)
+    if isinstance(value, list):
+        return [_bound_vendor_value(item, max_chars=max_chars) for item in value]
+    if isinstance(value, dict):
+        return {k: _bound_vendor_value(v, max_chars=max_chars) for k, v in value.items()}
+    return value
+
+
+def _vendor_nonzero_failure(
+    run_dir: str,
+    adapter_id: Optional[str],
+    exit_code: Optional[int],
+    testing_mode: Optional[bool] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    """Map vendor non-zero exit codes (e.g. vibe exit 3) and stderr signatures (plan §14.5/§14.6)."""
+    reason = "timeout" if (adapter_id == "vibe" and exit_code == 3) else "exit_nonzero"
+    extra: Dict[str, Any] = {}
+    tmode = _testing_mode() if testing_mode is None else bool(testing_mode)
+    try:
+        adapter = get_adapter(adapter_id or "", testing_mode=tmode)
+    except Exception:
+        return reason, extra
+    if reason == "exit_nonzero" and getattr(adapter, "nonzero_exit_uses_stream_meaning", False) is True:
+        # Opt-in switch (codex, claude only): these CLIs report auth/quota/network failures in
+        # their stdout stream and exit non-zero, so the parsed meaning names the reason. Every
+        # other adapter keeps exit_nonzero refined by stderr only, exactly as before.
+        try:
+            meaning = adapter.parse(run_dir).vendor_exit_meaning
+        except Exception:
+            meaning = None
+        if isinstance(meaning, str) and meaning in _NONZERO_STREAM_MEANINGS:
+            reason = meaning
+            extra["vendor_exit_meaning"] = meaning
+    parser = getattr(adapter, "parse_stderr_error", None)
+    if not callable(parser):
+        return reason, extra
+    try:
+        with open(os.path.join(run_dir, "stderr.log"), "r", encoding="utf-8", errors="replace") as f:
+            stderr_text = f.read(200_000)
+    except OSError:
+        return reason, extra
+    try:
+        parsed = parser(stderr_text)
+    except Exception:
+        return reason, extra
+    if not isinstance(parsed, dict):
+        return reason, extra
+    # Redact secrets/unbroken lines before bounding strings so partial slices never split tokens.
+    bounded_parsed = _bound_vendor_value(redact_value(parsed))
+    parsed_reason = bounded_parsed.get("reason")
+    if (
+        reason == "exit_nonzero"
+        and isinstance(parsed_reason, str)
+        and parsed_reason
+        and parsed_reason not in _NONFATAL_STDERR_REASONS
+    ):
+        reason = parsed_reason
+        if isinstance(bounded_parsed.get("details"), dict):
+            extra.update(bounded_parsed["details"])
+    else:
+        extra["stderr_error"] = bounded_parsed
+    return reason, extra
 
 
 def revoke_run_token(conn: sqlite3.Connection, run_id: str) -> None:
@@ -1172,7 +1393,8 @@ def _code_workspace_state(conn: sqlite3.Connection, home: str, task: Mapping[str
             if not entry["done"]:
                 return None
             del _WS_PREP[task_id]
-            if time.monotonic() - entry.get("done_at", 0.0) <= WS_PREP_MAX_AGE_S:
+            if (time.monotonic() - entry.get("done_at", 0.0) <= WS_PREP_MAX_AGE_S
+                    and not entry.get("stale")):
                 return entry
             entry = None  # too old to trust the disk state it saw (finding 5): prepare again
         if entry is not None and not entry["done"]:
@@ -1181,6 +1403,19 @@ def _code_workspace_state(conn: sqlite3.Connection, home: str, task: Mapping[str
         _WS_PREP[task_id] = entry
     threading.Thread(target=_ws_prep_worker, args=(entry, plan), name=f"mesh-ws-{task_id}", daemon=True).start()
     return None
+
+
+def forget_ws_prep(task_id: str) -> None:
+    """Full review r2 P1-C: the task's worktree changed on disk (`workspace delete`); a
+    preparation finished or still running saw the old state and is never used."""
+    with _WS_PREP_LOCK:
+        entry = _WS_PREP.get(task_id)
+        if entry is None:
+            return
+        if entry["done"]:
+            del _WS_PREP[task_id]
+        else:
+            entry["stale"] = True  # the running worker keeps its slot; its result is dropped
 
 
 def _evict_ws_prep(candidate_ids: Set[str]) -> None:
@@ -1267,6 +1502,8 @@ def spawn_launch_runs(
 def _spawn_one(conn: sqlite3.Connection, home: str, task: Mapping[str, Any], testing_mode: bool) -> Optional[str]:
     """T5 for one candidate that has a free slot: the run id, "reserved" while its
     worktree is prepared, or None (failed or skipped)."""
+    if has_task_ws_reservation(conn, task["id"], task["project_id"]):
+        return None
     agent_id = task["agent_id"]
     agent = conn.execute(
         "SELECT a.*, p.name FROM agents a JOIN principals p ON a.id = p.id WHERE a.id = ?;",
@@ -1299,7 +1536,11 @@ def _spawn_one(conn: sqlite3.Connection, home: str, task: Mapping[str, Any], tes
 DEFAULT_KILL_GRACE_S = 15
 DEFAULT_POST_SUBMIT_GRACE_S = 60
 #: Terminations started by crash recovery (§11.7) → the status their run closes with.
-RECOVERY_END_STATUS = {"lost_on_restart": "lost", "lost_before_spawn": "spawn_failed"}
+RECOVERY_END_STATUS = {
+    "lost_on_restart": "lost",
+    "lost_before_spawn": "spawn_failed",
+    "spawn_failed": "spawn_failed",
+}
 
 
 def _testing_mode() -> bool:
@@ -1636,8 +1877,9 @@ def _persist_seen(run: Mapping[str, Any], seen: Dict[int, int], home: Optional[s
         _log_seen(home, f"run {run['id']}: seen.json written after an earlier failure")
     if run["id"] in _SEEN_UNUSABLE:
         _log_seen(home, f"run {run['id']}: seen.json rewritten; seen state ok again")
-    if _SEEN_REASON.get(run["id"]) == ADOPT_PENDING and _SEEN_PERSISTED.get(run["id"]) is None \
-            and _SEEN_EVENT_PENDING.get(run["id"]) == ADOPT_PENDING:
+    if _SEEN_REASON.get(run["id"]) in (ADOPT_PENDING, "spawn_abort_pending") \
+            and _SEEN_PERSISTED.get(run["id"]) is None \
+            and _SEEN_EVENT_PENDING.get(run["id"]) in (ADOPT_PENDING, "spawn_abort_pending"):
         # Round 6: an adoption that completed with a trusted scan before its pending
         # state was persisted anywhere: no event.
         _SEEN_EVENT_PENDING.pop(run["id"], None)
@@ -1807,6 +2049,14 @@ def _sync_hold_row(conn: sqlite3.Connection, run: Mapping[str, Any]) -> None:
     while the run is unusable, deleted once a valid file (reload or rewrite) lifted it.
     The in-memory mirror changes only after the commit."""
     run_id = run["id"]
+    cur_status = conn.execute("SELECT status FROM runs WHERE id = ?;", (run_id,)).fetchone()
+    if cur_status is None or cur_status[0] not in ("starting", "running"):
+        if run_id in _SEEN_PERSISTED:
+            with transaction(conn):
+                conn.execute("DELETE FROM meta WHERE key = ?;", (seen_hold_key(run_id),))
+            _SEEN_PERSISTED.pop(run_id, None)
+            _SEEN_HOLD_TOKEN.pop(run_id, None)
+        return
     if run_id in _SEEN_UNUSABLE:
         reason = _SEEN_REASON.get(run_id) or "unreadable"
         if _SEEN_PERSISTED.get(run_id) == reason:
@@ -1931,9 +2181,40 @@ def report_seen_unusable(conn: sqlite3.Connection, run: Mapping[str, Any], home:
             break  # round 4: event and hold row go together; retry both next tick
 
 
-def seen_held(run: Mapping[str, Any]) -> bool:
+def seen_held(run: Mapping[str, Any], home: Optional[str] = None) -> bool:
     """True while the run is held only because its seen state is unusable (r4c operator path)."""
-    return run["kind"] == "task" and run["status"] in ("starting", "running") and seen_hold(run)
+    run_id = run["id"]
+    if run["kind"] not in ("task", "lead_turn") or run["status"] not in ("starting", "running"):
+        return False
+    if run_id in _SPAWN_ABORTS:
+        return False
+    if _effective_wrapper_liveness(run) != "gone":
+        return False
+    if not seen_hold(run):
+        return False
+    t = terminate.get(run_id)
+    if t is not None and any(_identity_live(int(p), int(st)) for p, st in list(t.seen.items())):
+        return False
+    pgid, wst = close_identity(run)
+    view = dict(run)
+    if pgid is not None:
+        view["pgid"] = pgid
+    recorded_pairs: Set[Tuple[int, int]] = {
+        (int(p), int(s)) for p, s in (_SEEN.get(run_id) or {}).items()
+    }
+    _st, from_file, _r, _l = _load_seen(view)
+    recorded_pairs.update((int(p), int(s)) for p, s in from_file.items())
+    recorded_pairs.update(_load_prior_member_pairs(view))
+    if any(_identity_live(p, s) for p, s in sorted(recorded_pairs)):
+        return False
+    seen = dict(seen_for(run, home) or {})
+    if t is not None:
+        seen.update({int(p): int(s) for p, s in t.seen.items()})
+    eff_wst = wst if wst is not None else run["proc_starttime"]
+    targets = terminate.run_targets(run_id, pgid, run["wrapper_pid"], eff_wst, seen or None)
+    if targets or getattr(targets, "uncertain", False):
+        return False
+    return True
 
 
 def release_seen_hold(run_id: str) -> Optional[str]:
@@ -2034,7 +2315,7 @@ def close_gate(run: Mapping[str, Any], end_reason: str = "") -> None:
     3. the run's pgid/session still occupied and the group still the run's -> refuse:
        hold (nothing signalled by pgid alone);
     4. otherwise the close may proceed. Raises :class:`CloseHeld` to refuse."""
-    if run["kind"] != "task":
+    if run["kind"] not in ("task", "lead_turn"):
         return
     pgid, wst = close_identity(run)
     if pgid is None:
@@ -2096,6 +2377,8 @@ def hold_close(conn: sqlite3.Connection, home: Optional[str], run: Mapping[str, 
             # Round 7 (Linear P2): the run had ended on its own (exit.json, or none:
             # lost). Its live recorded processes are leftovers (H17): terminated, then the
             # run closes with its own outcome (exit 0 -> auto-submit), never as killed.
+            with _WS_PREP_LOCK:
+                _GIT_INFO.pop(run_id, None)
             if home:
                 _begin_termination(conn, home, fresh, "leftovers", leftovers=True, seen=dict(held.live))
             else:
@@ -2383,6 +2666,18 @@ def _evict_seen(active_run_ids: Set[str]) -> None:
             d.pop(run_id, None)
 
 
+def _redact_aborted_run_output(run_dir: Optional[str]) -> None:
+    """Ensure adapter sidecar output (``vibe-out/``) is redacted even on ``spawn_failed``."""
+    if not run_dir:
+        return
+    try:
+        from mesh.adapters.vibe import _redact_output_dir
+
+        _redact_output_dir(os.path.join(run_dir, "vibe-out"))
+    except Exception:
+        pass
+
+
 def _reap_wrapper(run: Mapping[str, Any]) -> None:
     """Collect the wrapper's exit status through its own Popen object (§11.4).
 
@@ -2409,9 +2704,14 @@ def _setting_int(conn: sqlite3.Connection, key: str, default: int) -> int:
     return default
 
 
-def _renew_meshd_lease(conn: sqlite3.Connection, task_id: str, run_id: str) -> None:
+def _renew_meshd_lease(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: str,
+    testing_mode: Optional[bool] = None,
+) -> None:
     now_ts = time.time()
-    ttl = get_lease_ttl_s(conn)
+    ttl = get_lease_ttl_s(conn, testing_mode=testing_mode)
     with transaction(conn):
         conn.execute(
             "UPDATE leases SET heartbeat_at = ?, expires_at = ? "
@@ -2428,6 +2728,7 @@ def _close_run(
     exit_code: Optional[int],
     result: Dict[str, Any],
     gate: bool = True,
+    testing_mode: Optional[bool] = None,
 ) -> None:
     """Close the run, release the lease and revoke the run token (caller owns the tx).
 
@@ -2437,14 +2738,17 @@ def _close_run(
         close_gate(run, end_reason)
     _CLOSE_REFUSED_LOGGED.pop(run["id"], None)
     now = now_iso_utc()
+    tmode = _testing_mode() if testing_mode is None else bool(testing_mode)
     session_id = None
-    if run["kind"] in ("task", "lead_turn"):
+    if run["kind"] in ("task", "lead_turn") and status != "spawn_failed":
         try:
-            parsed = get_adapter(run["adapter"], testing_mode=_testing_mode()).parse(run["run_dir"])
+            parsed = get_adapter(run["adapter"], testing_mode=tmode).parse(run["run_dir"])
             if isinstance(parsed.session_id, str) and parsed.session_id:
                 session_id = parsed.session_id
         except Exception:
-            pass  # Unparseable/missing output must not block closing a run.
+            _redact_aborted_run_output(run["run_dir"])
+    elif run["run_dir"]:
+        _redact_aborted_run_output(run["run_dir"])
     closed = conn.execute(
         "UPDATE runs SET status = ?, end_reason = ?, exit_code = ?, ended_at = ?, result_json = ?, session_id = ? "
         "WHERE id = ? AND status IN ('starting', 'running');",
@@ -2460,6 +2764,9 @@ def _close_run(
     # A lead turn holds `leadturn:<prj>` and has no task (m2-r9); a task run holds
     # `task:<tsk>`. Releasing by run_id alone keeps both correct.
     conn.execute("DELETE FROM leases WHERE run_id = ?;", (run["id"],))
+    conn.execute("DELETE FROM meta WHERE key = ?;", (seen_hold_key(run["id"]),))
+    _SEEN_PERSISTED.pop(run["id"], None)
+    _SEEN_HOLD_TOKEN.pop(run["id"], None)
     revoke_run_token(conn, run["id"])
 
 
@@ -2480,6 +2787,10 @@ def _task_failed(
     now = now_iso_utc()
     details = dict(details)
     details["run_id"] = run["id"]
+    rep = reporter or {}
+    is_direct_user_reporter = rep.get("actor_kind") == "user" and rep.get("via") == "direct"
+    if is_direct_user_reporter:
+        details.setdefault("reported_by", rep.get("actor_id") or "user")
     if stderr_lines is not None:
         details["stderr_tail"] = stderr_lines
     failure = redact_value({"reason": reason, "details": details})
@@ -2504,9 +2815,9 @@ def _task_failed(
     record_event(
         conn=conn,
         type_="task.failed",
-        actor_id=(reporter or {}).get("actor_id") or "system",
-        actor_kind=(reporter or {}).get("actor_kind") or "system",
-        via=(reporter or {}).get("via") or "system",
+        actor_id="system" if is_direct_user_reporter else (rep.get("actor_id") or "system"),
+        actor_kind="system" if is_direct_user_reporter else (rep.get("actor_kind") or "system"),
+        via="system" if is_direct_user_reporter else (rep.get("via") or "system"),
         project_id=task["project_id"],
         task_id=task["id"],
         run_id=run["id"],
@@ -2523,14 +2834,30 @@ def is_auto_submit(record: Mapping[str, Any]) -> bool:
     return record.get("auto") is True
 
 
+_MAX_AUTO_DELIVERABLE_BYTES = 200 * 1024
+
+
 def _task_auto_submit(conn: sqlite3.Connection, task: Mapping[str, Any], run: Mapping[str, Any],
-                      git: Optional[Dict[str, Any]] = None) -> None:
+                      git: Optional[Dict[str, Any]] = None,
+                      testing_mode: Optional[bool] = None) -> None:
     """T7 auto-submit after exit 0 without a prior submit (submitted_by: system).
 
     `git` is a code task's `deliverable.git` (§10.4, m2-r4), collected off the loop.
     """
     now = now_iso_utc()
-    deliverable = redact_value(parse_run_output(conn, run["id"], run["run_dir"], run["adapter"]))
+    deliverable = redact_value(
+        parse_run_output(conn, run["id"], run["run_dir"], run["adapter"], testing_mode=testing_mode)
+    )
+    raw_bytes = len(json.dumps(deliverable).encode("utf-8"))
+    if raw_bytes > _MAX_AUTO_DELIVERABLE_BYTES:
+        preview = json.dumps(deliverable, ensure_ascii=False)[:4096]
+        deliverable = {
+            "truncated": True,
+            "original_bytes": raw_bytes,
+            "limit_bytes": _MAX_AUTO_DELIVERABLE_BYTES,
+            "run_id": run["id"],
+            "preview": preview,
+        }
     if git is not None:
         deliverable = dict(deliverable) if isinstance(deliverable, dict) else {"raw": deliverable}
         deliverable["git"] = git
@@ -2570,6 +2897,7 @@ def _finish_run(
     run: Mapping[str, Any],
     exit_info: Optional[Dict[str, Any]],
     git: Optional[Dict[str, Any]] = None,
+    testing_mode: Optional[bool] = None,
 ) -> str:
     """Close a run whose processes are all gone and apply the task transition (§11.3)."""
     task = conn.execute("SELECT * FROM tasks WHERE id = ?;", (run["task_id"],)).fetchone()
@@ -2582,15 +2910,25 @@ def _finish_run(
 
     with transaction(conn):
         if exit_info is None:
-            _close_run(conn, run, "lost", "lost", None, {"reason": "lost"})
-            if task is not None and task["status"] == "running":
+            _close_run(conn, run, "lost", "lost", None, {"reason": "lost"}, testing_mode=testing_mode)
+            if task is None:
+                return "lost"
+            if task["status"] == "cancelling":
+                _task_cancelled(conn, task, run, "cancelled")
+                return "cancelled"
+            if task["status"] == "running":
+                if pending:
+                    _task_failed(
+                        conn, task, run, "reported", {"message": pending.get("message", "")}, reporter=pending
+                    )
+                    return "reported"
                 _task_failed(conn, task, run, "lost", {}, stderr_tail(run["run_dir"]))
             return "lost"
 
         exit_code = exit_info.get("exit_code")
         signo = exit_info.get("signal")
         result = {"exit_code": exit_code, "signal": signo, "ended_at": exit_info.get("ended_at")}
-        _close_run(conn, run, "exited", "exited", exit_code, result)
+        _close_run(conn, run, "exited", "exited", exit_code, result, testing_mode=testing_mode)
         if signo is not None:
             conn.execute("UPDATE runs SET signal = ? WHERE id = ?;", (signo, run["id"]))
         if task is None:
@@ -2598,6 +2936,18 @@ def _finish_run(
         if task["status"] == "submitted" and is_auto_submit(_submitted_record(task)) \
                 and _submitted_record(task).get("run_id") == run["id"]:
             # Auto-submitted at exit while leftovers were being terminated (§11.3).
+            if git is not None:
+                rec = _submitted_record(task)
+                deliv = rec.get("deliverable")
+                deliv = dict(deliv) if isinstance(deliv, dict) else {"raw": deliv}
+                if deliv.get("git") != git:
+                    deliv["git"] = git
+                    rec["deliverable"] = deliv
+                    conn.execute(
+                        "UPDATE tasks SET deliverable_json = ?, updated_at = ?, version = version + 1 "
+                        "WHERE id = ? AND status = 'submitted';",
+                        (json.dumps(rec), now_iso_utc(), task["id"]),
+                    )
             return "auto_submitted"
         if task["status"] == "submitted":
             record_event(
@@ -2629,9 +2979,13 @@ def _finish_run(
                          stderr_tail(run["run_dir"]))
             return "capture_failed"
         if exit_code == 0 and signo is None:
-            meaning = vendor_failure_meaning(run["run_dir"], run["adapter"])
+            meaning = (
+                vendor_failure_meaning(run["run_dir"], run["adapter"])
+                if testing_mode is None
+                else vendor_failure_meaning(run["run_dir"], run["adapter"], testing_mode=testing_mode)
+            )
             if meaning is None:
-                _task_auto_submit(conn, task, run, git=git)
+                _task_auto_submit(conn, task, run, git=git, testing_mode=testing_mode)
                 return "auto_submitted"
             # §11.3 as ruled in docs/impl-notes-m3-kiro-real.md: exit 0 with an in-stream
             # vendor error is T8, never T7 (no automatic retry, §11.6).
@@ -2643,10 +2997,21 @@ def _finish_run(
                          stderr_tail(run["run_dir"]))
             return VENDOR_FAILURE_REASON
         details: Dict[str, Any] = {"exit_code": exit_code}
+        reason = "exit_nonzero"
         if signo is not None:
             details["signal"] = signo
-        _task_failed(conn, task, run, "exit_nonzero", details, stderr_tail(run["run_dir"]))
-        return "exit_nonzero"
+        else:
+            reason, vendor_details = (
+                _vendor_nonzero_failure(run["run_dir"], run["adapter"], exit_code)
+                if testing_mode is None
+                else _vendor_nonzero_failure(
+                    run["run_dir"], run["adapter"], exit_code, testing_mode=testing_mode
+                )
+            )
+            if vendor_details:
+                details.update(vendor_details)
+        _task_failed(conn, task, run, reason, details, stderr_tail(run["run_dir"]))
+        return reason
 
 
 def _task_cancelled(
@@ -2693,14 +3058,26 @@ def _submitted_record(task: Mapping[str, Any]) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _adapter_liveness(adapter_id: Optional[str]) -> str:
+def _adapter_liveness(adapter_id: Optional[str], testing_mode: Optional[bool] = None) -> str:
+    tmode = _testing_mode() if testing_mode is None else bool(testing_mode)
     try:
-        return str(getattr(get_adapter(adapter_id or "", testing_mode=_testing_mode()), "liveness", "none"))
+        return str(getattr(get_adapter(adapter_id or "", testing_mode=tmode), "liveness", "none"))
     except Exception:
         return "none"
 
 
-def termination_reason(conn: sqlite3.Connection, run: Mapping[str, Any], task: Optional[Mapping[str, Any]]) -> Optional[str]:
+def _call_adapter_liveness(adapter_id: Optional[str], testing_mode: Optional[bool]) -> str:
+    if testing_mode is None:
+        return _adapter_liveness(adapter_id)
+    return _adapter_liveness(adapter_id, testing_mode=testing_mode)
+
+
+def termination_reason(
+    conn: sqlite3.Connection,
+    run: Mapping[str, Any],
+    task: Optional[Mapping[str, Any]],
+    testing_mode: Optional[bool] = None,
+) -> Optional[str]:
     """Why a live run must be terminated now, or None (plan §11.3, §11.4)."""
     if task is None:
         return None
@@ -2717,7 +3094,7 @@ def termination_reason(conn: sqlite3.Connection, run: Mapping[str, Any], task: O
     if run["deadline_at"] and now > parse_utc(run["deadline_at"]).timestamp():
         return "timeout"
     idle_s = int(task["idle_timeout_s"] or 0)
-    if idle_s > 0 and task["status"] == "running" and _adapter_liveness(run["adapter"]) == "stream":
+    if idle_s > 0 and task["status"] == "running" and _call_adapter_liveness(run["adapter"], testing_mode) == "stream":
         try:
             last = os.stat(os.path.join(run["run_dir"], "activity")).st_mtime
         except OSError:
@@ -2736,8 +3113,12 @@ def _begin_termination(
     seen: Optional[Dict[int, int]] = None,
 ) -> terminate.Termination:
     grace = _setting_int(conn, "kill.grace_s", DEFAULT_KILL_GRACE_S)
-    t = terminate.begin(run["id"], run["pgid"], run["wrapper_pid"], end_reason, grace,
-                        wrapper_starttime=run["proc_starttime"], seen=seen)
+    pgid, wst = close_identity(run)
+    eff_pgid = run["pgid"] or pgid
+    eff_wrapper = run["wrapper_pid"] or pgid
+    eff_wst = run["proc_starttime"] if run["proc_starttime"] is not None else wst
+    t = terminate.begin(run["id"], eff_pgid, eff_wrapper, end_reason, grace,
+                        wrapper_starttime=eff_wst, seen=seen)
     if leftovers and not t.leftovers_reported:
         t.leftovers_reported = True
         with transaction(conn):
@@ -2762,6 +3143,7 @@ def _finalize_lead_turn_termination(
     run: Mapping[str, Any],
     t: terminate.Termination,
     exit_info: Optional[Dict[str, Any]],
+    testing_mode: Optional[bool] = None,
 ) -> str:
     """Close a terminated lead turn (m2-r9, §11.4, §12.4).
 
@@ -2770,6 +3152,7 @@ def _finalize_lead_turn_termination(
     """
     from mesh.daemon import lead_turns
 
+    tmode = _testing_mode() if testing_mode is None else bool(testing_mode)
     with transaction(conn):
         result: Dict[str, Any] = {"end_reason": t.end_reason, "kill_failed": t.kill_failed,
                                   "pids": sorted(t.seen)}
@@ -2779,13 +3162,36 @@ def _finalize_lead_turn_termination(
             result["exit_code"] = exit_code
             result["signal"] = exit_info.get("signal")
         counts = lead_turns._release_messages(conn, run["id"], False, run["project_id"],
-                                              _testing_mode())
+                                              tmode)
         result["messages"] = counts
         _close_run(conn, run, RECOVERY_END_STATUS.get(t.end_reason, "killed"), t.end_reason,
-                   exit_code, result)
+                   exit_code, result, testing_mode=tmode)
         if exit_info and exit_info.get("signal") is not None:
             conn.execute("UPDATE runs SET signal = ? WHERE id = ?;", (exit_info.get("signal"), run["id"]))
     return "killed"
+
+
+def _call_finish_run(
+    conn: sqlite3.Connection,
+    run: Mapping[str, Any],
+    exit_info: Optional[Dict[str, Any]],
+    git: Optional[Dict[str, Any]] = None,
+    testing_mode: Optional[bool] = None,
+) -> str:
+    if testing_mode is None:
+        return _finish_run(conn, run, exit_info, git=git)
+    return _finish_run(conn, run, exit_info, git=git, testing_mode=testing_mode)
+
+
+def _call_watch_one(
+    conn: sqlite3.Connection,
+    home: str,
+    run: Mapping[str, Any],
+    testing_mode: Optional[bool] = None,
+) -> Optional[str]:
+    if testing_mode is None:
+        return _watch_one(conn, home, run)
+    return _watch_one(conn, home, run, testing_mode=testing_mode)
 
 
 def _finalize_termination(
@@ -2793,25 +3199,53 @@ def _finalize_termination(
     home: str,
     run: Mapping[str, Any],
     t: terminate.Termination,
-) -> str:
+    testing_mode: Optional[bool] = None,
+) -> Optional[str]:
     """The release condition holds: close the run, release the lease, then the task transition."""
+    tmode = _testing_mode() if testing_mode is None else bool(testing_mode)
     _reap_wrapper(run)
     exit_info = _read_json_file(os.path.join(run["run_dir"], "exit.json"))
     if run["kind"] == "lead_turn":
         if t.end_reason == "leftovers":
-            # Review m2-r9 finding 2: a turn that exited 0 and left an escapee is a
-            # success (§11.4 release condition, §12.4 "exit 0 → acked"), exactly as for
-            # a task run (H17). Only timeout/recovery reasons take the failure path.
             from mesh.daemon import lead_turns
 
-            with transaction(conn):
-                lead_turns.finish_lead_turn(conn, home, run, exit_info, _testing_mode())
+            reason = lead_turns.lead_turn_termination_reason(conn, run)
+            if reason in ("project_cancelled", "lead_superseded"):
+                t.end_reason = reason
+        if t.end_reason == "leftovers":
+            # Review m2-r9 finding 2: a turn that exited 0 and left an escapee is a
+            # success (§11.4 release condition, §12.4 "exit 0 → acked"), exactly as for
+            # a task run (H17). Only timeout/recovery/cancel/supersede reasons fail.
+            lead_turns.finish_lead_turn_committed(conn, home, run, exit_info, tmode)
             # finish_lead_turn closes the run as "exited", or "lost" with no exit.json.
             return "exited" if exit_info is not None else "lost"
-        return _finalize_lead_turn_termination(conn, home, run, t, exit_info)
-    if t.end_reason == "leftovers":
-        return _finish_run(conn, run, exit_info)
+        return _finalize_lead_turn_termination(
+            conn, home, run, t, exit_info, testing_mode=testing_mode
+        )
     task = conn.execute("SELECT * FROM tasks WHERE id = ?;", (run["task_id"],)).fetchone()
+    if t.end_reason == "leftovers":
+        git: Optional[Dict[str, Any]] = None
+        needs_git = (
+            _needs_submit_git(run, task, exit_info)
+            if testing_mode is None
+            else _needs_submit_git(run, task, exit_info, testing_mode=testing_mode)
+        )
+        submitted_rec = _submitted_record(task) if task is not None else {}
+        needs_git_refresh = bool(
+            not needs_git
+            and task is not None
+            and task["kind"] == "code"
+            and task["status"] == "submitted"
+            and is_auto_submit(submitted_rec)
+            and submitted_rec.get("run_id") == run["id"]
+        )
+        if needs_git or needs_git_refresh:
+            assert task is not None
+            state = _submit_git_state(run, task, _project_repo_path(conn, task))
+            if state is None:
+                return None
+            git = state["git"]
+        return _call_finish_run(conn, run, exit_info, git=git, testing_mode=testing_mode)
     pending = None
     if run["result_json"]:
         try:
@@ -2826,7 +3260,15 @@ def _finalize_termination(
             result["exit_code"] = exit_code
             result["signal"] = exit_info.get("signal")
         # Recovery terminations (§11.7) close the run as lost / spawn_failed, not killed.
-        _close_run(conn, run, RECOVERY_END_STATUS.get(t.end_reason, "killed"), t.end_reason, exit_code, result)
+        _close_run(
+            conn,
+            run,
+            RECOVERY_END_STATUS.get(t.end_reason, "killed"),
+            t.end_reason,
+            exit_code,
+            result,
+            testing_mode=testing_mode,
+        )
         if exit_info and exit_info.get("signal") is not None:
             conn.execute("UPDATE runs SET signal = ? WHERE id = ?;", (exit_info.get("signal"), run["id"]))
         if task is None:
@@ -2846,9 +3288,9 @@ def _finalize_termination(
 
 
 def _advance(conn: sqlite3.Connection, home: str, run: Mapping[str, Any], t: terminate.Termination,
-             hold_tick: bool = False) -> Optional[str]:
+             hold_tick: bool = False, testing_mode: Optional[bool] = None) -> Optional[str]:
     snap: Optional[SeenSnapshot] = None
-    if run["kind"] != "lead_turn" and is_adopted(run):
+    if run["kind"] in ("task", "lead_turn") and is_adopted(run):
         # r4c: a failed seen.json write is retried on every tick, also while the run is
         # terminating (grace window, kill retries, a seen hold), so a later restart still
         # finds the members. r4d: the seen state is read once per tick (snapshot); the
@@ -2872,11 +3314,15 @@ def _advance(conn: sqlite3.Connection, home: str, run: Mapping[str, Any], t: ter
         outcome = "pending"
     if outcome == "done":
         try:
-            res = _finalize_termination(conn, home, run, t)
+            if testing_mode is None:
+                res = _finalize_termination(conn, home, run, t)
+            else:
+                res = _finalize_termination(conn, home, run, t, testing_mode=testing_mode)
         finally:
             children.reap_orphans()
-        terminate.forget(run["id"])
-        return res
+        if res is not None:
+            terminate.forget(run["id"])
+            return res
     if outcome == "kill_failed":
         with transaction(conn):
             record_event(
@@ -2898,9 +3344,9 @@ def _advance(conn: sqlite3.Connection, home: str, run: Mapping[str, Any], t: ter
             )
         _log_meshd(home, f"run {run['id']} kill failed; pids {sorted(t.seen)} still alive; lease kept, retrying")
     if run["kind"] == "lead_turn":
-        _renew_lead_turn_lease(conn, run)
+        _call_renew_lead_turn_lease(conn, run, testing_mode)
     else:
-        _renew_meshd_lease(conn, run["task_id"], run["id"])
+        _call_renew_meshd_lease(conn, run["task_id"], run["id"], testing_mode)
     return None
 
 
@@ -2931,7 +3377,11 @@ def next_exit_check_in(now: Optional[float] = None) -> Optional[float]:
     return min(dues) - now
 
 
-def confirm_pending_exits(conn: sqlite3.Connection, home: str) -> List[str]:
+def confirm_pending_exits(
+    conn: sqlite3.Connection,
+    home: str,
+    testing_mode: Optional[bool] = None,
+) -> List[str]:
     """Take the confirming scan of exited runs once it is due (meshd's 200 ms loop).
 
     Without this the second empty scan would wait for the next 1 s watch pass; a
@@ -2951,7 +3401,7 @@ def confirm_pending_exits(conn: sqlite3.Connection, home: str) -> List[str]:
                 _CLEAR.pop(run_id, None)
                 continue
             try:
-                if _watch_one(conn, home, run):
+                if _call_watch_one(conn, home, run, testing_mode):
                     closed.append(run_id)
             except Exception as exc:
                 _log_meshd(home, f"exit confirmation failed for run {run_id}: {type(exc).__name__}: {exc}")
@@ -2964,7 +3414,11 @@ def confirm_pending_exits(conn: sqlite3.Connection, home: str) -> List[str]:
     return closed
 
 
-def watch_launch_runs(conn: sqlite3.Connection, home: str) -> List[str]:
+def watch_launch_runs(
+    conn: sqlite3.Connection,
+    home: str,
+    testing_mode: Optional[bool] = None,
+) -> List[str]:
     """One supervisor pass over active launch-mode runs (plan §11.3, every 1 s).
 
     Returns the ids of runs closed in this pass.
@@ -2981,14 +3435,14 @@ def watch_launch_runs(conn: sqlite3.Connection, home: str) -> List[str]:
     closed: List[str] = []
     refresh_persisted_holds(conn, home)
     try:
-        closed.extend(retry_spawn_aborts(conn, home))
+        closed.extend(retry_spawn_aborts(conn, home, testing_mode=testing_mode))
     except Exception as exc:
         _log_meshd(home, f"spawn abort retry failed: {type(exc).__name__}: {exc}")
     try:
         from mesh.daemon import recovery
 
         if recovery.DEFERRED:
-            closed.extend(recovery.retry_deferred(conn, home))
+            closed.extend(recovery.retry_deferred(conn, home, testing_mode=testing_mode))
     except Exception as exc:
         _log_meshd(home, f"deferred recovery retry failed: {type(exc).__name__}: {exc}")
     runs = conn.execute(
@@ -3003,7 +3457,7 @@ def watch_launch_runs(conn: sqlite3.Connection, home: str) -> List[str]:
             # The merge pipeline owns its run (no process; m2-r5). Explicit skip (m2-plan risk 5).
             continue
         try:
-            outcome = _watch_one(conn, home, run)
+            outcome = _watch_one(conn, home, run, testing_mode=testing_mode)
         except Exception as exc:  # one run must not stop the others
             _log_meshd(home, f"supervisor watch failed for run {run['id']}: {type(exc).__name__}: {exc}")
             continue
@@ -3018,7 +3472,11 @@ def watch_launch_runs(conn: sqlite3.Connection, home: str) -> List[str]:
     return closed
 
 
-def advance_terminations(conn: sqlite3.Connection, home: str) -> List[str]:
+def advance_terminations(
+    conn: sqlite3.Connection,
+    home: str,
+    testing_mode: Optional[bool] = None,
+) -> List[str]:
     """Advance only the runs being terminated (meshd's 200 ms loop, §11.4)."""
     closed: List[str] = []
     for run_id, t in terminate.active().items():
@@ -3031,17 +3489,22 @@ def advance_terminations(conn: sqlite3.Connection, home: str) -> List[str]:
             # never goes through T7/T8.
             continue
         try:
-            if _advance(conn, home, run, t):
+            if _advance(conn, home, run, t, testing_mode=testing_mode):
                 closed.append(run_id)
         except CloseHeld as held:
             hold_close(conn, home, run, held)
         except Exception as exc:
             _log_meshd(home, f"termination step failed for run {run_id}: {type(exc).__name__}: {exc}")
-    closed.extend(confirm_pending_exits(conn, home))
+    closed.extend(confirm_pending_exits(conn, home, testing_mode=testing_mode))
     return closed
 
 
-def _watch_lead_turn(conn: sqlite3.Connection, home: str, run: Mapping[str, Any]) -> Optional[str]:
+def _watch_lead_turn(
+    conn: sqlite3.Connection,
+    home: str,
+    run: Mapping[str, Any],
+    testing_mode: Optional[bool] = None,
+) -> Optional[str]:
     """One watch pass over a lead turn (m2-r9, §12.4).
 
     A lead turn has no task, so it never reaches T7/T8: exit handling is
@@ -3052,45 +3515,108 @@ def _watch_lead_turn(conn: sqlite3.Connection, home: str, run: Mapping[str, Any]
 
     t = terminate.get(run["id"])
     if t is not None:
-        return _advance(conn, home, run, t)
+        return _advance(conn, home, run, t, testing_mode=testing_mode)
     liveness = _effective_wrapper_liveness(run)
     if liveness in ("alive", "uncertain"):
-        if liveness == "uncertain":
+        if liveness == "alive":
+            track_adopted_seen(run, home)
+        else:
             _clear_check(run["id"]).invalidate()
         reason = lead_turns.lead_turn_termination_reason(conn, run)
         if reason:
-            t = _begin_termination(conn, home, run, reason)
-            return _advance(conn, home, run, t)
-        _renew_lead_turn_lease(conn, run)
+            t = _begin_termination(conn, home, run, reason, seen=seen_for(run, home))
+            return _advance(conn, home, run, t, testing_mode=testing_mode)
+        _call_renew_lead_turn_lease(conn, run, testing_mode)
         return None
     exit_info = _read_json_file(os.path.join(run["run_dir"], "exit.json"))
     # Scan before reaping, exactly as for a task run (review m1c-run4 §2).
-    leftovers = terminate.run_targets(run["id"], run["pgid"], run["wrapper_pid"], run["proc_starttime"])
-    if leftovers:
+    snap = seen_snapshot(run, home)
+    seen = snap.members
+    leftovers = terminate.run_targets(run["id"], run["pgid"], run["wrapper_pid"], run["proc_starttime"], seen)
+    if not leftovers:
+        if getattr(leftovers, "uncertain", False):
+            _clear_check(run["id"]).invalidate()
+            _call_renew_lead_turn_lease(conn, run, testing_mode)
+            return None
+        if snap.changed or snapshot_hold(run, snap):
+            _clear_check(run["id"]).invalidate()
+            _reap_wrapper(run)
+            _call_renew_lead_turn_lease(conn, run, testing_mode)
+            return None
+        # One empty scan is not "nothing left" (m3-runtargets-race): the run closes on a
+        # second empty scan at least POLL_S later, taken on a later tick (no sleeping here;
+        # the 200 ms termination loop takes it, see confirm_pending_exits). The wrapper stays
+        # unreaped until then, so its pgid stays trusted for that scan.
+        if not _clear_check(run["id"]).observe(leftovers):
+            _call_renew_lead_turn_lease(conn, run, testing_mode)
+            return None
         _CLEAR.pop(run["id"], None)
-        # Hand the identities this scan found to begin() (review #20b L1 handoff): its
-        # own re-scan may no longer reach an escapee whose parent exited in between.
-        t = _begin_termination(conn, home, run, "leftovers", leftovers=True, seen=dict(leftovers))
+        _reap_wrapper(run)
+    else:
+        _CLEAR.pop(run["id"], None)
+    cancel_reason = lead_turns.lead_turn_termination_reason(conn, run)
+    override_reason = cancel_reason if cancel_reason in ("project_cancelled", "lead_superseded") else None
+    if leftovers:
+        # Hand the identities recorded for the run plus every identity this scan found to
+        # begin() (review #20b L1 handoff).
+        handoff = dict(seen)
+        handoff.update(leftovers)
+        t = _begin_termination(
+            conn, home, run, override_reason or "leftovers",
+            leftovers=(override_reason is None), seen=handoff,
+        )
         if not getattr(leftovers, "uncertain", False) and not getattr(t, "scan_uncertain", False):
             _reap_wrapper(run)
-        return _advance(conn, home, run, t)
-    # One empty scan is not "nothing left" (m3-runtargets-race): the run closes on a
-    # second empty scan at least POLL_S later, taken on a later tick (no sleeping here;
-    # the 200 ms termination loop takes it, see confirm_pending_exits). The wrapper stays
-    # unreaped until then, so its pgid stays trusted for that scan.
-    if not _clear_check(run["id"]).observe(leftovers):
+        return _advance(conn, home, run, t, hold_tick=snap.changed, testing_mode=testing_mode)
+    if override_reason is not None:
+        pgid, wst = close_identity(run)
+        t_synth = terminate.Termination(
+            run_id=run["id"],
+            pgid=run["pgid"] or pgid,
+            wrapper_pid=run["wrapper_pid"] or pgid,
+            end_reason=override_reason,
+            grace_s=0.0,
+            wrapper_starttime=run["proc_starttime"] if run["proc_starttime"] is not None else wst,
+            seen=dict(seen),
+        )
+        return _finalize_lead_turn_termination(
+            conn, home, run, t_synth, exit_info, testing_mode=testing_mode
+        )
+    tmode = _testing_mode() if testing_mode is None else bool(testing_mode)
+    return lead_turns.finish_lead_turn_committed(conn, home, run, exit_info, tmode)
+
+
+def _call_renew_meshd_lease(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: str,
+    testing_mode: Optional[bool],
+) -> None:
+    if testing_mode is None:
+        _renew_meshd_lease(conn, task_id, run_id)
+    else:
+        _renew_meshd_lease(conn, task_id, run_id, testing_mode=testing_mode)
+
+
+def _call_renew_lead_turn_lease(
+    conn: sqlite3.Connection,
+    run: Mapping[str, Any],
+    testing_mode: Optional[bool],
+) -> None:
+    if testing_mode is None:
         _renew_lead_turn_lease(conn, run)
-        return None
-    _CLEAR.pop(run["id"], None)
-    _reap_wrapper(run)
-    with transaction(conn):
-        return lead_turns.finish_lead_turn(conn, home, run, exit_info, _testing_mode())
+    else:
+        _renew_lead_turn_lease(conn, run, testing_mode=testing_mode)
 
 
-def _renew_lead_turn_lease(conn: sqlite3.Connection, run: Mapping[str, Any]) -> None:
+def _renew_lead_turn_lease(
+    conn: sqlite3.Connection,
+    run: Mapping[str, Any],
+    testing_mode: Optional[bool] = None,
+) -> None:
     """Keep the `leadturn:<prj>` lease alive while the turn runs (§11.5)."""
     now_ts = time.time()
-    ttl = get_lease_ttl_s(conn)
+    ttl = get_lease_ttl_s(conn, testing_mode=testing_mode)
     with transaction(conn):
         conn.execute(
             "UPDATE leases SET heartbeat_at = ?, expires_at = ? "
@@ -3100,29 +3626,44 @@ def _renew_lead_turn_lease(conn: sqlite3.Connection, run: Mapping[str, Any]) -> 
         )
 
 
-def _watch_one(conn: sqlite3.Connection, home: str, run: Mapping[str, Any]) -> Optional[str]:
+def _watch_one(
+    conn: sqlite3.Connection,
+    home: str,
+    run: Mapping[str, Any],
+    testing_mode: Optional[bool] = None,
+) -> Optional[str]:
     """One watch step; a close refused by the close-safety gate turns into a hold."""
     try:
-        return _watch_one_inner(conn, home, run)
+        return _watch_one_inner(conn, home, run, testing_mode=testing_mode)
     except CloseHeld as held:
         hold_close(conn, home, run, held)
         return None
 
 
-def _watch_one_inner(conn: sqlite3.Connection, home: str, run: Mapping[str, Any]) -> Optional[str]:
-    if run["kind"] == "lead_turn":
-        return _watch_lead_turn(conn, home, run)
+def _watch_one_inner(
+    conn: sqlite3.Connection,
+    home: str,
+    run: Mapping[str, Any],
+    testing_mode: Optional[bool] = None,
+) -> Optional[str]:
     t = terminate.get(run["id"])
     if t is not None:
-        return _advance(conn, home, run, t)
+        return _advance(conn, home, run, t, testing_mode=testing_mode)
     try:
-        return _watch_task_run(conn, home, run)
+        if run["kind"] == "lead_turn":
+            return _watch_lead_turn(conn, home, run, testing_mode=testing_mode)
+        return _watch_task_run(conn, home, run, testing_mode=testing_mode)
     finally:
         if is_adopted(run):
             report_seen_unusable(conn, run, home)
 
 
-def _watch_task_run(conn: sqlite3.Connection, home: str, run: Mapping[str, Any]) -> Optional[str]:
+def _watch_task_run(
+    conn: sqlite3.Connection,
+    home: str,
+    run: Mapping[str, Any],
+    testing_mode: Optional[bool] = None,
+) -> Optional[str]:
     task = conn.execute("SELECT * FROM tasks WHERE id = ?;", (run["task_id"],)).fetchone()
     exit_path = os.path.join(run["run_dir"], "exit.json")
     liveness = _effective_wrapper_liveness(run)
@@ -3131,20 +3672,25 @@ def _watch_task_run(conn: sqlite3.Connection, home: str, run: Mapping[str, Any])
             track_adopted_seen(run, home)
         else:
             _clear_check(run["id"]).invalidate()
-        reason = termination_reason(conn, run, task)
+        reason = termination_reason(conn, run, task, testing_mode=testing_mode)
         if reason:
             t = _begin_termination(conn, home, run, reason, seen=seen_for(run, home))
-            return _advance(conn, home, run, t)
-        _renew_meshd_lease(conn, run["task_id"], run["id"])
+            return _advance(conn, home, run, t, testing_mode=testing_mode)
+        _call_renew_meshd_lease(conn, run["task_id"], run["id"], testing_mode)
         return None
     exit_info = _read_json_file(exit_path)
     git = None
-    if _needs_submit_git(run, task, exit_info):
+    if (
+        _needs_submit_git(run, task, exit_info)
+        if testing_mode is None
+        else _needs_submit_git(run, task, exit_info, testing_mode=testing_mode)
+    ):
         # §10.4 (m2-r4): a code task about to be auto-submitted gets `deliverable.git`,
         # collected in a worker thread. Until it is ready the run stays open and the
         # wrapper stays unreaped, so the scan-before-reap order below is unchanged.
-        state = _submit_git_state(run, task)
+        state = _submit_git_state(run, task, _project_repo_path(conn, task))
         if state is None:
+            _call_renew_meshd_lease(conn, run["task_id"], run["id"], testing_mode)
             return None
         git = state["git"]
     # Scan before reaping (review m1c-run4 §2): while meshd's own wrapper is an unreaped
@@ -3162,7 +3708,7 @@ def _watch_task_run(conn: sqlite3.Connection, home: str, run: Mapping[str, Any])
             # ClickUp P1-1: an uncertain scan is never an empty scan; keep the wrapper
             # unreaped so its pgid stays trusted on the next tick.
             _clear_check(run["id"]).invalidate()
-            _renew_meshd_lease(conn, run["task_id"], run["id"])
+            _call_renew_meshd_lease(conn, run["task_id"], run["id"], testing_mode)
             return None
         if snap.changed or snapshot_hold(run, snap):
             # r4b: seen.json is unusable and the run's group/session is still occupied:
@@ -3172,14 +3718,14 @@ def _watch_task_run(conn: sqlite3.Connection, home: str, run: Mapping[str, Any])
             # never a confirming empty scan (review #20 L3).
             _clear_check(run["id"]).invalidate()
             _reap_wrapper(run)
-            _renew_meshd_lease(conn, run["task_id"], run["id"])
+            _call_renew_meshd_lease(conn, run["task_id"], run["id"], testing_mode)
             return None
         # One empty scan is not "nothing left" (m3-runtargets-race): exactly one
         # confirmation step per real scan; the second empty scan, at least POLL_S
         # later, comes from a later tick (confirm_pending_exits, 200 ms loop). The
         # wrapper is not reaped before that, so its pgid stays trusted.
         if not _clear_check(run["id"]).observe(leftovers):
-            _renew_meshd_lease(conn, run["task_id"], run["id"])
+            _call_renew_meshd_lease(conn, run["task_id"], run["id"], testing_mode)
             return None
         _CLEAR.pop(run["id"], None)
         _reap_wrapper(run)
@@ -3190,7 +3736,7 @@ def _watch_task_run(conn: sqlite3.Connection, home: str, run: Mapping[str, Any])
         # terminate them at once; the run closes when the release condition holds.
         reason = "leftovers"
         if task is not None and task["status"] == "cancelling":
-            reason = termination_reason(conn, run, task) or "cancelled"
+            reason = termination_reason(conn, run, task, testing_mode=testing_mode) or "cancelled"
         # The members recorded for the run plus every identity this scan found (review
         # #20b L1 handoff): begin() re-scans, and an escapee found only through a parent
         # that exited in between would otherwise be lost. begin() keeps only entries
@@ -3211,21 +3757,28 @@ def _watch_task_run(conn: sqlite3.Connection, home: str, run: Mapping[str, Any])
             and exit_info.get("signal") is None
             and not exit_info.get("capture_error")  # PR #40 r1: lost output never submits
             and not _pending_failure(run)
-            and vendor_failure_meaning(run["run_dir"], run["adapter"]) is None
+            and (
+                vendor_failure_meaning(run["run_dir"], run["adapter"])
+                if testing_mode is None
+                else vendor_failure_meaning(run["run_dir"], run["adapter"], testing_mode=testing_mode)
+            ) is None
         ):
             # T7 auto-submit may happen while leftovers are terminated; the lease is kept
             # until the release condition holds (allowed by I1, §11.3).
             with transaction(conn):
-                _task_auto_submit(conn, task, run, git=git)
-        return _advance(conn, home, run, t, hold_tick=snap.changed)
-    return _finish_run(conn, run, exit_info, git=git)
+                _task_auto_submit(conn, task, run, git=git, testing_mode=testing_mode)
+        with _WS_PREP_LOCK:
+            _GIT_INFO.pop(run["id"], None)
+        return _advance(conn, home, run, t, hold_tick=snap.changed, testing_mode=testing_mode)
+    return _call_finish_run(conn, run, exit_info, git=git, testing_mode=testing_mode)
 
 
 _GIT_INFO: Dict[str, Dict[str, Any]] = {}
 
 
 def _needs_submit_git(run: Mapping[str, Any], task: Optional[Mapping[str, Any]],
-                      exit_info: Optional[Dict[str, Any]]) -> bool:
+                      exit_info: Optional[Dict[str, Any]],
+                      testing_mode: Optional[bool] = None) -> bool:
     """True when this exit will auto-submit a code task (T7 at exit 0, §11.3)."""
     return bool(
         task is not None
@@ -3236,13 +3789,18 @@ def _needs_submit_git(run: Mapping[str, Any], task: Optional[Mapping[str, Any]],
         and exit_info.get("signal") is None
         and not exit_info.get("capture_error")
         and not _pending_failure(run)
-        and vendor_failure_meaning(run["run_dir"], run["adapter"]) is None
+        and (
+            vendor_failure_meaning(run["run_dir"], run["adapter"])
+            if testing_mode is None
+            else vendor_failure_meaning(run["run_dir"], run["adapter"], testing_mode=testing_mode)
+        ) is None
     )
 
 
-def _git_info_worker(entry: Dict[str, Any], workspace: str, branch: Optional[str], base: Optional[str]) -> None:
+def _git_info_worker(entry: Dict[str, Any], workspace: str, branch: Optional[str], base: Optional[str],
+                     repo_path: Optional[str] = None) -> None:
     try:
-        git = submission_git_info(workspace, branch, base)
+        git = submission_git_info(workspace, branch, base, repo_path=repo_path)
     except Exception as exc:  # noqa: BLE001 - never blocks the submit
         git = {"branch": branch, "base_commit": base,
                "error": {"step": "collect", "reason": "exception", "stderr_tail": f"{type(exc).__name__}: {exc}"}}
@@ -3261,7 +3819,17 @@ def _evict_git_info(active_run_ids: Set[str]) -> None:
         _VENDOR_MEANING.pop(rd, None)
 
 
-def _submit_git_state(run: Mapping[str, Any], task: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+def _project_repo_path(conn: sqlite3.Connection, task: Mapping[str, Any]) -> Optional[str]:
+    """The repository a code task's worktree must belong to (r4 P2-3), if known."""
+    try:
+        row = conn.execute("SELECT repo_path FROM projects WHERE id = ?;", (task["project_id"],)).fetchone()
+        return row["repo_path"] if row is not None and isinstance(row["repo_path"], str) else None
+    except (KeyError, IndexError, TypeError, sqlite3.Error):
+        return None
+
+
+def _submit_git_state(run: Mapping[str, Any], task: Mapping[str, Any],
+                      repo_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """The finished `deliverable.git` for this run, or None while it is collected."""
     run_id = run["id"]
     with _WS_PREP_LOCK:
@@ -3277,7 +3845,7 @@ def _submit_git_state(run: Mapping[str, Any], task: Mapping[str, Any]) -> Option
         _GIT_INFO[run_id] = entry
     threading.Thread(
         target=_git_info_worker,
-        args=(entry, task["workspace_path"], task["branch"], task["base_commit"]),
+        args=(entry, task["workspace_path"], task["branch"], task["base_commit"], repo_path),
         name=f"mesh-git-{run_id}",
         daemon=True,
     ).start()

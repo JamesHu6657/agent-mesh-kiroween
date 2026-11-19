@@ -1,18 +1,19 @@
 """Asynchronous Unix-socket server, dispatch, auth, and single-instance daemon (meshd)."""
 
 import asyncio
-import collections
 import ctypes
 import fcntl
 import hashlib
 import json
 import logging
 import os
+import shutil
 import signal
 import socket
 import sys
 import time
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from collections import deque
+from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Set, Tuple
 
 import mesh.constants as c
 from mesh.core.logfile import append_line, escape_field
@@ -29,9 +30,10 @@ from mesh.core.auth import (
 from mesh.core.authz import ADAPTER_CMDS, ROSTER_READ_CMDS, UNAUTH_CMDS, check_authz
 from mesh.core.canonical import canonical_json
 from mesh.core.clock import now_iso_utc, now_monotonic
-from mesh.core.db import connect_db
+from mesh.core.db import connect_db, parse_schema_version
 from mesh.core.events import insert_event
 from mesh.core.ids import new_id
+from mesh.core.lead_actions import IDEMPOTENCY_KEY_RE
 from mesh.core.leases import task_start_replay_matches
 from mesh.core.paths import (
     check_home_permissions,
@@ -40,6 +42,7 @@ from mesh.core.paths import (
     get_install_root,
     refuse_testing_on_default_home,
     resolve_home,
+    rmtree_allow_readonly,
 )
 from mesh.core.schema import CURRENT_SCHEMA_VERSION
 from mesh.daemon.handlers.base import Effect, HandlerContext, HandlerResult
@@ -80,9 +83,15 @@ from mesh.daemon.handlers.project import (
     handle_project_update,
     handle_project_wait,
 )
-from mesh.daemon.handlers.inbox import handle_inbox_ack, handle_inbox_list, handle_inbox_wait
+from mesh.daemon.handlers.inbox import (
+    handle_inbox_ack,
+    handle_inbox_list,
+    handle_inbox_wait,
+    recheck_tx_credential_and_authz,
+)
 from mesh.daemon.handlers.event import handle_event_list, handle_event_tail_live
 from mesh.daemon.handlers.approval import (
+    check_approval_replay_authz,
     handle_approval_approve,
     handle_approval_cancel,
     handle_approval_check,
@@ -120,6 +129,7 @@ from mesh.daemon.handlers.dep import (
     handle_dep_remove,
 )
 from mesh.daemon.handlers.audit import handle_audit_verify
+from mesh.daemon.handlers import run as run_handlers
 from mesh.daemon.handlers.run import (
     handle_run_list,
     handle_run_log,
@@ -130,13 +140,14 @@ from mesh.daemon.handlers.run import (
     handle_workspace_prune,
     handle_workspace_delete,
     handle_workspace_show,
+    prepare_workspace_prune,
 )
 from mesh.daemon.scheduler import _sweep_error, reset_scheduler_errors, run_scheduler_tick, scheduler_errors_view
 from mesh.core.policy import parse_positive_int
 from mesh.core.redact import redact, redact_value
 from mesh.core.settings import validate_setting
 from mesh.core.repos import add_lead_repo_worktree, project_repo_paths
-from mesh.core.workspaces import ensure_run_dir, ensure_workspace_dir
+from mesh.core.workspaces import ensure_run_dir, ensure_workspace_dir, find_ws_reserved_idempotency
 
 # Linux PR_SET_CHILD_SUBREAPER. 34 is PR_SET_THP_DISABLE and yields EINVAL (M1a bug).
 PR_SET_CHILD_SUBREAPER = 36
@@ -178,8 +189,19 @@ PLANNED_COMMAND_MILESTONES = {
 REAP_INTERVAL_S = 5.0
 
 
-def _start_replay_ok(cmd: str, args: Dict[str, Any], approval: Any, idempotency_key: Optional[str],
-                     stored_hash: str, stored_response_json: str) -> bool:
+def _start_replay_ok(
+    cmd: str,
+    args: Dict[str, Any],
+    approval: Any,
+    idempotency_key: Optional[str],
+    stored_hash: str,
+    stored_response_json: str,
+    *,
+    via: Optional[str] = None,
+    user_statement: Any = None,
+    evidence_ref: Any = None,
+    if_version: Any = None,
+) -> bool:
     """Sakana PR #4 P2-3: a `task.start` retry that differs from the stored request only in
     its key-derived default session replays the original start (see
     ``task_start_replay_matches``). Every other command keeps the exact-hash rule."""
@@ -194,6 +216,12 @@ def _start_replay_ok(cmd: str, args: Dict[str, Any], approval: Any, idempotency_
         doc: Dict[str, Any] = {"cmd": cmd, "args": new_args}
         if approval:
             doc["approval"] = approval
+        if via == "relayed" and user_statement is not None:
+            doc["user_statement"] = user_statement
+        if evidence_ref is not None:
+            doc["evidence_ref"] = evidence_ref
+        if if_version is not None:
+            doc["if_version"] = if_version
         try:
             return hashlib.sha256(canonical_json(doc)).hexdigest() == stored_hash
         except ValueError:
@@ -203,17 +231,83 @@ def _start_replay_ok(cmd: str, args: Dict[str, Any], approval: Any, idempotency_
 
 
 def idempotency_partition(principal: Dict[str, Any], via: Optional[str]) -> str:
-    """Key the idempotency cache by effective credential scope, not just principal.
-
-    Pre-public review P2: run tokens of one principal scoped to different projects
-    shared a cache row, so a project-A token could replay a cached project-B response.
-    Scoped run tokens get their own partition; other callers keep the principal id.
-    """
+    """Key the idempotency cache by effective credential scope and channel, not just principal."""
     pid = principal["id"]
-    scope = principal.get("scope") if via == "run_token" else None
-    if scope:
-        return pid + "#scope:" + hashlib.sha256(canonical_json(scope)).hexdigest()[:32]
+    if via == "run_token":
+        scope = principal.get("scope")
+        scope_doc = scope if isinstance(scope, dict) else {}
+        return pid + "#scope:" + hashlib.sha256(canonical_json(scope_doc)).hexdigest()[:32]
+    if via == "relayed":
+        return pid + "#relayed"
     return pid
+
+
+_NON_MUTATING_CMDS = frozenset({
+    "daemon.status", "whoami", "version",
+    "config.get", "config.list",
+    "agent.list", "agent.show", "agent.token.list",
+    "adapter.list", "adapter.show", "adapter.models",
+    "project.list", "project.show", "project.leads", "project.wait",
+    "task.list", "task.show", "task.log", "task.wait", "dep.list",
+    "inbox.list", "inbox.wait",
+    "run.list", "run.show", "run.log", "run.attach_info",
+    "workspace.list", "workspace.show",
+    "approval.list", "approval.show", "approval.check",
+    "event.list", "event.tail", "audit.verify", "doctor",
+})
+
+
+def _resolve_idempotency_scope(
+    conn: Any,
+    cmd: str,
+    args: Any,
+    stored_envelope: Any,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Extract (project_id, task_id) for resource-scoped authz re-check on idempotent replay."""
+    proj_id: Optional[str] = None
+    tsk_id: Optional[str] = None
+    if isinstance(args, dict):
+        if isinstance(args.get("project_id"), str) and args["project_id"]:
+            proj_id = args["project_id"]
+        elif isinstance(args.get("project"), str) and args["project"]:
+            prow = conn.execute(
+                "SELECT id FROM projects WHERE id = ? OR name = ? LIMIT 1;",
+                (args["project"], args["project"]),
+            ).fetchone()
+            if prow is not None:
+                proj_id = prow["id"]
+        if isinstance(args.get("task_id"), str) and args["task_id"]:
+            tsk_id = args["task_id"]
+        elif isinstance(args.get("task"), str) and args["task"]:
+            tsk_id = args["task"]
+    data = stored_envelope.get("data") if isinstance(stored_envelope, dict) else None
+    if isinstance(data, dict):
+        if not proj_id and isinstance(data.get("project_id"), str) and data["project_id"]:
+            proj_id = data["project_id"]
+        if not tsk_id and isinstance(data.get("task_id"), str) and data["task_id"]:
+            tsk_id = data["task_id"]
+        if not tsk_id and isinstance(data.get("task"), dict) and isinstance(data["task"].get("id"), str):
+            tsk_id = data["task"]["id"]
+        if not proj_id and isinstance(data.get("project"), dict) and isinstance(data["project"].get("id"), str):
+            proj_id = data["project"]["id"]
+    if tsk_id and not proj_id:
+        trow = conn.execute("SELECT project_id FROM tasks WHERE id = ?;", (tsk_id,)).fetchone()
+        if trow is not None:
+            proj_id = trow["project_id"]
+    if not proj_id and not tsk_id and isinstance(args, dict):
+        if isinstance(args.get("approval_id"), str) and args["approval_id"]:
+            arow = conn.execute("SELECT project_id, task_id FROM approvals WHERE id = ?;", (args["approval_id"],)).fetchone()
+            if arow is not None:
+                proj_id, tsk_id = arow["project_id"], arow["task_id"]
+        elif isinstance(args.get("run_id"), str) and args["run_id"]:
+            rrow = conn.execute("SELECT project_id, task_id FROM runs WHERE id = ?;", (args["run_id"],)).fetchone()
+            if rrow is not None:
+                proj_id, tsk_id = rrow["project_id"], rrow["task_id"]
+    if cmd in ("intake.submit", "project.create") and not (
+        isinstance(args, dict) and (args.get("project") or args.get("project_id"))
+    ):
+        return None, None
+    return proj_id, tsk_id
 
 
 def _idempotency_record(cmd: str, envelope: Dict[str, Any]) -> Dict[str, Any]:
@@ -228,6 +322,55 @@ def _idempotency_record(cmd: str, envelope: Dict[str, Any]) -> Dict[str, Any]:
     if cmd == "agent.token.issue" and isinstance(data, dict) and "token" in data:
         data["token"] = "[REDACTED:shown_once]"
     return stored
+
+
+def _idempotency_cutoff_iso(now_ts: Optional[float] = None) -> str:
+    ts = time.time() if now_ts is None else now_ts
+    return now_iso_utc(ts - c.IDEMPOTENCY_TTL_S)
+
+
+def _lookup_live_idempotency(
+    conn: Any,
+    principal_id: str,
+    key: str,
+    now_ts: Optional[float] = None,
+) -> Optional[Any]:
+    cutoff = _idempotency_cutoff_iso(now_ts)
+    return conn.execute(
+        "SELECT request_hash, response_json, exit_code FROM idempotency "
+        "WHERE principal_id = ? AND key = ? AND created_at >= ?;",
+        (principal_id, key, cutoff),
+    ).fetchone()
+
+
+def _store_idempotency_row(
+    conn: Any,
+    principal_id: str,
+    key: str,
+    cmd: str,
+    req_hash: str,
+    response_json: str,
+    exit_code: int,
+    now_ts: Optional[float] = None,
+    *,
+    ignore_conflict: bool = False,
+) -> bool:
+    ts = time.time() if now_ts is None else now_ts
+    cutoff = now_iso_utc(ts - c.IDEMPOTENCY_TTL_S)
+    now = now_iso_utc(ts)
+    conn.execute(
+        "DELETE FROM idempotency WHERE principal_id = ? AND key = ? AND created_at < ?;",
+        (principal_id, key, cutoff),
+    )
+    sql = (
+        "INSERT OR IGNORE INTO idempotency (principal_id, key, cmd, request_hash, response_json, exit_code, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?);"
+        if ignore_conflict else
+        "INSERT INTO idempotency (principal_id, key, cmd, request_hash, response_json, exit_code, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?);"
+    )
+    cur = conn.execute(sql, (principal_id, key, cmd, req_hash, response_json, exit_code, now))
+    return cur.rowcount == 1
 
 
 def _kill_failed_runs() -> List[Dict[str, Any]]:
@@ -275,45 +418,175 @@ def dispatch_internal_request(ctx: HandlerContext, idempotency_key: Optional[str
     conn = ctx.conn
     cmd = ctx.cmd
     principal_id = idempotency_partition(ctx.principal, ctx.via)
+    dry_run = bool(getattr(ctx, "dry_run", False))
+
+    def _err_env(err: MeshError) -> Dict[str, Any]:
+        env = err.to_envelope(request_id=ctx.request_id)
+        if dry_run:
+            env["dry_run"] = True
+        return env
+
+    approval_val = getattr(ctx, "approval", None)
+    if approval_val is not None and not isinstance(approval_val, str):
+        return _err_env(MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Field 'approval' must be a string",
+            details={"param": "approval"},
+        ))
+    user_stmt = getattr(ctx, "user_statement", None)
+    if ctx.via == "relayed":
+        if not isinstance(user_stmt, str) or not user_stmt.strip():
+            return _err_env(MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message="Field '--user-statement' is required and non-empty when using --relayed",
+                details={"param": "user_statement"},
+            ))
+        if len(user_stmt) > 4000:
+            return _err_env(MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message="User statement exceeds 4000 character limit",
+                details={"param": "user_statement"},
+            ))
+    ev_ref = getattr(ctx, "evidence_ref", None)
+    if ev_ref is not None and (not isinstance(ev_ref, str) or len(ev_ref) > 4000):
+        return _err_env(MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Field 'evidence_ref' must be a string up to 4000 characters",
+            details={"param": "evidence_ref"},
+        ))
+    top_if_version = getattr(ctx, "if_version", None)
+    if top_if_version is not None and (isinstance(top_if_version, bool) or not isinstance(top_if_version, int)):
+        return _err_env(MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Field 'if_version' must be an integer",
+            details={"param": "if_version"},
+        ))
+
+    relayed_by = (getattr(ctx, "relayed_by", None) or ctx.principal.get("name")) if ctx.via == "relayed" else None
+    try:
+        check_authz(
+            conn,
+            cmd,
+            ctx.principal,
+            ctx.actor_kind,
+            ctx.via,
+            relayed_by=relayed_by if isinstance(relayed_by, str) else None,
+            resource_resolved=False,
+        )
+    except MeshError as exc:
+        return _err_env(exc)
+
     cmd_and_args: Dict[str, Any] = {"cmd": cmd, "args": ctx.args}
-    if ctx.approval:
-        cmd_and_args["approval"] = ctx.approval  # as handle_client hashes it (§13.4)
+    if approval_val:
+        cmd_and_args["approval"] = approval_val  # as handle_client hashes it (§13.4)
+    if ctx.via == "relayed" and user_stmt is not None:
+        cmd_and_args["user_statement"] = user_stmt
+    if ev_ref is not None:
+        cmd_and_args["evidence_ref"] = ev_ref
+    if top_if_version is not None:
+        cmd_and_args["if_version"] = top_if_version
     try:
         req_hash = hashlib.sha256(canonical_json(cmd_and_args)).hexdigest()
     except ValueError as ve:
-        return MeshError(code=c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
-                         message=str(ve)).to_envelope(request_id=ctx.request_id)
-    if idempotency_key:
-        irow = conn.execute(
-            "SELECT request_hash, response_json, exit_code FROM idempotency WHERE principal_id = ? AND key = ?;",
-            (principal_id, idempotency_key),
-        ).fetchone()
+        return _err_env(MeshError(code=c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message=str(ve)))
+    if idempotency_key and not dry_run and cmd not in _NON_MUTATING_CMDS:
+        irow = _lookup_live_idempotency(conn, principal_id, idempotency_key)
         if irow:
             if irow["request_hash"] != req_hash and not _start_replay_ok(
-                    cmd, ctx.args, ctx.approval, idempotency_key, irow["request_hash"], irow["response_json"]):
-                return MeshError(
+                    cmd, ctx.args, approval_val, idempotency_key, irow["request_hash"], irow["response_json"],
+                    via=ctx.via, user_statement=user_stmt, evidence_ref=ev_ref, if_version=top_if_version):
+                return _err_env(MeshError(
                     code=c.IDEMPOTENCY_KEY_REUSED,
                     exit_code=c.EXIT_CONFLICT,
                     message=f"Idempotency key '{idempotency_key}' reused with different request parameters",
-                ).to_envelope(request_id=ctx.request_id)
+                ))
             stored = json.loads(irow["response_json"])
+            r_proj, r_task = _resolve_idempotency_scope(conn, cmd, ctx.args, stored)
+            try:
+                check_authz(
+                    conn,
+                    cmd,
+                    ctx.principal,
+                    ctx.actor_kind,
+                    ctx.via,
+                    project_id=r_proj,
+                    task_id=r_task,
+                    relayed_by=relayed_by if isinstance(relayed_by, str) else None,
+                    resource_resolved=(r_proj is not None or r_task is not None),
+                )
+                check_approval_replay_authz(conn, cmd, ctx.principal, ctx.actor_kind, ctx.via, ctx.args, stored)
+            except MeshError as exc:
+                return _err_env(exc)
             stored["idempotent_replay"] = True
             stored.setdefault("exit_code", irow["exit_code"])
             return stored
     if cmd == "task.merge":
-        return _queue_internal_merge(ctx)
+        effects_before = len(ctx.effects) if isinstance(getattr(ctx, "effects", None), list) else None
+        env = _queue_internal_merge(ctx)
+        if dry_run:
+            added = []
+            if effects_before is not None:
+                added = list(ctx.effects[effects_before:])
+                del ctx.effects[effects_before:]
+            if env.get("ok"):
+                return {
+                    "ok": True,
+                    "data": {"would": {"transitions": [], "events": [], "effects": [e.kind for e in added]}},
+                    "warnings": env.get("warnings", []),
+                    "request_id": ctx.request_id,
+                    "idempotent_replay": False,
+                    "dry_run": True,
+                    "exit_code": env.get("exit_code", c.EXIT_OK),
+                }
+            env["dry_run"] = True
+        return env
     handler = INTERNAL_REQUEST_HANDLERS.get(cmd)
     if handler is None:
-        return MeshError(
+        return _err_env(MeshError(
             code=c.INVALID_ARGUMENT,
             exit_code=c.EXIT_USAGE,
             message=f"Command '{cmd}' cannot run as an internal request",
             details={"cmd": cmd, "reason": "not_internal"},
-        ).to_envelope(request_id=ctx.request_id)
+        ))
 
+    if cmd == "project.deliver":
+        # Full review r3 P1-4: a lead action's deliver intent carries its idempotency key
+        # too, so recovery stores the replay of a delivery whose transaction was lost.
+        ctx.idempotency = (  # type: ignore[attr-defined]
+            {"principal_id": principal_id, "key": idempotency_key, "request_hash": req_hash}
+            if idempotency_key and not dry_run else None
+        )
+    effects_before = len(ctx.effects) if isinstance(getattr(ctx, "effects", None), list) else None
     conn.execute("SAVEPOINT internal_request;")
     try:
         res = handler(ctx)
+        if dry_run:
+            added = []
+            if effects_before is not None:
+                added = list(ctx.effects[effects_before:])
+                del ctx.effects[effects_before:]
+            conn.execute("ROLLBACK TO internal_request;")
+            conn.execute("RELEASE internal_request;")
+            return {
+                "ok": True,
+                "data": {
+                    "would": {
+                        "transitions": res.transitions,
+                        "events": res.events,
+                        "effects": [eff.kind for eff in added],
+                    }
+                },
+                "warnings": res.warnings,
+                "request_id": ctx.request_id,
+                "idempotent_replay": False,
+                "dry_run": True,
+                "exit_code": res.exit_code,
+            }
         envelope = {
             "ok": True,
             "data": res.data,
@@ -323,28 +596,39 @@ def dispatch_internal_request(ctx: HandlerContext, idempotency_key: Optional[str
             "dry_run": False,
             "exit_code": res.exit_code,
         }
-        if idempotency_key and res.exit_code not in (c.EXIT_INTERNAL, c.EXIT_APPROVAL_REQUIRED,
-                                                     c.EXIT_DAEMON_UNAVAILABLE):
-            conn.execute(
-                """INSERT INTO idempotency (principal_id, key, cmd, request_hash, response_json, exit_code, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?);""",
-                (principal_id, idempotency_key, cmd, req_hash,
-                 json.dumps(_idempotency_record(cmd, envelope)), res.exit_code, now_iso_utc()),
+        if idempotency_key and cmd not in _NON_MUTATING_CMDS and res.exit_code not in (
+            c.EXIT_INTERNAL, c.EXIT_APPROVAL_REQUIRED, c.EXIT_DAEMON_UNAVAILABLE
+        ):
+            _store_idempotency_row(
+                conn,
+                principal_id,
+                idempotency_key,
+                cmd,
+                req_hash,
+                json.dumps(_idempotency_record(cmd, envelope)),
+                res.exit_code,
             )
     except MeshError as exc:
-        if exc.exit_code != c.EXIT_APPROVAL_REQUIRED:
+        if exc.exit_code != c.EXIT_APPROVAL_REQUIRED or dry_run:
             conn.execute("ROLLBACK TO internal_request;")
+            if effects_before is not None:
+                del ctx.effects[effects_before:]
         conn.execute("RELEASE internal_request;")
-        return exc.to_envelope(request_id=ctx.request_id)
+        return _err_env(exc)
     except Exception as exc:  # noqa: BLE001 - reported like handle_client's rc 1
         conn.execute("ROLLBACK TO internal_request;")
+        if effects_before is not None:
+            del ctx.effects[effects_before:]
         conn.execute("RELEASE internal_request;")
-        return {
+        err_env: Dict[str, Any] = {
             "ok": False,
             "error": {"code": c.INTERNAL_ERROR, "message": _redact_msg(f"Daemon unexpected error: {exc}"), "details": {}},
             "exit_code": c.EXIT_INTERNAL,
             "request_id": ctx.request_id,
         }
+        if dry_run:
+            err_env["dry_run"] = True
+        return err_env
     conn.execute("RELEASE internal_request;")
     return envelope
 
@@ -427,8 +711,9 @@ class DaemonServer:
         self._last_reap = 0.0
         self._notify_cond: Optional[asyncio.Condition] = None
         self._lead_merge_tasks: Set[asyncio.Future] = set()
-        # Carbon P2-6: queued lead merges of one project run one at a time, in queue order.
-        self._lead_merge_queues: Dict[str, "collections.deque[Dict[str, Any]]"] = {}
+        self._project_merge_queues: Dict[str, Deque[Dict[str, Any]]] = {}
+        self._project_merge_workers: Dict[str, asyncio.Future] = {}
+        self._project_merge_inflight_reqs: Set[str] = set()
         # Full review P1 (daemon-rest): shutdown waits for these before it releases
         # meshd.lock and closes SQLite. `_merge_jobs` holds the shielded
         # `_pipeline_and_finish` futures (merge.py), `_client_tasks` the socket handlers.
@@ -449,7 +734,7 @@ class DaemonServer:
 
     @property
     def notify_cond(self) -> asyncio.Condition:
-        if self._notify_cond is None:
+        if getattr(self, "_notify_cond", None) is None:
             self._notify_cond = asyncio.Condition()
         return self._notify_cond
 
@@ -482,7 +767,7 @@ class DaemonServer:
 
     def wake_scheduler(self) -> None:
         """Wake up the scheduler loop immediately."""
-        if self._scheduler_wake:
+        if getattr(self, "_scheduler_wake", None):
             self._scheduler_wake.set()
 
     async def _termination_loop(self) -> None:
@@ -501,8 +786,12 @@ class DaemonServer:
             await asyncio.sleep(delay)
             if not self.db_conn or not (terminate.active() or pending_exit_checks()):
                 continue
+            tmode = getattr(self, "testing_mode", None)
             try:
-                closed = advance_terminations(self.db_conn, self.home)
+                if tmode is None:
+                    closed = advance_terminations(self.db_conn, self.home)
+                else:
+                    closed = advance_terminations(self.db_conn, self.home, testing_mode=tmode)
             except Exception as e:
                 self.log_error(f"Termination loop failed: {e}")
                 continue
@@ -620,43 +909,54 @@ class DaemonServer:
             )
 
         self.db_conn = connect_db(db_path)
-
-        # Check configured workspaces.root if set in DB
-        configured_ws = None
         try:
-            cur = self.db_conn.execute("SELECT value_json FROM settings WHERE key = 'workspaces.root';")
+            # Check configured workspaces.root if set in DB
+            configured_ws = None
+            try:
+                cur = self.db_conn.execute("SELECT value_json FROM settings WHERE key = 'workspaces.root';")
+                row = cur.fetchone()
+                if row and row["value_json"]:
+                    configured_ws = json.loads(row["value_json"])
+            except Exception:
+                pass
+
+            if configured_ws:
+                check_install_path_secure(
+                    install_root=get_install_root(), home=self.home, workspaces_root=configured_ws
+                )
+
+            # Registered project repos must not overlap the install root either (§7.6 mitigation 7).
+            repo_paths = project_repo_paths(self.db_conn)
+            if repo_paths:
+                check_install_path_secure(install_root=get_install_root(), repo_paths=repo_paths)
+
+            # Check schema version
+            cur = self.db_conn.execute("SELECT value FROM meta WHERE key = 'schema_version';")
             row = cur.fetchone()
-            if row and row["value_json"]:
-                configured_ws = json.loads(row["value_json"])
-        except Exception:
-            pass
+            if not row:
+                raise MeshError(
+                    code=c.INTERNAL_ERROR,
+                    exit_code=c.EXIT_INTERNAL,
+                    message="Missing schema_version in database meta table",
+                )
+            raw = row["value"]
+            schema_version = parse_schema_version(raw)
+            if schema_version is None:
+                raise DbIntegrityError([f"schema_version is not an integer: {raw!r}"])
+            if schema_version > CURRENT_SCHEMA_VERSION:
+                raise SchemaTooNewError(schema_version, CURRENT_SCHEMA_VERSION)
+            if schema_version < 1:
+                raise DbIntegrityError([f"schema_version out of range: {schema_version}"])
 
-        if configured_ws:
-            check_install_path_secure(install_root=get_install_root(), home=self.home, workspaces_root=configured_ws)
-
-        # Registered project repos must not overlap the install root either (§7.6 mitigation 7).
-        repo_paths = project_repo_paths(self.db_conn)
-        if repo_paths:
-            check_install_path_secure(install_root=get_install_root(), repo_paths=repo_paths)
-
-        # Check schema version
-        cur = self.db_conn.execute("SELECT value FROM meta WHERE key = 'schema_version';")
-        row = cur.fetchone()
-        if not row:
-            raise MeshError(
-                code=c.INTERNAL_ERROR,
-                exit_code=c.EXIT_INTERNAL,
-                message="Missing schema_version in database meta table",
-            )
-        schema_version = int(row["value"])
-        if schema_version > CURRENT_SCHEMA_VERSION:
-            raise SchemaTooNewError(schema_version, CURRENT_SCHEMA_VERSION)
-
-        # Integrity quick check
-        cur = self.db_conn.execute("PRAGMA quick_check;")
-        rows = [r[0] for r in cur.fetchall()]
-        if rows != ["ok"]:
-            raise DbIntegrityError(rows)
+            # Integrity quick check
+            cur = self.db_conn.execute("PRAGMA quick_check;")
+            rows = [r[0] for r in cur.fetchall()]
+            if rows != ["ok"]:
+                raise DbIntegrityError(rows)
+        except BaseException:
+            self.db_conn.close()
+            self.db_conn = None
+            raise
 
     def acquire_lock(self) -> None:
         """Acquire single-instance flock on $MESH_HOME/run/meshd.lock."""
@@ -664,10 +964,14 @@ class DaemonServer:
         os.makedirs(run_dir, mode=0o700, exist_ok=True)
         lock_path = os.path.join(run_dir, "meshd.lock")
 
-        self.lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except (BlockingIOError, OSError) as exc:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
             raise MeshError(
                 code=c.DAEMON_ALREADY_RUNNING,
                 exit_code=c.EXIT_INTERNAL,
@@ -676,12 +980,26 @@ class DaemonServer:
 
         # Write pid file
         pid_path = os.path.join(run_dir, "meshd.pid")
-        with open(pid_path, "w", encoding="utf-8") as f:
-            f.write(str(os.getpid()))
-        os.chmod(pid_path, 0o600)
+        try:
+            with open(pid_path, "w", encoding="utf-8") as f:
+                f.write(str(os.getpid()))
+            os.chmod(pid_path, 0o600)
+        except BaseException:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        self.lock_fd = fd
 
     def release_lock(self) -> None:
         """Release flock and remove pid file."""
+        if self.lock_fd is None:
+            return
         run_dir = os.path.join(self.home, "run")
         pid_path = os.path.join(run_dir, "meshd.pid")
         if os.path.exists(pid_path):
@@ -690,13 +1008,15 @@ class DaemonServer:
             except OSError:
                 pass
 
-        if self.lock_fd is not None:
-            try:
-                fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
-                os.close(self.lock_fd)
-            except OSError:
-                pass
-            self.lock_fd = None
+        try:
+            fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(self.lock_fd)
+        except OSError:
+            pass
+        self.lock_fd = None
 
     def record_boot(self) -> None:
         """Insert boots table row and mark previous active boots crashed."""
@@ -742,7 +1062,7 @@ class DaemonServer:
         if not self.db_conn or not self.boot_id:
             return
         try:
-            recover(self.db_conn, self.home, self.boot_id)
+            recover(self.db_conn, self.home, self.boot_id, testing_mode=self.testing_mode)
         except Exception as e:  # recovery must not keep meshd down; each step is its own tx
             self.log_error(f"Recovery failed: {type(e).__name__}: {e}")
         self.refresh_run_caches()
@@ -779,15 +1099,29 @@ class DaemonServer:
         from mesh.daemon import supervisor
 
         cur = self.db_conn.execute(
-            "SELECT id, wrapper_pid, status FROM runs;"
+            "SELECT id, wrapper_pid, proc_starttime, status, run_dir FROM runs;"
         )
         self.known_run_ids.clear()
         self.active_runs.clear()
         for r in cur.fetchall():
             self.known_run_ids.add(r["id"])
-            if r["status"] in ("starting", "running") and r["wrapper_pid"]:
-                self.active_runs[r["id"]] = r["wrapper_pid"]
+            if r["status"] in ("starting", "running"):
+                wpid, st = r["wrapper_pid"], r["proc_starttime"]
+                if not wpid and r["run_dir"]:
+                    # Full review r3 P1-5: a live run whose wrapper pid is not recorded
+                    # yet (merge_test before its TX2, a spawn window, recovery deferred
+                    # after a restart): the wrapper's own wrapper.json identifies it.
+                    wpid, st = supervisor.close_identity({"run_dir": r["run_dir"]})
+                # r4 P2-1: a pid reused by another process (proven by its starttime)
+                # is not the run's; an unknown starttime keeps it (fail closed).
+                if wpid and supervisor.group_still_ours(int(wpid), st):
+                    self.active_runs[r["id"]] = int(wpid)
         for rid, wpid in supervisor.in_memory_active_runs().items():
+            self.known_run_ids.add(rid)
+            self.active_runs.setdefault(rid, wpid)
+        from mesh.daemon import merge  # r2 P1-F: merge_test wrappers before TX2 records them
+
+        for rid, wpid in merge.in_memory_active_test_runs().items():
             self.known_run_ids.add(rid)
             self.active_runs.setdefault(rid, wpid)
 
@@ -813,7 +1147,38 @@ class DaemonServer:
             meshd_pid=os.getpid(),
         )
 
+        if not isinstance(auth_info, dict):
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message="Field 'auth' must be a JSON object",
+                details={"param": "auth"},
+            )
         auth_type = auth_info.get("type", "none")
+        if not isinstance(auth_type, str):
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message="Field 'auth.type' must be a string",
+                details={"param": "auth.type"},
+            )
+        if auth_type == "token":
+            token_val = auth_info.get("token", "")
+            if not isinstance(token_val, str):
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message="Field 'auth.token' must be a string",
+                    details={"param": "auth.token"},
+                )
+        elif auth_type == "user":
+            if "passphrase" in auth_info and not isinstance(auth_info["passphrase"], str):
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message="Field 'auth.passphrase' must be a string",
+                    details={"param": "auth.passphrase"},
+                )
 
         # If inside a run, ONLY that run's own token is allowed
         if bound_run_id is not None:
@@ -861,6 +1226,9 @@ class DaemonServer:
                         },
                     )
                     self.db_conn.execute("COMMIT;")
+
+                self.wake_scheduler()
+                await self.notify_waiters()
 
                 raise MeshError(
                     code=c.CREDENTIAL_NOT_ALLOWED_IN_RUN,
@@ -938,6 +1306,8 @@ class DaemonServer:
                         payload={"peer_pid": peer_pid, "target_user_id": urow["id"]},
                     )
                     self.db_conn.execute("COMMIT;")
+
+                await self.notify_waiters()
 
                 raise MeshError(
                     code=c.PASSPHRASE_INVALID,
@@ -1050,8 +1420,25 @@ class DaemonServer:
             message=f"Unknown auth type: '{auth_type}'",
         )
 
-    def execute_effects(self, effects: List[Effect]) -> None:
+    def _rewrite_idempotency_response(self, principal_id: str, key: str, cmd: str,
+                                      envelope: Dict[str, Any], exit_code: int) -> None:
+        """Store ``envelope`` as the replay of an already committed keyed request."""
+        if not self.db_conn:
+            return
+        from mesh.core.db import transaction
+
+        try:
+            with transaction(self.db_conn):
+                self.db_conn.execute(
+                    "UPDATE idempotency SET response_json = ?, exit_code = ? WHERE principal_id = ? AND key = ?;",
+                    (json.dumps(_idempotency_record(cmd, envelope)), exit_code, principal_id, key),
+                )
+        except Exception as e:  # noqa: BLE001 - the live error is still returned
+            self.log_error(f"Idempotent replay of {cmd} not updated after a reconcile failure: {e}")
+
+    def execute_effects(self, effects: List[Effect]) -> List[asyncio.Future]:
         """Execute side-effects outside transaction."""
+        pending_reconciles: List[asyncio.Future] = []
         for eff in effects:
             if eff.kind == "stop_daemon":
                 if self.stop_event:
@@ -1061,8 +1448,20 @@ class DaemonServer:
                 ws_dir = eff.params.get("workspace_dir")
                 if run_dir:
                     ensure_run_dir(run_dir)
-                if ws_dir:
+                if ws_dir and eff.params.get("worktree"):
+                    # Full review r2 P1-C: a code task's worktree is never created as a
+                    # plain directory (a `workspace delete` raced the start); the next
+                    # attempt re-attaches the kept branch.
+                    if not os.path.lexists(os.path.join(ws_dir, ".git")):
+                        self.log_error(f"Task worktree {ws_dir} is missing at start")
+                elif ws_dir:
                     ensure_workspace_dir(ws_dir)
+            elif eff.kind == "unlink_deliver_intent":
+                # Full review r2 P1-D: the delivery is committed; its intent is done.
+                try:
+                    os.unlink(eff.params["path"])
+                except OSError:
+                    pass
             elif eff.kind == "create_lead_dir":
                 # Best effort: re-created at the next set-lead (§10.1, m1c Q6).
                 try:
@@ -1079,19 +1478,116 @@ class DaemonServer:
                         self.log_error(f"Lead repo/ worktree not created: {e}")
             elif eff.kind == "terminate_lead_turn":
                 self._terminate_lead_turn(eff.params["run_id"], eff.params.get("end_reason", "lead_superseded"))
+            elif eff.kind == "cancel_project_merges":
+                self._clear_project_merge_queue(eff.params["project_id"])
             elif eff.kind == "reconcile_merging_task":
-                # Carbon P2-8: after the commit of `run release --force-merge-held`, decide the
-                # task the way boot recovery would (its merge run is closed, the lease gone).
+                # Carbon P2-8 + R2 P2-9 + R3 P1-5: run heavy git/worktree inspection in a
+                # worker thread when an event loop is running, track/return the future so
+                # handle_client awaits asyncio.shield(fut) before responding, and keep any
+                # deferred merge:<prj> lease held until reconciliation finishes.
+                import sqlite3
+                from mesh.core.db import transaction
                 from mesh.daemon import merge
 
+                tid = eff.params["task_id"]
+                lease_key = eff.params.get("lease_key")
+                lease_run_id = eff.params.get("run_id")
+
+                def _cleanup_held_lease(
+                    l_key: Optional[str] = lease_key,
+                    l_run_id: Optional[str] = lease_run_id,
+                ) -> None:
+                    if not (l_key and l_run_id and self.db_conn):
+                        return
+                    try:
+                        still_there = self.db_conn.execute(
+                            "SELECT 1 FROM leases WHERE key = ? AND run_id = ?;",
+                            (l_key, l_run_id),
+                        ).fetchone()
+                        if still_there is None:
+                            return
+                        with transaction(self.db_conn):
+                            self.db_conn.execute(
+                                "DELETE FROM leases WHERE key = ? AND run_id = ?;",
+                                (l_key, l_run_id),
+                            )
+                    except Exception as lease_exc:  # noqa: BLE001
+                        self.log_error(
+                            f"Lease {l_key} for run {l_run_id} not released after "
+                            f"reconcile: {type(lease_exc).__name__}: {lease_exc}"
+                        )
+
                 try:
-                    task = self.db_conn.execute("SELECT * FROM tasks WHERE id = ? AND status = 'merging';",
-                                                (eff.params["task_id"],)).fetchone()
-                    if task is not None:
-                        merge.recover_merging_task(self.db_conn, self.home, task)
-                except Exception as e:  # noqa: BLE001 - the next boot decides it
-                    self.log_error(f"Task {eff.params.get('task_id')} not reconciled after a forced "
-                                   f"merge release: {type(e).__name__}: {e}")
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                if loop is not None and loop.is_running():
+                    async def _bg_reconcile(
+                        target_tid: str = tid,
+                        l_key: Optional[str] = lease_key,
+                        l_run_id: Optional[str] = lease_run_id,
+                    ) -> None:
+                        try:
+                            if not self.db_conn:
+                                return
+                            for attempt in range(4):
+                                t_row = self.db_conn.execute(
+                                    "SELECT * FROM tasks WHERE id = ? AND status = 'merging';",
+                                    (target_tid,),
+                                ).fetchone()
+                                if t_row is None:
+                                    break
+                                try:
+                                    await merge.recover_merging_task_async(self.db_conn, self.home, t_row)
+                                    break
+                                except sqlite3.OperationalError as op_exc:
+                                    msg = str(op_exc).lower()
+                                    if attempt < 3 and ("locked" in msg or "busy" in msg):
+                                        await asyncio.sleep(0.05 * (attempt + 1))
+                                        continue
+                                    raise
+                            await self.notify_waiters()
+                            self.wake_scheduler()
+                        except Exception as e:  # noqa: BLE001 - logged and surfaced to shielded caller
+                            self.log_error(
+                                f"Task {target_tid} not reconciled after a forced "
+                                f"merge release: {type(e).__name__}: {e}"
+                            )
+                            raise
+                        finally:
+                            _cleanup_held_lease(l_key, l_run_id)
+
+                    bg_job = asyncio.ensure_future(_bg_reconcile())
+                    bg_job.add_done_callback(lambda fut: fut.exception() if not fut.cancelled() else None)
+                    track = getattr(self, "track_merge_job", None)
+                    if callable(track):
+                        track(bg_job)
+                    pending_reconciles.append(bg_job)
+                else:
+                    try:
+                        for attempt in range(4):
+                            task = self.db_conn.execute(
+                                "SELECT * FROM tasks WHERE id = ? AND status = 'merging';",
+                                (tid,),
+                            ).fetchone()
+                            if task is None:
+                                break
+                            try:
+                                merge.recover_merging_task(self.db_conn, self.home, task)
+                                break
+                            except sqlite3.OperationalError as op_exc:
+                                msg = str(op_exc).lower()
+                                if attempt < 3 and ("locked" in msg or "busy" in msg):
+                                    time.sleep(0.05 * (attempt + 1))
+                                    continue
+                                raise
+                    except Exception as e:  # noqa: BLE001 - the next boot decides it
+                        self.log_error(
+                            f"Task {tid} not reconciled after a forced "
+                            f"merge release: {type(e).__name__}: {e}"
+                        )
+                    finally:
+                        _cleanup_held_lease()
             elif eff.kind == "seen_release_forced":
                 # r4e: after the commit of `run release --force-seen-unusable` only.
                 from mesh.daemon import supervisor
@@ -1101,6 +1597,35 @@ class DaemonServer:
                                                      eff.params.get("reason"), eff.params.get("actor"))
                 except Exception as e:  # noqa: BLE001 - the run is closed; eviction cleans up
                     self.log_error(f"Seen hold of run {eff.params.get('run_id')} not forgotten: {e}")
+            elif eff.kind == "delete_workspace":
+                from mesh.core.gitops import run_git
+
+                p = eff.params.get("path")
+                raw_p = (eff.params.get("raw_path") or p or "").rstrip(os.sep)
+                repo_p = eff.params.get("repo_path")
+                try:
+                    tasks_d = os.path.dirname(raw_p) if raw_p else ""
+                    proj_d = os.path.dirname(tasks_d) if tasks_d else ""
+                    root_d = os.path.dirname(proj_d) if proj_d else ""
+                    if (
+                        raw_p
+                        and not os.path.islink(raw_p)
+                        and not (tasks_d and os.path.islink(tasks_d))
+                        and not (proj_d and os.path.islink(proj_d))
+                        and not (root_d and os.path.islink(root_d))
+                        and p
+                        and not os.path.islink(p)
+                        and os.path.isdir(p)
+                    ):
+                        rmtree_allow_readonly(p, boundary_real=os.path.realpath(root_d) if root_d else None)
+                    if repo_p and os.path.isdir(repo_p):
+                        try:
+                            run_git(["worktree", "prune"], cwd=repo_p)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    self.log_error(f"Workspace delete failed for {p}: {e}")
+        return pending_reconciles
 
     def _terminate_lead_turn(self, run_id: str, end_reason: str) -> None:
         """Begin the §11.4 termination of a superseded lead turn (set-lead, §8).
@@ -1111,17 +1636,87 @@ class DaemonServer:
         from mesh.daemon import supervisor, terminate
 
         try:
-            if terminate.get(run_id) is not None:
+            t = terminate.get(run_id)
+            if t is not None:
+                if t.end_reason == "leftovers":
+                    t.end_reason = end_reason
                 return
             run = self.db_conn.execute("SELECT * FROM runs WHERE id = ?;", (run_id,)).fetchone()
-            if run is None or run["status"] not in ("starting", "running") or not run["wrapper_pid"]:
+            if run is None or run["status"] not in ("starting", "running"):
                 return
-            supervisor._begin_termination(self.db_conn, self.home, run, end_reason)
+            pgid, _wst = supervisor.close_identity(run)
+            if not (run["wrapper_pid"] or pgid):
+                return
+            supervisor._begin_termination(
+                self.db_conn, self.home, run, end_reason, seen=supervisor.seen_for(run, self.home)
+            )
         except Exception as e:  # noqa: BLE001 - see below
             # The supervisor watch pass terminates a superseded turn on its own: its
             # `lead_turn_termination_reason` returns `lead_superseded` once the run's
             # assignment is no longer current.
             self.log_error(f"Lead turn {run_id} termination not started: {type(e).__name__}: {e}")
+
+    def _queued_merge_project_id(self, item: Mapping[str, Any]) -> str:
+        pid = (
+            item.get("project_id")
+            or ((item.get("principal") or {}).get("scope") or {}).get("project_id")
+            or (item.get("args") or {}).get("project_id")
+        )
+        if isinstance(pid, str) and pid:
+            return pid
+        if self.db_conn is not None:
+            if item.get("run_id"):
+                rrow = self.db_conn.execute(
+                    "SELECT project_id FROM runs WHERE id = ?;", (item["run_id"],)
+                ).fetchone()
+                if rrow is not None and rrow["project_id"]:
+                    return str(rrow["project_id"])
+            tid = (item.get("args") or {}).get("task_id")
+            if tid:
+                trow = self.db_conn.execute(
+                    "SELECT project_id FROM tasks WHERE id = ?;", (tid,)
+                ).fetchone()
+                if trow is not None and trow["project_id"]:
+                    return str(trow["project_id"])
+        return ""
+
+    def _clear_project_merge_queue(self, project_id: str) -> None:
+        q = self._project_merge_queues.pop(project_id, None)
+        if not q:
+            return
+        for rem in list(q):
+            if rem.get("request_id"):
+                self._project_merge_inflight_reqs.discard(rem["request_id"])
+        q.clear()
+
+    async def _drain_project_lead_merges(self, project_id: str) -> None:
+        try:
+            q = self._project_merge_queues.get(project_id)
+            while q:
+                if self._stopping:
+                    for rem in list(q):
+                        if rem.get("request_id"):
+                            self._project_merge_inflight_reqs.discard(rem["request_id"])
+                    q.clear()
+                    break
+                if self.db_conn is not None:
+                    prow = self.db_conn.execute(
+                        "SELECT status FROM projects WHERE id = ?;", (project_id,)
+                    ).fetchone()
+                    if prow is not None and prow["status"] == "cancelled":
+                        self._clear_project_merge_queue(project_id)
+                        break
+                item = q.popleft()
+                try:
+                    await self._run_lead_merge(item)
+                finally:
+                    if item.get("request_id"):
+                        self._project_merge_inflight_reqs.discard(item["request_id"])
+        finally:
+            if not self._project_merge_queues.get(project_id):
+                self._project_merge_queues.pop(project_id, None)
+            if self._project_merge_workers.get(project_id) is asyncio.current_task():
+                self._project_merge_workers.pop(project_id, None)
 
     def start_queued_lead_merges(self) -> None:
         """Start the `task.merge` actions queued by closed lead turns (Quest r10b, option b).
@@ -1129,6 +1724,7 @@ class DaemonServer:
         Called on the event loop after a scheduler tick or a termination pass, never
         inside a transaction: a merge is started only once the close TX that queued it
         committed (its `lead.action_result` exists); one whose TX rolled back is dropped.
+        Queued merges for the same project run strictly in FIFO order.
         """
         from mesh.daemon import lead_turns
 
@@ -1154,51 +1750,20 @@ class DaemonServer:
             if not committed:
                 self.log_error(f"Queued lead merge of run {item['run_id']} dropped: its turn did not commit")
                 continue
-            self._enqueue_lead_merge(item)
-
-    def _lead_merge_chain_key(self, item: Dict[str, Any]) -> str:
-        """The serialisation key of a queued lead merge: its project (unknown: its own request)."""
-        try:
-            row = self.db_conn.execute("SELECT project_id FROM tasks WHERE id = ?;",
-                                       (item["args"].get("task_id"),)).fetchone()
-        except Exception:  # noqa: BLE001 - an unreadable task simply gets its own chain
-            row = None
-        return row["project_id"] if row is not None else f"request:{item['request_id']}"
-
-    def _enqueue_lead_merge(self, item: Dict[str, Any]) -> None:
-        """Carbon P2-6: serialise the queued merges of one project.
-
-        `_queue_internal_merge` checks each `task.merge` in a rolled-back savepoint, so two
-        merges of the same project queued by one lead turn both look startable. Starting
-        them concurrently made the second one collide with the first one's `merge:<prj>`
-        lease (rc 11) and fail. They now run one after another through a per-project
-        drain task; merges of different projects stay concurrent.
-        """
-        key = self._lead_merge_chain_key(item)
-        queue = self._lead_merge_queues.get(key)
-        if queue is not None:
-            queue.append(item)  # the running drain task picks it up in order
-            return
-        self._lead_merge_queues[key] = collections.deque([item])
-        task = asyncio.ensure_future(self._drain_lead_merges(key))
-        self._lead_merge_tasks.add(task)
-        task.add_done_callback(self._lead_merge_tasks.discard)
-
-    async def _drain_lead_merges(self, key: str) -> None:
-        queue = self._lead_merge_queues[key]
-        try:
-            # batch6: once meshd is stopping, the merge in progress finishes (shutdown
-            # awaits this task) but no further queued merge starts.
-            while queue and not self._stopping:
-                item = queue.popleft()
-                try:
-                    await self._run_lead_merge(item)
-                except Exception as e:  # noqa: BLE001 - one failing merge must not strand the rest
-                    self.log_error(f"Lead merge of {item['args'].get('task_id')} raised: {type(e).__name__}: {e}")
-        finally:
-            # No await between the last empty check and this pop: a merge queued meanwhile
-            # either was seen by the loop above or finds no queue and starts a new drain.
-            self._lead_merge_queues.pop(key, None)
+            req_id = item.get("request_id")
+            if req_id and req_id in self._project_merge_inflight_reqs:
+                continue
+            project_id = self._queued_merge_project_id(item)
+            q = self._project_merge_queues.setdefault(project_id, deque())
+            if req_id:
+                self._project_merge_inflight_reqs.add(req_id)
+            q.append(item)
+            worker = self._project_merge_workers.get(project_id)
+            if worker is None or worker.done():
+                task = asyncio.ensure_future(self._drain_project_lead_merges(project_id))
+                self._project_merge_workers[project_id] = task
+                self._lead_merge_tasks.add(task)
+                task.add_done_callback(self._lead_merge_tasks.discard)
 
     async def _run_lead_merge(self, item: Dict[str, Any]) -> None:
         """One queued lead merge, through the socket's entry point (`handle_task_merge`).
@@ -1226,6 +1791,7 @@ class DaemonServer:
             credential_id=principal.get("credential_id"),
         )
         ctx.idempotency = None  # type: ignore[attr-defined]
+        ctx._queued_lead_merge = True  # type: ignore[attr-defined]
         error: Optional[MeshError] = None
         try:
             await handle_task_merge(self, ctx)
@@ -1353,16 +1919,119 @@ class DaemonServer:
                     message="Request payload exceeds 1 MiB limit",
                 )
 
-            req = json.loads(line_bytes.decode("utf-8"))
-            request_id = req.get("request_id") or request_id
-            cmd = req.get("cmd", "")
+            try:
+                req = json.loads(line_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+                raise MeshError(
+                    code=c.INVALID_JSON,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Malformed request JSON: {exc}",
+                ) from exc
+            if not isinstance(req, dict):
+                raise MeshError(
+                    code=c.INVALID_JSON,
+                    exit_code=c.EXIT_USAGE,
+                    message="Request envelope must be a JSON object",
+                )
+            raw_request_id = req.get("request_id")
+            if raw_request_id is not None:
+                if (
+                    not isinstance(raw_request_id, str)
+                    or not IDEMPOTENCY_KEY_RE.fullmatch(raw_request_id)
+                ):
+                    raise MeshError(
+                        code=c.INVALID_ARGUMENT,
+                        exit_code=c.EXIT_USAGE,
+                        message="Field 'request_id' must match ^[A-Za-z0-9._:-]{1,128}$",
+                        details={"param": "request_id"},
+                    )
+                request_id = redact(raw_request_id)
+            cmd_val = req.get("cmd")
+            if not isinstance(cmd_val, str) or not cmd_val:
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message="Field 'cmd' must be a non-empty string",
+                    details={"param": "cmd"},
+                )
+            cmd = cmd_val
             _me = asyncio.current_task()
             if _me is not None and hasattr(self, "_client_cmds"):
-                self._client_cmds[_me] = str(cmd)
-            auth_info = req.get("auth", {})
-            args = req.get("args", {})
+                self._client_cmds[_me] = cmd
+            auth_info = req.get("auth") if "auth" in req else {}
+            if not isinstance(auth_info, dict):
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message="Field 'auth' must be a JSON object",
+                    details={"param": "auth"},
+                )
+            args = req.get("args") if "args" in req else {}
+            if not isinstance(args, dict):
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message="Field 'args' must be a JSON object",
+                    details={"param": "args"},
+                )
+            dry_raw = req.get("dry_run", False)
+            if dry_raw is not None and not isinstance(dry_raw, bool):
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message="Field 'dry_run' must be a boolean",
+                    details={"param": "dry_run"},
+                )
+            dry_run = bool(dry_raw)
+            replay_only_raw = req.get("replay_only", False)
+            if replay_only_raw is not None and not isinstance(replay_only_raw, bool):
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message="Field 'replay_only' must be a boolean",
+                    details={"param": "replay_only"},
+                )
+            replay_only = bool(replay_only_raw)
+            approval_val = req.get("approval")
+            if approval_val is not None and not isinstance(approval_val, str):
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message="Field 'approval' must be a string",
+                    details={"param": "approval"},
+                )
+            relayed_raw = req.get("relayed")
+            if relayed_raw is not None and not isinstance(relayed_raw, bool):
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message="Field 'relayed' must be a boolean",
+                    details={"param": "relayed"},
+                )
             idempotency_key = req.get("idempotency_key")
-            dry_run = bool(req.get("dry_run", False))
+            if idempotency_key is not None and (
+                not isinstance(idempotency_key, str) or not IDEMPOTENCY_KEY_RE.match(idempotency_key)
+            ):
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message="idempotency_key must match ^[A-Za-z0-9._:-]{1,128}$",
+                    details={"param": "idempotency_key"},
+                )
+            if replay_only and not idempotency_key:
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message="Field 'replay_only' requires an idempotency_key",
+                    details={"param": "idempotency_key"},
+                )
+            if replay_only and dry_run:
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message="Field 'replay_only' cannot be combined with 'dry_run'",
+                    details={"param": "replay_only"},
+                )
 
             # Authenticate
             principal, actor_kind, via, k_user = await self.authenticate_and_authorize(
@@ -1372,7 +2041,6 @@ class DaemonServer:
                 request_id=request_id,
             )
             principal_id = principal["id"]
-            idem_pid = idempotency_partition(principal, via)
 
             # User-only operations per plan §7.3: config.*, agent.*, audit.*
             # Any agent credential (with or without --relayed, with or without relay capability) gets exit 4 CAPABILITY_MISSING
@@ -1402,7 +2070,7 @@ class DaemonServer:
                         details={"principal": principal.get("name"), "missing": "relay"},
                     )
                 user_stmt = req.get("user_statement")
-                if not user_stmt or not str(user_stmt).strip():
+                if not isinstance(user_stmt, str) or not user_stmt.strip():
                     raise MeshError(
                         code=c.INVALID_ARGUMENT,
                         exit_code=c.EXIT_USAGE,
@@ -1417,6 +2085,27 @@ class DaemonServer:
                         details={"param": "user_statement"},
                     )
                 via = "relayed"
+
+            ev_ref = req.get("evidence_ref")
+            if ev_ref is not None and (not isinstance(ev_ref, str) or len(ev_ref) > 4000):
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message="Field 'evidence_ref' must be a string up to 4000 characters",
+                    details={"param": "evidence_ref"},
+                )
+            top_if_version = req.get("if_version")
+            if top_if_version is not None and (
+                isinstance(top_if_version, bool) or not isinstance(top_if_version, int)
+            ):
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message="Field 'if_version' must be an integer",
+                    details={"param": "if_version"},
+                )
+
+            idem_pid = idempotency_partition(principal, via)
 
             # Central command-level authorization (§7.2, §7.3, §13.4) before idempotency
             # replay, long-poll/stream/merge dispatch, or any worker-thread/DB work.
@@ -1437,13 +2126,19 @@ class DaemonServer:
                 if "max_concurrency" in args:
                     parse_positive_int(args["max_concurrency"], "max_concurrency")
             elif cmd == "agent.update":
-                if args.get("max_concurrency") is not None:
+                if "max_concurrency" in args:
                     parse_positive_int(args["max_concurrency"], "max_concurrency")
 
             # Idempotency check (§13.4, B5)
-            cmd_and_args = {"cmd": cmd, "args": args}
+            cmd_and_args: Dict[str, Any] = {"cmd": cmd, "args": args}
             if req.get("approval"):
                 cmd_and_args["approval"] = req["approval"]
+            if via == "relayed" and req.get("user_statement") is not None:
+                cmd_and_args["user_statement"] = req["user_statement"]
+            if ev_ref is not None:
+                cmd_and_args["evidence_ref"] = ev_ref
+            if top_if_version is not None:
+                cmd_and_args["if_version"] = top_if_version
             try:
                 req_hash = hashlib.sha256(canonical_json(cmd_and_args)).hexdigest()
             except ValueError as ve:
@@ -1467,6 +2162,21 @@ class DaemonServer:
                     message=str(ve),
                 )
 
+            if cmd == "project.deliver" and not dry_run and isinstance(args, dict):
+                # Full review r4 P1-1: settle an earlier, lost delivery first (own
+                # transaction), so a keyed retry of it replays its recorded result.
+                from mesh.daemon.recovery import DeliverIntentUnresolved, settle_deliver_intent
+
+                try:
+                    settle_deliver_intent(self.db_conn, self.home, args.get("project_id"))
+                except DeliverIntentUnresolved as e:
+                    raise MeshError(
+                        code=c.INTERNAL_ERROR,
+                        exit_code=c.EXIT_INTERNAL,
+                        message=f"An earlier delivery of this project cannot be checked: {e}; nothing was changed",
+                        details={"reason": "git_failed", "step": "deliver intent"},
+                    )
+
             if idempotency_key:
                 if not (1 <= len(idempotency_key) <= 128):
                     raise MeshError(
@@ -1474,18 +2184,30 @@ class DaemonServer:
                         exit_code=c.EXIT_USAGE,
                         message="idempotency_key must be between 1 and 128 characters",
                     )
-                cur = self.db_conn.execute(
-                    "SELECT request_hash, response_json, exit_code FROM idempotency WHERE principal_id = ? AND key = ?;",
-                    (idem_pid, idempotency_key),
-                )
                 # Blind review P3: a dry run never replays a real execution's stored result.
-                irow = None if dry_run else cur.fetchone()
+                irow = None if (dry_run or cmd in _NON_MUTATING_CMDS) else _lookup_live_idempotency(self.db_conn, idem_pid, idempotency_key)
                 if irow:
                     if irow["request_hash"] == req_hash or _start_replay_ok(
                             cmd, args, req.get("approval"), idempotency_key,
-                            irow["request_hash"], irow["response_json"]):
-                        # Return stored response
+                            irow["request_hash"], irow["response_json"],
+                            via=via, user_statement=req.get("user_statement"),
+                            evidence_ref=ev_ref, if_version=top_if_version):
                         stored_envelope = json.loads(irow["response_json"])
+                        r_proj, r_task = _resolve_idempotency_scope(self.db_conn, cmd, args, stored_envelope)
+                        check_authz(
+                            self.db_conn,
+                            cmd,
+                            principal,
+                            actor_kind,
+                            via,
+                            project_id=r_proj,
+                            task_id=r_task,
+                            relayed_by=principal["name"] if via == "relayed" else None,
+                            resource_resolved=(r_proj is not None or r_task is not None),
+                        )
+                        check_approval_replay_authz(
+                            self.db_conn, cmd, principal, actor_kind, via, args, stored_envelope
+                        )
                         stored_envelope["idempotent_replay"] = True
                         writer.write((json.dumps(stored_envelope) + "\n").encode("utf-8"))
                         await writer.drain()
@@ -1496,6 +2218,37 @@ class DaemonServer:
                             code=c.IDEMPOTENCY_KEY_REUSED,
                             exit_code=c.EXIT_CONFLICT,
                             message=f"Idempotency key '{idempotency_key}' reused with different request parameters",
+                        )
+                elif not dry_run or replay_only:
+                    r_idem = (
+                        find_ws_reserved_idempotency(self.db_conn, idem_pid, idempotency_key)
+                        if not dry_run else None
+                    )
+                    if r_idem:
+                        if r_idem.get("request_hash") == req_hash:
+                            raise MeshError(
+                                code=c.CONCURRENCY_LIMIT,
+                                exit_code=c.EXIT_BUSY,
+                                message=(
+                                    f"Operation '{r_idem.get('cmd') or cmd}' with idempotency key "
+                                    f"'{idempotency_key}' is already in progress"
+                                ),
+                                details={
+                                    "idempotency_key": idempotency_key,
+                                    "reservation": r_idem.get("reservation_key"),
+                                },
+                            )
+                        raise MeshError(
+                            code=c.IDEMPOTENCY_KEY_REUSED,
+                            exit_code=c.EXIT_CONFLICT,
+                            message=f"Idempotency key '{idempotency_key}' reused with different request parameters",
+                        )
+                    if replay_only:
+                        raise MeshError(
+                            code=c.INVALID_ARGUMENT,
+                            exit_code=c.EXIT_USAGE,
+                            message="No matching idempotent execution found for replay_only request",
+                            details={"param": "idempotency_key", "reason": "replay_only_miss"},
                         )
 
             # Blind review P2: state-dependent validation runs after the replay lookup, so a
@@ -1509,6 +2262,7 @@ class DaemonServer:
                     home=self.home,
                     current_settings=current_settings,
                     db_conn=self.db_conn,
+                    testing_mode=self.testing_mode,
                 )
 
             # Handler context
@@ -1575,18 +2329,35 @@ class DaemonServer:
                 await handle_event_tail_live(self, ctx, reader, writer)
                 return
 
-            # `task merge` (m2-r5, §10.5): a long request. It owns its transactions (TX1,
-            # then the git pipeline in a worker thread with no transaction open, then the
-            # final TX), so it does not go through the generic one-transaction dispatch.
-            if cmd == "task.merge":
-                # §13.4: merge.py stores the response inside its final TX (rc 0 and rc 14),
-                # never in a separate transaction (review m2-r4b-r5 finding 1).
+            # `task merge` (m2-r5, §10.5) and `workspace delete`/`prune` (PR #45 r2):
+            # long requests that own their TX1 -> off-TX worker -> final TX lifecycle
+            # instead of holding BEGIN IMMEDIATE across git/filesystem I/O.
+            if cmd == "project.deliver":
+                # Full review r2 P1-E: the deliver intent carries the key, so recovery can
+                # store the replay of a delivery whose request transaction was lost.
                 ctx.idempotency = (  # type: ignore[attr-defined]
                     {"principal_id": idem_pid, "key": idempotency_key, "request_hash": req_hash}
                     if idempotency_key and not dry_run else None
                 )
-                res = await handle_task_merge(self, ctx)
+            if cmd == "task.merge" or (cmd in ("workspace.delete", "workspace.prune") and not dry_run):
+                # §13.4: merge.py and workspace delete/prune store idempotency inside
+                # their own transaction, never in a separate transaction after commit.
+                ctx.idempotency = (  # type: ignore[attr-defined]
+                    {"principal_id": idem_pid, "key": idempotency_key, "request_hash": req_hash}
+                    if idempotency_key and not dry_run else None
+                )
+                if cmd == "task.merge":
+                    res = await handle_task_merge(self, ctx)
+                elif cmd == "workspace.delete":
+                    res = await run_handlers.run_workspace_delete(self, ctx)
+                else:
+                    res = await run_handlers.run_workspace_prune(self, ctx)
                 exit_code = res.exit_code
+                replay_env = getattr(res, "_idempotent_replay_envelope", None)
+                if replay_env is not None:
+                    writer.write((json.dumps(replay_env) + "\n").encode("utf-8"))
+                    await writer.drain()
+                    return
                 if dry_run:
                     envelope = {
                         "ok": True,
@@ -1607,16 +2378,20 @@ class DaemonServer:
                         "dry_run": False,
                         "exit_code": exit_code,
                     }
+                    if cmd != "task.merge":
+                        self.execute_effects(ctx.effects)
+                        await self.notify_waiters()
                     # PR42 r2: no tick (promotion, launches, lead turns) once stopping;
                     # the next boot's scheduler does it.
                     if not getattr(self, "_stopping", False):
                         try:
                             run_scheduler_tick(self.db_conn, self.home, testing_mode=self.testing_mode)
                         except Exception as e:
-                            _sweep_error(self.home, "tick_post_merge", e)
-                    self.start_queued_lead_merges()
-                    self.wake_scheduler()
-                    await self.notify_waiters()
+                            _sweep_error(self.home, "tick_post_merge" if cmd == "task.merge" else "tick_post_commit", e)
+                    if cmd == "task.merge" or not getattr(self, "_stopping", False):
+                        self.start_queued_lead_merges()
+                        self.wake_scheduler()
+                        await self.notify_waiters()
                 writer.write((json.dumps(envelope) + "\n").encode("utf-8"))
                 await writer.drain()
                 return
@@ -1625,32 +2400,67 @@ class DaemonServer:
             # git info (§10.4) run git in a worker thread before the request
             # transaction, never on the event loop (review m2-r3 finding 5).
             if cmd == "task.start":
+                ctx.idempotency = (  # type: ignore[attr-defined]
+                    {"principal_id": idem_pid, "key": idempotency_key, "request_hash": req_hash}
+                    if idempotency_key and not dry_run else None
+                )
                 await prepare_task_start_workspace(ctx)
             elif cmd == "task.submit":
                 await prepare_task_submit_git(ctx)
+            elif cmd == "workspace.prune" and dry_run:
+                prune_plan = run_handlers.plan_workspace_prune(ctx)
+                ctx.prepared_prune = await asyncio.to_thread(
+                    run_handlers.execute_workspace_prune_plan,
+                    prune_plan,
+                )
+            elif cmd == "task.close":
+                from mesh.daemon.handlers.task import prepare_task_close
+
+                await prepare_task_close(ctx)
             elif cmd in ADAPTER_CMDS:
                 await prepare_adapter_command(ctx, self.testing_mode)
+            elif cmd in ("run.log", "task.log"):
+                await run_handlers.prepare_log_command(ctx)
 
             # Transaction execution
             if True:
                 self.db_conn.execute("BEGIN IMMEDIATE;")
+                if (
+                    cmd in ("task.start", "task.submit", "task.close", "run.log", "task.log")
+                    or (cmd == "workspace.prune" and dry_run)
+                    or cmd in ADAPTER_CMDS
+                ):
+                    recheck_tx_credential_and_authz(ctx)
 
                 # Linear full review B1: the cache was read before the awaits above
                 # (workspace/git preparation); an identical keyed request may have finished
                 # meanwhile. Re-read it under the write lock and replay it, so overlapping
                 # retries get the original response instead of INVALID_TRANSITION.
-                if idempotency_key and not dry_run:
-                    irow = self.db_conn.execute(
-                        "SELECT request_hash, response_json, exit_code FROM idempotency "
-                        "WHERE principal_id = ? AND key = ?;",
-                        (idem_pid, idempotency_key),
-                    ).fetchone()
+                if idempotency_key and not dry_run and cmd not in _NON_MUTATING_CMDS:
+                    irow = _lookup_live_idempotency(self.db_conn, idem_pid, idempotency_key)
                     if irow:
                         self.db_conn.execute("ROLLBACK;")
                         if irow["request_hash"] == req_hash or _start_replay_ok(
                                 cmd, args, req.get("approval"), idempotency_key,
-                                irow["request_hash"], irow["response_json"]):
+                                irow["request_hash"], irow["response_json"],
+                                via=via, user_statement=req.get("user_statement"),
+                                evidence_ref=ev_ref, if_version=top_if_version):
                             stored_envelope = json.loads(irow["response_json"])
+                            r_proj, r_task = _resolve_idempotency_scope(self.db_conn, cmd, args, stored_envelope)
+                            check_authz(
+                                self.db_conn,
+                                cmd,
+                                principal,
+                                actor_kind,
+                                via,
+                                project_id=r_proj,
+                                task_id=r_task,
+                                relayed_by=principal["name"] if via == "relayed" else None,
+                                resource_resolved=(r_proj is not None or r_task is not None),
+                            )
+                            check_approval_replay_authz(
+                                self.db_conn, cmd, principal, actor_kind, via, args, stored_envelope
+                            )
                             stored_envelope["idempotent_replay"] = True
                             writer.write((json.dumps(stored_envelope) + "\n").encode("utf-8"))
                             await writer.drain()
@@ -1660,6 +2470,35 @@ class DaemonServer:
                             code=c.IDEMPOTENCY_KEY_REUSED,
                             exit_code=c.EXIT_CONFLICT,
                             message=f"Idempotency key '{idempotency_key}' reused with different request parameters",
+                        )
+                    r_idem = find_ws_reserved_idempotency(self.db_conn, idem_pid, idempotency_key)
+                    if r_idem:
+                        self.db_conn.execute("ROLLBACK;")
+                        if r_idem.get("request_hash") == req_hash:
+                            raise MeshError(
+                                code=c.CONCURRENCY_LIMIT,
+                                exit_code=c.EXIT_BUSY,
+                                message=(
+                                    f"Operation '{r_idem.get('cmd') or cmd}' with idempotency key "
+                                    f"'{idempotency_key}' is already in progress"
+                                ),
+                                details={
+                                    "idempotency_key": idempotency_key,
+                                    "reservation": r_idem.get("reservation_key"),
+                                },
+                            )
+                        raise MeshError(
+                            code=c.IDEMPOTENCY_KEY_REUSED,
+                            exit_code=c.EXIT_CONFLICT,
+                            message=f"Idempotency key '{idempotency_key}' reused with different request parameters",
+                        )
+                    if replay_only:
+                        self.db_conn.execute("ROLLBACK;")
+                        raise MeshError(
+                            code=c.INVALID_ARGUMENT,
+                            exit_code=c.EXIT_USAGE,
+                            message="No matching idempotent execution found for replay_only request",
+                            details={"param": "idempotency_key", "reason": "replay_only_miss"},
                         )
 
                 # Dispatch
@@ -1861,7 +2700,10 @@ class DaemonServer:
                         "exit_code": exit_code,
                     }
                 else:
-                    # Store idempotency if key provided and exit code not in (1, 7, 10)
+                    # Store idempotency if key provided and exit code not in (1, 7, 10). The one
+                    # exit-1 exception (plan §13.4): a post-commit reconcile failure below rewrites
+                    # this row with its error envelope in a separate tx, because the command is
+                    # already committed and must never run again.
                     envelope = {
                         "ok": True,
                         "data": res.data,
@@ -1871,23 +2713,48 @@ class DaemonServer:
                         "dry_run": False,
                         "exit_code": exit_code,
                     }
-                    if idempotency_key and exit_code not in (c.EXIT_INTERNAL, c.EXIT_APPROVAL_REQUIRED, c.EXIT_DAEMON_UNAVAILABLE):
-                        self.db_conn.execute(
-                            """INSERT INTO idempotency (principal_id, key, cmd, request_hash, response_json, exit_code, created_at)
-                               VALUES (?, ?, ?, ?, ?, ?, ?);""",
-                            (
-                                idem_pid,
-                                idempotency_key,
-                                cmd,
-                                req_hash,
-                                json.dumps(_idempotency_record(cmd, envelope)),
-                                exit_code,
-                                now_iso_utc(),
-                            ),
+                    idem_stored = False
+                    if idempotency_key and cmd not in _NON_MUTATING_CMDS and exit_code not in (c.EXIT_INTERNAL, c.EXIT_APPROVAL_REQUIRED, c.EXIT_DAEMON_UNAVAILABLE):
+                        _store_idempotency_row(
+                            self.db_conn,
+                            idem_pid,
+                            idempotency_key,
+                            cmd,
+                            req_hash,
+                            json.dumps(_idempotency_record(cmd, envelope)),
+                            exit_code,
                         )
+                        idem_stored = True
 
                     self.db_conn.execute("COMMIT;")
-                    self.execute_effects(ctx.effects)
+                    for fut in self.execute_effects(ctx.effects):
+                        try:
+                            await asyncio.shield(fut)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            ctx._committed_side_effect = True  # type: ignore[attr-defined]
+                            err = exc if isinstance(exc, MeshError) else MeshError(
+                                code=c.INTERNAL_ERROR,
+                                exit_code=c.EXIT_INTERNAL,
+                                message=_redact_msg(f"Post-commit reconcile failed: {exc}"),
+                                details={
+                                    "reason": "reconcile_failed",
+                                    "committed": True,
+                                    "hint": ("the command is committed; do not retry with a new key; "
+                                             "the task is reconciled at the next meshd start"),
+                                },
+                            )
+                            # Devin full-review P2-2: the keyed request is committed, so its
+                            # replay must return this same error, not the ok stored above.
+                            if idem_stored:
+                                self._rewrite_idempotency_response(
+                                    idem_pid, idempotency_key, cmd,
+                                    err.to_envelope(request_id=request_id), err.exit_code,
+                                )
+                            if err is exc:
+                                raise
+                            raise err from exc
                     await self.notify_waiters()
                     if not dry_run and exit_code == 0 and not getattr(self, "_stopping", False):
                         try:
@@ -1903,7 +2770,7 @@ class DaemonServer:
 
         except MeshError as exc:
             exit_code = exc.exit_code
-            if self.db_conn:
+            if self.db_conn and self.db_conn.in_transaction:
                 try:
                     if exit_code == c.EXIT_APPROVAL_REQUIRED and not dry_run:
                         self.db_conn.execute("COMMIT;")
@@ -1911,6 +2778,9 @@ class DaemonServer:
                         self.db_conn.execute("ROLLBACK;")
                 except Exception:
                     pass
+            if getattr(locals().get("ctx"), "_committed_side_effect", False):
+                await self.notify_waiters()
+                self.wake_scheduler()
             err_envelope = exc.to_envelope(request_id=request_id)
             if dry_run:
                 err_envelope["dry_run"] = True
@@ -1921,7 +2791,7 @@ class DaemonServer:
                 pass
         except Exception as exc:
             exit_code = c.EXIT_INTERNAL
-            if self.db_conn:
+            if self.db_conn and self.db_conn.in_transaction:
                 try:
                     self.db_conn.execute("ROLLBACK;")
                 except Exception:
@@ -2043,82 +2913,34 @@ class DaemonServer:
                 self.db_conn.execute("ROLLBACK;")
             except Exception:
                 pass
+        if self.db_conn is not None:
+            from mesh.daemon import supervisor
+
+            abort_deadline = time.monotonic() + max(0.5, float(grace_s))
+            while supervisor._SPAWN_ABORTS and time.monotonic() < abort_deadline:
+                try:
+                    supervisor.retry_spawn_aborts(self.db_conn, self.home, testing_mode=self.testing_mode)
+                except Exception as exc:  # noqa: BLE001
+                    self.log_error(f"Spawn abort drain error: {type(exc).__name__}: {exc}")
+                if not supervisor._SPAWN_ABORTS:
+                    break
+                await asyncio.sleep(0.05)
 
     async def run_server(self) -> None:
         """Run the daemon server loop."""
         self.start_time = time.time()
         self.stop_event = asyncio.Event()
-
-        # Check setup and lock
-        self.setup_storage()
-        self.acquire_lock()
-        self.record_boot()
-        self.setup_subreaper()
-        self.run_recovery()
-
         sock_path = os.path.join(self.home, "run", "mesh.sock")
-        if os.path.exists(sock_path):
-            try:
-                os.remove(sock_path)
-            except OSError:
-                pass
-
-        # Set umask 077
+        sock_bound = False
         old_umask = os.umask(0o077)
-        try:
-            self.server = await asyncio.start_unix_server(
-                self.handle_client,
-                path=sock_path,
-                backlog=64,
-                limit=MAX_REQUEST_BYTES + 4096,
-            )
-            os.chmod(sock_path, 0o600)
-        finally:
-            os.umask(old_umask)
-
-        loop = asyncio.get_running_loop()
-        self._scheduler_wake = asyncio.Event()
-        self._scheduler_task = asyncio.create_task(self._scheduler_loop())
-        self._termination_task = asyncio.create_task(self._termination_loop())
-        stub_s = os.environ.get("MESH_TEST_STUB_CHILD_S")
-        if self.testing_mode and stub_s:
-            try:
-                self._stub_task = asyncio.create_task(self._stub_child(float(stub_s)))
-            except ValueError:
-                self.log_error("MESH_TEST_STUB_CHILD_S is not a number; ignored")
-
-        def on_signal() -> None:
-            if self.stop_event:
-                self.stop_event.set()
-
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            try:
-                loop.add_signal_handler(sig, on_signal)
-            except NotImplementedError:
-                pass
 
         try:
-            await self.stop_event.wait()
-        finally:
-            # Graceful shutdown
-            for bg_task in (self._scheduler_task, self._termination_task, self._stub_task):
-                if bg_task:
-                    bg_task.cancel()
-                    try:
-                        await bg_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-
-            if self.server:
-                # Stop accepting first. On Python 3.11 wait_closed() does not wait for
-                # the connection handlers, so they are drained below.
-                self.server.close()
-            await self._drain_for_shutdown()
-            if self.server:
-                try:
-                    await asyncio.wait_for(self.server.wait_closed(), timeout=5.0)
-                except (asyncio.TimeoutError, Exception):
-                    pass
+            # Check setup and lock
+            self.setup_storage()
+            self.acquire_lock()
+            self.record_boot()
+            self.setup_subreaper()
+            self.run_recovery()
 
             if os.path.exists(sock_path):
                 try:
@@ -2126,8 +2948,70 @@ class DaemonServer:
                 except OSError:
                     pass
 
-            self.record_stop()
-            self.release_lock()
-            if self.db_conn:
-                self.db_conn.close()
-                self.db_conn = None
+            sock_bound = True
+            self.server = await asyncio.start_unix_server(
+                self.handle_client,
+                path=sock_path,
+                backlog=64,
+                limit=MAX_REQUEST_BYTES + 4096,
+            )
+            os.chmod(sock_path, 0o600)
+
+            loop = asyncio.get_running_loop()
+            self._scheduler_wake = asyncio.Event()
+            self._scheduler_task = asyncio.create_task(self._scheduler_loop())
+            self._termination_task = asyncio.create_task(self._termination_loop())
+            stub_s = os.environ.get("MESH_TEST_STUB_CHILD_S")
+            if self.testing_mode and stub_s:
+                try:
+                    self._stub_task = asyncio.create_task(self._stub_child(float(stub_s)))
+                except ValueError:
+                    self.log_error("MESH_TEST_STUB_CHILD_S is not a number; ignored")
+
+            def on_signal() -> None:
+                if self.stop_event:
+                    self.stop_event.set()
+
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                try:
+                    loop.add_signal_handler(sig, on_signal)
+                except NotImplementedError:
+                    pass
+
+            await self.stop_event.wait()
+        finally:
+            try:
+                # Graceful shutdown
+                for bg_task in (self._scheduler_task, self._termination_task, self._stub_task):
+                    if bg_task:
+                        bg_task.cancel()
+                        try:
+                            await bg_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+
+                if self.server:
+                    # Stop accepting first. On Python 3.11 wait_closed() does not wait for
+                    # the connection handlers, so they are drained below.
+                    self.server.close()
+                if self.lock_fd is not None or self.server is not None:
+                    await self._drain_for_shutdown()
+                if self.server:
+                    try:
+                        await asyncio.wait_for(self.server.wait_closed(), timeout=5.0)
+                    except (asyncio.TimeoutError, Exception):
+                        pass
+
+                if sock_bound and os.path.exists(sock_path):
+                    try:
+                        os.remove(sock_path)
+                    except OSError:
+                        pass
+
+                self.record_stop()
+                self.release_lock()
+                if self.db_conn:
+                    self.db_conn.close()
+                    self.db_conn = None
+            finally:
+                os.umask(old_umask)

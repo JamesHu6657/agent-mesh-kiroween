@@ -27,7 +27,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-#: The 15 commands a lead turn may execute (plan §12.4).
+#: The 16 commands a lead turn may execute (plan §12.4 + task.close).
 ALLOWED_ACTION_CMDS: List[str] = [
     "task.create",
     "task.assign",
@@ -37,6 +37,7 @@ ALLOWED_ACTION_CMDS: List[str] = [
     "task.retry",
     "task.escalate",
     "task.cancel",
+    "task.close",
     "task.merge",
     "dep.add",
     "dep.remove",
@@ -57,7 +58,7 @@ ERR_CMD_NOT_ALLOWED = "cmd_not_allowed"
 ERR_TOO_MANY_ACTIONS = "too_many_actions"
 
 #: `--idempotency-key` charset and length (plan §13.1).
-IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+IDEMPOTENCY_KEY_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,128}\Z")
 
 #: An opening fence line: 3+ backticks, an optional info string, LF or CRLF.
 _OPEN_RE = re.compile(r"^[ \t]*(`{3,})[ \t]*([^\r\n`]*)\r?$")
@@ -157,7 +158,7 @@ def parse_actions(final_text: str) -> ParsedActions:
             continue
         try:
             parsed = json.loads(body)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             continue
         if not isinstance(parsed, list):
             continue
@@ -215,7 +216,7 @@ def action_idempotency_key(run_id: str, index: int) -> str:
 #: Commands whose handler names the task `task_id`; the §12.4 example writes `task`.
 _TASK_ARG_CMDS = frozenset({
     "task.assign", "task.reassign", "task.accept", "task.reject", "task.retry",
-    "task.escalate", "task.cancel", "task.merge", "dep.add", "dep.remove",
+    "task.escalate", "task.cancel", "task.close", "task.merge", "dep.add", "dep.remove",
 })
 
 #: Commands whose handler names the project `project_id` (the CLI's positional).
@@ -239,6 +240,8 @@ def action_request_args(cmd: str, args: Dict[str, Any], scope_project_id: Option
     out = dict(args)
     if cmd in _TASK_ARG_CMDS:
         _alias(out, "task", "task_id")
+    if cmd in ("task.assign", "task.reassign"):
+        _alias(out, "agent", "to")
     if cmd == "task.create":
         _alias(out, "project_id", "project")
         if not out.get("project") and scope_project_id:

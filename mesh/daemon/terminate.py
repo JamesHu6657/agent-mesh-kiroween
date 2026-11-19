@@ -32,6 +32,11 @@ Safety rules:
   ``EACCES``/``EPERM`` on ``/proc/<pid>/environ`` is uncertain for same-uid
   non-kthreads started at/after ``wrapper_starttime`` (or within ``YOUNG_S``
   when ``wrapper_starttime`` is unknown), leaving older host bystanders alone.
+  Full review r7 (R2-P2-1): for a run this meshd spawned, it is not uncertain when
+  the process's PPid chain never passes through meshd (meshd is a child subreaper,
+  so every process of such a run, setsid'd and double-forked ones included, stays
+  in meshd's tree): an ``ssh-agent``/``gpg-agent`` the user starts during a run is
+  not one of its processes. An adopted run keeps the rule above unchanged.
 - Nothing here sleeps on the scheduler path; "nothing left" needs two empty scans
   at least POLL_S apart, taken on separate ticks (``Termination.empty_scan_at``,
   ``ClearCheck``).
@@ -41,9 +46,10 @@ import contextvars
 import errno
 import os
 import signal
+import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from mesh.core.proc import ScanResult, get_proc_environ, get_proc_stat, is_tgid_alive
 from mesh.daemon import children
@@ -137,32 +143,41 @@ class ClearCheck:
 
 
 _active: Dict[str, Termination] = {}
+_active_lock = threading.RLock()
 
 
 def get(run_id: str) -> Optional[Termination]:
-    return _active.get(run_id)
+    with _active_lock:
+        return _active.get(run_id)
 
 
 def active() -> Dict[str, Termination]:
-    return dict(_active)
+    with _active_lock:
+        return dict(_active)
 
 
 def forget(run_id: str) -> None:
-    _active.pop(run_id, None)
+    with _active_lock:
+        _active.pop(run_id, None)
 
 
 def kill_failed_runs() -> List[Dict[str, object]]:
     """Runs whose kill failed and are being retried (shown in `mesh status`)."""
-    out = []
-    for t in _active.values():
-        if t.kill_failed:
-            out.append({
-                "run_id": t.run_id,
-                "end_reason": t.end_reason,
-                "pids": sorted(t.seen),
-                "attempts": t.kill_failed_count,
-            })
-    return out
+    with _active_lock:
+        snapshot = [
+            (t.run_id, t.end_reason, list(t.seen), t.kill_failed_count)
+            for t in _active.values()
+            if t.kill_failed
+        ]
+    return [
+        {
+            "run_id": run_id,
+            "end_reason": end_reason,
+            "pids": sorted(pids),
+            "attempts": attempts,
+        }
+        for run_id, end_reason, pids, attempts in snapshot
+    ]
 
 
 def _wrapper_identity_alive(wrapper_pid: Optional[int], wrapper_starttime: Optional[int],
@@ -405,6 +420,75 @@ def _foreign_spawned_bystander(info: Dict[str, int], eacces_from: Optional[int],
         return False
 
 
+#: prctl(2) PR_GET_CHILD_SUBREAPER.
+_PR_GET_CHILD_SUBREAPER = 37
+_libc = None
+
+
+def _is_child_subreaper() -> bool:
+    """True when this process is a child subreaper (meshd sets it at start, §11.4).
+    Unknown (no libc, prctl error) is False: the stricter rule then applies."""
+    global _libc
+    try:
+        import ctypes
+        if _libc is None:
+            _libc = ctypes.CDLL(None, use_errno=True)
+        val = ctypes.c_int(0)
+        if _libc.prctl(_PR_GET_CHILD_SUBREAPER, ctypes.byref(val), 0, 0, 0) != 0:
+            return False
+        return val.value != 0
+    except (OSError, AttributeError, ValueError):
+        return False
+
+
+def _tree_root_for(wrapper_starttime: Optional[int]) -> Optional[Tuple[int, int]]:
+    """Full review r7 (R2-P2-1): ``(meshd pid, meshd starttime)`` when every process of the
+    run is provably in meshd's process tree, else None.
+
+    That holds when meshd is a child subreaper and the run's wrapper started after meshd
+    did (this meshd spawned it; an adopted run's wrapper predates it, and its orphans went
+    to the old meshd's ancestors). An orphan reparents to its nearest living subreaper
+    ancestor, which for such a run is meshd or one of the run's own processes."""
+    if wrapper_starttime is None or int(wrapper_starttime) <= 0 or not _is_child_subreaper():
+        return None
+    me = os.getpid()
+    try:
+        info = get_proc_stat(me)
+    except OSError:
+        return None
+    if info is None or int(wrapper_starttime) < int(info["starttime"]):
+        return None
+    return me, int(info["starttime"])
+
+
+def _outside_tree(pid: int, info: Dict[str, int], stats: Dict[int, Dict[str, int]],
+                  root: Tuple[int, int]) -> bool:
+    """True when ``pid``'s PPid chain provably never passes through meshd: it ends at pid
+    0/1, or at a process older than meshd (which cannot descend from it). Each parent must
+    have started no later than its child (else the ppid was reused mid-walk). A read
+    error, a vanished parent or an over-long chain is no proof (False: stays uncertain)."""
+    me, me_start = root
+    cur = info
+    for _ in range(64):
+        ppid = int(cur["ppid"])
+        if ppid == me:
+            return False
+        if ppid <= 1:
+            return True
+        parent = stats.get(ppid)
+        if parent is None:
+            try:
+                parent = get_proc_stat(ppid)
+            except OSError:
+                return False
+        if parent is None or int(parent["starttime"]) > int(cur["starttime"]):
+            return False
+        if int(parent["starttime"]) < me_start:
+            return True
+        cur = parent
+    return False
+
+
 def _environ_unknown(env: Optional[Dict[str, str]], pid: int, info: Dict[str, int],
                      young_from: Optional[int]) -> bool:
     """True when an empty/unreadable environ may just not be visible yet (UNKNOWN).
@@ -530,6 +614,7 @@ def _run_targets_inner(
         if wrapper_starttime is not None and int(wrapper_starttime) > 0
         else young_from
     )
+    tree_root = _tree_root_for(wrapper_starttime)
 
     stats: Dict[int, Dict[str, int]] = {}
     found = ScanResult()
@@ -594,7 +679,8 @@ def _run_targets_inner(
                 # have st < eacces_from and do not wedge scans.
                 if _same_uid(pid) and not _is_kthread(pid, info):
                     if ((eacces_from is None or st >= eacces_from) and not _exiting_or_gone(pid, st)
-                            and not _foreign_spawned_bystander(info, eacces_from, pid)):
+                            and not _foreign_spawned_bystander(info, eacces_from, pid)
+                            and not (tree_root is not None and _outside_tree(pid, info, stats, tree_root))):
                         found.uncertain = True
             env = None
         if env and env.get("MESH_RUN_ID") == run_id:
@@ -664,7 +750,9 @@ def run_targets_or_recheck(
 
 
 def _targets(t: Termination) -> Dict[int, int]:
-    return run_targets(t.run_id, t.pgid, t.wrapper_pid, t.wrapper_starttime, t.seen)
+    with _active_lock:
+        seen = dict(t.seen)
+    return run_targets(t.run_id, t.pgid, t.wrapper_pid, t.wrapper_starttime, seen)
 
 
 def signal_if_same(pid: int, starttime: int, sig: int) -> bool:
@@ -687,6 +775,48 @@ def signal_if_same(pid: int, starttime: int, sig: int) -> bool:
     return True
 
 
+def _filter_live_seen(seen: Optional[Dict[int, int]]) -> Dict[int, int]:
+    kept: Dict[int, int] = {}
+    for pid, st in (seen or {}).items():
+        ip = int(pid)
+        ist = int(st)
+        try:
+            info = get_proc_stat(ip)
+            if info is not None and int(info["starttime"]) == ist and is_tgid_alive(ip, info):
+                kept[ip] = ist
+        except OSError:
+            kept[ip] = ist
+    return kept
+
+
+def _merge_seen_locked(
+    existing: Termination,
+    additions: Dict[int, int],
+    *,
+    signalled_term: Optional[Set[int]] = None,
+    scan_uncertain: bool = False,
+) -> List[Tuple[int, int]]:
+    newly_added: List[Tuple[int, int]] = []
+    for pid, st in additions.items():
+        if existing.seen.get(pid) != st:
+            existing.seen[pid] = st
+            existing.signalled_kill.discard(pid)
+            if signalled_term is not None and pid in signalled_term:
+                existing.signalled_term.add(pid)
+            else:
+                existing.signalled_term.discard(pid)
+            newly_added.append((pid, st))
+        elif signalled_term is not None and pid in signalled_term:
+            existing.signalled_term.add(pid)
+    if scan_uncertain:
+        existing.scan_uncertain = True
+    if newly_added:
+        existing.empty_scan_at = None
+        if existing.phase == "failed":
+            existing.next_retry = 0.0
+    return newly_added
+
+
 def begin(
     run_id: str,
     pgid: Optional[int],
@@ -703,18 +833,30 @@ def begin(
     entries still alive with the same starttime (or whose /proc stat is unreadable,
     so they cannot be proven gone) are kept.
     """
-    existing = _active.get(run_id)
+    verified_seen = _filter_live_seen(seen)
+    with _active_lock:
+        existing = _active.get(run_id)
+        if existing is not None:
+            newly_added = _merge_seen_locked(existing, verified_seen)
+            phase = existing.phase
+        else:
+            newly_added = []
+            phase = None
     if existing is not None:
+        if newly_added and phase == "term":
+            termed: List[Tuple[int, int]] = []
+            for pid, st in newly_added:
+                if signal_if_same(pid, st, signal.SIGTERM):
+                    termed.append((pid, st))
+            if termed:
+                with _active_lock:
+                    for pid, st in termed:
+                        if existing.seen.get(pid) == st:
+                            existing.signalled_term.add(pid)
         return existing
     t = Termination(run_id=run_id, pgid=pgid, wrapper_pid=wrapper_pid, end_reason=end_reason,
                     grace_s=float(grace_s), wrapper_starttime=wrapper_starttime)
-    for pid, st in (seen or {}).items():
-        try:
-            info = get_proc_stat(int(pid))
-            if info is not None and int(info["starttime"]) == int(st) and is_tgid_alive(int(pid), info):
-                t.seen[int(pid)] = int(st)
-        except OSError:
-            t.seen[int(pid)] = int(st)
+    t.seen.update(verified_seen)
     t.deadline = t.started + t.grace_s
     live = _targets(t)
     t.scan_uncertain = getattr(live, "uncertain", False)
@@ -723,7 +865,17 @@ def begin(
         t.seen[pid] = st
         if signal_if_same(pid, st, signal.SIGTERM):
             t.signalled_term.add(pid)
-    _active[run_id] = t
+    with _active_lock:
+        existing = _active.get(run_id)
+        if existing is not None:
+            _merge_seen_locked(
+                existing,
+                t.seen,
+                signalled_term=t.signalled_term,
+                scan_uncertain=t.scan_uncertain,
+            )
+            return existing
+        _active[run_id] = t
     return t
 
 
@@ -734,11 +886,12 @@ def step(t: Termination) -> str:
     t.scan_uncertain = uncertain
     # A pid seen before with a different starttime is a reused pid: it qualified on
     # its own (MESH_RUN_ID, a trusted group, or descent from a seen process).
-    for pid, st in live.items():
-        if t.seen.get(pid) != st:
-            t.seen[pid] = st
-            t.signalled_term.discard(pid)
-            t.signalled_kill.discard(pid)
+    with _active_lock:
+        for pid, st in live.items():
+            if t.seen.get(pid) != st:
+                t.seen[pid] = st
+                t.signalled_term.discard(pid)
+                t.signalled_kill.discard(pid)
     now = time.monotonic()
     if not live and not uncertain:
         # Two consecutive empty scans at least one poll apart; one empty scan is not "done".

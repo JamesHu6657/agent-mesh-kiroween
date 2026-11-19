@@ -13,6 +13,9 @@ from mesh.adapters.droid import DroidAdapter
 from mesh.adapters.agy import AgyAdapter
 from mesh.adapters.kiro import KiroAdapter
 from mesh.adapters.vibe import VibeAdapter
+from mesh.adapters.codex import CodexAdapter
+from mesh.adapters.claude import ClaudeAdapter
+from mesh.adapters.devin import DevinAdapter
 from mesh.adapters.hermes import HermesAdapter
 from mesh.adapters.openclaw import OpenclawAdapter
 from mesh.adapters.none_adapter import NoneAdapter
@@ -24,6 +27,9 @@ ADAPTER_CLASSES: Dict[str, Type[Adapter]] = {
     "agy": AgyAdapter,
     "kiro": KiroAdapter,
     "vibe": VibeAdapter,
+    "codex": CodexAdapter,
+    "claude": ClaudeAdapter,
+    "devin": DevinAdapter,
     "hermes": HermesAdapter,
     "openclaw": OpenclawAdapter,
     "none": NoneAdapter,
@@ -35,6 +41,9 @@ STANDARD_ADAPTER_ORDER = [
     "agy",
     "kiro",
     "vibe",
+    "codex",
+    "claude",
+    "devin",
     "hermes",
     "openclaw",
     "none",

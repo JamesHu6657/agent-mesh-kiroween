@@ -91,8 +91,7 @@ class TestDelegatedSelfApproval(unittest.TestCase):
         rc, resp = self.harness.cli("approval", "request", "--category", "deploy", "--summary", "ship",
                                     "--operation", '{"what":"deploy"}', "--project", self.prj,
                                     token=self.tok_grok)
-        if rc != c.EXIT_APPROVAL_REQUIRED and rc != 0:
-            self.skipTest(f"approval request by a non-lead not allowed here: {resp}")
+        self.assertIn(rc, (0, c.EXIT_APPROVAL_REQUIRED), resp)
         d = resp.get("data") or resp["error"]["details"]
         apr, h = d["approval_id"] if "approval_id" in d else d["id"], d["op_hash"]
         rc, resp = self._decide("approve", apr, h, self.tok_lead1, "James: ship it")

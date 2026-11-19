@@ -101,6 +101,17 @@ def check_quick(conn: sqlite3.Connection) -> None:
         raise DbIntegrityError(lines)
 
 
+def parse_schema_version(raw: object) -> Optional[int]:
+    """Return integer schema version if *raw* is a strict unsigned int, else None."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 0 else None
+    if isinstance(raw, str) and raw.isascii() and raw.isdigit():
+        return int(raw)
+    return None
+
+
 def get_schema_version(conn: sqlite3.Connection) -> int:
     """Retrieve current schema version from meta table, or 0 if meta does not exist."""
     cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='meta';")
@@ -122,10 +133,23 @@ def migrate_db(conn: sqlite3.Connection) -> int:
 
     Raises:
         SchemaTooNewError (exit 1, SCHEMA_TOO_NEW) if DB version > CURRENT_SCHEMA_VERSION.
+        DbIntegrityError (exit 1, DB_INTEGRITY_FAILED) if meta exists with invalid/zero schema_version.
     """
-    current_ver = get_schema_version(conn)
-    if current_ver > CURRENT_SCHEMA_VERSION:
-        raise SchemaTooNewError(current_version=current_ver, supported_version=CURRENT_SCHEMA_VERSION)
+    has_meta = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='meta';").fetchone()
+    if has_meta:
+        row = conn.execute("SELECT value FROM meta WHERE key='schema_version';").fetchone()
+        if not row:
+            raise DbIntegrityError(["schema_version missing in meta table"])
+        raw = row["value"]
+        current_ver = parse_schema_version(raw)
+        if current_ver is None:
+            raise DbIntegrityError([f"schema_version is not an integer: {raw!r}"])
+        if current_ver > CURRENT_SCHEMA_VERSION:
+            raise SchemaTooNewError(current_version=current_ver, supported_version=CURRENT_SCHEMA_VERSION)
+        if current_ver < 1:
+            raise DbIntegrityError([f"schema_version out of range: {current_ver}"])
+    else:
+        current_ver = 0
 
     for migration in MIGRATIONS:
         if migration.version > current_ver:

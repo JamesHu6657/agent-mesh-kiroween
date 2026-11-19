@@ -1,0 +1,8 @@
+Logged in (via Devin).
+
+Credentials:
+  File:              /home/u/.local/share/devin/credentials.toml
+
+User:
+  Name:              Jane Roe
+  Email:             jane@example.com

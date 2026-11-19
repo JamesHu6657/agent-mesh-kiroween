@@ -242,6 +242,13 @@ def verify_user_passphrase(
     Returns:
         (is_valid, K_user or None)
     """
+    if not isinstance(passphrase, str):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Passphrase must be a string",
+            details={"param": "passphrase"},
+        )
     params = parse_kdf_params(kdf_params, testing_mode)
     dk = hashlib.scrypt(
         passphrase.encode("utf-8"),
@@ -294,6 +301,8 @@ def generate_run_token() -> Tuple[str, str, bytes]:
 
 def parse_token_lookup(token: str) -> Optional[str]:
     """Extract lookup ID from token string."""
+    if not isinstance(token, str):
+        return None
     if token.startswith("mesh_at_") or token.startswith("mesh_rt_"):
         if len(token) >= 19 and token[18] == "_":
             return token[8:18]
@@ -302,6 +311,8 @@ def parse_token_lookup(token: str) -> Optional[str]:
 
 def verify_token_hash(token: str, stored_hash: bytes) -> bool:
     """Compare sha256(token) against stored hash constant-time."""
+    if not isinstance(token, str):
+        return False
     token_hash = hashlib.sha256(token.encode("utf-8")).digest()
     return hmac.compare_digest(token_hash, stored_hash)
 

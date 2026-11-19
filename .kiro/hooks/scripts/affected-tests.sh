@@ -22,10 +22,12 @@
 
 set -o pipefail
 
+CALLER_PWD="$(pwd -P)" || exit 2
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd -P)" || exit 2
 cd "$ROOT" || exit 2
 
 files=()
+from_git_status=0
 if [ "$#" -gt 0 ]; then
   files=("$@")
 else
@@ -64,6 +66,7 @@ print(path)
   if [ -n "$hook_path" ]; then
     files=("$hook_path")
   else
+    from_git_status=1
     while IFS= read -r line; do
       p="${line:3}"
       case "$p" in *" -> "*) p="${p##* -> }" ;; esac
@@ -89,21 +92,56 @@ map_name() {
   for t in tests/unit/test_"$1"*.py; do
     [ -f "$t" ] && add_module "$t"
   done
+  case "$1" in
+    terminate|children)
+      [ -f tests/unit/test_termination_units.py ] && add_module tests/unit/test_termination_units.py
+      ;;
+    authz)
+      for t in tests/unit/test_auth.py tests/unit/test_projects.py; do
+        [ -f "$t" ] && add_module "$t"
+      done
+      ;;
+    task)
+      for t in tests/unit/test_leases.py tests/unit/test_projects.py tests/unit/test_friction4.py tests/unit/test_friction5.py; do
+        [ -f "$t" ] && add_module "$t"
+      done
+      ;;
+    approvals|approval)
+      for t in tests/unit/test_projects.py tests/unit/test_friction4.py; do
+        [ -f "$t" ] && add_module "$t"
+      done
+      ;;
+    agy|droid|kiro|vibe|base|registry|smoke_schema)
+      for t in tests/unit/test_adapters*.py; do
+        [ -f "$t" ] && add_module "$t"
+      done
+      ;;
+  esac
 }
 
 normalize() {
-  local f="$1" r
+  local f="$1" r cand
   case "$f" in
     /*)
       r="$(realpath -m -- "$f" 2>/dev/null || printf '%s' "$f")"
-      case "$r" in
-        "$ROOT"/*) f="${r#"$ROOT"/}" ;;
-        *) f="" ;;
-      esac
       ;;
-    ./*) f="${f#./}" ;;
+    *)
+      if [ "$from_git_status" -eq 1 ]; then
+        cand="$ROOT/$f"
+      elif [ -e "$CALLER_PWD/$f" ]; then
+        cand="$CALLER_PWD/$f"
+      elif [ -e "$ROOT/$f" ]; then
+        cand="$ROOT/$f"
+      else
+        cand="$CALLER_PWD/$f"
+      fi
+      r="$(realpath -m -- "$cand" 2>/dev/null || printf '%s' "$cand")"
+      ;;
   esac
-  printf '%s' "$f"
+  case "$r" in
+    "$ROOT"/*) printf '%s' "${r#"$ROOT"/}" ;;
+    *) printf '' ;;
+  esac
 }
 
 for raw in "${files[@]}"; do
@@ -119,7 +157,7 @@ for raw in "${files[@]}"; do
       skipped+=("$f (opt-in tier)")
       ;;
     tests/integration/test_*|tests/recovery/test_*)
-      skipped+=("$f (integration/recovery: run bash scripts/test.sh or python3 -m unittest ${f%.py})")
+      skipped+=("$f (integration/recovery: run bash scripts/test.sh or python3 -m unittest $f)")
       ;;
     mesh/*|tests/*)
       map_name "$name"
@@ -141,7 +179,7 @@ trap 'rm -f "$TW"' EXIT
 
 echo "affected-tests: python3 -m unittest ${modules[*]}"
 PATH="$ROOT/tests/shims:$ROOT/bin:$PATH" \
-MESH_TRIPWIRE_FILE="$TW" MESH_SUITE_TRIPWIRE_FILE="$TW" \
+_TRIPWIRE_FILE="$TW" _SUITE_TRIPWIRE_FILE="$TW" \
   python3 -m unittest "${modules[@]}"
 rc=$?
 

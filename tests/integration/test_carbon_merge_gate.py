@@ -222,19 +222,44 @@ class TestP26SerialLeadMerges(LeadActionCase):
         tok_ibx = create_agent(self.harness, "ibx", adapter="none", delivery="inbox")
         repo = self.fixture.make_k0("SER")
         slow = json.dumps(["python3", "-c", "import time; time.sleep(1.5)"])  # holds the merge lease
-        rc, resp = self.harness.cli("intake", "submit", "--title", "Serial merges", "--goal", "g",
-                                    "--criterion", "C1", "--lead", "flead", "--repo", repo,
-                                    "--base-branch", "main", "--test-command", slow, token=self.tok_grok)
+        gate = os.path.join(self.harness.fixtures_dir, "serial-merges")
+        # Hold launch starts across setup so every initial wake coalesces into one lead turn
+        # with the action goal; otherwise an earlier turn or a `task.merged` wake re-runs
+        # the same goal actions and fails with INVALID_TRANSITION.
+        self.harness.hold_launch_starts()
+        try:
+            rc, resp = self.harness.cli("intake", "submit", "--title", "Serial merges", "--goal", "g",
+                                        "--criterion", "C1", "--lead", "flead", "--repo", repo,
+                                        "--base-branch", "main", "--test-command", slow, token=self.tok_grok)
+            self.assertEqual(rc, 0, resp)
+            project_id = resp["data"]["id"]
+            a = self._submitted_code_task(project_id, tok_ibx, "alpha")
+            b = self._submitted_code_task(project_id, tok_ibx, "beta")
+            actions = [
+                {"cmd": "task.accept", "args": {"task": a}},
+                {"cmd": "task.accept", "args": {"task": b}},
+                {"cmd": "task.merge", "args": {"task": a}},
+                {"cmd": "task.merge", "args": {"task": b}},
+            ]
+            rc, resp = self.harness.cli(
+                "project", "update", project_id, "--goal",
+                _fake_goal({"steps": [{"wait_release": {"path": gate}}, {"lead_actions": {"actions": actions}}]}),
+                user=True,
+            )
+            self.assertEqual(rc, 0, resp)
+            self._follow_up(project_id, "merge both")
+        finally:
+            self.harness.release_launch_starts()
+        # Clear the one-shot goal actions while the turn is held on `gate` so a subsequent
+        # `task.merged` wake turn never replays the already-applied accept/merge actions.
+        self._wait_turn_running(project_id)
+        rc, resp = self.harness.cli(
+            "project", "update", project_id, "--goal",
+            _fake_goal({"lead_actions": {"actions": []}}), user=True,
+        )
         self.assertEqual(rc, 0, resp)
-        project_id = resp["data"]["id"]
-        a = self._submitted_code_task(project_id, tok_ibx, "alpha")
-        b = self._submitted_code_task(project_id, tok_ibx, "beta")
-        self._set_actions(project_id, [
-            {"cmd": "task.accept", "args": {"task": a}},
-            {"cmd": "task.accept", "args": {"task": b}},
-            {"cmd": "task.merge", "args": {"task": a}},
-            {"cmd": "task.merge", "args": {"task": b}},
-        ], "merge both")
+        with open(gate, "w", encoding="utf-8"):
+            pass
         self.assertTrue(self.harness.wait_for(
             lambda: self._task_status(a) == "merged" and self._task_status(b) == "merged",
             timeout=90.0, step=0.2), f"statuses: {self._task_status(a)}, {self._task_status(b)}")
@@ -489,6 +514,14 @@ class TestP13IntentAndRecoveryByParents(MergeGateCase):
         with open(hook, "w", encoding="utf-8") as f:
             f.write('#!/bin/sh\necho "chore: merge branch" > "$1"\n')
         os.chmod(hook, 0o755)
+        if not os.access(hook, os.X_OK):  # R1 P2-4: /tmp mounted noexec; git would skip the hook
+            hooks_dir = tempfile.mkdtemp(prefix="mh-hooks-", dir=os.path.dirname(os.path.abspath(__file__)))
+            self.addCleanup(shutil.rmtree, hooks_dir, True)
+            alt = os.path.join(hooks_dir, "commit-msg")
+            shutil.copyfile(hook, alt)
+            os.chmod(alt, 0o755)
+            with open(os.path.join(repo, ".git", "config"), "a", encoding="utf-8") as cf:
+                cf.write(f"\n[core]\n\thooksPath = {hooks_dir}\n")
 
     def crash_after_merge_commit(self, tsk: str) -> None:
         self.harness.kill9_daemon()
@@ -506,69 +539,71 @@ class TestP13IntentAndRecoveryByParents(MergeGateCase):
         return repo, prj, tsk, ws, self.fixture.head(repo, f"mesh/{prj}/{tsk}")
 
     def test_intent_is_durable_and_names_pre_head_and_tip(self) -> None:
+        """Port: the private repo's intent is commit_ready.json (fsynced, 0600)."""
         repo, prj, tsk, _ws, tip = self.crashed_project("I1")
         pre_head = self.fixture.head(repo, self.integ_branch(prj))
         rc, resp = self.merge(tsk)
         self.assertEqual(rc, 0, resp)
         mrg = self.show(tsk)["merge"]["mrg"]
-        path = os.path.join(self.harness.home, "merges", mrg, "merge_intent.json")
+        path = os.path.join(self.harness.home, "merges", mrg, "commit_ready.json")
         with open(path, encoding="utf-8") as f:
             intent = json.load(f)
         self.assertEqual((intent["task_id"], intent["pre_head"], intent["tip"]), (tsk, pre_head, tip))
         self.assertEqual(oct(os.stat(path).st_mode & 0o777), oct(0o600))
         self.doctor_ok()
 
-    def test_commit_msg_hook_that_rewrites_the_message_is_still_reconciled(self) -> None:
+    def test_genuine_crash_after_commit_is_reconciled_by_commit_ready(self) -> None:
+        repo, prj, tsk, _ws, tip = self.crashed_project("I0")
+        pre_head = self.fixture.head(repo, self.integ_branch(prj))
+        self.crash_after_merge_commit(tsk)
+        head = self.fixture.head(repo, self.integ_branch(prj))
+        self.harness.restart_daemon()
+        d = self.show(tsk)
+        self.assertEqual(d["status"], "merged", d)
+        mj = self.merge_json(tsk)
+        self.assertEqual((mj["merge_commit"], mj["pre_head"], mj["reconciled"]), (head, pre_head, True), mj)
+        self.assertEqual(mj["matched_by"], "commit_ready")
+        parents = self.fixture.git(repo, "rev-list", "--parents", "-n", "1", head).stdout.split()
+        self.assertEqual(parents[1:], [pre_head, tip])
+        self.assert_no_merge_lease(prj)
+        self.doctor_ok()
+
+    def test_commit_msg_hook_that_rewrites_the_message_fails_closed(self) -> None:
+        """Port decision: the public repo reconciles this by parents alone; the private repo
+        keeps batch7's stricter rule (message must match), so recovery rolls the merge back:
+        merge_failed/interrupted, integration at pre_head, nothing unrecorded integrated."""
         repo, prj, tsk, _ws, tip = self.crashed_project("I2")
         self.install_message_rewriting_hook(repo)
         pre_head = self.fixture.head(repo, self.integ_branch(prj))
         self.crash_after_merge_commit(tsk)
         head = self.fixture.head(repo, self.integ_branch(prj))
         self.assertNotEqual(head, pre_head)
-        self.assertEqual(self.fixture.git(repo, "log", "-1", "--format=%s", head).stdout.strip(),
-                         "chore: merge branch")  # the task id is not in the message any more
-        self.harness.restart_daemon()
-        d = self.show(tsk)
-        self.assertEqual(d["status"], "merged", d)
-        mj = self.merge_json(tsk)
-        self.assertEqual((mj["merge_commit"], mj["pre_head"], mj["reconciled"]), (head, pre_head, True), mj)
-        self.assertEqual(mj["matched_by"], "merge_intent")
-        parents = self.fixture.git(repo, "rev-list", "--parents", "-n", "1", head).stdout.split()
-        self.assertEqual(parents[1:], [pre_head, tip])
-        self.assertEqual(self.merge_events(tsk, "merge.failed"), [])
-        self.assert_no_merge_lease(prj)
-        self.doctor_ok()
-
-    def test_task_branch_advanced_after_the_tip_was_resolved_is_still_reconciled(self) -> None:
-        repo, prj, tsk, ws, tip = self.crashed_project("I3")
-        pre_head = self.fixture.head(repo, self.integ_branch(prj))
-        self.crash_after_merge_commit(tsk)
-        head = self.fixture.head(repo, self.integ_branch(prj))
-        # an inbox executor keeps working on its branch while meshd is down
-        self.commit_file(ws, "more.txt", "more\n", "more work after the merge")
-        self.assertNotEqual(self.fixture.head(repo, f"mesh/{prj}/{tsk}"), tip)
-        self.harness.restart_daemon()
-        d = self.show(tsk)
-        self.assertEqual(d["status"], "merged", d)
-        mj = self.merge_json(tsk)
-        self.assertEqual((mj["merge_commit"], mj["pre_head"], mj["reconciled"]), (head, pre_head, True), mj)
-        self.assertEqual(self.merge_events(tsk, "merge.failed"), [])
-        self.doctor_ok()
-
-    def test_without_intent_and_with_rewritten_message_doctor_flags_the_cancelled_task(self) -> None:
-        """The report's scenario when no intent is available (a run from before intents): recovery
-        cannot prove the merge, the task ends merge_failed and, once cancelled, `doctor
-        --check-invariants` reports that its work is already in integration."""
-        repo, prj, tsk, _ws, tip = self.crashed_project("I4")
-        self.install_message_rewriting_hook(repo)
-        self.crash_after_merge_commit(tsk)
-        mrg = json.loads(self.q("SELECT merge_json FROM tasks WHERE id = ?;", (tsk,))[0]["merge_json"])["mrg"]
-        os.unlink(os.path.join(self.harness.home, "merges", mrg, "merge_intent.json"))
         self.harness.restart_daemon()
         self.assertEqual(self.show(tsk)["status"], "merge_failed")
         self.assertEqual(self.merge_json(tsk)["reason"], "interrupted")
-        rc, resp = self.harness.cli("doctor", "--check-invariants", user=True, timeout=60.0)
-        self.assertEqual(rc, 1, resp)  # already: merge_failed but integrated
+        self.assertEqual(self.fixture.head(repo, self.integ_branch(prj)), pre_head)
+        self.assertEqual(self.fixture.head(repo, f"mesh/{prj}/{tsk}"), tip)  # the work is kept on its branch
+        self.assert_no_merge_lease(prj)
+        self.doctor_ok()
+
+    def test_task_branch_advanced_after_the_tip_was_resolved_fails_closed(self) -> None:
+        repo, prj, tsk, ws, tip = self.crashed_project("I3")
+        pre_head = self.fixture.head(repo, self.integ_branch(prj))
+        self.crash_after_merge_commit(tsk)
+        self.commit_file(ws, "more.txt", "more\n", "more work after the merge")
+        self.assertNotEqual(self.fixture.head(repo, f"mesh/{prj}/{tsk}"), tip)
+        self.harness.restart_daemon()
+        self.assertEqual(self.show(tsk)["status"], "merge_failed")
+        self.assertEqual(self.fixture.head(repo, self.integ_branch(prj)), pre_head)
+        self.doctor_ok()
+
+    def test_deliver_refuses_integrated_work_of_a_cancelled_task(self) -> None:
+        """Reverse I9 + deliver gate: work of a non-merged task that is in integration (put
+        there here by hand, as a crash the recovery could not reconcile would) is reported by
+        `doctor --check-invariants` and never delivered."""
+        repo, prj, tsk, _ws, tip = self.crashed_project("I4")
+        integ = self.integ_wt(prj)
+        self.fixture.git(integ, "merge", "--no-ff", "-m", "chore: merge branch", f"mesh/{prj}/{tsk}", identity=True)
         rc, resp = self.harness.cli("task", "cancel", tsk, "--reason", "abandon", token=self.tok_lead1)
         self.assertEqual(rc, 0, resp)
         rc, resp = self.harness.cli("doctor", "--check-invariants", user=True, timeout=60.0)
@@ -577,9 +612,6 @@ class TestP13IntentAndRecoveryByParents(MergeGateCase):
         self.assertEqual([(v["invariant"], v["details"]["task_id"], v["details"]["reason"]) for v in viol],
                          [("I9", tsk, "integrated_but_not_merged")], viol)
         self.assertEqual(viol[0]["details"]["status"], "cancelled")
-        head = self.fixture.head(repo, self.integ_branch(prj))
-        self.assertEqual(self.fixture.git(repo, "rev-list", "--parents", "-n", "1", head).stdout.split()[2], tip)
-        # the cancelled task's code never reaches main: deliver refuses (P1-2 follow-up gate)
         main_before = self.fixture.head(repo, "main")
         rc, resp = self.harness.cli("project", "deliver", prj, token=self.tok_lead1, timeout=60.0)
         self.assertEqual(rc, c.EXIT_CONFLICT, resp)
@@ -633,7 +665,6 @@ class TestP12TestStepGitState(MergeGateCase):
         self.assertEqual(resp["error"]["code"], c.TESTS_FAILED, resp)
         det = resp["error"]["details"]
         self.assertIs(det["restored"], True, det)
-        self.assertIn("cov.xml", det["cleanup"]["removed"], det)
         self.assert_integration_restored(repo, prj, pre_head)
         self.assertFalse(os.path.exists(os.path.join(self.integ_wt(prj), "cov.xml")))
         # Task B: before the fix rc 14 INTEGRATION_DIRTY; now its own test run decides (and fails).
@@ -669,35 +700,38 @@ class TestP12TestStepGitState(MergeGateCase):
         self.assertEqual(self.show(tsk_b)["status"], "merged")
         self.doctor_ok()
 
-    def test_a_passing_test_that_stages_a_file_is_tests_failed_and_nothing_is_committed(self) -> None:
+    def test_a_passing_test_that_stages_a_file_fails_and_nothing_is_committed(self) -> None:
+        """Port: the private repo's batch7 guard reports this as INTEGRATION_DIRTY
+        (dirty_after_tests) instead of TESTS_FAILED; the safety outcome is the same."""
         repo, prj = self.project_with("P12c", STAGE_SCRIPT)
         tsk, _ = self.accepted_task(prj, "Feature", "f.txt", "f\n")
         pre_head = self.fixture.head(repo, self.integ_branch(prj))
         rc, resp = self.merge(tsk)
         self.assertEqual(rc, c.EXIT_MERGE_FAILED, resp)
-        self.assertEqual(resp["error"]["code"], c.TESTS_FAILED, resp)
+        self.assertEqual(resp["error"]["code"], c.INTEGRATION_DIRTY, resp)
         det = resp["error"]["details"]
         self.assertEqual(det["exit_code"], 0, det)  # the command itself "passed"
-        self.assertIn("index_changed", det["git_changes"], det)
-        self.assertEqual(det["error"], "test_changed_git_state", det)
+        self.assertEqual(det["error"], "dirty_after_tests", det)
         self.assertIs(det["restored"], True, det)
         self.assert_integration_restored(repo, prj, pre_head)
         self.assertNotIn("injected.py", self.tree_files(repo, self.integ_branch(prj)))
         self.assertFalse(os.path.exists(os.path.join(self.integ_wt(prj), "injected.py")))
         self.assertEqual(self.show(tsk)["status"], "merge_failed")
-        self.assertEqual(self.merge_runs(tsk)[0]["end_reason"], "tests_failed")
         self.assert_no_merge_lease(prj)
         self.assert_remote_unchanged()
         self.doctor_ok()
 
-    def test_a_tracked_file_rewritten_by_a_passing_test_is_restored_before_the_commit(self) -> None:
+    def test_a_tracked_file_rewritten_by_a_passing_test_fails_and_is_restored(self) -> None:
+        """Port: public restores the file and commits; the private repo refuses the merge
+        (stricter) and restores the integration tree, so the next merge is not wedged."""
         repo, prj = self.project_with("P12d", REWRITE_SCRIPT)
         original = self.fixture.git(repo, "show", "main:calc.py").stdout
         tsk, _ = self.accepted_task(prj, "Feature", "f.txt", "f\n")
+        pre_head = self.fixture.head(repo, self.integ_branch(prj))
         rc, resp = self.merge(tsk)
-        self.assertEqual(rc, 0, resp)
-        mc = resp["data"]["merge_commit"]
-        self.assertEqual(self.fixture.git(repo, "show", f"{mc}:calc.py").stdout, original)
+        self.assertEqual(resp["error"]["code"], c.INTEGRATION_DIRTY, resp)
+        self.assertIs(resp["error"]["details"]["restored"], True, resp)
+        self.assert_integration_restored(repo, prj, pre_head)
         wt = self.integ_wt(prj)
         with open(os.path.join(wt, "calc.py"), encoding="utf-8") as f:
             self.assertEqual(f.read(), original)
@@ -716,36 +750,172 @@ class TestP12TestStepGitState(MergeGateCase):
         rc, resp = self.merge(tsk_b)
         self.assertEqual(rc, 0, resp)
 
-    def test_a_test_that_commits_moves_head_and_is_tests_failed(self) -> None:
+    def test_a_test_that_commits_is_refused_and_head_restored(self) -> None:
+        """Port: public cannot rewind HEAD and relies on reverse I9 + the deliver gate; the
+        private repo's CAS restore puts the integration branch back to pre_head."""
         repo, prj = self.project_with("P12f", COMMIT_SCRIPT)
         tsk, _ = self.accepted_task(prj, "Feature", "f.txt", "f\n")
+        pre_head = self.fixture.head(repo, self.integ_branch(prj))
         rc, resp = self.merge(tsk)
-        self.assertEqual(rc, c.EXIT_MERGE_FAILED, resp)
-        self.assertEqual(resp["error"]["code"], c.TESTS_FAILED, resp)
-        det = resp["error"]["details"]
-        self.assertIn("head_moved", det["git_changes"], det)
-        # HEAD is never rewound (no reset, no non-CAS ref update): reported as not restored.
-        self.assertIs(det["restored"], False, det)
+        self.assertEqual(resp["error"]["code"], c.INTEGRATION_DIRTY, resp)
+        self.assertIs(resp["error"]["details"]["restored"], True, resp)
+        self.assert_integration_restored(repo, prj, pre_head)
         self.assertEqual(self.show(tsk)["status"], "merge_failed")
         self.assert_no_merge_lease(prj)
         self.assert_remote_unchanged()
-        # The commit the test made stays in integration; reverse I9 (P1-3) is what reports it.
-        rc, resp = self.harness.cli("doctor", "--check-invariants")
-        self.assertNotEqual(rc, 0, resp)
-        reasons = [(v["details"]["task_id"], v["details"]["reason"]) for v in resp["error"]["details"]["violations"]]
-        self.assertEqual(reasons, [(tsk, "integrated_but_not_merged")], resp)
-        # ... and `project deliver` refuses to hand that unreviewed commit to the base branch.
-        main_before = self.fixture.head(repo, "main")
-        for args in (("--dry-run",), ()):
-            rc, resp = self.harness.cli("project", "deliver", prj, *args, token=self.tok_lead1, timeout=60.0)
-            self.assertEqual(rc, c.EXIT_CONFLICT, resp)
-            err = resp["error"]
-            self.assertEqual((err["code"], err["details"]["reason"]),
-                             (c.INVALID_TRANSITION, "integrated_unmerged_work"), err)
-            self.assertEqual([t["task_id"] for t in err["details"]["tasks"]], [tsk], err)
-        self.assertEqual(self.fixture.head(repo, "main"), main_before)
-        self.assertEqual(self.q("SELECT 1 FROM events WHERE type = 'project.delivered';"), [])
+        self.doctor_ok()
+
+class TestPR51R1(MergeGateCase):
+    """PR #51 R1 review findings P1-1 (unsettled merge), P1-4 (reverse I9 after a branch
+    synced integration) and P2-3 (workspace delete vs a sibling project's merge)."""
+
+    def set_status(self, tsk: str, status: str) -> None:
+        conn = sqlite3.connect(os.path.join(self.harness.home, "mesh.db"), timeout=10)
+        try:
+            conn.execute("UPDATE tasks SET status = ? WHERE id = ?;", (status, tsk))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_p1_1_merge_refused_while_another_task_is_merging_without_lease(self) -> None:
+        repo, prj = self.make_project("U1", test_command="none")
+        self.repo = repo
+        tsk_a, _ = self.accepted_task(prj, "A", "a.txt", "a\n")
+        tsk_b, _ = self.accepted_task(prj, "B", "b.txt", "b\n")
+        self.set_status(tsk_a, "merging")  # e.g. a forced release whose recovery effect failed
+        try:
+            rc, resp = self.merge(tsk_b)
+            self.assertEqual(rc, c.EXIT_BUSY, resp)
+            self.assertEqual(resp["error"]["details"]["reason"], "merge_unsettled", resp)
+            self.assertEqual(resp["error"]["details"]["task_id"], tsk_a, resp)
+        finally:
+            self.set_status(tsk_a, "accepted")
+        rc, resp = self.merge(tsk_b)
+        self.assertEqual(rc, 0, resp)
+
+    def test_p1_4_branch_that_synced_integration_is_not_reported(self) -> None:
+        repo, prj = self.make_project("S1", test_command="none")
+        self.repo = repo
+        tsk_2, ws_2 = self.accepted_task(prj, "Second", "s.txt", "s\n")
+        tsk_1, _ = self.accepted_task(prj, "First", "f.txt", "f\n")
+        rc, resp = self.merge(tsk_1)
+        self.assertEqual(rc, 0, resp)
+        # the second task's branch pulls integration in (to resolve a conflict, say)
+        self.fixture.git(ws_2, "merge", "--no-ff", "-m", "sync integration", self.integ_branch(prj), identity=True)
+        rc, resp = self.harness.cli("doctor", "--check-invariants", user=True, timeout=60.0)
+        self.assertEqual(rc, 0, resp)
+        rc, resp = self.harness.cli("project", "deliver", prj, "--dry-run", token=self.tok_lead1, timeout=60.0)
+        self.assertEqual(rc, 0, resp)
+        # its own work merged by hand (unrecorded) is still reported
+        integ = self.integ_wt(prj)
+        self.fixture.git(integ, "merge", "--no-ff", "-m", "by hand", f"mesh/{prj}/{tsk_2}", identity=True)
+        rc, resp = self.harness.cli("doctor", "--check-invariants", user=True, timeout=60.0)
+        self.assertEqual(rc, 1, resp)
+        viol = resp["error"]["details"]["violations"]
+        self.assertEqual([(v["details"]["task_id"], v["details"]["reason"]) for v in viol],
+                         [(tsk_2, "integrated_but_not_merged")], viol)
         self.harness.check_invariants_on_teardown = False
+
+    def test_r2_p1_1_noop_merge_does_not_vouch_for_an_unrecorded_merge(self) -> None:
+        repo, prj = self.make_project("S2", test_command="none")
+        self.repo = repo
+        bad, ws_bad = self.accepted_task(prj, "Bad", "unreviewed.txt", "u\n")
+        integ = self.integ_wt(prj)
+        self.fixture.git(integ, "merge", "--no-ff", "-m", "by hand", f"mesh/{prj}/{bad}", identity=True)
+        m_unrec = self.fixture.head(repo, self.integ_branch(prj))
+        zero, _ = self.accepted_task(prj, "Zero", None)  # based on the unrecorded merge
+        rc, resp = self.merge(zero)
+        self.assertEqual(rc, 0, resp)
+        mj = json.loads(self.q("SELECT merge_json FROM tasks WHERE id = ?;", (zero,))[0]["merge_json"])
+        self.assertTrue(mj["noop"], mj)
+        self.assertEqual(mj["merge_commit"], m_unrec, mj)
+        self.fixture.git(ws_bad, "merge", "--no-ff", "-m", "sync integration", self.integ_branch(prj), identity=True)
+        rc, resp = self.harness.cli("doctor", "--check-invariants", user=True, timeout=60.0)
+        self.assertEqual(rc, 1, resp)
+        viol = resp["error"]["details"]["violations"]
+        self.assertEqual([(v["details"]["task_id"], v["details"]["merge_commit"]) for v in viol],
+                         [(bad, m_unrec)], viol)
+        rc, resp = self.harness.cli("project", "deliver", prj, "--dry-run", token=self.tok_lead1, timeout=60.0)
+        self.assertNotEqual(rc, 0, resp)
+        self.harness.check_invariants_on_teardown = False
+
+    def test_r3_p2_1_gated_noop_merge_still_vouches_for_its_own_merge(self) -> None:
+        repo, prj = self.make_project("S3", test_command="none")
+        self.repo = repo
+        tsk_2, ws_2 = self.accepted_task(prj, "Second", "s.txt", "s\n")
+        tsk_1, _ = self.accepted_task(prj, "First", "f.txt", "f\n")
+        integ = self.integ_wt(prj)
+        self.fixture.git(integ, "merge", "--no-ff", "-m", "crash window", f"mesh/{prj}/{tsk_1}", identity=True)
+        m1 = self.fixture.head(integ)
+        rc, resp = self.merge(tsk_1)  # Carbon P2-5: gated no-op, records m1
+        self.assertEqual(rc, 0, resp)
+        self.assertIs(resp["data"]["noop"], True, resp)
+        self.assertEqual(resp["data"]["merge_commit"], m1, resp)
+        self.fixture.git(ws_2, "merge", "--no-ff", "-m", "sync integration", self.integ_branch(prj), identity=True)
+        rc, resp = self.harness.cli("doctor", "--check-invariants", user=True, timeout=60.0)
+        self.assertEqual(rc, 0, resp)
+        rc, resp = self.harness.cli("project", "deliver", prj, "--dry-run", token=self.tok_lead1, timeout=60.0)
+        self.assertEqual(rc, 0, resp)
+
+    def test_r3_p2_1_octopus_noop_merge_does_not_hide_other_work(self) -> None:
+        repo, prj = self.make_project("S4", test_command="none")
+        self.repo = repo
+        bad, ws_bad = self.accepted_task(prj, "Bad", "unreviewed.txt", "u\n")
+        good, _ = self.accepted_task(prj, "Good", "g.txt", "g\n")
+        integ = self.integ_wt(prj)
+        self.fixture.git(integ, "merge", "--no-ff", "-m", "octopus", f"mesh/{prj}/{good}", f"mesh/{prj}/{bad}",
+                         identity=True)
+        octo = self.fixture.head(integ)
+        rc, resp = self.merge(good)
+        self.assertEqual(rc, 0, resp)
+        self.assertEqual(resp["data"]["merge_commit"], octo, resp)
+        self.fixture.git(ws_bad, "merge", "--no-ff", "-m", "sync integration", self.integ_branch(prj), identity=True)
+        rc, resp = self.harness.cli("doctor", "--check-invariants", user=True, timeout=60.0)
+        self.assertEqual(rc, 1, resp)
+        viol = resp["error"]["details"]["violations"]
+        self.assertEqual([v["details"]["task_id"] for v in viol], [bad], viol)
+        self.harness.check_invariants_on_teardown = False
+
+    def test_r4_p1_1_task_reset_back_to_unrecorded_parent_does_not_launder_it(self) -> None:
+        repo, prj = self.make_project("S5", test_command="none")
+        self.repo = repo
+        bad, ws_bad = self.accepted_task(prj, "Bad", "unreviewed.txt", "u\n")
+        integ = self.integ_wt(prj)
+        self.fixture.git(integ, "merge", "--no-ff", "-m", "by hand", f"mesh/{prj}/{bad}", identity=True)
+        m_unrec = self.fixture.head(repo, self.integ_branch(prj))
+        b_tip = self.fixture.head(ws_bad)
+        cover, st = self.start_task(prj, "Cover")  # based on the unrecorded merge
+        self.fixture.git(st["workspace"], "reset", "--hard", b_tip)
+        self.submit_accept(cover, st)
+        rc, resp = self.merge(cover)
+        self.assertEqual(rc, 0, resp)
+        mj = json.loads(self.q("SELECT merge_json FROM tasks WHERE id = ?;", (cover,))[0]["merge_json"])
+        self.assertTrue(mj["noop"], mj)
+        self.assertEqual(mj["merge_commit"], m_unrec, mj)
+        self.fixture.git(ws_bad, "merge", "--no-ff", "-m", "sync integration", self.integ_branch(prj), identity=True)
+        rc, resp = self.harness.cli("doctor", "--check-invariants", user=True, timeout=60.0)
+        self.assertEqual(rc, 1, resp)
+        viol = resp["error"]["details"]["violations"]
+        self.assertEqual([v["details"]["task_id"] for v in viol], [bad], viol)
+        rc, resp = self.harness.cli("project", "deliver", prj, "--dry-run", token=self.tok_lead1, timeout=60.0)
+        self.assertNotEqual(rc, 0, resp)
+        self.harness.check_invariants_on_teardown = False
+
+    def test_p2_3_workspace_delete_refused_while_sibling_project_merges(self) -> None:
+        gate = self.gate_path()
+        repo, prj = self.gated_project("W1", gate)
+        other = self.second_project_on_repo(repo)
+        tsk_o, ws_o = self.accepted_task(other, "Other", "o.txt", "o\n")
+        tsk, _ = self.accepted_task(prj, "Slow", "b.txt", "b\n")
+        th, box = self.background_merge(tsk)
+        self.wait_merge_lease(prj)
+        rc, resp = self.harness.cli("workspace", "delete", tsk_o, user=True, timeout=60.0)
+        self.assertEqual(rc, c.EXIT_CONFLICT, resp)
+        self.assertEqual(resp["error"]["code"], c.RUN_STILL_ACTIVE, resp)
+        self.assertTrue(os.path.isdir(ws_o))
+        self.finish_merge(th, box, gate)
+        rc, resp = self.harness.cli("workspace", "delete", tsk_o, user=True, timeout=60.0)
+        self.assertEqual(rc, 0, resp)
 
 
 if __name__ == "__main__":

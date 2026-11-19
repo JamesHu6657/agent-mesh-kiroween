@@ -611,12 +611,14 @@ class TestHandoffWindow(unittest.TestCase):
         self.assertIn(c, t.signalled_term)
 
     def test_lead_turn_leftovers_handoff(self):
+        from mesh.daemon import lead_turns
         run_id = f"run_hl{_RUN_SFX}"
         p, c = self._spawn_p(run_id)
         race = _HandoffRace(self, run_id)
         with contextlib.ExitStack() as stack:
             for patch in self._common_patches(race):
                 stack.enter_context(patch)
+            stack.enter_context(mock.patch.object(lead_turns, "lead_turn_termination_reason", return_value=None))
             with self.assertRaises(_Closing):
                 supervisor._watch_lead_turn(mock.Mock(), "/tmp", self._run(run_id, p, "lead_turn"))
         self.assertEqual(race.escapees, [c])
@@ -685,6 +687,7 @@ class TestLeadTurnTwoScanGate(unittest.TestCase):
                 mock.patch.object(supervisor, "_renew_lead_turn_lease") as renew, \
                 mock.patch.object(supervisor, "_reap_wrapper") as reap, \
                 mock.patch.object(supervisor, "transaction", lambda conn: contextlib.nullcontext()), \
+                mock.patch.object(lead_turns, "lead_turn_termination_reason", return_value=None), \
                 mock.patch.object(lead_turns, "finish_lead_turn", return_value="succeeded") as fin:
             self.assertIsNone(supervisor._watch_lead_turn(mock.Mock(), "/tmp", run))
             clock[0] += terminate.POLL_S / 2
@@ -866,7 +869,7 @@ class TestGitCollectedOnce(unittest.TestCase):
             fetchone=mock.Mock(return_value=task if "FROM tasks" in sql else run))
         collections = []
 
-        def collect(ws, branch, base):
+        def collect(ws, branch, base, repo_path=None):
             collections.append(1)
             time.sleep(0.3)
             return {"branch": branch, "head": "x"}

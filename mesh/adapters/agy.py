@@ -17,13 +17,19 @@ from mesh.adapters.base import (
     RunRequest,
     RunResult,
     find_missing_flags,
+    is_safe_cli_token,
+    open_run_file_nofollow,
     parse_version_output,
+    read_run_file_nofollow,
     record_adapter_probe,
     run_readonly_cmd,
+    validate_adapter_options,
+    validate_run_request_tokens,
 )
+from mesh.core.policy import AGY_EFFORT_SUFFIXES, check_agy_model_effort_conflict
 
 
-EFFORT_SUFFIXES = ("-low", "-medium", "-high", "-xhigh", "-max")
+EFFORT_SUFFIXES = AGY_EFFORT_SUFFIXES
 AGY_ERROR_MARKER = "AGY_ERROR:"
 # Token counters of agy 1.5.3 result.usage and step_update.usage
 _USAGE_KEYS = ("input_tokens", "output_tokens", "thinking_tokens", "cache_read_tokens", "total_tokens")
@@ -68,14 +74,10 @@ class AgyAdapter(Adapter):
         raise ProfileUnsupported(self.id, profile)
 
     def build(self, req: RunRequest) -> CommandSpec:
+        validate_run_request_tokens(req)
+        validate_adapter_options(self.id, req.options, strict_keys=False)
         # Check model effort suffix conflict per §14.4, §9.1
-        if req.model and req.effort:
-            for suffix in EFFORT_SUFFIXES:
-                if req.model.endswith(suffix):
-                    raise EffortNotAllowed(
-                        f"Model '{req.model}' already encodes reasoning effort; cannot specify effort '{req.effort}'",
-                        details={"reason": "model_encodes_effort", "model": req.model, "effort": req.effort},
-                    )
+        check_agy_model_effort_conflict(self.id, req.model, req.effort)
 
         binary = req.options.get("binary") or self.binary_names[0]
         if req.options.get("binary"):
@@ -109,9 +111,10 @@ class AgyAdapter(Adapter):
                     prompt_content = f.read()
 
         if prompt_bytes > self.max_argv_prompt_bytes:
-            run_dir = os.path.dirname(os.path.abspath(req.prompt_path))
+            prompt_abs = os.path.abspath(req.prompt_path)
+            run_dir = os.path.dirname(prompt_abs)
             argv.extend(["--add-dir", run_dir])
-            prompt_content = f"Read the file {req.prompt_path} and follow the instructions in it exactly. It is your complete task."
+            prompt_content = f"Read the file {prompt_abs} and follow the instructions in it exactly. It is your complete task."
 
         if req.resume_session_id:
             argv.extend(["--conversation", req.resume_session_id])
@@ -198,7 +201,7 @@ class AgyAdapter(Adapter):
         session_id = scan["session_id"]
         if not session_id and result is not None:
             sid = result.get("conversation_id")
-            session_id = sid if isinstance(sid, str) and sid else None
+            session_id = sid if is_safe_cli_token(sid) else None
 
         final_text = ""
         if result is not None and isinstance(result.get("response"), str) and result["response"]:
@@ -247,7 +250,7 @@ class AgyAdapter(Adapter):
             etype = event.get("event")
             if etype == "init":
                 sid = event.get("conversation_id")
-                if facts["session_id"] is None and isinstance(sid, str) and sid:
+                if facts["session_id"] is None and is_safe_cli_token(sid):
                     facts["session_id"] = sid
                 init = event.get("init")
                 if not isinstance(init, dict):
@@ -267,7 +270,7 @@ class AgyAdapter(Adapter):
                     saw_result = True
                     last_result = body if isinstance(body, dict) else {}
                 sid = body.get("conversation_id") if isinstance(body, dict) else None
-                if fallback_sid is None and isinstance(sid, str) and sid:
+                if fallback_sid is None and is_safe_cli_token(sid):
                     fallback_sid = sid
         if facts["session_id"] is None:
             facts["session_id"] = fallback_sid
@@ -403,6 +406,8 @@ class AgyAdapter(Adapter):
         res_h = run_readonly_cmd([bin_path, "--help"], timeout_s=timeout_s)
         if res_h.returncode != 0:
             caps = {name: c.to_dict() for name, c in self.capabilities.items()}
+            for cdict in caps.values():
+                cdict["verification"] = "none"
             probe = Probe(
                 adapter=self.id,
                 version=v,
@@ -478,8 +483,7 @@ def _is_count(value: Any) -> bool:
 
 def _read_text(path: str) -> Optional[str]:
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            return f.read()
+        return read_run_file_nofollow(path, encoding="utf-8", errors="replace")
     except OSError:
         return None
 
@@ -510,7 +514,7 @@ def _scan_stream(path: str) -> Dict[str, Any]:
         "missing": False, "empty": True,
     }
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
+        with open_run_file_nofollow(path, encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -532,7 +536,7 @@ def _scan_stream(path: str) -> Dict[str, Any]:
                         continue
                     scan["saw_init"] = True
                     sid = event.get("conversation_id")
-                    if isinstance(sid, str) and sid:
+                    if is_safe_cli_token(sid):
                         scan["session_id"] = sid
                     init = event.get("init")
                     if isinstance(init, dict):

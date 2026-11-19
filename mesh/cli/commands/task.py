@@ -91,7 +91,7 @@ def register_task_commands(subparsers: argparse._SubParsersAction, parent_parser
         epilog="Examples:\n  mesh task assign tsk_123 --to fx\n",
     )
     assign_parser.add_argument("task_id", help="Task identifier")
-    assign_parser.add_argument("--to", required=True, help="Target agent identifier")
+    assign_parser.add_argument("--to", "--agent", dest="to", required=True, help="Target agent identifier")
     assign_parser.add_argument("--profile", help="Permission profile override")
     assign_parser.add_argument("--model", help="Model override")
     assign_parser.add_argument("--effort", help="Reasoning effort override")
@@ -106,8 +106,11 @@ def register_task_commands(subparsers: argparse._SubParsersAction, parent_parser
         epilog="Examples:\n  mesh task reassign tsk_123 --to ibx --reason \"Specialist needed\"\n",
     )
     reassign_parser.add_argument("task_id", help="Task identifier")
-    reassign_parser.add_argument("--to", required=True, help="New target agent identifier")
+    reassign_parser.add_argument("--to", "--agent", dest="to", required=True, help="New target agent identifier")
     reassign_parser.add_argument("--reason", required=True, help="Reason for reassignment")
+    reassign_parser.add_argument("--profile", help="Permission profile override")
+    reassign_parser.add_argument("--model", help="Model override")
+    reassign_parser.add_argument("--effort", help="Reasoning effort override")
     reassign_parser.add_argument("--reuse-workspace", action="store_true", default=False, help="Preserve existing workspace directory")
     reassign_parser.set_defaults(func=handle_task_reassign)
 
@@ -538,21 +541,46 @@ def handle_task_merge_all(args: argparse.Namespace) -> Dict[str, Any]:
                         message="--all-accepted cannot be combined with --idempotency-key or --dry-run "
                                 "(it sends one merge request per task)",
                         details={"param": "all_accepted"})
+    from mesh.cli.main import generate_request_id
+
+    def _rpc_args(task_id: Optional[str] = None) -> argparse.Namespace:
+        sub = argparse.Namespace(**vars(args))
+        sub.request_id = generate_request_id()
+        sub._warnings = []
+        if task_id is not None:
+            sub.task_id = task_id
+        return sub
+
+    all_warnings: list = []
     lister = MeshClient(home=args.home)
-    resp = lister.execute_cmd(args, "task.list", {"project": args.project, "status": "accepted"})
+    lister.resolve_auth(args)
+    list_args = _rpc_args()
+    resp = lister.execute_cmd(list_args, "task.list", {"project": args.project, "status": "accepted"})
+    all_warnings.extend(getattr(list_args, "_warnings", None) or [])
     items = [t for t in resp.get("data", {}).get("items", []) if t.get("kind", "code") == "code"]
     items.sort(key=lambda t: (t.get("created_at") or "", t.get("id") or ""))
     queue = [t["id"] for t in items]
+    if not queue:
+        auth_args = _rpc_args()
+        lister.execute_cmd(
+            auth_args,
+            "task.list",
+            {"project": args.project, "status": "accepted", "verify_merge_auth": True},
+        )
+        all_warnings.extend(getattr(auth_args, "_warnings", None) or [])
+
     text = getattr(args, "format", "json") == "text"
     merged: list = []
     for n, tsk in enumerate(queue):
         if text:
             print(f"merge {n + 1}/{len(queue)}: {tsk} ...", file=sys.stderr, flush=True)
-        sub = argparse.Namespace(**vars(args))
-        sub.task_id = tsk
+        sub = _rpc_args(tsk)
         try:
             data = _merge_one(sub)
         except MeshError as e:
+            all_warnings.extend(getattr(sub, "_warnings", None) or [])
+            if all_warnings:
+                setattr(args, "_warnings", all_warnings)
             rest = queue[n + 1:]
             step = _merge_all_next_step(e.code, tsk, args.project, bool(rest))
             summary = {"project": args.project, "merged": merged, "failed": {"task_id": tsk, "code": e.code,
@@ -566,10 +594,13 @@ def handle_task_merge_all(args: argparse.Namespace) -> Dict[str, Any]:
                             message=(f"merge --all-accepted stopped at {tsk} ({n + 1}/{len(queue)}): {e.message} "
                                      f"[merged {len(merged)}, not attempted {len(rest)}] Next: {step}"),
                             details=summary, data=e.data) from e
+        all_warnings.extend(getattr(sub, "_warnings", None) or [])
         merged.append({"task_id": tsk, "merge_commit": data.get("merge_commit") or data.get("commit"),
                        "status": data.get("status")})
         if text:
             print(f"  merged {tsk} {merged[-1]['merge_commit'] or '-'}", file=sys.stderr, flush=True)
+    if all_warnings:
+        setattr(args, "_warnings", all_warnings)
     out = {"project": args.project, "merged": merged, "failed": None, "not_attempted": []}
     if text:
         lines = [f"merged {len(merged)} accepted task(s) in {args.project}" if merged
@@ -611,7 +642,7 @@ def handle_task_merge(args: argparse.Namespace) -> Dict[str, Any]:
         raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
                         message="task merge needs a task id (or --all-accepted --project P)",
                         details={"param": "task_id"})
-    if getattr(args, "project", None):
+    if getattr(args, "project", None) is not None:
         raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
                         message="--project is only used with --all-accepted", details={"param": "project"})
     return _merge_one(args)
@@ -640,6 +671,9 @@ def handle_task_reassign(args: argparse.Namespace) -> Dict[str, Any]:
         "task_id": args.task_id,
         "to": getattr(args, "to", None),
         "reason": getattr(args, "reason", None),
+        "profile": getattr(args, "profile", None),
+        "model": getattr(args, "model", None),
+        "effort": getattr(args, "effort", None),
         "reuse_workspace": getattr(args, "reuse_workspace", False),
     }
     resp = client.execute_cmd(args, "task.reassign", payload)
@@ -835,6 +869,9 @@ def handle_task_keepalive(args: argparse.Namespace) -> Dict[str, Any]:
                 break
             except MeshError as exc:
                 if exc.code in _LEASE_LOST_CODES:
+                    reason = (exc.details or {}).get("reason")
+                    if exc.code == c.FENCE_MISMATCH and reason in ("session_missing", "session_mismatch"):
+                        raise exc
                     return _keepalive_end(client, args, exc, beats)
                 # Transient (daemon restarting, socket timeout): keep trying until the
                 # lease could have run out, then give up with the last error.
@@ -847,11 +884,13 @@ def handle_task_keepalive(args: argparse.Namespace) -> Dict[str, Any]:
                                             f"(lease_ttl_s {limit}); last error: {exc.message}",
                                     details={"task_id": args.task_id, "run_id": args.run, "beats": beats,
                                              "last_error": exc.code})
-                if every is None:
-                    every = 40
+                remaining = max(0.5, float(limit) - waited)
+                sleep_for = min(2.0, float(every) if every is not None else 2.0, max(0.5, remaining / 2.0))
+            else:
+                sleep_for = float(every)
             slept = 0.0
-            step = min(1.0, float(every))
-            while slept < every and stop["signal"] is None:
+            step = min(1.0, float(sleep_for))
+            while slept < sleep_for and stop["signal"] is None:
                 _t.sleep(step)
                 slept += step
     except _KeepaliveStop:
@@ -949,10 +988,9 @@ def handle_task_submit(args: argparse.Namespace) -> Dict[str, Any]:
     summary_arg = getattr(args, "summary", None)
 
     deliverable_data = None
-    if deliverable_arg is not None and "deliverable" in getattr(args, "_from_json", set()) \
-            and not isinstance(deliverable_arg, str):
-        # Full review: an --input JSON deliverable is already structured; never probe
-        # it as a path or an fd (bool/int would open stdout).
+    if "deliverable" in getattr(args, "_from_json", set()):
+        # Full review: an --input JSON deliverable must already be a JSON object; never
+        # probe a string/bool/int/null from --input as stdin, a file path, or an fd.
         if not isinstance(deliverable_arg, dict):
             raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="Deliverable must be a JSON object", details={"param": "deliverable"})
         deliverable_data = deliverable_arg
@@ -962,6 +1000,10 @@ def handle_task_submit(args: argparse.Namespace) -> Dict[str, Any]:
     if deliverable_arg is not None and not isinstance(deliverable_arg, str):
         raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="Deliverable must be a JSON object", details={"param": "deliverable"})
     if deliverable_arg is not None:
+        if "\x00" in deliverable_arg:
+            raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
+                            message="--deliverable cannot contain NUL bytes",
+                            details={"param": "deliverable"})
         if deliverable_arg == "-":
             from mesh.cli.stdin import read_stdin
             raw_content = read_stdin("--deliverable")

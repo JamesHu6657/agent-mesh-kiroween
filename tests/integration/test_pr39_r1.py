@@ -53,8 +53,7 @@ class TestPr39R1(unittest.TestCase):
     def test_c5_json_string_kept(self):
         out = os.path.join(self.harness.fixtures_dir, "null.tok")
         rc, resp = self.harness.cli("agent", "onboard", "null", "--adapter", "none", "--out", out, user=True)
-        if rc != 0:
-            self.skipTest(f"agent name 'null' not accepted: {resp}")
+        self.assertEqual(rc, 0, resp)
         rc, resp = self.harness.cli("config", "set", "--input",
                                     self._input({"key": "lead.default_agent", "value": "null"}), user=True)
         # The string "null" names the agent; it must not be decoded again into JSON null

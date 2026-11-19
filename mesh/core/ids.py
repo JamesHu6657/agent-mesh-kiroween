@@ -29,7 +29,7 @@ PREFIXES: Set[str] = {
 
 # RFC 4648 lowercase base32 alphabet
 BASE32_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567"
-ID_PATTERN = re.compile(r"^([a-z]+)_([0-9a-f]{10})([a-z2-7]{16})$")
+ID_PATTERN = re.compile(r"\A([a-z]+)_([0-9a-f]{10})([a-z2-7]{16})\Z")
 
 
 def generate_id(prefix: str, ts_ms: Optional[int] = None) -> str:

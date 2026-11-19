@@ -1,7 +1,7 @@
 """Git operations allow-list and wrapper per plan §7.5, §10.5, §11.3."""
 
 import subprocess
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from mesh.constants import build_external_env
 
@@ -13,6 +13,7 @@ from mesh.constants import build_external_env
 REPO_LOCATION_ENV = (
     "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX",
+    "GIT_CONFIG_PARAMETERS",
 )
 # GIT_CEILING_DIRECTORIES / GIT_DISCOVERY_ACROSS_FILESYSTEM only narrow discovery and are kept.
 
@@ -104,14 +105,19 @@ def validate_git_args(args: List[str]) -> None:
         return
 
     if subcmd == "merge":
-        # Exactly three allowed forms (plan §10.5):
+        # Exactly four allowed forms (plan §10.5):
         # 1. ["merge", "--abort"]
         # 2. ["merge", "--ff-only", <ref>]
-        # 3. ["merge", "--no-ff", "--no-commit", <ref>]
+        # 3. ["merge", "--ff-only", "--no-overwrite-ignore", <ref>] (the §10.6 deliver form:
+        #    an ignored, untracked file in the base's worktree is never silently replaced)
+        # 4. ["merge", "--no-ff", "--no-commit", <ref>]
         if rest == ["--abort"]:
             return
         if len(rest) == 2 and rest[0] == "--ff-only":
             _check_ref(rest[1], "merge")
+            return
+        if len(rest) == 3 and rest[0] == "--ff-only" and rest[1] == "--no-overwrite-ignore":
+            _check_ref(rest[2], "merge")
             return
         if len(rest) == 3 and rest[0] == "--no-ff" and rest[1] == "--no-commit":
             _check_ref(rest[2], "merge")
@@ -126,6 +132,9 @@ def validate_git_args(args: List[str]) -> None:
 
     if subcmd == "update-ref":
         # Require compare-and-swap: no deletion, stdin batch, or unconditional update.
+        # `--no-deref` (detached HEAD restore in the merge pipeline) is the only flag.
+        if rest and rest[0] == "--no-deref":
+            rest = rest[1:]
         if len(rest) != 3:
             raise AssertionError("git update-ref requires <ref> <new> <old>")
         for arg in rest:
@@ -142,6 +151,7 @@ def run_git(
     check: bool = False,
     capture_output: bool = True,
     text: bool = True,
+    input: Optional[str] = None,
 ) -> subprocess.CompletedProcess:
     """Run an allow-listed git command with external environment sanitization."""
     validate_git_args(args)
@@ -149,8 +159,31 @@ def run_git(
     env = build_external_env()
     for key in REPO_LOCATION_ENV:
         env.pop(key, None)
+    # Full review r5 P1-3 / r6 P1-4: append `core.fsmonitor=false` after any valid
+    # caller-supplied GIT_CONFIG_COUNT entries so K8 env identity/config is preserved
+    # while later-index env config still overrides any earlier `core.fsmonitor`.
+    raw_cnt = env.get("GIT_CONFIG_COUNT")
+    try:
+        idx = int(raw_cnt) if raw_cnt not in (None, "") else 0
+        if idx < 0 or idx > 1024:
+            raise ValueError("out of range")
+        for i in range(idx):
+            key_i = env.get(f"GIT_CONFIG_KEY_{i}")
+            if not key_i or "." not in key_i or f"GIT_CONFIG_VALUE_{i}" not in env:
+                raise ValueError("invalid config entry")
+    except ValueError:
+        for k in [k for k in env if k.startswith("GIT_CONFIG_")]:
+            env.pop(k, None)
+        idx = 0
+    env["GIT_CONFIG_COUNT"] = str(idx + 1)
+    env[f"GIT_CONFIG_KEY_{idx}"] = "core.fsmonitor"
+    env[f"GIT_CONFIG_VALUE_{idx}"] = "false"
     from mesh.daemon.children import run_registered  # meshd child registry (§11.4)
 
+    extra: Dict[str, Any] = {}
+    if input is not None:
+        extra["input"] = input
+        extra["stdin"] = subprocess.PIPE
     return run_registered(
         "git",
         cmd,
@@ -163,4 +196,5 @@ def run_git(
         # PR #39 review: its own process group, so a timeout also kills hooks and helpers
         # git started (run_registered SIGKILLs the whole group).
         start_new_session=True,
+        **extra,
     )

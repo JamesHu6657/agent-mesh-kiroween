@@ -248,11 +248,11 @@ class TestDelegatedApproval(unittest.TestCase):
         self.assertEqual(it["decision_channel"], "relayed")
         self.assertIn("--relayed", it["approve"])
         rc, resp = self.harness.cli("approval", "pending", extra_env={"MESH_TOKEN": self.tok_lead1})
-        if rc == 0:
-            it = resp["data"]["items"][0]
-            self.assertNotIn("<token file>", it["approve"])
-            self.assertNotIn(self.tok_lead1, it["approve"])
-            self.assertNotIn("--token-file", it["approve"])
+        self.assertEqual(rc, 0, resp)
+        it = resp["data"]["items"][0]
+        self.assertNotIn("<token file>", it["approve"])
+        self.assertNotIn(self.tok_lead1, it["approve"])
+        self.assertNotIn("--token-file", it["approve"])
 
     def test_disabled_hint_is_a_valid_command(self) -> None:
         apr, h = self._gated_pause()

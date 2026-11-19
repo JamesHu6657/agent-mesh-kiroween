@@ -185,7 +185,7 @@ class TestGitMeshHarness(unittest.TestCase):
             self.assertIn(os.path.join(harness.repo_root, "tests", "shims"), env["PATH"])
             self.assertEqual(env["MESH_HOME"], harness.home)
             self.assertEqual(env["MESH_TESTING"], "1")
-            self.assertEqual(env["MESH_TRIPWIRE_FILE"], harness.tripwire_file)
+            self.assertEqual(env["_TRIPWIRE_FILE"], harness.tripwire_file)
             self.assertEqual(env["GIT_CONFIG_GLOBAL"], self.fixture.empty_gitconfig)
             self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
             self.assertEqual(env["GIT_CEILING_DIRECTORIES"], self.fixture.base)

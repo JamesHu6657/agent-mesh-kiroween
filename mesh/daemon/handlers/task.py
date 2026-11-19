@@ -13,8 +13,10 @@ import mesh.constants as c
 from mesh.adapters.base import (
     AdapterNotInstalled,
     AdapterUnsupported,
+    EffortNotAllowed,
     EffortUnsupported,
     ProfileUnsupported,
+    PromptTooLong,
 )
 from mesh.adapters.registry import get_adapter
 from mesh.core.approvals import (
@@ -26,6 +28,14 @@ from mesh.core.clock import now_iso_utc, parse_duration
 from mesh.core.events import last_rejection, record_event
 from mesh.core.ids import generate_id
 from mesh.core.leases import check_run_session, get_lease_ttl_s, verify_task_lease_and_fence, remember_run_session
+from mesh.core.policy import parse_json_str_list, resolve_model_and_effort, validate_resolved_effort
+from mesh.core.prompts import (
+    PROMPT_LIMIT_BYTES,
+    deliverable_summary,
+    prompt_strategy,
+    read_rework_feedback,
+    render_executor_prompt,
+)
 from mesh.core.states import TASK_STATES, check_task_transition, is_task_terminal
 from mesh.core.db import transaction
 from mesh.core.repos import submission_git_info
@@ -34,12 +44,14 @@ from mesh.core.workspaces import (
     WorkspaceError,
     compute_task_workspace_path,
     get_workspaces_root,
+    has_task_ws_reservation,
     plan_code_workspace,
     run_code_workspace_plan,
+    task_branch_name,
 )
 from mesh.daemon.handlers.base import Effect, HandlerContext, HandlerResult
-from mesh.daemon.handlers.inbox import _recheck_credential
-from mesh.daemon.scheduler import ack_window_now, compute_queue_info, fail_queued_task_t6, promote_tasks
+from mesh.daemon.handlers.inbox import _recheck_wait_authz
+from mesh.daemon.scheduler import ack_window_now, compute_queue_info, fail_queued_task_t6
 from mesh.errors import MeshError
 
 PROFILE_RANKS: Dict[str, int] = {
@@ -234,11 +246,157 @@ def _created_profile_override(conn: sqlite3.Connection, task: sqlite3.Row) -> Op
     return task["profile"]
 
 
+def _reassigned_profile_override(
+    conn: sqlite3.Connection,
+    task: sqlite3.Row,
+    to_agent: str,
+    testing_mode: bool,
+) -> Optional[str]:
+    """Default profile override on `task reassign` when `--profile` is omitted.
+
+    If the task's current profile came only from a previous agent's default
+    (``profile_explicit: false``), let the new agent's default apply. If the
+    task's profile was explicit (e.g. ``elevated`` or ``dev``), keep it unless
+    the target launch adapter does not support that profile (e.g. ``dev`` ->
+    ``agy``/``kiro``), in which case fall back to the target agent's default.
+    """
+    ev = conn.execute(
+        """SELECT payload_json FROM events
+           WHERE task_id = ? AND type IN ('task.created', 'task.assigned', 'task.reassigned')
+           ORDER BY seq DESC LIMIT 1;""",
+        (task["id"],),
+    ).fetchone()
+    if ev is not None:
+        try:
+            payload = json.loads(ev["payload_json"] or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        if payload.get("profile_explicit") is False:
+            return None
+
+    ag = conn.execute(
+        """SELECT a.adapter, a.delivery FROM agents a JOIN principals p ON a.id = p.id
+           WHERE a.id = ? OR p.name = ?;""",
+        (to_agent, to_agent),
+    ).fetchone()
+    if ag is not None and ag["delivery"] == "launch":
+        try:
+            adapter = get_adapter(ag["adapter"], testing_mode=testing_mode)
+            adapter.profile_flags(task["profile"])
+        except ProfileUnsupported:
+            return None
+        except Exception:
+            pass
+    return task["profile"]
+
+
+_MAX_INT64 = 9223372036854775807
+
+
+def _require_str_param(val: Any, param: str, message: Optional[str] = None, *, strip: bool = False) -> str:
+    if not isinstance(val, str) or not val.strip():
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=message or f"Parameter '{param}' must be a non-empty string",
+            details={"param": param},
+        )
+    return val.strip() if strip else val
+
+
+def _optional_str_param(val: Any, param: str) -> Optional[str]:
+    if val is not None and not isinstance(val, str):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=f"Parameter '{param}' must be a string",
+            details={"param": param, "got": type(val).__name__},
+        )
+    return val
+
+
+def _optional_bool_param(val: Any, param: str, default: bool = False) -> bool:
+    if val is None:
+        return default
+    if not isinstance(val, bool):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=f"Parameter '{param}' must be a boolean",
+            details={"param": param, "got": type(val).__name__},
+        )
+    return val
+
+
+def _validate_session_param(val: Any) -> Optional[str]:
+    if val is None:
+        return None
+    if not isinstance(val, str) or "\x00" in val or len(val) > 256:
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Parameter 'session' must be a string up to 256 characters without NUL bytes",
+            details={"param": "session"},
+        )
+    return val or None
+
+
+def _validate_fence_param(val: Any) -> Optional[int]:
+    if val is None:
+        return None
+    if isinstance(val, (bool, float)) or not isinstance(val, int) or not (0 <= val <= _MAX_INT64):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Parameter 'fence' must be a non-negative 64-bit integer",
+            details={"param": "fence"},
+        )
+    return val
+
+
+def _parse_strict_int(val: Any, param: str, *, allow_s_suffix: bool = False) -> int:
+    if isinstance(val, (bool, float)):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=f"Invalid {param}: {val}",
+            details={"param": param},
+        )
+    if isinstance(val, str):
+        if len(val) > 64:
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message=f"Invalid {param}: {val[:64]}",
+                details={"param": param},
+            )
+        raw = val[:-1] if (allow_s_suffix and val.endswith("s")) else val
+    elif isinstance(val, int):
+        raw = val
+    else:
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=f"Invalid {param}: {val}",
+            details={"param": param},
+        )
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=f"Invalid {param}: {val}",
+            details={"param": param},
+        )
+
+
 def _validate_profile_and_effort(profile_override: Optional[str], effort_override: Optional[str]) -> None:
     """Validate profile and effort overrides and check profile/effort swap (§9.1)."""
     valid_profiles = set(PROFILE_RANKS.keys())
-    valid_efforts = {"low", "medium", "high", "xhigh"}
+    valid_efforts = {"low", "medium", "high", "xhigh", "max", "ultra", "ultracode"}
     if profile_override is not None:
+        _optional_str_param(profile_override, "profile")
         if profile_override in valid_efforts:
             raise MeshError(
                 code=c.INVALID_ARGUMENT,
@@ -255,6 +413,7 @@ def _validate_profile_and_effort(profile_override: Optional[str], effort_overrid
             )
 
     if effort_override is not None:
+        _optional_str_param(effort_override, "effort")
         if effort_override in valid_profiles:
             raise MeshError(
                 code=c.INVALID_ARGUMENT,
@@ -271,49 +430,187 @@ def _validate_model_and_effort(
     current_model: Optional[str] = None,
     current_effort: Optional[str] = None,
     testing_mode: bool = False,
+    check_resolved_model: bool = False,
+    check_effort_before_stale_model: bool = False,
 ) -> Tuple[Optional[str], Optional[str]]:
     """Validate model and effort overrides against agent allowed lists and adapter capabilities (AG Step 5)."""
-    allowed_models = []
-    if agent["allowed_models_json"]:
-        try:
-            allowed_models = json.loads(agent["allowed_models_json"])
-        except Exception:
-            pass
+    allowed_models = parse_json_str_list(agent["allowed_models_json"])
+    resolved_model, resolved_effort = resolve_model_and_effort(
+        model=model_override,
+        current_model=current_model,
+        default_model=agent["default_model"],
+        effort=effort_override,
+        current_effort=current_effort,
+        default_effort=agent["default_effort"],
+    )
 
-    resolved_model = model_override or current_model or agent["default_model"]
-    if model_override:
-        if model_override not in allowed_models:
+    def _require_allowed_model(model: Optional[str]) -> None:
+        if model and model not in allowed_models:
             raise MeshError(
                 code=c.MODEL_NOT_ALLOWED,
                 exit_code=c.EXIT_USAGE,
-                message=f"Model '{model_override}' is not allowed for agent '{agent['name']}'",
-                details={"model": model_override, "allowed": allowed_models},
+                message=f"Model '{model}' is not allowed for agent '{agent['name']}'",
+                details={"model": model, "allowed": allowed_models},
             )
 
-    allowed_efforts = []
-    if agent["allowed_efforts_json"]:
-        try:
-            allowed_efforts = json.loads(agent["allowed_efforts_json"])
-        except Exception:
-            pass
+    _require_allowed_model(
+        resolved_model if (check_resolved_model and not check_effort_before_stale_model) else model_override
+    )
 
-    resolved_effort = effort_override or current_effort or agent["default_effort"]
-    if effort_override:
-        # Check adapter effort capability
-        adapter_inst = get_adapter(agent["adapter"], testing_mode=testing_mode)
-        effort_cap = adapter_inst.capabilities.get("reasoning_effort")
-        if effort_cap and effort_cap.supported == "no":
-            raise EffortUnsupported(agent["adapter"])
+    allowed_efforts = parse_json_str_list(agent["allowed_efforts_json"])
+    adapter_inst = get_adapter(agent["adapter"], testing_mode=testing_mode) if resolved_effort else None
+    validate_resolved_effort(
+        adapter_id=agent["adapter"],
+        resolved_model=resolved_model,
+        resolved_effort=resolved_effort,
+        allowed_efforts=allowed_efforts,
+        agent_name=agent["name"],
+        adapter=adapter_inst,
+        testing_mode=testing_mode,
+    )
 
-        if effort_override not in allowed_efforts:
-            raise MeshError(
-                code=c.EFFORT_NOT_ALLOWED,
-                exit_code=c.EXIT_USAGE,
-                message=f"Effort '{effort_override}' is not allowed for agent '{agent['name']}'",
-                details={"effort": effort_override, "allowed": allowed_efforts},
-            )
+    if check_resolved_model and check_effort_before_stale_model:
+        _require_allowed_model(resolved_model)
 
     return resolved_model, resolved_effort
+
+
+def _requeue_approval_gates(
+    ctx: HandlerContext,
+    task: sqlite3.Row,
+    ag_row: Optional[sqlite3.Row],
+) -> Tuple[str, bool, bool, bool]:
+    """Compute (resolved_profile, need_retry, need_perm, will_gate_approval) for retry/reject."""
+    resolved_profile = task["profile"] or (ag_row["default_profile"] if ag_row else None) or "edit"
+    need_retry = task["attempt"] >= task["max_attempts"]
+    max_unapproved = (ag_row["max_unapproved_profile"] if ag_row else None) or "dev"
+    need_perm = bool(ag_row) and PROFILE_RANKS.get(resolved_profile, 0) > PROFILE_RANKS.get(max_unapproved, 2)
+    will_gate_approval = (need_retry or need_perm) and ctx.actor_kind != "user" and ctx.via != "direct"
+    return resolved_profile, need_retry, need_perm, will_gate_approval
+
+
+def _check_spec_prompt_length(
+    conn: sqlite3.Connection,
+    project_id: str,
+    adapter_id: str,
+    profile: str,
+    task_doc: Dict[str, Any],
+    workspace: str,
+    attempt: int,
+    max_attempts: int,
+    rework: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Enforce plan §12.5 prompt-length refusal when a caller exists (create/assign/reassign/retry)."""
+    if adapter_id == "fake":
+        return
+    project_row = conn.execute("SELECT id, name FROM projects WHERE id = ?;", (project_id,)).fetchone()
+    if not project_row:
+        return
+    criteria = [
+        r["text"]
+        for r in conn.execute(
+            "SELECT text FROM acceptance_criteria WHERE project_id = ? AND superseded_at IS NULL ORDER BY ordinal ASC;",
+            (project_id,),
+        ).fetchall()
+    ]
+    branch = task_doc.get("branch")
+    if not branch and task_doc.get("kind") == "code":
+        branch = task_branch_name(project_id, task_doc["id"])
+    prompt_text = render_executor_prompt(
+        task=task_doc,
+        project=project_row,
+        criteria=criteria,
+        workspace=workspace,
+        attempt=attempt,
+        max_attempts=max_attempts,
+        rework=rework,
+        branch=branch,
+    )
+    prompt_bytes = len(prompt_text.encode("utf-8"))
+    if prompt_strategy(adapter_id, profile, prompt_bytes, PROMPT_LIMIT_BYTES) == "too_long":
+        raise PromptTooLong(prompt_bytes, PROMPT_LIMIT_BYTES, adapter_id, profile)
+
+
+def _require_task_approval(
+    conn: sqlite3.Connection,
+    ctx: HandlerContext,
+    op: str,
+    project_id: str,
+    task_id: Optional[str],
+    params: Dict[str, Any],
+    need_retry: bool,
+    need_perm: bool,
+    retry_summary: str = "",
+    perm_summary: str = "",
+    compound_summary: str = "",
+    retry_message: str = "",
+    perm_message: str = "",
+    compound_message: str = "",
+) -> None:
+    """Create or consume a single/compound approval for a task mutation (§7.4)."""
+    if not (need_retry or need_perm):
+        return
+    if ctx.actor_kind == "user" or ctx.via == "direct":
+        return
+
+    gate_params = dict(params)
+    if need_retry and need_perm:
+        category = "retry_over_limit"
+        extra_categories = ["permission_escalation"]
+        gate_params["gates"] = ["permission_escalation", "retry_over_limit"]
+        summary = compound_summary
+        message = compound_message
+    elif need_retry:
+        category = "retry_over_limit"
+        extra_categories = []
+        summary = retry_summary
+        message = retry_message
+    else:
+        category = "permission_escalation"
+        extra_categories = []
+        summary = perm_summary
+        message = perm_message
+
+    if not ctx.approval:
+        apr_info = create_or_get_pending_approval(
+            conn=conn,
+            category=category,
+            op=op,
+            requested_by=ctx.principal["id"],
+            params=gate_params,
+            summary=summary,
+            project_id=project_id,
+            target_id=task_id,
+            task_id=task_id,
+            dry_run=ctx.dry_run,
+            actor_kind=ctx.actor_kind,
+            via=ctx.via,
+            request_id=ctx.request_id,
+            k_user=ctx.k_user,
+            testing_mode=ctx.testing_mode,
+        )
+        raise MeshError(
+            code=c.APPROVAL_REQUIRED,
+            exit_code=c.EXIT_APPROVAL_REQUIRED,
+            message=message,
+            details=apr_info,
+        )
+
+    check_and_consume_approval(
+        conn=conn,
+        approval_id=ctx.approval,
+        op=op,
+        category=category,
+        caller_id=ctx.principal["id"],
+        params=gate_params,
+        project_id=project_id,
+        target_id=task_id,
+        request_id=ctx.request_id,
+        extra_categories=extra_categories,
+        actor_kind=ctx.actor_kind,
+        via=ctx.via,
+        k_user=ctx.k_user,
+    )
 
 
 def _validate_assignment_guards(
@@ -326,6 +623,10 @@ def _validate_assignment_guards(
     effort_override: Optional[str] = None,
     task_title: str = "",
     op: str = "task.create",
+    task_id: Optional[str] = None,
+    approval_params_extra: Optional[Dict[str, Any]] = None,
+    prompt_check: Optional[Dict[str, Any]] = None,
+    check_approval: bool = True,
 ) -> Tuple[sqlite3.Row, str, Optional[str], Optional[str]]:
     """Execute Assignment Guards (AG) 1-6 in order per plan §6.2.
 
@@ -387,7 +688,7 @@ def _validate_assignment_guards(
                 exit_code=c.EXIT_ADAPTER_UNAVAILABLE,
                 message="Test double adapter 'fake' is only available when MESH_TESTING=1",
             )
-        if not adapter.is_installed():
+        if not adapter.is_installed(binary_path=agent["binary_path"]):
             raise AdapterNotInstalled(agent["adapter"])
 
         # 3. Profile supported by adapter (ACC: N5)
@@ -408,7 +709,7 @@ def _validate_assignment_guards(
                 reason=ev.reason,
             )
 
-    # 5. Model and effort resolve and are allowed (ACC: D3, D7)
+    # 5. Model and effort resolve and are allowed (ACC: D3, D7, D17)
     resolved_model, resolved_effort = _validate_model_and_effort(
         agent=agent,
         model_override=model_override,
@@ -416,55 +717,56 @@ def _validate_assignment_guards(
         testing_mode=ctx.testing_mode,
     )
 
+    # Plan §12.5: check spec-rendered prompt length before requesting/consuming approval
+    if delivery == "launch" and prompt_check is not None:
+        _check_spec_prompt_length(
+            conn=conn,
+            project_id=project_id,
+            adapter_id=agent["adapter"],
+            profile=resolved_profile,
+            task_doc=prompt_check["task_doc"],
+            workspace=prompt_check["workspace"],
+            attempt=prompt_check["attempt"],
+            max_attempts=prompt_check["max_attempts"],
+            rework=prompt_check.get("rework"),
+        )
+
     # 6. Profile rank vs max_unapproved_profile (ACC: D16)
-    max_unapproved = agent["max_unapproved_profile"] or "dev"
-    if PROFILE_RANKS.get(resolved_profile, 0) > PROFILE_RANKS.get(max_unapproved, 2):
-        if ctx.actor_kind != "user" and ctx.via != "direct":
-            if not ctx.approval:
-                apr_info = create_or_get_pending_approval(
-                    conn=conn,
-                    category="permission_escalation",
-                    op=op,
-                    requested_by=ctx.principal["id"],
-                    params=ctx.args,
-                    summary=f"Permission escalation to '{resolved_profile}' for task '{task_title}' on agent '{agent['name']}'",
-                    project_id=project_id,
-                    dry_run=ctx.dry_run,
-                    request_id=ctx.request_id,
-                    k_user=ctx.k_user,
-                )
-                raise MeshError(
-                    code=c.APPROVAL_REQUIRED,
-                    exit_code=c.EXIT_APPROVAL_REQUIRED,
-                    message=f"Profile '{resolved_profile}' requires user approval (category: permission_escalation)",
-                    details=apr_info,
-                )
+    if check_approval:
+        max_unapproved = agent["max_unapproved_profile"] or "dev"
+        need_perm = PROFILE_RANKS.get(resolved_profile, 0) > PROFILE_RANKS.get(max_unapproved, 2)
+        if need_perm:
+            norm_params = dict(approval_params_extra or {})
+            norm_params.update({
+                "profile": resolved_profile,
+                "model": resolved_model,
+                "effort": resolved_effort,
+            })
+            if op == "task.create":
+                norm_params["assignee"] = agent["name"]
             else:
-                check_and_consume_approval(
-                    conn=conn,
-                    approval_id=ctx.approval,
-                    op=op,
-                    category="permission_escalation",
-                    caller_id=ctx.principal["id"],
-                    params=ctx.args,
-                    project_id=project_id,
-                    request_id=ctx.request_id,
-                    actor_kind=ctx.actor_kind, via=ctx.via, k_user=ctx.k_user,
-                )
+                norm_params["to"] = agent["name"]
+            _require_task_approval(
+                conn=conn,
+                ctx=ctx,
+                op=op,
+                project_id=project_id,
+                task_id=task_id,
+                params=norm_params,
+                need_retry=False,
+                need_perm=True,
+                perm_summary=f"Permission escalation to '{resolved_profile}' for task '{task_title}' on agent '{agent['name']}'",
+                perm_message=f"Profile '{resolved_profile}' requires user approval (category: permission_escalation)",
+            )
 
     return agent, resolved_profile, resolved_model, resolved_effort
 
 
 def handle_task_create(ctx: HandlerContext) -> HandlerResult:
     """Create a new task under a project per plan §6.2 (T1/T2)."""
-    project_id = ctx.args.get("project")
-    if not project_id:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="Missing required parameter --project",
-            details={"param": "project"},
-        )
+    project_id = _require_str_param(
+        ctx.args.get("project"), "project", "Missing required parameter --project"
+    )
 
     # Check project exists
     cur_p = ctx.conn.execute("SELECT * FROM projects WHERE id = ?;", (project_id,))
@@ -489,56 +791,26 @@ def handle_task_create(ctx: HandlerContext) -> HandlerResult:
 
     check_authz(ctx.conn, "task.create", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id)
 
-    title = ctx.args.get("title")
-    if not title or not str(title).strip():
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="Parameter --title must be non-empty",
-            details={"param": "title"},
-        )
-    title = str(title).strip()
-
-    spec = ctx.args.get("spec")
-    if not spec or not str(spec).strip():
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="Parameter --spec must be non-empty",
-            details={"param": "spec"},
-        )
-    spec = str(spec).strip()
+    title = _require_str_param(ctx.args.get("title"), "title", "Parameter --title must be non-empty", strip=True)
+    spec = _require_str_param(ctx.args.get("spec"), "spec", "Parameter --spec must be non-empty", strip=True)
 
     # Priority
     priority = 0
     if "priority" in ctx.args and ctx.args["priority"] is not None:
-        try:
-            priority = int(ctx.args["priority"])
-        except (ValueError, TypeError):
+        priority = _parse_strict_int(ctx.args["priority"], "priority")
+        if not (-1_000_000 <= priority <= 1_000_000):
             raise MeshError(
                 code=c.INVALID_ARGUMENT,
                 exit_code=c.EXIT_USAGE,
-                message=f"Invalid priority: {ctx.args['priority']}",
-                details={"param": "priority"},
+                message=f"priority must be between -1000000 and 1000000; got {priority}",
+                details={"param": "priority", "expected": "-1000000..1000000", "got": priority},
             )
 
     # Timeout
     min_timeout = 1 if ctx.testing_mode else 60
     timeout_s = None
     if "timeout" in ctx.args and ctx.args["timeout"] is not None:
-        raw_to = ctx.args["timeout"]
-        try:
-            if isinstance(raw_to, str) and raw_to.endswith("s"):
-                timeout_s = int(raw_to[:-1])
-            else:
-                timeout_s = int(raw_to)
-        except (ValueError, TypeError):
-            raise MeshError(
-                code=c.INVALID_ARGUMENT,
-                exit_code=c.EXIT_USAGE,
-                message=f"Invalid timeout: {raw_to}",
-                details={"param": "timeout"},
-            )
+        timeout_s = _parse_strict_int(ctx.args["timeout"], "timeout", allow_s_suffix=True)
         if not (min_timeout <= timeout_s <= 604800):
             raise MeshError(
                 code=c.INVALID_ARGUMENT,
@@ -551,23 +823,13 @@ def handle_task_create(ctx: HandlerContext) -> HandlerResult:
         cur_to = ctx.conn.execute("SELECT value_json FROM settings WHERE key = 'task.default_timeout_s';")
         to_row = cur_to.fetchone()
         timeout_s = int(json.loads(to_row["value_json"])) if to_row else 3600
+        if not ctx.testing_mode:
+            timeout_s = max(60, timeout_s)
 
     # Idle timeout
     idle_timeout_s = 0
     if "idle_timeout" in ctx.args and ctx.args["idle_timeout"] is not None:
-        raw_ito = ctx.args["idle_timeout"]
-        try:
-            if isinstance(raw_ito, str) and raw_ito.endswith("s"):
-                idle_timeout_s = int(raw_ito[:-1])
-            else:
-                idle_timeout_s = int(raw_ito)
-        except (ValueError, TypeError):
-            raise MeshError(
-                code=c.INVALID_ARGUMENT,
-                exit_code=c.EXIT_USAGE,
-                message=f"Invalid idle_timeout: {raw_ito}",
-                details={"param": "idle_timeout"},
-            )
+        idle_timeout_s = _parse_strict_int(ctx.args["idle_timeout"], "idle_timeout", allow_s_suffix=True)
         if idle_timeout_s != 0 and not (min_timeout <= idle_timeout_s <= 604800):
             raise MeshError(
                 code=c.INVALID_ARGUMENT,
@@ -583,15 +845,7 @@ def handle_task_create(ctx: HandlerContext) -> HandlerResult:
 
     max_attempts = None
     if "max_attempts" in ctx.args and ctx.args["max_attempts"] is not None:
-        try:
-            max_attempts = int(ctx.args["max_attempts"])
-        except (ValueError, TypeError):
-            raise MeshError(
-                code=c.INVALID_ARGUMENT,
-                exit_code=c.EXIT_USAGE,
-                message=f"Invalid max_attempts: {ctx.args['max_attempts']}",
-                details={"param": "max_attempts"},
-            )
+        max_attempts = _parse_strict_int(ctx.args["max_attempts"], "max_attempts")
         if not (1 <= max_attempts <= cap):
             raise MeshError(
                 code=c.INVALID_ARGUMENT,
@@ -605,7 +859,7 @@ def handle_task_create(ctx: HandlerContext) -> HandlerResult:
         max_attempts = int(json.loads(dma_row["value_json"])) if dma_row else 3
 
     # Kind: code or general
-    kind = ctx.args.get("kind")
+    kind = _optional_str_param(ctx.args.get("kind"), "kind")
     if kind:
         if kind not in ("code", "general"):
             raise MeshError(
@@ -626,14 +880,21 @@ def handle_task_create(ctx: HandlerContext) -> HandlerResult:
         )
 
     # 1. Dependencies check (validated before AG per plan §6.2)
-    deps = ctx.args.get("depends_on") or []
+    if "depends_on" in ctx.args and ctx.args["depends_on"] is not None:
+        deps = ctx.args["depends_on"]
+    else:
+        deps = []
     if isinstance(deps, str):
         deps = [deps]
+    if not isinstance(deps, list) or any(not isinstance(d, str) or not d.strip() for d in deps):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="depends_on must be a list of task ids",
+            details={"param": "depends_on"},
+        )
     # Deduplicate preserving order
-    clean_deps: List[str] = []
-    for d in deps:
-        if d and d not in clean_deps:
-            clean_deps.append(d)
+    clean_deps: List[str] = list(dict.fromkeys(deps))
 
     for dep_id in clean_deps:
         cur_dep = ctx.conn.execute(
@@ -657,14 +918,19 @@ def handle_task_create(ctx: HandlerContext) -> HandlerResult:
             )
 
     # 2. Assignee & assignment guards
-    assignee_ident = ctx.args.get("assignee")
+    assignee_ident = _optional_str_param(ctx.args.get("assignee"), "assignee")
     agent_id = None
     agent_name = None
-    profile = ctx.args.get("profile") or "edit"
-    model = ctx.args.get("model")
-    effort = ctx.args.get("effort")
+    profile_raw = _optional_str_param(ctx.args.get("profile"), "profile")
+    profile = profile_raw or "edit"
+    model = _optional_str_param(ctx.args.get("model"), "model")
+    effort = _optional_str_param(ctx.args.get("effort"), "effort")
 
     if assignee_ident:
+        preview_task_id = "tsk_" + "0" * 26
+        preview_ws = compute_task_workspace_path(
+            get_workspaces_root(ctx.conn, ctx.home), project_id, preview_task_id, attempt=1
+        )
         agent_row, profile, model, effort = _validate_assignment_guards(
             conn=ctx.conn,
             ctx=ctx,
@@ -675,6 +941,23 @@ def handle_task_create(ctx: HandlerContext) -> HandlerResult:
             effort_override=ctx.args.get("effort"),
             task_title=title,
             op="task.create",
+            approval_params_extra={
+                "project": project_id,
+                "title": title,
+                "spec": spec,
+                "kind": kind,
+                "timeout_s": timeout_s,
+                "idle_timeout_s": idle_timeout_s,
+                "max_attempts": max_attempts,
+                "priority": priority,
+                "depends_on": clean_deps,
+            },
+            prompt_check={
+                "task_doc": {"id": preview_task_id, "title": title, "spec": spec, "kind": kind, "branch": None},
+                "workspace": preview_ws,
+                "attempt": 1,
+                "max_attempts": max_attempts,
+            },
         )
         agent_id = agent_row["id"]
         agent_name = agent_row["name"]
@@ -760,22 +1043,12 @@ def handle_task_create(ctx: HandlerContext) -> HandlerResult:
 
 def handle_task_assign(ctx: HandlerContext) -> HandlerResult:
     """Assign an unassigned task to an agent per plan §6.2 (T3)."""
-    task_id = ctx.args.get("task_id")
-    to_agent = ctx.args.get("to")
-    if not task_id:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="Missing required parameter task_id",
-            details={"param": "task_id"},
-        )
-    if not to_agent:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="Missing required parameter --to",
-            details={"param": "to"},
-        )
+    task_id = _require_str_param(ctx.args.get("task_id"), "task_id", "Missing required parameter task_id")
+    raw_to = ctx.args.get("to") if ctx.args.get("to") is not None else ctx.args.get("agent")
+    to_agent = _require_str_param(raw_to, "to", "Missing required parameter --to")
+    _optional_str_param(ctx.args.get("profile"), "profile")
+    _optional_str_param(ctx.args.get("model"), "model")
+    _optional_str_param(ctx.args.get("effort"), "effort")
 
     task = _get_task(ctx.conn, task_id)
     project_id = task["project_id"]
@@ -795,16 +1068,30 @@ def handle_task_assign(ctx: HandlerContext) -> HandlerResult:
         )
     check_task_transition(task["status"], "assigned")
 
+    created_prof = _created_profile_override(ctx.conn, task)
+    effective_prof_override = ctx.args.get("profile") or created_prof
+    preview_ws = task["workspace_path"] or compute_task_workspace_path(
+        get_workspaces_root(ctx.conn, ctx.home), project_id, task_id, attempt=task["attempt"] + 1
+    )
+
     agent_row, profile, model, effort = _validate_assignment_guards(
         conn=ctx.conn,
         ctx=ctx,
         project_id=project_id,
         assignee_ident=to_agent,
-        profile_override=ctx.args.get("profile") or _created_profile_override(ctx.conn, task),
+        profile_override=effective_prof_override,
         model_override=ctx.args.get("model") or task["model"],
         effort_override=ctx.args.get("effort") or task["effort"],
         task_title=task["title"],
         op="task.assign",
+        task_id=task_id,
+        approval_params_extra={"task_id": task_id},
+        prompt_check={
+            "task_doc": dict(task),
+            "workspace": preview_ws,
+            "attempt": task["attempt"] + 1,
+            "max_attempts": task["max_attempts"],
+        },
     )
 
     now = now_iso_utc()
@@ -831,6 +1118,7 @@ def handle_task_assign(ctx: HandlerContext) -> HandlerResult:
             "project_id": project_id,
             "assignee": agent_row["name"],
             "profile": profile,
+            "profile_explicit": bool(effective_prof_override is not None),
             "model": model,
             "effort": effort,
         },
@@ -851,14 +1139,7 @@ def handle_task_assign(ctx: HandlerContext) -> HandlerResult:
 
 def handle_task_show(ctx: HandlerContext) -> HandlerResult:
     """Show details of a task."""
-    task_id = ctx.args.get("task_id")
-    if not task_id:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="Missing required parameter task_id",
-            details={"param": "task_id"},
-        )
+    task_id = _require_str_param(ctx.args.get("task_id"), "task_id", "Missing required parameter task_id")
 
     row = _get_task(ctx.conn, task_id)
     project_id = row["project_id"]
@@ -897,14 +1178,33 @@ def _live_run_for_viewer(ctx: HandlerContext, task: sqlite3.Row) -> Optional[Dic
     if lease is None or lease["holder_kind"] != "agent":
         return None
     live: Dict[str, Any] = {"run_id": lease["run_id"], "fence": lease["fence"]}
-    live.update(_lease_timing(get_lease_ttl_s(ctx.conn), lease["expires_at"], task["timeout_s"],
+    live.update(_lease_timing(get_lease_ttl_s(ctx.conn, testing_mode=ctx.testing_mode), lease["expires_at"], task["timeout_s"],
                               heartbeat_at=lease["heartbeat_at"]))
     return live
 
 
 def handle_task_list(ctx: HandlerContext) -> HandlerResult:
     """List tasks with optional filters."""
-    project_id = ctx.args.get("project") or ctx.args.get("project_id")
+    raw_proj = ctx.args.get("project") if ctx.args.get("project") is not None else ctx.args.get("project_id")
+    project_id = _optional_str_param(raw_proj, "project")
+    raw_status = _optional_str_param(ctx.args.get("status"), "status")
+    raw_assignee = _optional_str_param(ctx.args.get("assignee"), "assignee")
+    if ctx.args.get("verify_merge_auth"):
+        if not project_id:
+            raise MeshError(
+                c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message="--project is required",
+                details={"param": "project"},
+            )
+        if ctx.conn.execute("SELECT 1 FROM projects WHERE id = ?;", (project_id,)).fetchone() is None:
+            raise MeshError(
+                code=c.NOT_FOUND,
+                exit_code=c.EXIT_NOT_FOUND,
+                message=f"Project '{project_id}' not found",
+                details={"project_id": project_id},
+            )
+        check_authz(ctx.conn, "task.merge", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id)
     check_authz(ctx.conn, "task.list", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id)
 
     query = """
@@ -924,10 +1224,10 @@ def handle_task_list(ctx: HandlerContext) -> HandlerResult:
         query += " AND t.project_id = ?"
         params.append(project_id)
 
-    status = ctx.args.get("status")
+    status = raw_status
     if status:
         # One status or a comma list (`--status submitted,accepted`).
-        wanted = [s.strip() for s in str(status).split(",") if s.strip()]
+        wanted = [s.strip() for s in status.split(",") if s.strip()]
         unknown = [s for s in wanted if s not in TASK_STATES]
         if unknown or not wanted:
             raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
@@ -937,7 +1237,7 @@ def handle_task_list(ctx: HandlerContext) -> HandlerResult:
         query += " AND t.status IN (" + ",".join("?" * len(wanted)) + ")"
         params.extend(wanted)
 
-    assignee = ctx.args.get("assignee")
+    assignee = raw_assignee
     if assignee:
         query += " AND (t.assignee_agent_id = ? OR p.name = ?)"
         params.extend([assignee, assignee])
@@ -969,23 +1269,10 @@ def handle_task_list(ctx: HandlerContext) -> HandlerResult:
 
 def handle_task_cancel(ctx: HandlerContext) -> HandlerResult:
     """Cancel a task per plan §6.2 (T22)."""
-    task_id = ctx.args.get("task_id")
-    reason = ctx.args.get("reason")
-    if not task_id:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="Missing required parameter task_id",
-            details={"param": "task_id"},
-        )
-    if not reason or not str(reason).strip():
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="Parameter --reason is required and non-empty for task cancellation",
-            details={"param": "reason"},
-        )
-    reason = str(reason).strip()
+    task_id = _require_str_param(ctx.args.get("task_id"), "task_id", "Missing required parameter task_id")
+    reason = _require_str_param(
+        ctx.args.get("reason"), "reason", "Parameter --reason is required and non-empty for task cancellation", strip=True
+    )
 
     task = _get_task(ctx.conn, task_id)
     project_id = task["project_id"]
@@ -999,6 +1286,15 @@ def handle_task_cancel(ctx: HandlerContext) -> HandlerResult:
             exit_code=c.EXIT_CONFLICT,
             message=f"Task '{task_id}' in state '{task['status']}' is terminal and cannot be cancelled",
             details={"task_id": task_id, "status": task["status"], "kind": task["kind"]},
+        )
+
+    res_key = has_task_ws_reservation(ctx.conn, task_id, project_id)
+    if res_key:
+        raise MeshError(
+            code=c.CONCURRENCY_LIMIT,
+            exit_code=c.EXIT_BUSY,
+            message=f"Cannot cancel task '{task_id}': workspace operation '{res_key}' is in progress",
+            details={"reservation": res_key, "task_id": task_id, "project_id": project_id},
         )
 
     lease = ctx.conn.execute(
@@ -1062,33 +1358,48 @@ def handle_task_close(ctx: HandlerContext) -> HandlerResult:
     `task.closed` event that links TSK2; `task show` prints `superseded_by`. The branch
     and worktree are kept. Only for a lead or the user (same rule as `task cancel`).
     """
-    task_id = ctx.args.get("task_id")
-    other_id = ctx.args.get("superseded_by")
-    note = (ctx.args.get("reason") or "").strip() or None
-    if not task_id:
-        raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="Missing required parameter task_id",
-                        details={"param": "task_id"})
-    if not other_id:
-        raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
-                        message="--superseded-by TASK is required (the task whose merge landed this work)",
-                        details={"param": "superseded_by"})
+    task_id = _require_str_param(ctx.args.get("task_id"), "task_id", "Missing required parameter task_id")
+    other_id = _require_str_param(
+        ctx.args.get("superseded_by"),
+        "superseded_by",
+        "--superseded-by TASK is required (the task whose merge landed this work)",
+    )
+    raw_note = _optional_str_param(ctx.args.get("reason"), "reason")
+    note = (raw_note or "").strip() or None
     task = _get_task(ctx.conn, task_id)
     project_id = task["project_id"]
     check_authz(ctx.conn, "task.cancel", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id,
                 task_id=task_id)
+    res_key = has_task_ws_reservation(ctx.conn, task_id, project_id)
+    if res_key:
+        raise MeshError(
+            code=c.CONCURRENCY_LIMIT,
+            exit_code=c.EXIT_BUSY,
+            message=f"Cannot close task '{task_id}': workspace operation '{res_key}' is in progress",
+            details={"reservation": res_key, "task_id": task_id, "project_id": project_id},
+        )
     if other_id == task_id:
         raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="A task cannot supersede itself",
                         details={"param": "superseded_by", "task_id": task_id})
-    if task["status"] not in ("accepted", "merge_failed") or task["kind"] != "code":
+    allowed_close_states = ("accepted", "merge_failed", "cancelled", "failed")
+    if task["status"] not in allowed_close_states or task["kind"] != "code":
         raise MeshError(
             code=c.INVALID_TRANSITION,
             exit_code=c.EXIT_CONFLICT,
-            message=(f"Only an accepted or merge_failed code task can be closed as superseded; task '{task_id}' "
-                     f"is a {task['kind']} task in '{task['status']}'. Use `mesh task cancel` otherwise."),
+            message=(f"Only an accepted, merge_failed, cancelled, or failed code task can be closed as superseded; "
+                     f"task '{task_id}' is a {task['kind']} task in '{task['status']}'. Use `mesh task cancel` otherwise."),
             details={"task_id": task_id, "status": task["status"], "kind": task["kind"],
-                     "allowed": ["accepted", "merge_failed"]},
+                     "allowed": list(allowed_close_states)},
         )
-    other = ctx.conn.execute("SELECT id, project_id, status FROM tasks WHERE id = ?;", (other_id,)).fetchone()
+    prev_sup = superseded_by(ctx.conn, task_id)
+    if prev_sup is not None:
+        raise MeshError(
+            code=c.INVALID_TRANSITION,
+            exit_code=c.EXIT_CONFLICT,
+            message=f"Task '{task_id}' has already been closed as superseded by '{prev_sup}'",
+            details={"task_id": task_id, "status": task["status"], "superseded_by": prev_sup},
+        )
+    other = ctx.conn.execute("SELECT id, project_id, status, merge_json FROM tasks WHERE id = ?;", (other_id,)).fetchone()
     if other is None or other["project_id"] != project_id:
         raise MeshError(c.NOT_FOUND, exit_code=c.EXIT_NOT_FOUND,
                         message=f"--superseded-by: task '{other_id}' not found in project '{project_id}'",
@@ -1101,6 +1412,80 @@ def handle_task_close(ctx: HandlerContext) -> HandlerResult:
                      f"after the other task's merge has landed."),
             details={"param": "superseded_by", "task_id": other_id, "status": other["status"]},
         )
+    prow_repo = ctx.conn.execute(
+        "SELECT repo_path, integration_branch FROM projects WHERE id = ?;",
+        (project_id,),
+    ).fetchone()
+    repo_path = prow_repo["repo_path"] if prow_repo else None
+    integration_branch = prow_repo["integration_branch"] if prow_repo else None
+    if repo_path and os.path.isdir(repo_path) and task["branch"]:
+        from mesh.core.gitops import run_git
+        from mesh.core.invariants import _SHA_RE, check_i9_integrated_unmerged_tasks
+
+        other_base_row = ctx.conn.execute("SELECT base_commit FROM tasks WHERE id = ?;", (other_id,)).fetchone()
+        other_base = other_base_row["base_commit"] if other_base_row else None
+        other_mc = _parse_merge_commit(other["merge_json"])
+
+        prepared = getattr(ctx, "prepared_close", None)
+        used_prepared = False
+        if isinstance(prepared, dict):
+            db_snap = prepared.get("db_snapshot")
+            git_snap = prepared.get("git_snapshot")
+            if isinstance(db_snap, dict) and isinstance(git_snap, dict):
+                cur_db_snap = _task_close_db_snapshot(
+                    task,
+                    other,
+                    other_base,
+                    repo_path,
+                    integration_branch,
+                    _task_close_merged_rows(ctx.conn, project_id),
+                )
+                if cur_db_snap == db_snap:
+                    prep_err = prepared.get("error")
+                    if git_snap.get("rev_parse_ok"):
+                        tip_ok, cur_tip = _read_branch_sha(run_git, _SHA_RE, repo_path, task["branch"])
+                        integ_ok, cur_integ = _read_branch_sha(run_git, _SHA_RE, repo_path, integration_branch)
+                        noop_ok = True
+                        for n_branch, n_sha in (git_snap.get("noop_branch_shas") or {}).items():
+                            nb_ok, cur_nb = _read_branch_sha(run_git, _SHA_RE, repo_path, n_branch)
+                            if not nb_ok or cur_nb != n_sha:
+                                noop_ok = False
+                                break
+                        if (
+                            tip_ok
+                            and integ_ok
+                            and noop_ok
+                            and cur_tip == git_snap.get("tip_sha")
+                            and cur_integ == git_snap.get("integ_sha")
+                        ):
+                            used_prepared = True
+                            if prep_err is not None:
+                                raise prep_err
+                    elif prep_err is not None:
+                        used_prepared = True
+                        raise prep_err
+
+        if not used_prepared:
+            if task["status"] in ("cancelled", "failed"):
+                _check_cancelled_failed_superseded_covered(
+                    run_git,
+                    _SHA_RE,
+                    repo_path,
+                    task_id,
+                    task["branch"],
+                    task["base_commit"],
+                    other_id,
+                    other_base,
+                    other_mc,
+                )
+            i9_viols = check_i9_integrated_unmerged_tasks(
+                ctx.conn,
+                project_id,
+                task_id=task_id,
+                superseding_override=(task_id, other_id),
+            )
+            if i9_viols:
+                raise _task_close_i9_error(task_id, other_id, other_mc, i9_viols)
     open_deps = ctx.conn.execute(
         """SELECT t.id FROM tasks t JOIN task_deps td ON t.id = td.task_id
            WHERE td.depends_on_task_id = ? AND t.status NOT IN ('merged', 'cancelled')
@@ -1116,7 +1501,8 @@ def handle_task_close(ctx: HandlerContext) -> HandlerResult:
                      f"dependency. Point them at '{other_id}' first (`mesh dep remove` / `mesh dep add`)."),
             details={"task_id": task_id, "dependents": ids, "superseded_by": other_id},
         )
-    check_task_transition(task["status"], "cancelled")
+    if task["status"] != "cancelled":
+        check_task_transition(task["status"], "cancelled")
 
     now = now_iso_utc()
     _supersede_offers(ctx.conn, task)
@@ -1159,6 +1545,366 @@ def superseded_by(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
         return json.loads(row["payload_json"] or "{}").get("superseded_by")
     except ValueError:
         return None
+
+
+def _parse_merge_commit(merge_json: Optional[str]) -> Optional[str]:
+    try:
+        mj = json.loads(merge_json or "{}") or {}
+    except (TypeError, ValueError):
+        mj = {}
+    return mj.get("merge_commit") if isinstance(mj, dict) else None
+
+
+def _task_close_db_snapshot(
+    task: Any,
+    other: Any,
+    other_base: Optional[str],
+    repo_path: str,
+    integration_branch: Optional[str],
+    merged_rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    return {
+        "task_id": task["id"],
+        "task_status": task["status"],
+        "task_branch": task["branch"],
+        "task_base_commit": task["base_commit"],
+        "other_id": other["id"],
+        "other_status": other["status"],
+        "other_base_commit": other_base,
+        "other_merge_json": other["merge_json"],
+        "project_id": task["project_id"],
+        "repo_path": repo_path,
+        "integration_branch": integration_branch,
+        "merged_sig": _task_close_merged_sig(merged_rows),
+    }
+
+
+def _task_close_i9_error(
+    task_id: str,
+    other_id: str,
+    other_mc: Optional[str],
+    i9_viols: List[Any],
+) -> MeshError:
+    return MeshError(
+        code=c.INVALID_TRANSITION,
+        exit_code=c.EXIT_CONFLICT,
+        message=(f"--superseded-by: task '{task_id}' has integrated work not carried by '{other_id}' "
+                 f"merge commit '{other_mc}'"),
+        details={"param": "superseded_by", "task_id": task_id, "superseded_by": other_id,
+                 "merge_commit": other_mc, "violations": [v.details for v in i9_viols]},
+    )
+
+
+def _task_close_merged_rows(conn: sqlite3.Connection, project_id: str) -> List[Dict[str, Any]]:
+    return [
+        dict(r)
+        for r in conn.execute(
+            """SELECT t.id AS task_id, t.project_id, t.branch, t.base_commit, t.merge_json, p.repo_path
+               FROM tasks t JOIN projects p ON t.project_id = p.id
+               WHERE t.kind = 'code' AND t.status = 'merged' AND t.project_id = ?
+               ORDER BY t.id;""",
+            (project_id,),
+        ).fetchall()
+    ]
+
+
+def _task_close_merged_sig(merged_rows: List[Dict[str, Any]]) -> Tuple[Tuple[Any, ...], ...]:
+    return tuple(
+        (r["task_id"], r["branch"], r["base_commit"], r["merge_json"], r["repo_path"])
+        for r in merged_rows
+    )
+
+
+def _read_branch_sha(
+    run_git: Any,
+    sha_re: Any,
+    repo_path: str,
+    branch_name: Optional[str],
+) -> Tuple[bool, Optional[str]]:
+    if not branch_name:
+        return True, None
+    try:
+        cp = run_git(
+            ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch_name}^{{commit}}"],
+            cwd=repo_path,
+        )
+    except Exception:
+        return False, None
+    if cp.returncode == 1:
+        return True, None
+    if cp.returncode != 0:
+        return False, None
+    sha = cp.stdout.strip()
+    return (True, sha) if sha_re.match(sha) else (False, None)
+
+
+def _check_cancelled_failed_superseded_covered(
+    run_git: Any,
+    sha_re: Any,
+    repo_path: str,
+    task_id: str,
+    task_branch: str,
+    task_base: Optional[str],
+    other_id: str,
+    other_base: Optional[str],
+    other_mc: Optional[str],
+) -> None:
+    """Verify `other_mc` carried at least one commit of a cancelled/failed task beyond `task_base`."""
+    try:
+        tip_cp = run_git(
+            ["rev-parse", "--verify", "--quiet", f"refs/heads/{task_branch}^{{commit}}"],
+            cwd=repo_path,
+        )
+    except Exception as exc:
+        raise MeshError(
+            code=c.INVALID_TRANSITION,
+            exit_code=c.EXIT_CONFLICT,
+            message=f"--superseded-by: failed to verify branch tip for task '{task_id}': {exc}",
+            details={"param": "superseded_by", "task_id": task_id, "superseded_by": other_id},
+        )
+    if tip_cp.returncode == 1:
+        return
+    if tip_cp.returncode != 0:
+        raise MeshError(
+            code=c.INVALID_TRANSITION,
+            exit_code=c.EXIT_CONFLICT,
+            message=f"--superseded-by: failed to verify branch tip for task '{task_id}'",
+            details={"param": "superseded_by", "task_id": task_id, "superseded_by": other_id},
+        )
+    tip_sha = tip_cp.stdout.strip()
+    if not sha_re.match(tip_sha):
+        raise MeshError(
+            code=c.INVALID_TRANSITION,
+            exit_code=c.EXIT_CONFLICT,
+            message=f"--superseded-by: failed to verify branch tip for task '{task_id}'",
+            details={"param": "superseded_by", "task_id": task_id, "superseded_by": other_id},
+        )
+
+    covered = False
+    try:
+        if (
+            isinstance(other_mc, str) and sha_re.match(other_mc)
+            and isinstance(task_base, str) and sha_re.match(task_base)
+            and isinstance(other_base, str) and sha_re.match(other_base)
+        ):
+            p_cp = run_git(["log", "-1", "--format=%P", other_mc], cwd=repo_path)
+            if p_cp.returncode != 0:
+                raise RuntimeError(f"git log failed (rc {p_cp.returncode})")
+            parents = p_cp.stdout.split()
+            if len(parents) >= 2:
+                other_first = parents[0]
+
+                def _is_anc(a: str, b: str) -> bool:
+                    cp = run_git(["merge-base", "--is-ancestor", a, b], cwd=repo_path)
+                    if cp.returncode not in (0, 1):
+                        raise RuntimeError(f"git merge-base failed (rc {cp.returncode})")
+                    return cp.returncode == 0
+
+                for bp in parents[1:]:
+                    mb_cp = run_git(["merge-base", "--all", tip_sha, bp], cwd=repo_path)
+                    if mb_cp.returncode not in (0, 1):
+                        raise RuntimeError(f"git merge-base failed (rc {mb_cp.returncode})")
+                    for mb in mb_cp.stdout.split():
+                        if (
+                            mb != task_base
+                            and not _is_anc(mb, task_base)
+                            and not _is_anc(mb, other_first)
+                            and not _is_anc(mb, other_base)
+                        ):
+                            covered = True
+                            break
+                    if covered:
+                        break
+    except Exception as exc:
+        raise MeshError(
+            code=c.INVALID_TRANSITION,
+            exit_code=c.EXIT_CONFLICT,
+            message=f"--superseded-by: failed to verify branch coverage for task '{task_id}': {exc}",
+            details={"param": "superseded_by", "task_id": task_id, "superseded_by": other_id},
+        )
+    if not covered:
+        raise MeshError(
+            code=c.INVALID_TRANSITION,
+            exit_code=c.EXIT_CONFLICT,
+            message=(f"--superseded-by: task '{task_id}' branch is not covered by '{other_id}' "
+                     f"merge commit '{other_mc}'"),
+            details={"param": "superseded_by", "task_id": task_id, "superseded_by": other_id,
+                     "tip": tip_sha, "merge_commit": other_mc},
+        )
+
+
+def _run_task_close_git_checks(
+    row_dict: Dict[str, Any],
+    merged_rows: List[Dict[str, Any]],
+    other_id: str,
+    other_base: Optional[str],
+    other_mc: Optional[str],
+) -> Dict[str, Any]:
+    """Run read-only git checks for `task.close` in a worker thread without DB access."""
+    from mesh.core.gitops import run_git
+    from mesh.core.invariants import (
+        _SHA_RE,
+        _check_i9_unmerged_row,
+        _merged_task_bases_by_project,
+    )
+
+    repo_path = row_dict["repo_path"]
+    task_id = row_dict["task_id"]
+    task_branch = row_dict["branch"]
+    integration_branch = row_dict["integration_branch"]
+
+    tip_ok, tip_sha = _read_branch_sha(run_git, _SHA_RE, repo_path, task_branch)
+    integ_ok, integ_sha = _read_branch_sha(run_git, _SHA_RE, repo_path, integration_branch)
+    noop_branch_shas: Dict[str, Optional[str]] = {}
+    noop_ok = True
+    for mr in merged_rows:
+        try:
+            mj = json.loads(mr["merge_json"] or "{}") or {}
+        except (TypeError, ValueError):
+            mj = {}
+        tip_field = mj.get("tip") if isinstance(mj, dict) else None
+        if (
+            isinstance(mj, dict)
+            and mj.get("noop") is not False
+            and not (isinstance(tip_field, str) and _SHA_RE.match(tip_field))
+            and mr.get("branch")
+            and mr["branch"] not in noop_branch_shas
+        ):
+            nb_ok, nb_sha = _read_branch_sha(run_git, _SHA_RE, repo_path, mr["branch"])
+            if not nb_ok:
+                noop_ok = False
+                break
+            noop_branch_shas[mr["branch"]] = nb_sha
+
+    err: Optional[MeshError] = None
+    if row_dict["status"] in ("cancelled", "failed"):
+        try:
+            _check_cancelled_failed_superseded_covered(
+                run_git,
+                _SHA_RE,
+                repo_path,
+                task_id,
+                task_branch,
+                row_dict["base_commit"],
+                other_id,
+                other_base,
+                other_mc,
+            )
+        except MeshError as exc:
+            err = exc
+
+    if err is None and integration_branch is not None:
+        def git(args: List[str], cwd: str, input: Optional[str] = None) -> Any:
+            if input is not None:
+                return run_git(args, cwd=cwd, input=input)
+            return run_git(args, cwd=cwd)
+
+        merged_bases = _merged_task_bases_by_project(git, merged_rows).get(row_dict["project_id"], {})
+        sup_mc = (
+            other_mc
+            if (
+                isinstance(other_mc, str)
+                and other_mc in merged_bases
+                and isinstance(other_base, str)
+                and _SHA_RE.match(other_base)
+            )
+            else None
+        )
+        i9_viols = _check_i9_unmerged_row(
+            git,
+            row_dict,
+            merged_bases,
+            sup_mc,
+            other_base if sup_mc else None,
+        )
+        if i9_viols:
+            err = _task_close_i9_error(task_id, other_id, other_mc, i9_viols)
+
+    return {
+        "git_snapshot": {
+            "rev_parse_ok": tip_ok and integ_ok and noop_ok,
+            "tip_sha": tip_sha,
+            "integ_sha": integ_sha,
+            "noop_branch_shas": noop_branch_shas,
+        },
+        "error": err,
+    }
+
+
+async def prepare_task_close(ctx: HandlerContext) -> None:
+    """Offload read-only git and reverse-I9 checks for `task.close` before BEGIN IMMEDIATE."""
+    if ctx.cmd != "task.close":
+        return
+    task_id = ctx.args.get("task_id")
+    other_id = ctx.args.get("superseded_by")
+    if not isinstance(task_id, str) or not task_id or not isinstance(other_id, str) or not other_id:
+        return
+    if other_id == task_id:
+        return
+    task = ctx.conn.execute("SELECT * FROM tasks WHERE id = ?;", (task_id,)).fetchone()
+    if task is None or task["kind"] != "code" or task["status"] not in ("accepted", "merge_failed", "cancelled", "failed"):
+        return
+    project_id = task["project_id"]
+    try:
+        check_authz(
+            ctx.conn,
+            "task.cancel",
+            ctx.principal,
+            ctx.actor_kind,
+            ctx.via,
+            project_id=project_id,
+            task_id=task_id,
+        )
+    except MeshError:
+        return
+    if has_task_ws_reservation(ctx.conn, task_id, project_id):
+        return
+    if superseded_by(ctx.conn, task_id) is not None:
+        return
+    other = ctx.conn.execute(
+        "SELECT id, project_id, status, base_commit, merge_json FROM tasks WHERE id = ?;",
+        (other_id,),
+    ).fetchone()
+    if other is None or other["project_id"] != project_id or other["status"] != "merged":
+        return
+    prow = ctx.conn.execute(
+        "SELECT repo_path, integration_branch FROM projects WHERE id = ?;",
+        (project_id,),
+    ).fetchone()
+    repo_path = prow["repo_path"] if prow else None
+    integration_branch = prow["integration_branch"] if prow else None
+    if not (repo_path and os.path.isdir(repo_path) and task["branch"]):
+        return
+
+    other_mc = _parse_merge_commit(other["merge_json"])
+    merged_rows = _task_close_merged_rows(ctx.conn, project_id)
+    row_dict = {
+        "task_id": task_id,
+        "status": task["status"],
+        "branch": task["branch"],
+        "base_commit": task["base_commit"],
+        "project_id": project_id,
+        "repo_path": repo_path,
+        "integration_branch": integration_branch,
+    }
+    db_snapshot = _task_close_db_snapshot(
+        task,
+        other,
+        other["base_commit"],
+        repo_path,
+        integration_branch,
+        merged_rows,
+    )
+    prep = await asyncio.to_thread(
+        _run_task_close_git_checks,
+        row_dict,
+        merged_rows,
+        other_id,
+        other["base_commit"],
+        other_mc,
+    )
+    prep["db_snapshot"] = db_snapshot
+    ctx.prepared_close = prep  # type: ignore[attr-defined]
 
 
 def _supersede_offers(conn: Any, task: Any) -> None:
@@ -1269,33 +2015,16 @@ def emit_dependents_blocked(conn: Any, task_id: str, request_id: Optional[str]) 
 
 def handle_task_reassign(ctx: HandlerContext) -> HandlerResult:
     """Reassign a task to a different agent per plan §6.2 (T20)."""
-    task_id = ctx.args.get("task_id")
-    to_agent = ctx.args.get("to")
-    reason = ctx.args.get("reason")
-    reuse_workspace = bool(ctx.args.get("reuse_workspace", False))
-
-    if not task_id:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="Missing required parameter task_id",
-            details={"param": "task_id"},
-        )
-    if not to_agent:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="Missing required parameter --to",
-            details={"param": "to"},
-        )
-    if not reason or not str(reason).strip():
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="Parameter --reason is required and non-empty for task reassignment",
-            details={"param": "reason"},
-        )
-    reason = str(reason).strip()
+    task_id = _require_str_param(ctx.args.get("task_id"), "task_id", "Missing required parameter task_id")
+    raw_to = ctx.args.get("to") if ctx.args.get("to") is not None else ctx.args.get("agent")
+    to_agent = _require_str_param(raw_to, "to", "Missing required parameter --to")
+    reason = _require_str_param(
+        ctx.args.get("reason"), "reason", "Parameter --reason is required and non-empty for task reassignment", strip=True
+    )
+    profile_arg = _optional_str_param(ctx.args.get("profile"), "profile")
+    model_arg = _optional_str_param(ctx.args.get("model"), "model")
+    effort_arg = _optional_str_param(ctx.args.get("effort"), "effort")
+    reuse_workspace = _optional_bool_param(ctx.args.get("reuse_workspace"), "reuse_workspace", default=False)
 
     task = _get_task(ctx.conn, task_id)
     project_id = task["project_id"]
@@ -1305,71 +2034,16 @@ def handle_task_reassign(ctx: HandlerContext) -> HandlerResult:
     # Check transition: T20 is from assigned, queued, rework, failed, escalated, merge_failed -> assigned
     check_task_transition(task["status"], "assigned")
 
-    # If coming from failed or escalated, attempt rule is same as T19 (retry_over_limit)
-    if task["status"] in ("failed", "escalated") and task["attempt"] >= task["max_attempts"]:
-        if ctx.actor_kind != "user" and ctx.via != "direct":
-            if not ctx.approval:
-                apr_info = create_or_get_pending_approval(
-                    conn=ctx.conn,
-                    category="retry_over_limit",
-                    op="task.reassign",
-                    requested_by=ctx.principal["id"],
-                    params=ctx.args,
-                    summary=f"Reassignment of task '{task['title']}' at attempt cap ({task['attempt']}/{task['max_attempts']}) requires user approval",
-                    project_id=project_id,
-                    task_id=task_id,
-                    dry_run=ctx.dry_run,
-                    request_id=ctx.request_id,
-                    k_user=ctx.k_user,
-                )
-                raise MeshError(
-                    code=c.APPROVAL_REQUIRED,
-                    exit_code=c.EXIT_APPROVAL_REQUIRED,
-                    message=f"Task reassignment exceeds max attempts ({task['max_attempts']}) and requires user approval (category: retry_over_limit)",
-                    details=apr_info,
-                )
-            else:
-                check_and_consume_approval(
-                    conn=ctx.conn,
-                    approval_id=ctx.approval,
-                    op="task.reassign",
-                    category="retry_over_limit",
-                    caller_id=ctx.principal["id"],
-                    params=ctx.args,
-                    project_id=project_id,
-                    request_id=ctx.request_id,
-                    actor_kind=ctx.actor_kind, via=ctx.via, k_user=ctx.k_user,
-                )
-
-    # Validate assignment guards for new assignee
-    agent_row, profile, model, effort = _validate_assignment_guards(
-        conn=ctx.conn,
-        ctx=ctx,
-        project_id=project_id,
-        assignee_ident=to_agent,
-        profile_override=task["profile"],
-        model_override=None,
-        effort_override=None,
-        task_title=task["title"],
-        op="task.reassign",
-    )
-
-    old_assignee_name = task["assignee_name"]
-    now = now_iso_utc()
-
-    # On T20 from queued, supersede old assignee's unacked task.offered rows for that task
-    if task["status"] == "queued" and task["assignee_agent_id"]:
-        ctx.conn.execute(
-            """UPDATE outbox
-               SET status = 'superseded'
-               WHERE recipient_id = ?
-                 AND type = 'task.offered'
-                 AND json_extract(payload_json, '$.task_id') = ?
-                 AND status IN ('pending', 'delivered');""",
-            (task["assignee_agent_id"], task_id),
+    res_key = has_task_ws_reservation(ctx.conn, task_id, project_id)
+    if res_key:
+        raise MeshError(
+            code=c.CONCURRENCY_LIMIT,
+            exit_code=c.EXIT_BUSY,
+            message=f"Cannot reassign task '{task_id}': workspace operation '{res_key}' is in progress",
+            details={"reservation": res_key, "task_id": task_id, "project_id": project_id},
         )
 
-    # Fresh workspace after an inbox lease expiry (§6.2 T20)
+    # Compute workspace path (defer DB mutations until after validation and approval)
     cur_prev_run = ctx.conn.execute(
         "SELECT end_reason FROM runs WHERE task_id = ? ORDER BY rowid DESC LIMIT 1;",
         (task_id,),
@@ -1385,15 +2059,106 @@ def handle_task_reassign(ctx: HandlerContext) -> HandlerResult:
             next_attempt = max(1, task["attempt"]) + 1
             ws_root = get_workspaces_root(ctx.conn, ctx.home)
             new_ws_path = compute_task_workspace_path(ws_root, project_id, task_id, attempt=next_attempt)
-            remember_protected_path(ctx.conn, task["workspace_path"])
-            remember_protected_path(ctx.conn, new_ws_path)
 
+    preview_ws = new_ws_path or compute_task_workspace_path(
+        get_workspaces_root(ctx.conn, ctx.home), project_id, task_id, attempt=task["attempt"] + 1
+    )
+    effective_profile_override = profile_arg or _reassigned_profile_override(
+        ctx.conn, task, to_agent, ctx.testing_mode
+    )
+
+    # Validate assignment guards for new assignee BEFORE creating or consuming any approval
+    agent_row, profile, model, effort = _validate_assignment_guards(
+        conn=ctx.conn,
+        ctx=ctx,
+        project_id=project_id,
+        assignee_ident=to_agent,
+        profile_override=effective_profile_override,
+        model_override=model_arg,
+        effort_override=effort_arg,
+        task_title=task["title"],
+        op="task.reassign",
+        task_id=task_id,
+        prompt_check={
+            "task_doc": dict(task),
+            "workspace": preview_ws,
+            "attempt": task["attempt"] + 1,
+            "max_attempts": task["max_attempts"],
+            "rework": read_rework_feedback(ctx.conn, task_id),
+        },
+        check_approval=False,
+    )
+
+    # Evaluate both retry_over_limit and permission_escalation together in a single gate check
+    need_retry = task["status"] in ("failed", "escalated") and task["attempt"] >= task["max_attempts"]
+    max_unapproved = agent_row["max_unapproved_profile"] or "dev"
+    need_perm = PROFILE_RANKS.get(profile, 0) > PROFILE_RANKS.get(max_unapproved, 2)
+    _require_task_approval(
+        conn=ctx.conn,
+        ctx=ctx,
+        op="task.reassign",
+        project_id=project_id,
+        task_id=task_id,
+        params={
+            "task_id": task_id,
+            "to": agent_row["name"],
+            "reason": reason,
+            "profile": profile,
+            "model": model,
+            "effort": effort,
+            "reuse_workspace": reuse_workspace,
+        },
+        need_retry=need_retry,
+        need_perm=need_perm,
+        retry_summary=f"Reassignment of task '{task['title']}' at attempt cap ({task['attempt']}/{task['max_attempts']}) requires user approval",
+        perm_summary=f"Permission escalation to '{profile}' for task '{task['title']}' on agent '{agent_row['name']}'",
+        compound_summary=(
+            f"Reassignment of task '{task['title']}' at attempt cap ({task['attempt']}/{task['max_attempts']}) "
+            f"with permission escalation to '{profile}' on agent '{agent_row['name']}' requires user approval"
+        ),
+        retry_message=f"Task reassignment exceeds max attempts ({task['max_attempts']}) and requires user approval (category: retry_over_limit)",
+        perm_message=f"Profile '{profile}' requires user approval (category: permission_escalation)",
+        compound_message=f"Task reassignment exceeds max attempts ({task['max_attempts']}) and escalates profile to '{profile}'; requires direct user approval",
+    )
+
+    old_assignee_name = task["assignee_name"]
+    now = now_iso_utc()
+
+    if workspace_choice == "fresh":
+        remember_protected_path(ctx.conn, task["workspace_path"])
+        remember_protected_path(ctx.conn, new_ws_path)
+
+    # On T20 from queued, supersede old assignee's unacked task.offered rows for that task
+    if task["status"] == "queued" and task["assignee_agent_id"]:
+        ctx.conn.execute(
+            """UPDATE outbox
+               SET status = 'superseded'
+               WHERE recipient_id = ?
+                 AND type = 'task.offered'
+                 AND json_extract(payload_json, '$.task_id') = ?
+                 AND status IN ('pending', 'delivered');""",
+            (task["assignee_agent_id"], task_id),
+        )
+
+    prev_reassign_model = task["model"]
+    if task["last_session_id"]:
+        srow = ctx.conn.execute(
+            "SELECT agent_id, model FROM runs WHERE task_id = ? AND session_id = ? ORDER BY rowid DESC LIMIT 1;",
+            (task_id, task["last_session_id"]),
+        ).fetchone()
+        if srow is not None:
+            prev_reassign_model = srow["model"]
+    reassign_session_id = (
+        None
+        if (agent_row["id"] != task["assignee_agent_id"] or model != prev_reassign_model or workspace_choice == "fresh")
+        else task["last_session_id"]
+    )
     ctx.conn.execute(
         """UPDATE tasks
            SET assignee_agent_id = ?, status = 'assigned', offered_at = NULL, profile = ?, model = ?, effort = ?,
-               workspace_path = ?, updated_at = ?, version = version + 1
+               workspace_path = ?, last_session_id = ?, updated_at = ?, version = version + 1
            WHERE id = ?;""",
-        (agent_row["id"], profile, model, effort, new_ws_path, now, task_id),
+        (agent_row["id"], profile, model, effort, new_ws_path, reassign_session_id, now, task_id),
     )
 
     reassign_payload: Dict[str, Any] = {
@@ -1403,6 +2168,7 @@ def handle_task_reassign(ctx: HandlerContext) -> HandlerResult:
         "old_assignee": old_assignee_name,
         "reason": reason,
         "profile": profile,
+        "profile_explicit": bool(profile_arg) or (effective_profile_override is not None),
         "model": model,
         "effort": effort,
         "reuse_workspace": reuse_workspace,
@@ -1439,19 +2205,38 @@ def handle_task_reassign(ctx: HandlerContext) -> HandlerResult:
     )
 
 
-def _requeue_launch_guard(ctx: HandlerContext, assignee_id: Optional[str]) -> None:
-    """Evidence check for paths that requeue a task without AG (retry T19, reject T12 -> rework,
-    which the scheduler requeues). Same rule as AG step 4 (ACC: N19; Kiro r5 finding 1): a
-    launch-delivery assignee whose adapter has no matching smoke evidence is refused with
-    ``ADAPTER_UNSUPPORTED`` before any write or approval use."""
+def _requeue_launch_guard(ctx: HandlerContext, assignee_id: Optional[str]) -> Optional[sqlite3.Row]:
+    """Assignee enabled + launch installation/evidence check for paths that requeue a task
+    without AG (retry T19, reject T12 -> rework, which the scheduler requeues). Refused
+    before any write or approval use."""
     if not assignee_id:
-        return
-    agent = ctx.conn.execute("SELECT * FROM agents WHERE id = ?;", (assignee_id,)).fetchone()
-    if agent is None or agent["delivery"] != "launch":
-        return
+        return None
+    agent = ctx.conn.execute(
+        "SELECT a.*, p.name, p.disabled_at FROM agents a JOIN principals p ON a.id = p.id WHERE a.id = ?;",
+        (assignee_id,),
+    ).fetchone()
+    if agent is None:
+        return None
+    if agent["disabled_at"]:
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=f"Agent '{agent['name']}' is disabled",
+            details={"agent": agent["name"], "reason": "disabled"},
+        )
+    if agent["delivery"] != "launch":
+        return agent
     from mesh.adapters.evidence import effective_launch
 
     adapter = get_adapter(agent["adapter"], testing_mode=ctx.testing_mode)
+    if adapter.kind == "test_double" and not ctx.testing_mode:
+        raise MeshError(
+            code=c.TEST_DOUBLE_DISABLED,
+            exit_code=c.EXIT_ADAPTER_UNAVAILABLE,
+            message="Test double adapter 'fake' is only available when MESH_TESTING=1",
+        )
+    if not adapter.is_installed(binary_path=agent["binary_path"]):
+        raise AdapterNotInstalled(agent["adapter"])
     ev = effective_launch(ctx.conn, adapter, ctx.testing_mode, agent["binary_path"])
     if not ev.ok:
         raise AdapterUnsupported(
@@ -1460,23 +2245,16 @@ def _requeue_launch_guard(ctx: HandlerContext, assignee_id: Optional[str]) -> No
             milestone=ev.milestone or adapter.launch_milestone or "M3",
             reason=ev.reason,
         )
+    return agent
 
 
 def handle_task_retry(ctx: HandlerContext) -> HandlerResult:
     """Retry a failed or escalated task per plan §6.2 (T19)."""
-    task_id = ctx.args.get("task_id")
-    model_override = ctx.args.get("model")
-    effort_override = ctx.args.get("effort")
-    reason = ctx.args.get("reason")
-    reuse_workspace = bool(ctx.args.get("reuse_workspace", False))
-
-    if not task_id:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="Missing required parameter task_id",
-            details={"param": "task_id"},
-        )
+    task_id = _require_str_param(ctx.args.get("task_id"), "task_id", "Missing required parameter task_id")
+    model_override = _optional_str_param(ctx.args.get("model"), "model")
+    effort_override = _optional_str_param(ctx.args.get("effort"), "effort")
+    reason = _optional_str_param(ctx.args.get("reason"), "reason")
+    reuse_workspace = _optional_bool_param(ctx.args.get("reuse_workspace"), "reuse_workspace", default=False)
 
     task = _get_task(ctx.conn, task_id)
     project_id = task["project_id"]
@@ -1485,6 +2263,15 @@ def handle_task_retry(ctx: HandlerContext) -> HandlerResult:
 
     # Check transition: T19 is from failed, escalated -> queued
     check_task_transition(task["status"], "queued")
+
+    res_key = has_task_ws_reservation(ctx.conn, task_id, project_id)
+    if res_key:
+        raise MeshError(
+            code=c.CONCURRENCY_LIMIT,
+            exit_code=c.EXIT_BUSY,
+            message=f"Cannot retry task '{task_id}': workspace operation '{res_key}' is in progress",
+            details={"reservation": res_key, "task_id": task_id, "project_id": project_id},
+        )
 
     # Pre-public re-review P2: T19 queues directly, so it must apply the T4 readiness
     # guards itself; otherwise a prerequisite added while the task was failed is skipped.
@@ -1506,87 +2293,30 @@ def handle_task_retry(ctx: HandlerContext) -> HandlerResult:
                      "unfinished_projects": unfinished_projects},
         )
 
-    # Launch evidence, as AG step 4 (ACC: N19), before any write or approval use
-    _requeue_launch_guard(ctx, task["assignee_agent_id"])
+    # Disabled check + launch installation/evidence (ACC: N19), before any write or approval use
+    assignee_id = task["assignee_agent_id"]
+    ag_row = _requeue_launch_guard(ctx, assignee_id)
 
-    # Attempt cap check (retry_over_limit)
-    if task["attempt"] >= task["max_attempts"]:
-        if ctx.actor_kind != "user" and ctx.via != "direct":
-            if not ctx.approval:
-                apr_info = create_or_get_pending_approval(
-                    conn=ctx.conn,
-                    category="retry_over_limit",
-                    op="task.retry",
-                    requested_by=ctx.principal["id"],
-                    params=ctx.args,
-                    summary=f"Retry of task '{task['title']}' at attempt cap ({task['attempt']}/{task['max_attempts']}) requires user approval",
-                    project_id=project_id,
-                    task_id=task_id,
-                    dry_run=ctx.dry_run,
-                    request_id=ctx.request_id,
-                    k_user=ctx.k_user,
-                )
-                raise MeshError(
-                    code=c.APPROVAL_REQUIRED,
-                    exit_code=c.EXIT_APPROVAL_REQUIRED,
-                    message=f"Task retry exceeds max attempts ({task['max_attempts']}) and requires user approval (category: retry_over_limit)",
-                    details=apr_info,
-                )
-            else:
-                check_and_consume_approval(
-                    conn=ctx.conn,
-                    approval_id=ctx.approval,
-                    op="task.retry",
-                    category="retry_over_limit",
-                    caller_id=ctx.principal["id"],
-                    params=ctx.args,
-                    project_id=project_id,
-                    request_id=ctx.request_id,
-                    actor_kind=ctx.actor_kind, via=ctx.via, k_user=ctx.k_user,
-                )
-
-    # Validate model and effort overrides
+    # Validate model and effort BEFORE creating or consuming any approval
     _validate_profile_and_effort(profile_override=None, effort_override=effort_override)
 
-    assignee_id = task["assignee_agent_id"]
+    resolved_profile, need_retry, need_perm, will_gate_approval = _requeue_approval_gates(ctx, task, ag_row)
+
     resolved_model = model_override or task["model"]
     resolved_effort = effort_override or task["effort"]
-
-    if assignee_id and (model_override or effort_override):
-        # Blind review P3: the validator names the agent in its errors (needs p.name).
-        cur_ag = ctx.conn.execute(
-            "SELECT a.*, p.name FROM agents a JOIN principals p ON a.id = p.id WHERE a.id = ?;", (assignee_id,))
-        ag_row = cur_ag.fetchone()
-        if ag_row:
-            resolved_model, resolved_effort = _validate_model_and_effort(
-                agent=ag_row,
-                model_override=model_override,
-                effort_override=effort_override,
-                current_model=task["model"],
-                current_effort=task["effort"],
-                testing_mode=ctx.testing_mode,
-            )
-
-    is_inbox = False
-    if assignee_id:
-        cur_d = ctx.conn.execute("SELECT delivery FROM agents WHERE id = ?;", (assignee_id,))
-        d_row = cur_d.fetchone()
-        if d_row and d_row["delivery"] == "inbox":
-            is_inbox = True
-
-    now = now_iso_utc()
-    if assignee_id:
-        ctx.conn.execute(
-            """UPDATE outbox
-               SET status = 'superseded'
-               WHERE recipient_id = ?
-                 AND type = 'task.offered'
-                 AND json_extract(payload_json, '$.task_id') = ?
-                 AND status IN ('pending', 'delivered');""",
-            (assignee_id, task_id),
+    if ag_row:
+        resolved_model, resolved_effort = _validate_model_and_effort(
+            agent=ag_row,
+            model_override=model_override,
+            effort_override=effort_override,
+            current_model=task["model"],
+            current_effort=task["effort"],
+            testing_mode=ctx.testing_mode,
+            check_resolved_model=will_gate_approval,
+            check_effort_before_stale_model=True,
         )
 
-    # Fresh workspace after an inbox lease expiry (§6.2 T19)
+    # Fresh workspace calculation after an inbox lease expiry (§6.2 T19); defer DB writes
     cur_prev_run = ctx.conn.execute(
         "SELECT end_reason FROM runs WHERE task_id = ? ORDER BY rowid DESC LIMIT 1;",
         (task_id,),
@@ -1602,15 +2332,91 @@ def handle_task_retry(ctx: HandlerContext) -> HandlerResult:
             next_attempt = max(1, task["attempt"]) + 1
             ws_root = get_workspaces_root(ctx.conn, ctx.home)
             new_ws_path = compute_task_workspace_path(ws_root, project_id, task_id, attempt=next_attempt)
-            remember_protected_path(ctx.conn, task["workspace_path"])
-            remember_protected_path(ctx.conn, new_ws_path)
+
+    if ag_row and ag_row["delivery"] == "launch":
+        preview_ws = new_ws_path or compute_task_workspace_path(
+            get_workspaces_root(ctx.conn, ctx.home), project_id, task_id, attempt=task["attempt"] + 1
+        )
+        _check_spec_prompt_length(
+            conn=ctx.conn,
+            project_id=project_id,
+            adapter_id=ag_row["adapter"],
+            profile=resolved_profile,
+            task_doc=dict(task),
+            workspace=preview_ws,
+            attempt=task["attempt"] + 1,
+            max_attempts=task["max_attempts"],
+            rework=read_rework_feedback(ctx.conn, task_id),
+        )
+
+    # Evaluate both retry_over_limit and permission_escalation (§7.4)
+    assignee_name = ag_row["name"] if ag_row else task["assignee_agent_id"]
+    _require_task_approval(
+        conn=ctx.conn,
+        ctx=ctx,
+        op="task.retry",
+        project_id=project_id,
+        task_id=task_id,
+        params={
+            "task_id": task_id,
+            "assignee": assignee_name,
+            "profile": resolved_profile,
+            "model": resolved_model,
+            "effort": resolved_effort,
+            "reason": reason,
+            "reuse_workspace": reuse_workspace,
+        },
+        need_retry=need_retry,
+        need_perm=need_perm,
+        retry_summary=f"Retry of task '{task['title']}' at attempt cap ({task['attempt']}/{task['max_attempts']}) requires user approval",
+        perm_summary=f"Permission escalation to '{resolved_profile}' for retry of task '{task['title']}' on agent '{ag_row['name'] if ag_row else ''}'",
+        compound_summary=(
+            f"Retry of task '{task['title']}' at attempt cap ({task['attempt']}/{task['max_attempts']}) "
+            f"with permission escalation to '{resolved_profile}' requires user approval"
+        ),
+        retry_message=f"Task retry exceeds max attempts ({task['max_attempts']}) and requires user approval (category: retry_over_limit)",
+        perm_message=f"Profile '{resolved_profile}' requires user approval (category: permission_escalation)",
+        compound_message=f"Task retry exceeds max attempts ({task['max_attempts']}) and escalates profile to '{resolved_profile}'; requires direct user approval",
+    )
+
+    is_inbox = bool(ag_row and ag_row["delivery"] == "inbox")
+
+    now = now_iso_utc()
+    if workspace_choice == "fresh":
+        remember_protected_path(ctx.conn, task["workspace_path"])
+        remember_protected_path(ctx.conn, new_ws_path)
+
+    if assignee_id:
+        ctx.conn.execute(
+            """UPDATE outbox
+               SET status = 'superseded'
+               WHERE recipient_id = ?
+                 AND type = 'task.offered'
+                 AND json_extract(payload_json, '$.task_id') = ?
+                 AND status IN ('pending', 'delivered');""",
+            (assignee_id, task_id),
+        )
 
     offered_at = now if is_inbox else None
+    prev_retry_model = task["model"] or (ag_row["default_model"] if ag_row else None)
+    if task["last_session_id"]:
+        srow = ctx.conn.execute(
+            "SELECT model FROM runs WHERE task_id = ? AND session_id = ? ORDER BY rowid DESC LIMIT 1;",
+            (task_id, task["last_session_id"]),
+        ).fetchone()
+        if srow is not None:
+            prev_retry_model = srow["model"]
+    retry_session_id = (
+        None
+        if (resolved_model != prev_retry_model or workspace_choice == "fresh")
+        else task["last_session_id"]
+    )
     ctx.conn.execute(
         """UPDATE tasks
-           SET status = 'queued', queued_at = ?, offered_at = ?, model = ?, effort = ?, workspace_path = ?, updated_at = ?, version = version + 1
+           SET status = 'queued', queued_at = ?, offered_at = ?, model = ?, effort = ?, workspace_path = ?,
+               last_session_id = ?, updated_at = ?, version = version + 1
            WHERE id = ?;""",
-        (now, offered_at, resolved_model, resolved_effort, new_ws_path, now, task_id),
+        (now, offered_at, resolved_model, resolved_effort, new_ws_path, retry_session_id, now, task_id),
     )
 
     retry_payload: Dict[str, Any] = {
@@ -1660,7 +2466,7 @@ def handle_task_retry(ctx: HandlerContext) -> HandlerResult:
                 "spec": task["spec"],
                 "fence": task["fence_seq"] + 1,
                 "assignee_id": assignee_id,
-                "ack_timeout_s": ack_window_now(ctx.conn, assignee_id)[0],
+                "ack_timeout_s": ack_window_now(ctx.conn, assignee_id, testing_mode=ctx.testing_mode)[0],
                 "last_rejection": last_rejection(ctx.conn, task_id),
             },
             request_id=ctx.request_id,
@@ -1679,24 +2485,10 @@ def handle_task_retry(ctx: HandlerContext) -> HandlerResult:
 
 def handle_task_escalate(ctx: HandlerContext) -> HandlerResult:
     """Escalate a failed task per plan §6.2 (T21)."""
-    task_id = ctx.args.get("task_id")
-    reason = ctx.args.get("reason")
-
-    if not task_id:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="Missing required parameter task_id",
-            details={"param": "task_id"},
-        )
-    if not reason or not str(reason).strip():
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="Parameter --reason is required and non-empty for task escalation",
-            details={"param": "reason"},
-        )
-    reason = str(reason).strip()
+    task_id = _require_str_param(ctx.args.get("task_id"), "task_id", "Missing required parameter task_id")
+    reason = _require_str_param(
+        ctx.args.get("reason"), "reason", "Parameter --reason is required and non-empty for task escalation", strip=True
+    )
 
     task = _get_task(ctx.conn, task_id)
     project_id = task["project_id"]
@@ -1749,14 +2541,7 @@ def handle_task_escalate(ctx: HandlerContext) -> HandlerResult:
 
 async def handle_task_wait(server: Any, ctx: HandlerContext, reader: Any = None) -> HandlerResult:
     """Block until task reaches a target state or terminal condition per plan §13."""
-    task_id = ctx.args.get("task_id")
-    if not task_id:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="Missing required parameter task_id",
-            details={"param": "task_id"},
-        )
+    task_id = _require_str_param(ctx.args.get("task_id"), "task_id", "Missing required parameter task_id")
 
     # Validate task existence and scoping
     row = _get_task(ctx.conn, task_id)
@@ -1764,6 +2549,13 @@ async def handle_task_wait(server: Any, ctx: HandlerContext, reader: Any = None)
     check_authz(ctx.conn, "task.wait", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id, task_id=task_id)
 
     until = ctx.args.get("until", "submitted")
+    if not isinstance(until, str):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Parameter 'until' must be a string",
+            details={"param": "until", "got": type(until).__name__},
+        )
     if until == "submitted":
         match_fn = lambda s, k: s == "submitted"
     elif until == "terminal":
@@ -1828,9 +2620,7 @@ async def handle_task_wait(server: Any, ctx: HandlerContext, reader: Any = None)
 
             # Blind review P2: re-check the credential and access on every pass, so a revoke,
             # disable or lost project access during the wait ends it before data is returned.
-            _recheck_credential(ctx)
-            check_authz(ctx.conn, "task.wait", ctx.principal, ctx.actor_kind, ctx.via,
-                        project_id=project_id, task_id=task_id)
+            _recheck_wait_authz(ctx, "task.wait", project_id=project_id, task_id=task_id)
             row = _get_task(ctx.conn, task_id)
             if match_fn(row["status"], row["kind"]):
                 cur_deps = ctx.conn.execute(
@@ -1879,14 +2669,36 @@ def _get_current_boot_id(conn: sqlite3.Connection) -> str:
     return generate_id("boot")
 
 
+def _count_active_task_runs(conn: sqlite3.Connection, agent_id: Optional[str] = None) -> int:
+    if agent_id is None:
+        return conn.execute(
+            "SELECT COUNT(*) FROM runs WHERE status IN ('starting', 'running') AND kind IN ('task', 'external');"
+        ).fetchone()[0]
+    return conn.execute(
+        "SELECT COUNT(*) FROM runs WHERE agent_id = ? AND status IN ('starting', 'running') AND kind IN ('task', 'external');",
+        (agent_id,),
+    ).fetchone()[0]
+
+
+def _get_global_run_cap(conn: sqlite3.Connection) -> Optional[int]:
+    set_row = conn.execute("SELECT value_json FROM settings WHERE key = 'scheduler.max_total_runs';").fetchone()
+    if set_row and set_row["value_json"]:
+        try:
+            return int(json.loads(set_row["value_json"]))
+        except Exception:
+            return None
+    return None
+
+
 async def prepare_task_start_workspace(ctx: HandlerContext) -> None:
     """Inbox `task start` of a code task: create/reuse its worktree before T5 (m2-r4).
 
     Runs before the request transaction, with the git work in a worker thread so the
     event loop is never blocked by git (review m2-r3 finding 5). It only acts when
     the start would get past the handler's own checks for authz, inbox delivery, an
-    active project and a queued task; otherwise it returns and the handler reports
-    the error as before. On success the result is put on `ctx.prepared_workspace`.
+    active project, a queued task, free lease/concurrency slots, and allowed model/effort;
+    otherwise it returns and the handler reports the error as before. On success the
+    result is put on `ctx.prepared_workspace`.
 
     A git failure is T6 `workspace_error` (committed here, lead notified by the
     `task.failed` event) and the call returns rc 6 INVALID_TRANSITION with
@@ -1895,21 +2707,57 @@ async def prepare_task_start_workspace(ctx: HandlerContext) -> None:
     if ctx.dry_run or ctx.cmd != "task.start":
         return
     task_id = ctx.args.get("task_id")
-    if not task_id:
+    if not isinstance(task_id, str) or not task_id.strip():
+        return
+    session = ctx.args.get("session")
+    if session is not None and (not isinstance(session, str) or "\x00" in session or len(session) > 256):
         return
     task = ctx.conn.execute(
-        "SELECT t.*, a.delivery AS _delivery, p.status AS _project_status FROM tasks t "
-        "LEFT JOIN agents a ON t.assignee_agent_id = a.id JOIN projects p ON t.project_id = p.id "
+        "SELECT t.*, a.delivery AS _delivery, pr.disabled_at AS _disabled_at, p.status AS _project_status "
+        "FROM tasks t LEFT JOIN agents a ON t.assignee_agent_id = a.id "
+        "LEFT JOIN principals pr ON t.assignee_agent_id = pr.id "
+        "JOIN projects p ON t.project_id = p.id "
         "WHERE t.id = ?;",
         (task_id,),
     ).fetchone()
     if not task or task["kind"] != "code" or task["status"] != "queued":
         return
-    if task["_delivery"] != "inbox" or task["_project_status"] != "active":
+    if task["_delivery"] != "inbox" or task["_disabled_at"] is not None or task["_project_status"] != "active":
         return
     try:
         check_authz(ctx.conn, "task.start", ctx.principal, ctx.actor_kind, ctx.via,
                     project_id=task["project_id"], task_id=task_id)
+    except MeshError:
+        return
+    if has_task_ws_reservation(ctx.conn, task_id, task["project_id"]):
+        return
+    if ctx.conn.execute("SELECT 1 FROM leases WHERE key = ?;", (f"task:{task_id}",)).fetchone():
+        return
+    ag = ctx.conn.execute(
+        "SELECT a.*, p.name FROM agents a JOIN principals p ON a.id = p.id WHERE a.id = ?;",
+        (task["assignee_agent_id"],),
+    ).fetchone()
+    if not ag:
+        return
+    # First start (branch is None) pins base_commit to current integration HEAD; skip preparation
+    # while concurrency slots are full so a queued task is not locked to a stale base_commit
+    # (retried tasks with an existing branch already fixed base_commit and keep m2-r4 prep reuse).
+    if not task["branch"]:
+        if _count_active_task_runs(ctx.conn, ag["id"]) >= (ag["max_concurrency"] or 1):
+            return
+        global_limit = _get_global_run_cap(ctx.conn)
+        if global_limit is not None and _count_active_task_runs(ctx.conn) >= global_limit:
+            return
+    try:
+        _validate_model_and_effort(
+            agent=ag,
+            model_override=None,
+            effort_override=None,
+            current_model=task["model"],
+            current_effort=task["effort"],
+            testing_mode=ctx.testing_mode,
+            check_resolved_model=True,
+        )
     except MeshError:
         return
     plan = plan_code_workspace(ctx.conn, ctx.home, task)
@@ -1920,36 +2768,104 @@ async def prepare_task_start_workspace(ctx: HandlerContext) -> None:
     except WorkspaceError as e:
         details = dict(e.details)
         details["message"] = str(e)
-        with transaction(ctx.conn):
-            current = ctx.conn.execute("SELECT * FROM tasks WHERE id = ?;", (task_id,)).fetchone()
-            failed = bool(current and current["fence_seq"] == task["fence_seq"]) and fail_queued_task_t6(
-                ctx.conn, current, "workspace_error", details,
-                assignee_id=current["assignee_agent_id"], request_id=ctx.request_id,
-            )
-        err = {"task_id": task_id, "reason": "workspace_error", "failed": failed}
+        err = {"task_id": task_id, "reason": "workspace_error", "failed": False}
         err.update({k: v for k, v in details.items() if k not in err})
-        raise MeshError(
+        m_err = MeshError(
             code=c.INVALID_TRANSITION,
             exit_code=c.EXIT_CONFLICT,
             message=f"Task '{task_id}' cannot start: {e}",
             details=err,
         )
+        idem = getattr(ctx, "idempotency", None)
+        with transaction(ctx.conn):
+            from mesh.daemon.handlers.inbox import recheck_tx_credential_and_authz
+            from mesh.daemon.server import _lookup_live_idempotency, find_ws_reserved_idempotency
+
+            recheck_tx_credential_and_authz(ctx, cmd="task.start")
+            if idem and idem.get("key"):
+                if (
+                    _lookup_live_idempotency(ctx.conn, idem["principal_id"], idem["key"]) is not None
+                    or find_ws_reserved_idempotency(ctx.conn, idem["principal_id"], idem["key"]) is not None
+                ):
+                    return
+            current = ctx.conn.execute("SELECT * FROM tasks WHERE id = ?;", (task_id,)).fetchone()
+            if current is None:
+                return
+            check_authz(
+                ctx.conn,
+                "task.start",
+                ctx.principal,
+                ctx.actor_kind,
+                ctx.via,
+                project_id=current["project_id"],
+                task_id=task_id,
+            )
+            if has_task_ws_reservation(ctx.conn, task_id, current["project_id"]):
+                return
+            cur_proj = ctx.conn.execute(
+                "SELECT status FROM projects WHERE id = ?;", (current["project_id"],)
+            ).fetchone()
+            cur_ag = (
+                ctx.conn.execute(
+                    "SELECT a.delivery, p.disabled_at FROM agents a JOIN principals p ON a.id = p.id WHERE a.id = ?;",
+                    (current["assignee_agent_id"],),
+                ).fetchone()
+                if current["assignee_agent_id"] else None
+            )
+            if (
+                not cur_proj or cur_proj["status"] != "active"
+                or not cur_ag or cur_ag["delivery"] != "inbox" or cur_ag["disabled_at"] is not None
+            ):
+                return
+            failed = (
+                current["fence_seq"] == task["fence_seq"]
+                and current["assignee_agent_id"] == task["assignee_agent_id"]
+                and fail_queued_task_t6(
+                    ctx.conn, current, "workspace_error", details,
+                    assignee_id=current["assignee_agent_id"], request_id=ctx.request_id,
+                )
+            )
+            m_err.details["failed"] = failed
+            if failed:
+                ctx._committed_side_effect = True  # type: ignore[attr-defined]
+                if idem and idem.get("key"):
+                    from mesh.daemon.server import _idempotency_record, _store_idempotency_row
+
+                    env_doc = m_err.to_envelope(request_id=ctx.request_id)
+                    _store_idempotency_row(
+                        ctx.conn,
+                        idem["principal_id"],
+                        idem["key"],
+                        "task.start",
+                        idem["request_hash"],
+                        json.dumps(_idempotency_record("task.start", env_doc)),
+                        m_err.exit_code,
+                        ignore_conflict=True,
+                    )
+        raise m_err
     result = dict(result)
     result["task_id"] = task_id
     result["fence_seq"] = task["fence_seq"]
     ctx.prepared_workspace = result  # type: ignore[attr-defined]
 
 
+def require_prepared_worktree(task_id: str, ws_path: str) -> None:
+    """Full review r3 P1-3: a code task's worktree deleted (`workspace delete`) between
+    its preparation and the start transaction fails the start; nothing is committed and
+    no attempt is spent (the next start re-attaches the kept branch)."""
+    if not os.path.lexists(os.path.join(ws_path, ".git")):
+        raise MeshError(
+            code=c.INVALID_TRANSITION,
+            exit_code=c.EXIT_CONFLICT,
+            message=f"Task '{task_id}' worktree disappeared before the start; retry `mesh task start`",
+            details={"task_id": task_id, "reason": "workspace_missing"},
+        )
+
+
 def handle_task_start(ctx: HandlerContext) -> HandlerResult:
     """Start execution of an inbox-assigned task per plan §6.2 (T5), §11.1, §11.5."""
-    task_id = ctx.args.get("task_id")
-    if not task_id:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="Task ID is required for task start",
-            details={"param": "task_id"},
-        )
+    task_id = _require_str_param(ctx.args.get("task_id"), "task_id", "Task ID is required for task start")
+    _validate_session_param(ctx.args.get("session"))
 
     # 1. Task exists
     task = _get_task(ctx.conn, task_id)
@@ -1959,7 +2875,10 @@ def handle_task_start(ctx: HandlerContext) -> HandlerResult:
     check_authz(ctx.conn, "task.start", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id, task_id=task_id)
 
     # 3. Delivery is inbox (if launch mode -> 6 INVALID_TRANSITION, reason: "launch_mode")
-    cur_ag = ctx.conn.execute("SELECT a.*, p.name FROM agents a JOIN principals p ON a.id = p.id WHERE a.id = ?;", (task["assignee_agent_id"],))
+    cur_ag = ctx.conn.execute(
+        "SELECT a.*, p.name, p.disabled_at FROM agents a JOIN principals p ON a.id = p.id WHERE a.id = ?;",
+        (task["assignee_agent_id"],),
+    )
     agent = cur_ag.fetchone()
     if not agent or agent["delivery"] != "inbox":
         raise MeshError(
@@ -1967,6 +2886,13 @@ def handle_task_start(ctx: HandlerContext) -> HandlerResult:
             exit_code=c.EXIT_CONFLICT,
             message="Task start is only valid for inbox-delivery agents",
             details={"reason": "launch_mode"},
+        )
+    if agent["disabled_at"]:
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=f"Agent '{agent['name']}' is disabled",
+            details={"agent": agent["name"], "reason": "disabled"},
         )
 
     # 4. Project active
@@ -1989,12 +2915,17 @@ def handle_task_start(ctx: HandlerContext) -> HandlerResult:
             details={"task_id": task_id, "from_state": task["status"], "expected": "queued"},
         )
 
+    res_key = has_task_ws_reservation(ctx.conn, task_id, project_id)
+    if res_key:
+        raise MeshError(
+            code=c.CONCURRENCY_LIMIT,
+            exit_code=c.EXIT_BUSY,
+            message=f"Cannot start task '{task_id}': workspace operation '{res_key}' is in progress",
+            details={"reservation": res_key, "task_id": task_id, "project_id": project_id},
+        )
+
     # 6. Concurrency limits
-    cur_slots = ctx.conn.execute(
-        "SELECT COUNT(*) FROM runs WHERE agent_id = ? AND status IN ('starting', 'running') AND kind IN ('task', 'external');",
-        (agent["id"],),
-    )
-    active_slots = cur_slots.fetchone()[0]
+    active_slots = _count_active_task_runs(ctx.conn, agent["id"])
     max_concurrency = agent["max_concurrency"] or 1
     if active_slots >= max_concurrency:
         raise MeshError(
@@ -2005,37 +2936,28 @@ def handle_task_start(ctx: HandlerContext) -> HandlerResult:
         )
 
     # Global cap (scheduler.max_total_runs)
-    cur_set = ctx.conn.execute("SELECT value_json FROM settings WHERE key = 'scheduler.max_total_runs';")
-    set_row = cur_set.fetchone()
     total_active_slots = None
-    global_limit = None
-    if set_row and set_row["value_json"]:
-        try:
-            global_limit = int(json.loads(set_row["value_json"]))
-            cur_tot = ctx.conn.execute("SELECT COUNT(*) FROM runs WHERE status IN ('starting', 'running') AND kind IN ('task', 'external');")
-            total_active_slots = cur_tot.fetchone()[0]
-            if total_active_slots >= global_limit:
-                raise MeshError(
-                    code=c.CONCURRENCY_LIMIT,
-                    exit_code=c.EXIT_BUSY,
-                    message=f"Global concurrency cap reached ({total_active_slots}/{global_limit})",
-                    details={"total_active": total_active_slots, "limit": global_limit},
-                )
-        except MeshError:
-            raise
-        except Exception:
-            pass
+    global_limit = _get_global_run_cap(ctx.conn)
+    if global_limit is not None:
+        total_active_slots = _count_active_task_runs(ctx.conn)
+        if total_active_slots >= global_limit:
+            raise MeshError(
+                code=c.CONCURRENCY_LIMIT,
+                exit_code=c.EXIT_BUSY,
+                message=f"Global concurrency cap reached ({total_active_slots}/{global_limit})",
+                details={"total_active": total_active_slots, "limit": global_limit},
+            )
 
-    # 7. Model allowed
-    task_model = task["model"] or agent["default_model"]
-    allowed_models = json.loads(agent["allowed_models_json"]) if agent["allowed_models_json"] else []
-    if allowed_models and task_model not in allowed_models:
-        raise MeshError(
-            code=c.MODEL_NOT_ALLOWED,
-            exit_code=c.EXIT_USAGE,
-            message=f"Model '{task_model}' is not in agent '{agent['name']}' allowed models",
-            details={"model": task_model, "allowed": allowed_models},
-        )
+    # 7. Model & Effort allowed
+    task_model, task_effort = _validate_model_and_effort(
+        agent=agent,
+        model_override=None,
+        effort_override=None,
+        current_model=task["model"],
+        current_effort=task["effort"],
+        testing_mode=ctx.testing_mode,
+        check_resolved_model=True,
+    )
 
     # 8. Lease is free
     cur_l = ctx.conn.execute("SELECT key FROM leases WHERE key = ?;", (f"task:{task_id}",))
@@ -2050,7 +2972,7 @@ def handle_task_start(ctx: HandlerContext) -> HandlerResult:
     # Transaction allocations
     now = now_iso_utc()
     now_ts = time.time()
-    lease_ttl_s = get_lease_ttl_s(ctx.conn)
+    lease_ttl_s = get_lease_ttl_s(ctx.conn, testing_mode=ctx.testing_mode)
     expires_at = now_iso_utc(now_ts + lease_ttl_s)
 
     fence = task["fence_seq"] + 1
@@ -2080,6 +3002,7 @@ def handle_task_start(ctx: HandlerContext) -> HandlerResult:
         ws_path = prepared["workspace_path"]
         branch = prepared["branch"]
         base_commit = prepared["base_commit"]
+        require_prepared_worktree(task_id, ws_path)
 
     # Insert run
     ctx.conn.execute(
@@ -2094,7 +3017,7 @@ def handle_task_start(ctx: HandlerContext) -> HandlerResult:
         );""",
         (
             run_id, task_id, project_id, agent["id"], attempt, fence,
-            agent["adapter"], task_model, task["effort"], task["profile"],
+            agent["adapter"], task_model, task_effort, task["profile"],
             boot_id, run_dir, now,
         ),
     )
@@ -2146,7 +3069,8 @@ def handle_task_start(ctx: HandlerContext) -> HandlerResult:
     remember_run_session(ctx.conn, run_id, ctx.args.get("session"))
 
     # Queue post-commit effect for directories
-    ctx.effects.append(Effect("create_run_and_workspace_dirs", {"run_dir": run_dir, "workspace_dir": ws_path}))
+    ctx.effects.append(Effect("create_run_and_workspace_dirs", {"run_dir": run_dir, "workspace_dir": ws_path,
+                                                               "worktree": bool(branch)}))
 
     data = {
         "run_id": run_id,
@@ -2179,8 +3103,10 @@ def _apply_run_token_scope(ctx: HandlerContext, task_id: str) -> Tuple[Optional[
     authoritative: explicit ``--run``/``--fence`` may only repeat them, and a
     differing value is a stale write (exit 9 ``FENCE_MISMATCH``, no state change).
     """
+    arg_run = _optional_str_param(ctx.args.get("run"), "run")
+    arg_fence = _validate_fence_param(ctx.args.get("fence"))
     if ctx.via != "run_token":
-        return ctx.args.get("run"), ctx.args.get("fence")
+        return arg_run, arg_fence
     scope = ctx.principal.get("scope") or {}
     if scope.get("task_id") and scope.get("task_id") != task_id:
         raise MeshError(
@@ -2191,8 +3117,6 @@ def _apply_run_token_scope(ctx: HandlerContext, task_id: str) -> Tuple[Optional[
         )
     run_id = scope.get("run_id")
     fence = scope.get("fence")
-    arg_run = ctx.args.get("run")
-    arg_fence = ctx.args.get("fence")
     fence_differs = False
     if arg_fence is not None:
         try:
@@ -2212,11 +3136,10 @@ def _apply_run_token_scope(ctx: HandlerContext, task_id: str) -> Tuple[Optional[
 
 def handle_task_heartbeat(ctx: HandlerContext) -> HandlerResult:
     """Heartbeat an active task lease per plan §11.5."""
-    task_id = ctx.args.get("task_id")
-    run_id, fence = _apply_run_token_scope(ctx, task_id or "")
+    task_id = _require_str_param(ctx.args.get("task_id"), "task_id", "Task ID is required")
+    session = _validate_session_param(ctx.args.get("session"))
+    run_id, fence = _apply_run_token_scope(ctx, task_id)
 
-    if not task_id:
-        raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="Task ID is required", details={"param": "task_id"})
     if not run_id:
         raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="--run is required for task heartbeat", details={"param": "run"})
     if fence is None:
@@ -2227,10 +3150,10 @@ def handle_task_heartbeat(ctx: HandlerContext) -> HandlerResult:
 
     # Verify lease and fence
     lease = verify_task_lease_and_fence(ctx.conn, task_id, presented_run_id=run_id, presented_fence=fence)
-    check_run_session(ctx.conn, task_id, run_id, ctx.args.get("session"))
+    check_run_session(ctx.conn, task_id, run_id, session)
 
     # Update lease
-    ttl_s = get_lease_ttl_s(ctx.conn)
+    ttl_s = get_lease_ttl_s(ctx.conn, testing_mode=ctx.testing_mode)
     now_ts = time.time()
     now = now_iso_utc(now_ts)
     expires_at = now_iso_utc(now_ts + ttl_s)
@@ -2258,17 +3181,16 @@ def handle_task_heartbeat(ctx: HandlerContext) -> HandlerResult:
 
 def handle_task_progress(ctx: HandlerContext) -> HandlerResult:
     """Report task progress and heartbeat lease per plan §11.5."""
-    task_id = ctx.args.get("task_id")
+    task_id = _require_str_param(ctx.args.get("task_id"), "task_id", "Task ID is required")
     message = ctx.args.get("message")
-    run_id, fence = _apply_run_token_scope(ctx, task_id or "")
+    session = _validate_session_param(ctx.args.get("session"))
+    run_id, fence = _apply_run_token_scope(ctx, task_id)
 
-    if not task_id:
-        raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="Task ID is required", details={"param": "task_id"})
     if not run_id:
         raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="--run is required for task progress", details={"param": "run"})
     if fence is None:
         raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="--fence is required for task progress", details={"param": "fence"})
-    if not message or len(message.encode("utf-8")) > 4096:
+    if not isinstance(message, str) or not message or len(message.encode("utf-8")) > 4096:
         raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="--message is required and must be non-empty and <= 4 KB", details={"param": "message"})
 
     task = _get_task(ctx.conn, task_id)
@@ -2276,10 +3198,10 @@ def handle_task_progress(ctx: HandlerContext) -> HandlerResult:
 
     # Verify lease and fence
     lease = verify_task_lease_and_fence(ctx.conn, task_id, presented_run_id=run_id, presented_fence=fence)
-    check_run_session(ctx.conn, task_id, run_id, ctx.args.get("session"))
+    check_run_session(ctx.conn, task_id, run_id, session)
 
     # Update lease expiration
-    ttl_s = get_lease_ttl_s(ctx.conn)
+    ttl_s = get_lease_ttl_s(ctx.conn, testing_mode=ctx.testing_mode)
     now_ts = time.time()
     now = now_iso_utc(now_ts)
     expires_at = now_iso_utc(now_ts + ttl_s)
@@ -2338,7 +3260,7 @@ async def prepare_task_submit_git(ctx: HandlerContext) -> None:
     if ctx.dry_run or ctx.cmd != "task.submit":
         return
     task_id = ctx.args.get("task_id")
-    if not task_id:
+    if not isinstance(task_id, str) or not task_id.strip():
         return
     task = ctx.conn.execute("SELECT * FROM tasks WHERE id = ?;", (task_id,)).fetchone()
     if not task or task["kind"] != "code" or task["status"] != "running":
@@ -2355,19 +3277,20 @@ async def prepare_task_submit_git(ctx: HandlerContext) -> None:
         verify_task_lease_and_fence(ctx.conn, task_id, presented_run_id=run_id, presented_fence=fence)
     except MeshError:
         return
-    git = await asyncio.to_thread(submission_git_info, task["workspace_path"], task["branch"], task["base_commit"])
+    prow = ctx.conn.execute("SELECT repo_path FROM projects WHERE id = ?;", (task["project_id"],)).fetchone()
+    git = await asyncio.to_thread(submission_git_info, task["workspace_path"], task["branch"], task["base_commit"],
+                                  repo_path=(prow["repo_path"] if prow is not None else None))
     ctx.submit_git = {"task_id": task_id, "fence_seq": task["fence_seq"], "git": git}  # type: ignore[attr-defined]
 
 
 def handle_task_submit(ctx: HandlerContext) -> HandlerResult:
     """Submit completed task deliverable per plan §6.2 (T7), §11.3."""
-    task_id = ctx.args.get("task_id")
+    task_id = _require_str_param(ctx.args.get("task_id"), "task_id", "Task ID is required")
     deliverable = ctx.args.get("deliverable")
-    summary = ctx.args.get("summary")
-    run_id, fence = _apply_run_token_scope(ctx, task_id or "")
+    summary = _optional_str_param(ctx.args.get("summary"), "summary")
+    session = _validate_session_param(ctx.args.get("session"))
+    run_id, fence = _apply_run_token_scope(ctx, task_id)
 
-    if not task_id:
-        raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="Task ID is required", details={"param": "task_id"})
     if not run_id:
         raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="--run is required for task submit", details={"param": "run"})
     if fence is None:
@@ -2378,7 +3301,7 @@ def handle_task_submit(ctx: HandlerContext) -> HandlerResult:
 
     # Verify lease and fence first per plan §11.5
     lease = verify_task_lease_and_fence(ctx.conn, task_id, presented_run_id=run_id, presented_fence=fence)
-    check_run_session(ctx.conn, task_id, run_id, ctx.args.get("session"))
+    check_run_session(ctx.conn, task_id, run_id, session)
 
     # Verify task state
     if task["status"] != "running":
@@ -2486,17 +3409,18 @@ def handle_task_submit(ctx: HandlerContext) -> HandlerResult:
 
 def handle_task_fail(ctx: HandlerContext) -> HandlerResult:
     """Report task execution failure per plan §6.2 (T8)."""
-    task_id = ctx.args.get("task_id")
+    task_id = _require_str_param(ctx.args.get("task_id"), "task_id", "Task ID is required")
     reason = ctx.args.get("reason")
-    run_id, fence = _apply_run_token_scope(ctx, task_id or "")
+    session = _validate_session_param(ctx.args.get("session"))
+    run_id, fence = _apply_run_token_scope(ctx, task_id)
 
-    if not task_id:
-        raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="Task ID is required", details={"param": "task_id"})
     if not run_id:
         raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="--run is required for task fail", details={"param": "run"})
     if fence is None:
         raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="--fence is required for task fail", details={"param": "fence"})
-    reason = reason.strip() if isinstance(reason, str) else reason
+    if not isinstance(reason, str):
+        raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="--reason is required and must be a non-empty string <= 4 KB", details={"param": "reason"})
+    reason = reason.strip()
     if not reason or len(reason.encode("utf-8")) > 4096:
         raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="--reason is required and must be non-empty and <= 4 KB", details={"param": "reason"})
     reason = redact(reason)  # §15.1/§15.2: stored in failure_json, result_json and the event
@@ -2506,7 +3430,7 @@ def handle_task_fail(ctx: HandlerContext) -> HandlerResult:
 
     # Verify lease and fence first per plan §11.5 (stale writes report 9, not 6)
     lease = verify_task_lease_and_fence(ctx.conn, task_id, presented_run_id=run_id, presented_fence=fence)
-    check_run_session(ctx.conn, task_id, run_id, ctx.args.get("session"))
+    check_run_session(ctx.conn, task_id, run_id, session)
 
     if task["status"] != "running":
         raise MeshError(
@@ -2533,8 +3457,24 @@ def handle_task_fail(ctx: HandlerContext) -> HandlerResult:
             "actor_id": ctx.principal["id"], "actor_kind": ctx.actor_kind, "via": ctx.via,
         }}
         ctx.conn.execute("UPDATE runs SET result_json = ? WHERE id = ?;", (json.dumps(redact_value(pending)), run_id))
+        evt = record_event(
+            conn=ctx.conn,
+            type_="task.fail_requested",
+            actor_id=ctx.principal["id"],
+            actor_kind=ctx.actor_kind,
+            via=ctx.via,
+            relayed_by=ctx.relayed_by,
+            project_id=task["project_id"],
+            task_id=task_id,
+            run_id=run_id,
+            reason="reported",
+            payload={"reason": "reported", "message": reason, "fence": fence, "run_id": run_id},
+            request_id=ctx.request_id,
+            k_user=ctx.k_user,
+        )
         return HandlerResult(
-            data={"task_id": task_id, "status": "running", "run_id": run_id, "fence": fence, "failure_pending": True}
+            data={"task_id": task_id, "status": "running", "run_id": run_id, "fence": fence, "failure_pending": True},
+            events=[evt],
         )
 
     # Release lease and end run
@@ -2601,11 +3541,8 @@ async def handle_task_merge(server: Any, ctx: HandlerContext) -> HandlerResult:
 
 def handle_task_accept(ctx: HandlerContext) -> HandlerResult:
     """Accept a submitted task deliverable per plan §6.2 (T11)."""
-    task_id = ctx.args.get("task_id")
-    note = ctx.args.get("note")
-
-    if not task_id:
-        raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="Task ID is required", details={"param": "task_id"})
+    task_id = _require_str_param(ctx.args.get("task_id"), "task_id", "Task ID is required")
+    note = _optional_str_param(ctx.args.get("note"), "note")
 
     task = _get_task(ctx.conn, task_id)
     project_id = task["project_id"]
@@ -2657,8 +3594,15 @@ def handle_task_accept(ctx: HandlerContext) -> HandlerResult:
         k_user=ctx.k_user,
     )
 
-    # Wake scheduler so dependent tasks promote (T4)
-    promote_tasks(ctx.conn)
+    warnings: List[str] = []
+    if task["kind"] == "code" and task["deliverable_json"]:
+        try:
+            drec = json.loads(task["deliverable_json"])
+            dgit = ((drec.get("deliverable") or {}).get("git") or {}) if isinstance(drec, dict) else {}
+            if isinstance(dgit, dict) and (dgit.get("error") or not dgit.get("head")):
+                warnings.append("Code task deliverable.git has an error or missing head; verify branch before merge")
+        except (TypeError, ValueError):
+            pass
 
     return HandlerResult(
         data={
@@ -2666,6 +3610,7 @@ def handle_task_accept(ctx: HandlerContext) -> HandlerResult:
             "status": "accepted",
             "note": note,
         },
+        warnings=warnings,
         transitions=[{"from": task["status"], "to": "accepted", "task_id": task_id}],
         events=[evt],
     )
@@ -2673,11 +3618,9 @@ def handle_task_accept(ctx: HandlerContext) -> HandlerResult:
 
 def handle_task_reject(ctx: HandlerContext) -> HandlerResult:
     """Reject a submitted task deliverable and request rework per plan §6.2 (T12)."""
-    task_id = ctx.args.get("task_id")
+    task_id = _require_str_param(ctx.args.get("task_id"), "task_id", "Task ID is required")
     reason = ctx.args.get("reason")
 
-    if not task_id:
-        raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="Task ID is required", details={"param": "task_id"})
     if not reason or not isinstance(reason, str) or not reason.strip():
         raise MeshError(c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="Rejection reason is required", details={"param": "reason"})
     if len(reason.encode("utf-8")) > 4096:
@@ -2696,7 +3639,7 @@ def handle_task_reject(ctx: HandlerContext) -> HandlerResult:
     # 1. Transition check first (§6.2 T12): only submitted (or merge_failed) -> rework
     check_task_transition(task["status"], "rework")
     # rework is requeued by the scheduler (T13) without AG: same evidence check (ACC: N19)
-    _requeue_launch_guard(ctx, task["assignee_agent_id"])
+    ag_row = _requeue_launch_guard(ctx, task["assignee_agent_id"])
 
     # 2. Check no active lease
     cur_l = ctx.conn.execute("SELECT key FROM leases WHERE key = ?;", (f"task:{task_id}",))
@@ -2708,41 +3651,62 @@ def handle_task_reject(ctx: HandlerContext) -> HandlerResult:
             details={"task_id": task_id},
         )
 
-    # 3. Check attempt cap (retry_over_limit)
-    if task["attempt"] >= task["max_attempts"]:
-        if ctx.actor_kind != "user" and ctx.via != "direct":
-            if not ctx.approval:
-                apr_info = create_or_get_pending_approval(
-                    conn=ctx.conn,
-                    category="retry_over_limit",
-                    op="task.reject",
-                    requested_by=ctx.principal["id"],
-                    params=ctx.args,
-                    summary=f"Reject to rework for task '{task['title']}' at attempt cap ({task['attempt']}/{task['max_attempts']}) requires user approval",
-                    project_id=project_id,
-                    task_id=task_id,
-                    dry_run=ctx.dry_run,
-                    request_id=ctx.request_id,
-                    k_user=ctx.k_user,
-                )
-                raise MeshError(
-                    code=c.APPROVAL_REQUIRED,
-                    exit_code=c.EXIT_APPROVAL_REQUIRED,
-                    message=f"Task rejection to rework exceeds max attempts ({task['max_attempts']}) and requires user approval (category: retry_over_limit)",
-                    details=apr_info,
-                )
-            else:
-                check_and_consume_approval(
-                    conn=ctx.conn,
-                    approval_id=ctx.approval,
-                    op="task.reject",
-                    category="retry_over_limit",
-                    caller_id=ctx.principal["id"],
-                    params=ctx.args,
-                    project_id=project_id,
-                    request_id=ctx.request_id,
-                    actor_kind=ctx.actor_kind, via=ctx.via, k_user=ctx.k_user,
-                )
+    # 3. Recheck assignee effort allowlist (and resolved model when approval-gated, plus launch prompt length)
+    # BEFORE approval creation/consumption
+    resolved_profile, need_retry, need_perm, will_gate_approval = _requeue_approval_gates(ctx, task, ag_row)
+    if ag_row:
+        _validate_model_and_effort(
+            agent=ag_row,
+            model_override=None,
+            effort_override=None,
+            current_model=task["model"],
+            current_effort=task["effort"],
+            testing_mode=ctx.testing_mode,
+            check_resolved_model=will_gate_approval,
+            check_effort_before_stale_model=True,
+        )
+        if ag_row["delivery"] == "launch":
+            preview_ws = task["workspace_path"] or compute_task_workspace_path(
+                get_workspaces_root(ctx.conn, ctx.home), project_id, task_id, attempt=task["attempt"] + 1
+            )
+            _check_spec_prompt_length(
+                conn=ctx.conn,
+                project_id=project_id,
+                adapter_id=ag_row["adapter"],
+                profile=resolved_profile,
+                task_doc=dict(task),
+                workspace=preview_ws,
+                attempt=task["attempt"] + 1,
+                max_attempts=task["max_attempts"],
+                rework={"reason": reason, "previous_summary": deliverable_summary(task["deliverable_json"])},
+            )
+
+    # 4. Evaluate both retry_over_limit and permission_escalation (§7.4)
+    assignee_name = ag_row["name"] if ag_row else task["assignee_agent_id"]
+    _require_task_approval(
+        conn=ctx.conn,
+        ctx=ctx,
+        op="task.reject",
+        project_id=project_id,
+        task_id=task_id,
+        params={
+            "task_id": task_id,
+            "assignee": assignee_name,
+            "profile": resolved_profile,
+            "reason": reason,
+        },
+        need_retry=need_retry,
+        need_perm=need_perm,
+        retry_summary=f"Reject to rework for task '{task['title']}' at attempt cap ({task['attempt']}/{task['max_attempts']}) requires user approval",
+        perm_summary=f"Permission escalation to '{resolved_profile}' for reject to rework of task '{task['title']}' on agent '{assignee_name}'",
+        compound_summary=(
+            f"Reject to rework for task '{task['title']}' at attempt cap ({task['attempt']}/{task['max_attempts']}) "
+            f"with permission escalation to '{resolved_profile}' requires user approval"
+        ),
+        retry_message=f"Task rejection to rework exceeds max attempts ({task['max_attempts']}) and requires user approval (category: retry_over_limit)",
+        perm_message=f"Profile '{resolved_profile}' requires user approval (category: permission_escalation)",
+        compound_message=f"Task rejection to rework exceeds max attempts ({task['max_attempts']}) and escalates profile to '{resolved_profile}'; requires direct user approval",
+    )
 
     now = now_iso_utc()
     ctx.conn.execute(
@@ -2776,9 +3740,6 @@ def handle_task_reject(ctx: HandlerContext) -> HandlerResult:
         request_id=ctx.request_id,
         k_user=ctx.k_user,
     )
-
-    # Wake scheduler so task promotes to queued (T13)
-    promote_tasks(ctx.conn)
 
     return HandlerResult(
         data={

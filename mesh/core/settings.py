@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import mesh.constants as c
 from mesh.errors import MeshError
-from mesh.core.paths import check_install_path_secure, get_install_root
+from mesh.core.paths import check_install_path_secure, get_install_root, is_path_equal_or_parent
 from mesh.core.policy import parse_positive_int
 
 PROFILES = {"readonly", "edit", "dev", "elevated", "unrestricted"}
@@ -31,13 +31,16 @@ APPROVAL_CATEGORIES = {
 }
 
 
-def is_testing_mode() -> bool:
-    """Check if MESH_TESTING=1 is enabled."""
+def is_testing_mode(testing_mode: Optional[bool] = None) -> bool:
+    """Check if testing mode is enabled (explicit flag overrides env)."""
+    if testing_mode is not None:
+        return bool(testing_mode)
     return os.environ.get("MESH_TESTING") == "1"
 
 
-def get_default_settings(home: str) -> Dict[str, Any]:
+def get_default_settings(home: str, testing_mode: Optional[bool] = None) -> Dict[str, Any]:
     """Return all default settings per plan §5.7 table."""
+    testing = is_testing_mode(testing_mode)
     defaults: Dict[str, Any] = {
         "lead.default_agent": None,
         "lead.wake_debounce_s": 5,
@@ -68,7 +71,7 @@ def get_default_settings(home: str) -> Dict[str, Any]:
         # evidence (the gap is reported by probe/doctor and in the assign response);
         # "strict" is the M3 evidence gate. Testing mode defaults to strict so the
         # acceptance suite keeps exercising the gate; tests opt into warn explicitly.
-        "adapter.evidence_mode": "strict" if is_testing_mode() else "warn",
+        "adapter.evidence_mode": "strict" if testing else "warn",
         # Testing-only knob (see validate_setting): the passphrase lockout window.
         "auth.lockout_window_s": 300,
         # Testing-only knob (see validate_setting): the lead-turn retry backoff, which
@@ -102,16 +105,16 @@ def agent_ack_timeout_key(agent_id: str) -> str:
     return AGENT_ACK_TIMEOUT_KEY.format(agent_id=agent_id)
 
 
-def ack_timeout_range() -> Tuple[int, int]:
+def ack_timeout_range(testing_mode: Optional[bool] = None) -> Tuple[int, int]:
     """Same range as the global inbox.ack_timeout_s."""
-    return (1 if is_testing_mode() else 10, 86400)
+    return (1 if is_testing_mode(testing_mode) else 10, 86400)
 
 
-def validate_ack_timeout(val: Any) -> int:
+def validate_ack_timeout(val: Any, testing_mode: Optional[bool] = None) -> int:
     """`--ack-timeout` value (a duration such as 30m / 2h or seconds) -> seconds."""
     from mesh.core.clock import parse_duration
 
-    lo, hi = ack_timeout_range()
+    lo, hi = ack_timeout_range(testing_mode=testing_mode)
     try:
         secs = parse_duration(val)
     except Exception:
@@ -126,7 +129,11 @@ def validate_ack_timeout(val: Any) -> int:
     return int(secs)
 
 
-def get_agent_ack_timeout_s(conn: Any, agent_id: str) -> Optional[int]:
+def get_agent_ack_timeout_s(
+    conn: Any,
+    agent_id: str,
+    testing_mode: Optional[bool] = None,
+) -> Optional[int]:
     """The agent's own ack window in seconds, or None when it uses the global one."""
     import json as _json
 
@@ -138,7 +145,10 @@ def get_agent_ack_timeout_s(conn: Any, agent_id: str) -> Optional[int]:
         val = _json.loads(row["value_json"])
     except Exception:
         return None
-    return int(val) if isinstance(val, int) and not isinstance(val, bool) else None
+    if isinstance(val, int) and not isinstance(val, bool):
+        secs = int(val)
+        return secs if is_testing_mode(testing_mode) else max(10, secs)
+    return None
 
 
 def set_agent_ack_timeout_s(conn: Any, agent_id: str, secs: Optional[int], now: str, by: str) -> None:
@@ -164,6 +174,7 @@ def validate_setting(
     current_settings: Optional[Dict[str, Any]] = None,
     install_root: Optional[str] = None,
     db_conn: Optional[Any] = None,
+    testing_mode: Optional[bool] = None,
 ) -> Any:
     """Validate a setting key and value per plan §5.7.
 
@@ -172,10 +183,10 @@ def validate_setting(
         MeshError(INSTALL_PATH_INSECURE) for workspaces.root overlap
         MeshError(INVALID_SETTING) for any other validation failure
     """
-    testing = is_testing_mode()
-    defaults = get_default_settings(home)
+    testing = is_testing_mode(testing_mode)
+    defaults = get_default_settings(home, testing_mode=testing)
 
-    if key not in defaults:
+    if not isinstance(key, str) or not key or key not in defaults:
         raise MeshError(
             code=c.INVALID_SETTING,
             exit_code=c.EXIT_USAGE,
@@ -274,6 +285,51 @@ def validate_setting(
             home=home,
             workspaces_root=val,
         )
+        home_real = os.path.realpath(home)
+        default_ws_real = os.path.join(home_real, "workspaces")
+        val_clean = val.rstrip(os.sep) or os.sep
+        sym_anc: Optional[str] = None
+        cur = os.path.abspath(val_clean)
+        while True:
+            if os.path.islink(cur):
+                sym_anc = cur
+                break
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+        if sym_anc is not None or (
+            os.path.abspath(val_clean) == default_ws_real and os.path.islink(default_ws_real)
+        ):
+            raise MeshError(
+                code=c.INVALID_SETTING,
+                exit_code=c.EXIT_USAGE,
+                message=f"workspaces.root '{val}' and its ancestors must not contain symlinks",
+                details={"key": key, "got": val, "symlink": sym_anc or default_ws_real},
+            )
+        val_real = os.path.realpath(val)
+        if (val_real != default_ws_real or os.path.islink(default_ws_real)) and (
+            is_path_equal_or_parent(home_real, val_real)
+            or is_path_equal_or_parent(val_real, home_real)
+        ):
+            raise MeshError(
+                code=c.INVALID_SETTING,
+                exit_code=c.EXIT_USAGE,
+                message=f"workspaces.root '{val}' must not overlap MESH_HOME '{home_real}'",
+                details={"key": key, "got": val, "conflict": home_real},
+            )
+        if db_conn is not None:
+            from mesh.core.repos import project_repo_paths
+
+            for repo_path in project_repo_paths(db_conn):
+                repo_real = os.path.realpath(repo_path)
+                if is_path_equal_or_parent(repo_real, val_real) or is_path_equal_or_parent(val_real, repo_real):
+                    raise MeshError(
+                        code=c.INVALID_SETTING,
+                        exit_code=c.EXIT_USAGE,
+                        message=f"workspaces.root '{val}' must not overlap registered repo '{repo_real}'",
+                        details={"key": key, "got": val, "conflict": repo_real},
+                    )
 
         if not os.path.exists(val):
             raise MeshError(
@@ -304,7 +360,7 @@ def validate_setting(
                 message=f"Directory for setting '{key}' must have mode 0700",
                 details={"key": key, "expected": "0700", "got": oct(stat.S_IMODE(st.st_mode))},
             )
-        return val
+        return val_real
 
     # 5. notify.command (JSON argv array of strings or null)
     if key == "notify.command":

@@ -184,6 +184,167 @@ class TestDeliverPrune(unittest.TestCase):
         self.assertEqual(len(self.q("SELECT 1 FROM events WHERE type = 'project.delivered';")), 1)
         self.assert_remote_unchanged()
 
+    def test_full_r1_p1_5_noop_deliver_needs_no_approval(self) -> None:
+        """Full review r1 P1-5: nothing to deliver is a noop before the approval gate, so a
+        single-use approval is never consumed (or requested) for it."""
+        rc, resp = self.harness.cli("config", "set", "approval.policy.deliver_to_base", '"direct_or_relayed"',
+                                    user=True)
+        self.assertEqual(rc, 0, resp)
+        rc, out = self.deliver()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["data"]["method"], "noop")
+        self.assertEqual(self.q("SELECT id FROM approvals;"), [])
+        self.assertEqual(len(self.q("SELECT 1 FROM events WHERE type = 'project.delivered';")), 0)
+
+    def intents(self) -> List[str]:
+        d = os.path.join(self.harness.home, "deliver-intents")
+        return sorted(os.listdir(d)) if os.path.isdir(d) else []
+
+    def test_full_r3_p1_4_retry_after_a_lost_transaction_records_the_delivery(self) -> None:
+        """Full review r3 P1-4: the base moved but the request's transaction was lost while
+        meshd stayed up (its intent is on disk); the retry finds base == integration and
+        records that delivery instead of answering a bare noop."""
+        from mesh.core.repos import write_deliver_intent
+
+        tsk, _ = self.accepted_task("Add feature", "feature.txt", "feature\n")
+        rc, merged = self.merge(tsk)
+        self.assertEqual(rc, 0, merged)
+        old = self.fixture.head(self.repo, "main")
+        new = self.fixture.head(self.repo, self.integ_branch())
+        horizon = self.q("SELECT MAX(seq) FROM events;")[0][0]
+        write_deliver_intent(self.harness.home, {
+            "project_id": self.prj, "repo": self.repo, "base_branch": "main",
+            "integration_branch": self.integ_branch(), "old": old, "new": new, "actor_id": "usr_x",
+            "actor_kind": "user", "via": "direct", "relayed_by": None, "request_id": "req_lost",
+            "approval_id": None, "min_event_seq": horizon, "idempotency": None})
+        self.fixture.git(self.repo, "update-ref", "refs/heads/main", new, old)  # the lost request's git write
+        rc, out = self.deliver()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["data"]["method"], "noop")
+        rows = self.q("SELECT payload_json, request_id FROM events WHERE type = 'project.delivered';")
+        self.assertEqual(len(rows), 1, rows)
+        payload = json.loads(rows[0][0])
+        self.assertEqual((payload["old"], payload["new"], payload["method"]), (old, new, "recovered"))
+        self.assertEqual(self.intents(), [])
+
+    def test_full_r4_p1_1_lost_delivery_is_kept_when_the_next_one_fails(self) -> None:
+        """Full review r4 P1-1: a lost delivery (A -> B, intent on disk) is settled in its
+        own transaction before the next `project deliver`; that request failing (here
+        NOT_FAST_FORWARD) no longer rolls the A -> B record back or drops its intent."""
+        from mesh.core.repos import write_deliver_intent
+
+        tsk, _ = self.accepted_task("Add feature", "feature.txt", "feature\n")
+        rc, merged = self.merge(tsk)
+        self.assertEqual(rc, 0, merged)
+        old = self.fixture.head(self.repo, "main")
+        new = self.fixture.head(self.repo, self.integ_branch())
+        horizon = self.q("SELECT MAX(seq) FROM events;")[0][0]
+        write_deliver_intent(self.harness.home, {
+            "project_id": self.prj, "repo": self.repo, "base_branch": "main",
+            "integration_branch": self.integ_branch(), "old": old, "new": new, "actor_id": "usr_x",
+            "actor_kind": "user", "via": "direct", "relayed_by": None, "request_id": "req_lost",
+            "approval_id": None, "min_event_seq": horizon, "idempotency": None})
+        self.fixture.git(self.repo, "update-ref", "refs/heads/main", new, old)  # the lost git write
+        tree = self.fixture.git(self.repo, "rev-parse", old + "^{tree}").stdout.strip()
+        side = self.fixture.git(self.repo, "commit-tree", tree, "-p", old, "-m", "side",
+                                identity=True).stdout.strip()
+        self.fixture.git(self.repo, "update-ref", "refs/heads/" + self.integ_branch(), side, new)
+        rc, out = self.deliver()
+        self.assertNotEqual(rc, 0, out)
+        rows = self.q("SELECT payload_json FROM events WHERE type = 'project.delivered';")
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(json.loads(rows[0][0])["new"], new)
+        self.assertEqual(self.intents(), [])
+        self.fixture.git(self.repo, "update-ref", "refs/heads/" + self.integ_branch(), new, side)  # I9
+
+    def test_full_r5_p1_3_merge_never_runs_git_in_a_repointed_worktree(self) -> None:
+        """Full review r5 P1-3: a task worktree whose `.git` now points at a task-made
+        repository (with `core.fsmonitor`) is refused before any git runs in it."""
+        tsk, ws = self.accepted_task("Add feature", "feature.txt", "feature\n")
+        dot_git = os.path.join(ws, ".git")
+        with open(dot_git) as f:
+            saved = f.read()
+        fake = os.path.join(ws, "sub")
+        self.fixture.git(ws, "init", "-q", fake)
+        marker = os.path.join(ws, "PWNED")
+        with open(os.path.join(fake, ".git", "config"), "a") as f:
+            f.write("[core]\n\tfsmonitor = touch %s\n" % marker)
+        with open(dot_git, "w") as f:
+            f.write("gitdir: sub/.git\n")
+        try:
+            rc, out = self.merge(tsk)
+        finally:
+            with open(dot_git, "w") as f:
+                f.write(saved)
+        self.assertFalse(os.path.exists(marker))
+        self.assertIn("foreign_repository", json.dumps(out), out)
+        self.assertNotEqual(self.q("SELECT status FROM tasks WHERE id = ?;", (tsk,))[0][0], "merged")
+
+    def test_full_r5_p2_1_unreadable_intent_is_kept(self) -> None:
+        """Full review r5 P2-1: an intent that cannot be read right now is kept (the
+        request fails), never deleted as if it were corrupt."""
+        from mesh.core.repos import deliver_intent_path
+
+        tsk, _ = self.accepted_task("Add feature", "feature.txt", "feature\n")
+        rc, merged = self.merge(tsk)
+        self.assertEqual(rc, 0, merged)
+        path = deliver_intent_path(self.harness.home, self.prj)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("{}")
+        os.chmod(path, 0)
+        if os.access(path, os.R_OK):
+            os.unlink(path)
+            self.skipTest("running as root")
+        try:
+            rc, out = self.deliver()
+            self.assertNotEqual(rc, 0, out)
+            self.assertTrue(os.path.lexists(path))
+            self.assertEqual(self.q("SELECT COUNT(*) FROM events WHERE type = 'project.delivered';")[0][0], 0)
+        finally:
+            os.chmod(path, 0o600)
+            os.unlink(path)
+
+    def test_full_r2_p1_d_no_intent_outlives_its_request(self) -> None:
+        """Full review r2 P1-D: a failed deliver (dirty base worktree, nothing moved) and a
+        committed one both leave no deliver intent behind for a later start to replay."""
+        tsk, _ = self.accepted_task("Add feature", "feature.txt", "feature\n")
+        rc, merged = self.merge(tsk)
+        self.assertEqual(rc, 0, merged)
+        with open(os.path.join(self.repo, "calc.py"), "a", encoding="utf-8") as f:
+            f.write("dirty\n")
+        main_before = self.fixture.head(self.repo, "main")
+        rc, out = self.deliver()
+        self.assertEqual(rc, c.EXIT_MERGE_FAILED, out)
+        self.assertEqual(self.fixture.head(self.repo, "main"), main_before)
+        self.assertEqual(self.intents(), [])
+        self.fixture.git(self.repo, "checkout", "--", "calc.py")
+        rc, out = self.deliver()
+        self.assertEqual(rc, 0, out)
+        self.assertNotEqual(out["data"]["method"], "noop")
+        self.assertEqual(self.intents(), [])
+
+    def test_full_r2_p2_b_unreadable_heads_fail_before_the_approval_gate(self) -> None:
+        """Full review r2 P2-B: heads that cannot be read never fall back to an unpinned
+        deliver without intent; the request fails before any approval is touched."""
+        rc, resp = self.harness.cli("config", "set", "approval.policy.deliver_to_base", '"direct_or_relayed"',
+                                    user=True)
+        self.assertEqual(rc, 0, resp)
+        tsk, _ = self.accepted_task("Add feature", "feature.txt", "feature\n")
+        rc, merged = self.merge(tsk)
+        self.assertEqual(rc, 0, merged)
+        ref = f"refs/heads/{self.integ_branch()}"
+        sha = self.fixture.head(self.repo, self.integ_branch())
+        self.fixture.git(self.repo, "update-ref", "-d", ref)
+        try:
+            rc, out = self.deliver()
+        finally:
+            self.fixture.git(self.repo, "update-ref", ref, sha)
+        self.assertEqual(rc, c.EXIT_INTERNAL, out)
+        self.assertEqual(out["error"]["details"]["reason"], "git_failed")
+        self.assertEqual(self.q("SELECT id FROM approvals;"), [])
+        self.assertEqual(self.intents(), [])
+
     def test_k10_deliver_through_a_worktree_holding_the_base(self) -> None:
         """ACC: K10 (partial) - a worktree with the base checked out gets merge --ff-only; a dirty one is rc 14."""
         tsk, _ = self.accepted_task("Add feature", "feature.txt", "feature\n")

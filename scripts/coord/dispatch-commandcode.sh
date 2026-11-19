@@ -4,13 +4,14 @@
 # Permissions: --yolo, but the Command Code guard hook + deny rules (set up 11:17) mirror the read-only allow-list of agy-settings-m1c.json.
 # Hang guard: timeout 3h. --max-turns 400. Usage/cost is in the final JSON result line of the log. One coder at a time.
 set -euo pipefail
-cd "$(dirname "$0")/../.."
+SD="$(cd "$(dirname "$(readlink -f "$0")")" && pwd -P)"
+cd "$SD/../.."
 P="${1:?prompt file}"; N="${2:?run name}"; M="${3:-deepseek/deepseek-v4.1-flash-ultrafast}"
 [[ "$P" =~ ^prompts/[A-Za-z0-9._-]+\.md$ ]] || { echo "bad prompt path"; exit 2; }
 [[ "$N" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad run name"; exit 2; }
 [[ "$M" =~ ^deepseek/deepseek-v4\.1-flash(-ultrafast)?$ ]] || { echo "model must be deepseek-v4.1-flash[-ultrafast]"; exit 2; }
 [ -f "$P" ] || { echo "missing $P"; exit 2; }
-source "$(dirname "$0")/coder-guard.sh"; coder_guard
+source "$SD/coder-guard.sh"; coder_guard
 [ -e "logs/raw/cc-$N.jsonl" ] && { echo "REFUSED: run name exists"; exit 2; }
 mkdir -p logs/raw
 export PATH="$HOME/.npm-global/bin:$PATH"

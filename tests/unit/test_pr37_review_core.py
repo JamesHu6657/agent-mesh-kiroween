@@ -240,7 +240,7 @@ class TestRosterRunTokens(unittest.TestCase):
 
     def test_current_lead_allowed(self):
         p = {"id": "agt_l", "name": "lead", "scope": {"role": "lead", "project_id": "prj", "lead_assignment_id": "la_1"}}
-        self._authz(p, {"assignment_id": "la_1"})
+        self._authz(p, {"assignment_id": "la_1", "can_lead": 1})
 
     def test_executor_run_token_denied(self):
         p = {"id": "agt_e", "name": "exec", "scope": {"role": "executor", "project_id": "prj"}}

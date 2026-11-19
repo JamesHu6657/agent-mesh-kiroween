@@ -35,7 +35,8 @@ In strict mode, launch requires a successful latest probe (`verified` or
 passing headless/stream and SIGTERM cases (fixture ids `S-X-1` and `S-X-6`). Reasons
 include `no_probe_version`, `no_smoke_evidence`, `evidence_stale`, `evidence_invalid`,
 `launch_cases_failed` and `launch_held`. Stub adapters and explicit launch holds are
-not waived in warn mode. No adapter has an explicit hold in this checkout.
+not waived in warn mode. `devin` is on an explicit hold until M5 in this checkout (see
+[adapters-devin.md](adapters-devin.md)); no other adapter is.
 
 `mesh adapter show "$ADAPTER" --token-file "$TOKEN_FILE"` reports the effective
 `launch_enabled`, `launch_reason`, warnings and capability evidence. Internal fields

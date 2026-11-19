@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import mesh
 import mesh.constants as c
+from mesh.core.paths import get_install_root, is_site_packages_dir
 from mesh.errors import MeshError
 
 
@@ -57,7 +58,11 @@ def _mesh_env() -> Dict[str, str]:
     # meshd restores it from this marker before starting any vendor process.
     if "_MESH_ORIG_PYTHONPATH" not in env:
         env["_MESH_ORIG_PYTHONPATH"] = os.environ.get("PYTHONPATH") or "__UNSET__"
-    env["PYTHONPATH"] = os.path.dirname(os.path.dirname(os.path.abspath(mesh.__file__)))
+    install_root = get_install_root()
+    if is_site_packages_dir(install_root):
+        env.pop("PYTHONPATH", None)
+    else:
+        env["PYTHONPATH"] = install_root
     # The passphrase goes over a pipe; do not leave it in a child's environment.
     env.pop("MESH_PASSPHRASE", None)
     env.pop("MESH_PASSPHRASE_FILE", None)
@@ -110,7 +115,7 @@ def _run(home: str, argv: List[str], passphrase: Optional[str] = None) -> Tuple[
     return proc.returncode, body
 
 
-_LEAD_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_LEAD_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 DEFAULT_TOKEN_DIR = "~/.config/agent-mesh"
 
 
@@ -161,8 +166,31 @@ def _check_token_destination(home: str, path: str, prefix: str = "mesh setup") -
     own (Linear PR30 P2-1, P2-3). Called before a token is issued."""
     from mesh.core.paths import is_path_equal_or_parent
     tdir = os.path.dirname(path)
-    if os.path.lexists(tdir) and not os.path.isdir(tdir):
-        raise _usage(_prefix=prefix, msg=f"token directory {tdir} exists and is not a directory", token_dir=tdir)
+    check_dir = tdir
+    while check_dir and not os.path.lexists(check_dir):
+        parent = os.path.dirname(check_dir)
+        if parent == check_dir:
+            break
+        check_dir = parent
+    if os.path.lexists(check_dir) and not os.path.isdir(check_dir):
+        msg = (
+            f"token directory {tdir} exists and is not a directory"
+            if check_dir == tdir
+            else f"token directory ancestor {check_dir} exists and is not a directory"
+        )
+        raise _usage(_prefix=prefix, msg=msg, token_dir=check_dir)
+    if os.path.isdir(check_dir):
+        import stat as _stat
+        st = os.stat(check_dir)
+        if hasattr(os, "geteuid") and st.st_uid not in (os.geteuid(), 0):
+            raise _usage(_prefix=prefix, msg=f"directory {check_dir} is owned by another user", token_dir=check_dir)
+        if st.st_mode & 0o022 and not (st.st_mode & _stat.S_ISVTX):
+            raise _usage(
+                _prefix=prefix,
+                msg=f"directory {check_dir} is writable by other users (mode {oct(_stat.S_IMODE(st.st_mode))}); "
+                    "choose a private directory such as ~/.config/agent-mesh",
+                token_dir=check_dir,
+            )
     real = os.path.realpath(path)
     for name in ("runs", "workspaces"):
         bad = os.path.realpath(os.path.join(home, name))
@@ -231,23 +259,37 @@ def handle_setup(args: argparse.Namespace) -> Dict[str, Any]:
     from mesh.cli.commands.doctor_env import environment_checks
     from mesh.core.passphrase import read_passphrase
     from mesh.core.paths import resolve_home
+    from mesh.core.settings import is_testing_mode
 
     home = getattr(args, "home", None) or os.environ.get("MESH_HOME") or os.path.expanduser("~/.agent-mesh")
     home = resolve_home(home)
     if getattr(args, "dry_run", False):
         raise _usage("--dry-run is not supported: setup only runs steps that are not done yet "
                      "(re-running it is safe); run `mesh doctor` to see the current state")
+    approval_mode = getattr(args, "approval_mode", None)
+    if approval_mode is not None and approval_mode not in ("passphrase", "delegated"):
+        raise _usage(f"invalid --approval-mode {approval_mode!r}: must be 'passphrase' or 'delegated'",
+                     approval_mode=approval_mode)
+    raw_token_dir = getattr(args, "token_dir", None)
+    if raw_token_dir is not None and (not isinstance(raw_token_dir, str) or not raw_token_dir.strip() or "\x00" in raw_token_dir):
+        raise _usage(f"invalid --token-dir {raw_token_dir!r}: path must be a non-empty string",
+                     token_dir=raw_token_dir)
     lead_name = None if args.no_lead else args.lead_name
-    if lead_name is not None and not _LEAD_NAME_RE.match(lead_name):
+    if not args.no_lead and (not isinstance(lead_name, str) or not _LEAD_NAME_RE.match(lead_name)):
         raise _usage(f"invalid --lead-name {lead_name!r}: use letters, digits, '-' or '_' (max 64)",
                      lead_name=lead_name)
-    token_file_planned = token_path_for(home, lead_name, args.token_dir) if lead_name else None
+    token_file_planned = token_path_for(home, lead_name, raw_token_dir) if lead_name else None
     if token_file_planned:
         _check_token_destination(home, token_file_planned)
     done: List[str] = []
     skipped: List[str] = []
     initialized = os.path.exists(os.path.join(home, "mesh.db"))
-    need_pass = (not initialized) or not args.no_lead or bool(getattr(args, "approval_mode", None))
+    daemon_up = False
+    if args.no_start and initialized:
+        rc_st, st_body = _run(home, ["daemon", "status"])
+        daemon_up = rc_st == 0 and (st_body.get("data") or {}).get("running", True)
+    need_daemon_steps = (not args.no_lead) or bool(getattr(args, "approval_mode", None))
+    need_pass = (not initialized) or (need_daemon_steps and (not args.no_start or daemon_up))
     passphrase = read_passphrase(args, "Mesh user passphrase (>= 12 chars): ") if need_pass else None
     if passphrase is not None and not initialized and (getattr(args, "passphrase_fd", None) is None
                                                        and not getattr(args, "passphrase_file", None)
@@ -267,6 +309,11 @@ def handle_setup(args: argparse.Namespace) -> Dict[str, Any]:
         done.append("init")
 
     if args.no_start:
+        if not daemon_up and initialized:
+            pass
+        elif args.no_start:
+            rc_st, st_body = _run(home, ["daemon", "status"])
+            daemon_up = rc_st == 0 and (st_body.get("data") or {}).get("running", True)
         skipped.append("daemon start (--no-start)")
     else:
         rc, body = _run(home, ["daemon", "status"])
@@ -277,23 +324,28 @@ def handle_setup(args: argparse.Namespace) -> Dict[str, Any]:
             if rc != 0:
                 raise _fail("daemon start", rc, body, done)
             done.append("daemon start")
+        daemon_up = True
 
     token_file = None
     lead = None
     if args.no_lead:
         skipped.append("lead agent (--no-lead)")
+    elif not daemon_up:
+        skipped.append(f"lead agent '{lead_name}' (daemon not running)")
     else:
         lead = lead_name
         token_file = token_file_planned
         rc, body = _run(home, ["agent", "show", lead, "--user"], passphrase)
         if rc == 0:
             skipped.append(f"lead agent '{lead}' (exists)")
-        else:
+        elif (body.get("error") or {}).get("code") == c.NOT_FOUND:
             rc, body = _run(home, ["agent", "create", "--user", "--name", lead, "--adapter", "none",
                                    "--delivery", "inbox", "--can-lead", "--max-concurrency", "1"], passphrase)
             if rc != 0:
                 raise _fail("agent create", rc, body, done)
             done.append(f"agent create {lead}")
+        else:
+            raise _fail("agent show", rc, body, done)
         # Credential provisioning is separate from agent creation, so an interrupted
         # setup or a deleted token file is repaired on the next run (Linear PR30 P2-2).
         if _token_works(home, token_file, lead):
@@ -308,19 +360,29 @@ def handle_setup(args: argparse.Namespace) -> Dict[str, Any]:
                 raise _fail("agent token issue", 1, {"error": {"message": "no token in response"}}, done)
             _write_token(token_file, token)
             done.append(f"token file {token_file}")
-        rc, body = _run(home, ["config", "set", "lead.default_agent", json.dumps(lead), "--user"], passphrase)
-        if rc != 0:
-            raise _fail("config set lead.default_agent", rc, body, done)
-        done.append(f"lead.default_agent = {lead}")
+        rc_cfg, cfg_body = _run(home, ["config", "get", "lead.default_agent", "--user"], passphrase)
+        if rc_cfg != 0:
+            raise _fail("config get lead.default_agent", rc_cfg, cfg_body, done)
+        cur_default = (cfg_body.get("data") or {}).get("value")
+        if cur_default:
+            skipped.append(f"lead.default_agent (already '{cur_default}')")
+        else:
+            rc, body = _run(home, ["config", "set", "lead.default_agent", json.dumps(lead), "--user"], passphrase)
+            if rc != 0:
+                raise _fail("config set lead.default_agent", rc, body, done)
+            done.append(f"lead.default_agent = {lead}")
 
     mode = getattr(args, "approval_mode", None)
     if mode:
-        rc, body = _run(home, ["config", "set", "approval.mode", json.dumps(mode), "--user"], passphrase)
-        if rc != 0:
-            raise _fail("config set approval.mode", rc, body, done)
-        done.append(f"approval.mode = {mode}")
+        if not daemon_up:
+            skipped.append(f"approval.mode ({mode}: daemon not running)")
+        else:
+            rc, body = _run(home, ["config", "set", "approval.mode", json.dumps(mode), "--user"], passphrase)
+            if rc != 0:
+                raise _fail("config set approval.mode", rc, body, done)
+            done.append(f"approval.mode = {mode}")
 
-    checks = environment_checks(home, os.path.exists(os.path.join(home, "mesh.db")))
+    checks = environment_checks(home, os.path.exists(os.path.join(home, "mesh.db")), testing_mode=is_testing_mode())
     tok = token_file or "<token file>"
     next_steps = [
         "mesh status",

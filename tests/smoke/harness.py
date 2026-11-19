@@ -333,14 +333,32 @@ class SmokeSession:
             for raw in (raw_out, raw_err):
                 if os.path.lexists(raw):
                     os.unlink(raw)
+        return self._save_outcome(
+            case_id=case_id, spec=spec, run_dir=run_dir, stdout=stdout, stderr=stderr,
+            rc=None if timed_out else proc.returncode, duration_s=duration,
+            timed_out=timed_out, group_gone=group_gone,
+        )
+
+    def _save_outcome(self, case_id: str, spec, run_dir: str, stdout: str, stderr: str,
+                      rc: Optional[int], duration_s: float, timed_out: bool, group_gone: bool) -> RunOutcome:
         with open(os.path.join(run_dir, "stdout.log"), "w", encoding="utf-8") as f:
             f.write(stdout)  # redacted copy; adapter.parse() reads stdout.log
+        with open(os.path.join(run_dir, "stderr.log"), "w", encoding="utf-8") as f:
+            f.write(stderr)
         cmd = [self.redact(a) for a in [os.path.basename(spec.argv[0])] + spec.argv[1:]]
         out_name, err_name = f"smoke-{case_id}-stdout.jsonl", f"smoke-{case_id}-stderr.txt"
         base = f"{self.adapter.id}/{self.version}"
         out_path = tierlib.write_capture(self.config.out, f"{base}/{out_name}", stdout.encode("utf-8"), cmd)
         tierlib.write_capture(self.config.out, f"{base}/{err_name}", stderr.encode("utf-8"), cmd)
-        return RunOutcome(case_id=case_id, argv=cmd, rc=None if timed_out else proc.returncode, duration_s=duration,
+        if self.adapter.id == "vibe":
+            exp_path = os.path.join(run_dir, "vibe-out", "export.json")
+            if os.path.isfile(exp_path) and not os.path.islink(exp_path):
+                exp_text = self.redact(_read_text(exp_path))
+                with open(exp_path, "w", encoding="utf-8") as f:
+                    f.write(exp_text)
+                exp_name = f"smoke-{case_id}-vibe-export.json"
+                tierlib.write_capture(self.config.out, f"{base}/{exp_name}", exp_text.encode("utf-8"), cmd)
+        return RunOutcome(case_id=case_id, argv=cmd, rc=rc, duration_s=duration_s,
                           stdout=stdout, stderr=stderr, timed_out=timed_out, run_dir=run_dir,
                           stdout_fixture=smoke_schema.fixture_rel(self.adapter.id, self.version, out_name),
                           stdout_sha256=tierlib.sha256_bytes(_read_bytes(out_path)),
@@ -350,6 +368,8 @@ class SmokeSession:
     def capture_names(self, case_id: str) -> List[str]:
         base = os.path.join(self.config.out, self.adapter.id, self.version)
         names = [f"smoke-{case_id}-stdout.jsonl", f"smoke-{case_id}-stderr.txt"]
+        if self.adapter.id == "vibe":
+            names.append(f"smoke-{case_id}-vibe-export.json")
         return [os.path.join(base, n + suffix) for n in names for suffix in ("", tierlib.SIDECAR_SUFFIX)]
 
     def refuse_existing_capture(self, case_id: str) -> None:
@@ -456,19 +476,10 @@ class SmokeSession:
             for raw in (raw_out, raw_err):
                 if os.path.lexists(raw):
                     os.unlink(raw)
-        with open(os.path.join(run_dir, "stdout.log"), "w", encoding="utf-8") as f:
-            f.write(stdout)
-        cmd = [self.redact(a) for a in [os.path.basename(spec.argv[0])] + spec.argv[1:]]
-        out_name, err_name = f"smoke-{case_id}-stdout.jsonl", f"smoke-{case_id}-stderr.txt"
-        base = f"{self.adapter.id}/{self.version}"
-        out_path = tierlib.write_capture(self.config.out, f"{base}/{out_name}", stdout.encode("utf-8"), cmd)
-        tierlib.write_capture(self.config.out, f"{base}/{err_name}", stderr.encode("utf-8"), cmd)
-        outcome = RunOutcome(case_id=case_id, argv=cmd, rc=proc.returncode, duration_s=duration, stdout=stdout,
-                             stderr=stderr, timed_out=False, run_dir=run_dir,
-                             stdout_fixture=smoke_schema.fixture_rel(self.adapter.id, self.version, out_name),
-                             stdout_sha256=tierlib.sha256_bytes(_read_bytes(out_path)),
-                             stderr_fixture=smoke_schema.fixture_rel(self.adapter.id, self.version, err_name),
-                             group_gone=group_gone)
+        outcome = self._save_outcome(
+            case_id=case_id, spec=spec, run_dir=run_dir, stdout=stdout, stderr=stderr,
+            rc=proc.returncode, duration_s=duration, timed_out=False, group_gone=group_gone,
+        )
         outcome.signal_info = {"first_byte": first_byte, "term_after_s": term_after,  # type: ignore[attr-defined]
                                "alive_at_term": alive_at_term, "rc": proc.returncode,
                                "lines_at_term": lines_at_term,

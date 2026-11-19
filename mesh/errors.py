@@ -32,6 +32,8 @@ class MeshError(Exception):
         }
 
     def to_envelope(self, request_id: Optional[str] = None) -> Dict[str, Any]:
+        from mesh.core.redact import redact_value
+
         env = {
             "ok": False,
             "error": self.to_dict(),
@@ -39,7 +41,7 @@ class MeshError(Exception):
             "request_id": request_id,
         }
         if self.data is not None:
-            env["data"] = self.data
+            env["data"] = redact_value(self.data)
         return env
 
 

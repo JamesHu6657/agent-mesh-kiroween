@@ -12,9 +12,10 @@ from typing import Any, Dict, List, Sequence
 
 #: Columns tried, in this order, for list tables (the first ones present are used).
 TABLE_COLUMNS = (
-    "seq", "id", "name", "key", "title", "status", "type", "kind", "category",
+    "seq", "id", "lookup", "name", "key", "title", "status", "type", "kind", "category",
     "adapter", "delivery", "assignee", "project_id", "task_id", "version", "value",
     "launch_enabled", "launch_reason", "ok", "detail", "hint", "created_at",
+    "expires_at", "revoked_at",
 )
 MAX_COLUMNS = 7
 MAX_CELL = 48
@@ -202,6 +203,23 @@ def render_object(d: Dict[str, Any], depth: int = 0) -> List[str]:
     return out
 
 
+def _is_actionable_list(items: List[Any]) -> bool:
+    """True when list items carry full commands or structured ops (e.g. approval pending)."""
+    return (
+        _is_table(items)
+        and any("decision_channel" in i or "approve" in i or "reject" in i for i in items)
+    )
+
+
+def _render_blocks(items: List[Dict[str, Any]], depth: int = 0) -> List[str]:
+    lines: List[str] = []
+    for idx, item in enumerate(items):
+        if idx > 0:
+            lines.append("")
+        lines.extend(render_object(item, depth=depth))
+    return lines
+
+
 def render_text(data: Any) -> str:
     """The text form of a command's ``data`` (no trailing newline)."""
     if not isinstance(data, dict):
@@ -210,9 +228,18 @@ def render_text(data: Any) -> str:
         return data["text"].rstrip("\n")
     if set(data) == {"version"}:  # `mesh version` / `mesh --version`
         return f"mesh {data['version']}"
+    if isinstance(data.get("workspaces"), list) and "root" in data:
+        lines = [f"root: {_scalar(data.get('root'))}"]
+        entries = data["workspaces"]
+        if _is_table(entries):
+            lines.append("workspaces:")
+            lines.extend(_render_blocks(entries, depth=1))
+        else:
+            lines.append("workspaces: (none)")
+        return "\n".join(lines)
     if isinstance(data.get("items"), list):
         items = data["items"]
-        lines = render_table(items)
+        lines = _render_blocks(items) if _is_actionable_list(items) else render_table(items)
         # Other keys (e.g. a project's current_lead); aliases of the item list are skipped.
         rest = {k: v for k, v in data.items() if k != "items" and v is not None and v != items}
         if rest:

@@ -5,7 +5,10 @@ import argparse
 from typing import Any, Dict
 
 from mesh.client import MeshClient
+import mesh.constants as c
+from mesh.core.clock import parse_duration
 from mesh.core.policy import parse_cli_positive_int
+from mesh.errors import MeshError
 
 
 def register_agent_commands(subparsers: argparse._SubParsersAction, parent_parser: argparse.ArgumentParser) -> None:
@@ -240,6 +243,18 @@ def handle_agent_create(args: argparse.Namespace) -> Dict[str, Any]:
     if options is None:
         options = args.option
 
+    from_json = getattr(args, "_from_json", set())
+    raw_bin = args.binary
+    if (
+        isinstance(raw_bin, str)
+        and raw_bin.strip()
+        and "\x00" not in raw_bin
+        and not raw_bin.lstrip().startswith("-")
+    ):
+        binary_val = os.path.abspath(os.path.expanduser(raw_bin))
+    else:
+        binary_val = raw_bin
+
     payload = {
         "name": args.name,
         "adapter": args.adapter,
@@ -251,15 +266,21 @@ def handle_agent_create(args: argparse.Namespace) -> Dict[str, Any]:
         "max_concurrency": max_concurrency,
         "can_lead": args.can_lead,
         "capabilities": capabilities,
-        "default_profile": args.default_profile or "edit",
-        "max_unapproved_profile": args.max_unapproved_profile or "dev",
-        "binary": os.path.abspath(os.path.expanduser(args.binary)) if args.binary else args.binary,
+        "default_profile": (
+            "edit" if (args.default_profile is None and "default_profile" not in from_json) else args.default_profile
+        ),
+        "max_unapproved_profile": (
+            "dev"
+            if (args.max_unapproved_profile is None and "max_unapproved_profile" not in from_json)
+            else args.max_unapproved_profile
+        ),
+        "binary": binary_val,
         "options": options,
         "strict_models": args.strict_models,
         "no_intake": bool(getattr(args, "no_intake", False)),
         "ack_timeout": getattr(args, "ack_timeout", None),
     }
-    if max_concurrency is None and "max_concurrency" not in getattr(args, "_from_json", set()):
+    if max_concurrency is None and "max_concurrency" not in from_json:
         del payload["max_concurrency"]  # not given: meshd uses 1 (an explicit null is still refused)
     resp = client.execute_cmd(args, "agent.create", payload)
     return resp.get("data", {})
@@ -309,6 +330,13 @@ def handle_agent_update(args: argparse.Namespace) -> Dict[str, Any]:
         "no_intake": bool(getattr(args, "no_intake", False)),
         "ack_timeout": getattr(args, "ack_timeout", None),
     }
+    from_json = getattr(args, "_from_json", set())
+    if args.default_model is None and "default_model" not in from_json:
+        del payload["default_model"]
+    if args.default_effort is None and "default_effort" not in from_json:
+        del payload["default_effort"]
+    if max_concurrency is None and "max_concurrency" not in from_json:
+        del payload["max_concurrency"]
     resp = client.execute_cmd(args, "agent.update", payload)
     return resp.get("data", {})
 
@@ -337,7 +365,13 @@ def handle_agent_enable(args: argparse.Namespace) -> Dict[str, Any]:
     return resp.get("data", {})
 
 
-def _check_out_path(home: str, out: str, force: bool, prefix: str = "mesh agent token issue --out") -> str:
+def _check_out_path(
+    home: str,
+    out: str,
+    force: bool,
+    prefix: str = "mesh agent token issue --out",
+    allow_existing: bool = False,
+) -> str:
     """Validate ``--out`` before any token is issued; returns the absolute path."""
     import os
     import stat as stat_mod
@@ -346,10 +380,10 @@ def _check_out_path(home: str, out: str, force: bool, prefix: str = "mesh agent 
     from mesh.cli.commands.setup import _check_token_destination
     from mesh.errors import MeshError
 
-    if not str(out).strip():
+    if not isinstance(out, str) or not out.strip() or "\x00" in out:
         # PR #37 #3: `--out ""` must never fall back to printing the token.
         raise MeshError(code=c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
-                        message=f"{prefix}: the token file path is empty; give a file path",
+                        message=f"{prefix}: the token file path is empty or invalid; give a file path",
                         details={"param": "out"})
     path = os.path.abspath(os.path.expanduser(out))
 
@@ -359,20 +393,18 @@ def _check_out_path(home: str, out: str, force: bool, prefix: str = "mesh agent 
 
     if out.endswith(os.sep) or os.path.isdir(path):
         raise usage(f"{path} is a directory; give a file path")
-    if os.path.lexists(path) and not os.path.islink(path) and not force:
-        raise usage(f"{path} already exists; use --force to replace it")
     # Same location guards as `mesh setup` (and the --token-file read side): not under
     # runs/, workspaces/, a configured workspace root, a project repo or a git work tree;
-    # never through a symlink; never over a non-regular file.
+    # never through a symlink; never over a non-regular file; tdir owned & private.
     _check_token_destination(home, path, prefix=prefix)
-    tdir = os.path.dirname(path)
-    if os.path.isdir(tdir):
-        st = os.stat(tdir)
-        if hasattr(os, "geteuid") and st.st_uid not in (os.geteuid(), 0):
-            raise usage(f"directory {tdir} is owned by another user")
-        if st.st_mode & 0o022 and not st.st_mode & stat_mod.S_ISVTX:
-            raise usage(f"directory {tdir} is writable by other users (mode {oct(stat_mod.S_IMODE(st.st_mode))}); "
-                        "choose a private directory such as ~/.config/agent-mesh")
+    if os.path.lexists(path) and not os.path.islink(path):
+        st_file = os.lstat(path)
+        if not stat_mod.S_ISREG(st_file.st_mode):
+            raise usage(f"{path} is not a regular file")
+        if hasattr(os, "geteuid") and st_file.st_uid not in (os.geteuid(), 0):
+            raise usage(f"{path} is owned by another user")
+        if not force and not allow_existing:
+            raise usage(f"{path} already exists; use --force to replace it")
     return path
 
 
@@ -401,21 +433,83 @@ def _write_out(path: str, token: str, force: bool) -> None:
         raise
 
 
+def _sync_req_meta(src: argparse.Namespace, dst: argparse.Namespace) -> None:
+    for attr in ("_resolved_auth", "_idempotent_replay", "_warnings"):
+        if hasattr(src, attr):
+            setattr(dst, attr, getattr(src, attr))
+
+
+def _validate_expires_in(expires_in: Any) -> None:
+    """Validate ``--expires-in`` before any daemon RPC."""
+    if expires_in is None:
+        return
+    if not isinstance(expires_in, str) or not expires_in.strip():
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=(
+                f"Invalid duration for --expires-in '{expires_in}': expected a positive "
+                "duration string (e.g. '30s', '2h', '7d')"
+            ),
+            details={"param": "expires_in", "got": expires_in},
+        )
+    try:
+        dur_s = parse_duration(expires_in)
+    except (ValueError, TypeError) as exc:
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=f"Invalid duration for --expires-in '{expires_in}': {exc}",
+            details={"param": "expires_in", "got": expires_in},
+        ) from exc
+    if dur_s <= 0:
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=f"--expires-in must be positive; got '{expires_in}' ({dur_s}s)",
+            details={"param": "expires_in", "got": expires_in},
+        )
+
+
 def handle_agent_token_issue(args: argparse.Namespace) -> Dict[str, Any]:
+    import copy
+
     out = getattr(args, "out", None)
     force = bool(getattr(args, "force", False))
+    has_idem = bool(getattr(args, "idempotency_key", None))
+    dry_run = bool(getattr(args, "dry_run", False))
     if force and out is None:
-        import mesh.constants as c
-        from mesh.errors import MeshError
         raise MeshError(code=c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE,
                         message="--force only applies together with --out", details={"param": "force"})
-    path = _check_out_path(args.home, out, force) if out is not None else None
+    path = _check_out_path(args.home, out, force, allow_existing=(has_idem and not dry_run)) if out is not None else None
+    existed_before = os.path.lexists(path) if path is not None else False
+    _validate_expires_in(getattr(args, "expires_in", None))
     client = MeshClient(home=args.home)
-    resp = client.execute_cmd(args, "agent.token.issue", {"name": args.name, "expires_in": args.expires_in})
+    req_args = copy.copy(args)
+    req_args._replay_only = bool(path is not None and existed_before and not force)
+    try:
+        resp = client.execute_cmd(req_args, "agent.token.issue", {"name": args.name, "expires_in": args.expires_in})
+    except MeshError as exc:
+        if (
+            path is not None
+            and existed_before
+            and not force
+            and exc.code == c.INVALID_ARGUMENT
+            and (exc.details or {}).get("reason") == "replay_only_miss"
+        ):
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message=f"mesh agent token issue --out: {path} already exists; use --force to replace it",
+                details={"param": "out", "token_file": path},
+            ) from exc
+        raise
+    finally:
+        _sync_req_meta(req_args, args)
     data = resp.get("data", {})
     if path is None or not isinstance(data, dict) or "token" not in data:
         return data  # no --out, or nothing issued
-    if getattr(args, "dry_run", False):
+    if dry_run:
         data.pop("token", None)  # a dry run issues nothing, so nothing is written
         data["token_file"] = path
         data["written"] = False
@@ -423,8 +517,6 @@ def handle_agent_token_issue(args: argparse.Namespace) -> Dict[str, Any]:
     if getattr(args, "_idempotent_replay", False):
         # PR #37 #2: a replay carries no usable token (the original is never stored), so
         # nothing is written: an existing token file is never replaced by a placeholder.
-        import mesh.constants as c
-        from mesh.errors import MeshError
         cred = data.get("credential_id")
         raise MeshError(
             code=c.IDEMPOTENCY_KEY_REUSED, exit_code=c.EXIT_CONFLICT,
@@ -434,12 +526,17 @@ def handle_agent_token_issue(args: argparse.Namespace) -> Dict[str, Any]:
                      f"one with a new idempotency key"),
             details={"credential_id": cred, "token_file": path, "written": False, "replay": True},
         )
+    if existed_before and not force:
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=f"mesh agent token issue --out: {path} already exists; use --force to replace it",
+            details={"param": "out", "token_file": path},
+        )
     token = data.pop("token")
     try:
         _write_out(path, token, force)
     except OSError as exc:
-        import mesh.constants as c
-        from mesh.errors import MeshError
         cred = data.get("credential_id")
         raise MeshError(
             code=c.INTERNAL_ERROR, exit_code=c.EXIT_INTERNAL,
@@ -480,14 +577,18 @@ def worker_cheat_sheet(name: str, token_file: str, ack_timeout_s: Any = None, ho
 
 def handle_agent_onboard(args: argparse.Namespace) -> Dict[str, Any]:
     """agent create (inbox) + token issue --out + cheat-sheet."""
-    import mesh.constants as c
-    from mesh.errors import MeshError
+    import copy
 
     force = bool(getattr(args, "force", False))
-    path = _check_out_path(args.home, args.out, force, prefix="mesh agent onboard --out")
+    has_idem = bool(getattr(args, "idempotency_key", None))
+    dry_run = bool(getattr(args, "dry_run", False))
+    path = _check_out_path(args.home, args.out, force, prefix="mesh agent onboard --out",
+                           allow_existing=(has_idem and not dry_run))
+    existed_before = os.path.lexists(path)
     max_concurrency = args.max_concurrency
     if "max_concurrency" not in getattr(args, "_from_json", set()):
         max_concurrency = parse_cli_positive_int(max_concurrency, "max_concurrency")
+    _validate_expires_in(getattr(args, "expires_in", None))
     client = MeshClient(home=args.home)
     payload = {
         "name": args.name,
@@ -503,13 +604,39 @@ def handle_agent_onboard(args: argparse.Namespace) -> Dict[str, Any]:
         "max_unapproved_profile": "dev",
         "options": [],
     }
-    created = client.execute_cmd(args, "agent.create", payload).get("data", {})
-    if getattr(args, "dry_run", False):
+    create_args = copy.copy(args)
+    create_args._replay_only = bool(existed_before and not force)
+    try:
+        created = client.execute_cmd(create_args, "agent.create", payload).get("data", {})
+    except MeshError as exc:
+        if (
+            existed_before
+            and not force
+            and exc.code == c.INVALID_ARGUMENT
+            and (exc.details or {}).get("reason") == "replay_only_miss"
+        ):
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message=f"mesh agent onboard --out: {path} already exists; use --force to replace it",
+                details={"param": "out", "token_file": path},
+            ) from exc
+        raise
+    finally:
+        _sync_req_meta(create_args, args)
+    if existed_before and not force and not getattr(args, "_idempotent_replay", False):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=f"mesh agent onboard --out: {path} already exists; use --force to replace it",
+            details={"param": "out", "token_file": path},
+        )
+    if dry_run:
         return {"agent": created, "token_file": path, "written": False,
                 "cheat_sheet": worker_cheat_sheet(args.name, path, created.get("ack_timeout_s"), args.home)}
     try:
-        import copy
         issue_args = copy.copy(args)  # keeps the resolved auth (one passphrase prompt)
+        issue_args._replay_only = bool(existed_before and not force)
         # A second command must not replay the create; a retried onboard with the same key
         # must replay the issue too instead of minting another token (Linear full review C3).
         key = getattr(args, "idempotency_key", None)
@@ -523,6 +650,18 @@ def handle_agent_onboard(args: argparse.Namespace) -> Dict[str, Any]:
         issued = client.execute_cmd(issue_args, "agent.token.issue",
                                     {"name": args.name, "expires_in": args.expires_in}).get("data", {})
     except MeshError as exc:
+        if (
+            existed_before
+            and not force
+            and exc.code == c.INVALID_ARGUMENT
+            and (exc.details or {}).get("reason") == "replay_only_miss"
+        ):
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message=f"mesh agent onboard --out: {path} already exists; use --force to replace it",
+                details={"param": "out", "token_file": path},
+            ) from exc
         raise MeshError(exc.code, exit_code=exc.exit_code,
                         message=(f"agent {args.name} was created but no token was issued ({exc.message}); "
                                  f"issue one with `mesh agent token issue {args.name} --out {path} --user`"),
@@ -548,6 +687,7 @@ def handle_agent_onboard(args: argparse.Namespace) -> Dict[str, Any]:
             try:
                 who_args = copy.copy(args)
                 who_args.idempotency_key = None
+                who_args._replay_only = False
                 who = client.execute_cmd(who_args, "whoami", {},
                                          auth_override={"type": "token", "token": held}).get("data", {})
                 genuine = who.get("name") == args.name
@@ -570,6 +710,13 @@ def handle_agent_onboard(args: argparse.Namespace) -> Dict[str, Any]:
             "written": False, "replayed": True,
             "cheat_sheet": worker_cheat_sheet(args.name, path, created.get("ack_timeout_s"), args.home),
         }
+    if existed_before and not force:
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=f"mesh agent onboard --out: {path} already exists; use --force to replace it",
+            details={"param": "out", "token_file": path},
+        )
     try:
         if token is None:
             raise OSError("no token in the response")

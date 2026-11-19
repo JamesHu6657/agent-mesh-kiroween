@@ -291,7 +291,10 @@ def reevaluate_doc(doc: Dict[str, Any], source_name: str, fixture_root: str) -> 
     errors = smoke_schema.validate(doc, REPO_ROOT, fixture_root=fixture_root)
     if errors:
         raise ReevaluateError(f"source results invalid: {errors}")
-    adapter = ADAPTER_CLASSES[doc["adapter"]]()
+    aid = doc.get("adapter")
+    if not isinstance(aid, str) or aid not in ADAPTER_CLASSES:
+        raise ReevaluateError(f"unknown adapter: {aid!r}")
+    adapter = ADAPTER_CLASSES[aid]()
     source = f"tests/smoke/results/{source_name}"
     new_cases: List[Dict[str, Any]] = []
     tmp = tempfile.mkdtemp(prefix="mh-reeval-")
@@ -313,12 +316,25 @@ def reevaluate_doc(doc: Dict[str, Any], source_name: str, fixture_root: str) -> 
             shutil.copyfile(src, os.path.join(run_dir, "stdout.log"))
             with open(src, encoding="utf-8", errors="replace") as f:
                 stdout = f.read()
+            base_name = os.path.basename(src)
+            stem = base_name[:-len("-stdout.jsonl")] if base_name.endswith("-stdout.jsonl") else base_name
+            err_src = os.path.join(os.path.dirname(src), f"{stem}-stderr.txt")
+            stderr = ""
+            if os.path.lexists(err_src):
+                tierlib.read_sidecar(err_src)
+                shutil.copyfile(err_src, os.path.join(run_dir, "stderr.log"))
+                with open(err_src, encoding="utf-8", errors="replace") as f:
+                    stderr = f.read()
+            exp_src = os.path.join(os.path.dirname(src), f"{stem}-vibe-export.json")
+            if aid == "vibe" and os.path.lexists(exp_src):
+                tierlib.read_sidecar(exp_src)
+                os.makedirs(os.path.join(run_dir, "vibe-out"), exist_ok=True)
+                shutil.copyfile(exp_src, os.path.join(run_dir, "vibe-out", "export.json"))
             parsed = adapter.parse(run_dir)
             rc = case.get("rc")
             obs = case.get("observation")
             timed_out = obs == "hang" or (isinstance(obs, dict) and obs.get("value") == "hang")
             cid = case["id"]
-            aid = doc["adapter"]
             if cid == "S-X-1":
                 verdict = eval_sx1(stdout, rc, timed_out, parsed)
             elif cid == "S-X-2":
@@ -327,12 +343,12 @@ def reevaluate_doc(doc: Dict[str, Any], source_name: str, fixture_root: str) -> 
                 verdict = eval_sx4(stdout, rc, timed_out, doc["model"], adapter_id=aid)
             else:
                 effort = _effort_of(case) or doc.get("effort")
-                if case.get("status") == "not_applicable" or not effort:
+                if not effort:
                     out["carried_from"] = source
                     out["evaluated_from"] = None
                     new_cases.append(out)
                     continue
-                verdict = with_effort(eval_sx5(stdout, "", rc, timed_out, effort, adapter_id=aid), effort)
+                verdict = with_effort(eval_sx5(stdout, stderr, rc, timed_out, effort, adapter_id=aid), effort)
             out["status"], out["reason"], out["observation"] = verdict
             out["evaluated_from"] = source
             out["carried_from"] = None
@@ -369,11 +385,22 @@ def reevaluate(results_path: str, out: str, fixture_root: Optional[str] = None,
     if name.startswith("synthetic_") or "/synthetic/" in os.path.abspath(results_path):
         raise ReevaluateError(f"synthetic results refused: {results_path}")
     tierlib.read_sidecar(results_path)
-    with open(results_path, encoding="utf-8") as f:
-        doc = json.load(f)
-    if not isinstance(doc, dict) or smoke_schema.parse_results_name(str(doc.get("adapter")), name) is None:
+    try:
+        with open(results_path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise ReevaluateError(f"unreadable results file: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise ReevaluateError(f"results document is not an object: {results_path}")
+    aid = doc.get("adapter")
+    if not isinstance(aid, str) or aid not in ADAPTER_CLASSES:
+        raise ReevaluateError(f"unknown or invalid adapter in {results_path}: {aid!r}")
+    ver = doc.get("version")
+    if not isinstance(ver, str) or not smoke_schema.version_ok(ver):
+        raise ReevaluateError(f"missing or invalid version in {results_path}: {ver!r}")
+    if smoke_schema.parse_results_name(aid, name) is None:
         raise ReevaluateError(f"not a results file name: {name}")
-    root = fixture_root or default_fixture_root(results_path, doc["adapter"], doc["version"])
+    root = fixture_root or default_fixture_root(results_path, aid, ver)
     new = reevaluate_doc(doc, name, root)
     errors = smoke_schema.validate(new, REPO_ROOT, fixture_root=root)
     if errors:

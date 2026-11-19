@@ -509,7 +509,7 @@ class TestInbox(unittest.TestCase):
         self.assertEqual(len(offered_msgs1), 1)
 
         # Update agent ibx2 allowed models to m-b, triggering T6 on next scheduler pass
-        rc_upd, _ = self.harness.cli("agent", "update", "ibx2", "--allowed-model", "m-b", user=True)
+        rc_upd, _ = self.harness.cli("agent", "update", "ibx2", "--allowed-model", "m-b", "--default-model", "m-b", user=True)
         self.assertEqual(rc_upd, 0)
 
         # Wait until task transitions to failed via T6

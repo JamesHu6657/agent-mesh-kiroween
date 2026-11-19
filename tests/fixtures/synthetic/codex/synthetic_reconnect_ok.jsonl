@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}
+{"type":"turn.started"}
+{"type":"error","message":"Reconnecting... 1/5 (stream disconnected before completion: error sending request for url (https://api.openai.com/v1/responses))"}
+{"type":"error","message":"Reconnecting... 2/5 (stream disconnected before completion: error sending request for url (https://api.openai.com/v1/responses))"}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Checking the repository first."}}
+{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"MESH_SMOKE_OK\n```mesh-deliverable\n{\"summary\":\"MESH_SMOKE_OK codex\",\"artifacts\":[],\"tests\":{\"command\":\"none\",\"result\":\"not_run\"},\"notes\":\"\"}\n```"}}
+{"type":"turn.completed","usage":{"input_tokens":24763,"cached_input_tokens":24448,"output_tokens":122,"reasoning_output_tokens":40}}

@@ -23,7 +23,7 @@ from mesh.core.authz import (
 from mesh.core.clock import now_iso_utc, parse_duration
 from mesh.core.events import record_event
 from mesh.core.ids import generate_id
-from mesh.core.paths import check_install_path_secure, get_install_root
+from mesh.core.paths import check_install_path_secure, get_install_root, is_path_equal_or_parent
 from mesh.core.repos import (
     encode_test_command,
     integration_branch_name,
@@ -32,10 +32,25 @@ from mesh.core.repos import (
     tests_view,
     validate_repo,
 )
-from mesh.core.workspaces import compute_lead_workspace_path, get_workspaces_root
+from mesh.core.workspaces import (
+    allowed_workspace_roots,
+    compute_lead_workspace_path,
+    get_workspaces_root,
+    has_project_any_ws_reservation,
+    list_project_ws_reservation_keys,
+)
+from mesh.core.redact import redact, redact_value
 from mesh.daemon.handlers.base import Effect, HandlerContext, HandlerResult
-from mesh.daemon.handlers.inbox import _recheck_credential
+from mesh.daemon.handlers.inbox import _recheck_wait_authz
 from mesh.errors import MeshError
+
+
+def _redact_lead_assignment(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Redact free-text lead assignment reasons on read."""
+    for field in ("reason", "ended_reason"):
+        if isinstance(row.get(field), str) and row[field]:
+            row[field] = redact(row[field])
+    return row
 
 
 def _lead_dir_effect(ctx: HandlerContext, project_id: str, agent_id: str) -> None:
@@ -95,8 +110,26 @@ def _prepare_repo_project(ctx: HandlerContext) -> Optional[Dict[str, Any]]:
             message=f"Repo path must be absolute: '{repo}'",
             details={"param": "repo", "repo": repo},
         )
-    # The repo must not overlap the install root in either direction (before any git call).
+    # The repo must not overlap the install root, MESH_HOME, or workspaces.root in either direction (before any git call).
     check_install_path_secure(install_root=get_install_root(), repo_paths=[repo])
+    home_real = os.path.realpath(ctx.home)
+    repo_real = os.path.realpath(repo)
+    if is_path_equal_or_parent(home_real, repo_real) or is_path_equal_or_parent(repo_real, home_real):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=f"Repo path '{repo}' must not overlap MESH_HOME '{home_real}'",
+            details={"param": "repo", "repo": repo, "conflict": home_real},
+        )
+    for ws_root in allowed_workspace_roots(ctx.conn, ctx.home):
+        ws_root_real = os.path.realpath(ws_root)
+        if is_path_equal_or_parent(ws_root_real, repo_real) or is_path_equal_or_parent(repo_real, ws_root_real):
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message=f"Repo path '{repo}' must not overlap workspaces.root '{ws_root_real}'",
+                details={"param": "repo", "repo": repo, "conflict": ws_root_real},
+            )
     info = validate_repo(repo, ctx.args.get("base_branch"))
     info["tests"] = tests
     return info
@@ -146,7 +179,7 @@ def _handle_intake_submit(ctx: HandlerContext) -> HandlerResult:
             )
 
         message = ctx.args.get("message")
-        if not message:
+        if not isinstance(message, str) or not message.strip():
             raise MeshError(
                 code=c.INVALID_ARGUMENT,
                 exit_code=c.EXIT_USAGE,
@@ -181,29 +214,35 @@ def _handle_intake_submit(ctx: HandlerContext) -> HandlerResult:
     repo_info = _prepare_repo_project(ctx)
 
     title = ctx.args.get("title")
-    if not title:
+    if not isinstance(title, str) or not title.strip():
         raise MeshError(
             code=c.INVALID_ARGUMENT,
             exit_code=c.EXIT_USAGE,
             message="Field 'title' is required",
             details={"param": "title"},
         )
+    title = title.strip()
 
     goal = ctx.args.get("goal")
-    if not goal:
+    if not isinstance(goal, str) or not goal.strip():
         raise MeshError(
             code=c.INVALID_ARGUMENT,
             exit_code=c.EXIT_USAGE,
             message="Field 'goal' is required",
             details={"param": "goal"},
         )
+    goal = goal.strip()
 
     criteria = ctx.args.get("criterion") or ctx.args.get("criteria") or []
-    if not criteria or not any(str(cr).strip() for cr in criteria):
+    if isinstance(criteria, str):
+        criteria = [criteria]
+    if not isinstance(criteria, list) or not criteria or any(
+        not isinstance(cr, str) or not cr.strip() for cr in criteria
+    ):
         raise MeshError(
             code=c.INVALID_ARGUMENT,
             exit_code=c.EXIT_USAGE,
-            message="At least one acceptance criterion is required",
+            message="At least one non-empty acceptance criterion is required",
             details={"param": "criterion"},
         )
 
@@ -314,7 +353,12 @@ def _handle_intake_submit(ctx: HandlerContext) -> HandlerResult:
         )
         criteria_records.append({"id": crit_id, "ordinal": idx + 1, "text": clean_text})
 
-    deps = ctx.args.get("depends_on_project") or []
+    if "depends_on_project" in ctx.args and ctx.args["depends_on_project"] is not None:
+        deps = ctx.args["depends_on_project"]
+    elif "depends_on_projects" in ctx.args and ctx.args["depends_on_projects"] is not None:
+        deps = ctx.args["depends_on_projects"]
+    else:
+        deps = []
     # Full review: a list of existing project ids, deduplicated (no INTERNAL_ERROR).
     if isinstance(deps, str):
         deps = [deps]
@@ -423,15 +467,23 @@ def _handle_project_create(ctx: HandlerContext) -> HandlerResult:
     return handle_intake_submit(ctx)
 
 
-def handle_project_leads(ctx: HandlerContext) -> HandlerResult:
-    """List lead assignment history for a project."""
+def _require_authorized_project_id(ctx: HandlerContext, cmd: str) -> str:
+    """Validate non-empty string ``project_id`` and authorize ``cmd`` before reading project state."""
     project_id = ctx.args.get("project_id")
-    if not project_id:
+    if not isinstance(project_id, str) or not project_id:
         raise MeshError(
             code=c.INVALID_ARGUMENT,
             exit_code=c.EXIT_USAGE,
             message="project_id is required",
+            details={"param": "project_id"},
         )
+    check_authz(ctx.conn, cmd, ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id)
+    return project_id
+
+
+def handle_project_leads(ctx: HandlerContext) -> HandlerResult:
+    """List lead assignment history for a project."""
+    project_id = _require_authorized_project_id(ctx, "project.leads")
 
     # Verify project exists
     pcur = ctx.conn.execute("SELECT id FROM projects WHERE id = ?;", (project_id,))
@@ -443,8 +495,6 @@ def handle_project_leads(ctx: HandlerContext) -> HandlerResult:
             details={"project_id": project_id},
         )
 
-    check_authz(ctx.conn, "project.leads", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id)
-
     cur = ctx.conn.execute(
         """SELECT la.id, la.project_id, la.agent_id, p.name as agent,
                   la.assigned_by, la.via, la.reason, la.started_at,
@@ -455,7 +505,7 @@ def handle_project_leads(ctx: HandlerContext) -> HandlerResult:
            ORDER BY la.started_at ASC, la.id ASC;""",
         (project_id,),
     )
-    items = [dict(r) for r in cur.fetchall()]
+    items = [_redact_lead_assignment(dict(r)) for r in cur.fetchall()]
     current_lead = None
     for item in items:
         if item["ended_at"] is None:
@@ -509,13 +559,7 @@ def handle_project_list(ctx: HandlerContext) -> HandlerResult:
 
 def handle_project_show(ctx: HandlerContext) -> HandlerResult:
     """Show details, criteria, and progress of a project."""
-    project_id = ctx.args.get("project_id")
-    if not project_id:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="project_id is required",
-        )
+    project_id = _require_authorized_project_id(ctx, "project.show")
 
     cur = ctx.conn.execute(
         """SELECT pr.id, pr.name, pr.goal, pr.status, pr.created_via,
@@ -538,8 +582,6 @@ def handle_project_show(ctx: HandlerContext) -> HandlerResult:
             message=f"Project '{project_id}' not found",
             details={"project_id": project_id},
         )
-
-    check_authz(ctx.conn, "project.show", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id)
 
     data = dict(row)
     repo_cols = {k: data.pop(k) for k in ("repo_path", "base_branch", "integration_branch",
@@ -567,25 +609,25 @@ def handle_project_show(ctx: HandlerContext) -> HandlerResult:
                ORDER BY la.started_at ASC;""",
             (project_id,),
         )
-        data["lead_history"] = [dict(r) for r in lcur.fetchall()]
+        data["lead_history"] = [_redact_lead_assignment(dict(r)) for r in lcur.fetchall()]
 
     return HandlerResult(data=data)
 
 
 def handle_project_set_lead(ctx: HandlerContext) -> HandlerResult:
     """Change the designated lead agent of a project per plan §8."""
-    project_id = ctx.args.get("project_id")
+    project_id = _require_authorized_project_id(ctx, "project.set_lead")
     new_lead_name = ctx.args.get("agent")
     reason = ctx.args.get("reason")
 
-    if not project_id or not new_lead_name or not reason:
+    if not isinstance(new_lead_name, str) or not new_lead_name or not isinstance(reason, str) or not reason:
         raise MeshError(
             code=c.INVALID_ARGUMENT,
             exit_code=c.EXIT_USAGE,
             message="project_id, agent, and reason are required",
         )
 
-    # 1. Project must exist and be active
+    # 2. Project must exist and be active
     pcur = ctx.conn.execute("SELECT id, name, goal, status FROM projects WHERE id = ?;", (project_id,))
     prow = pcur.fetchone()
     if not prow:
@@ -603,50 +645,14 @@ def handle_project_set_lead(ctx: HandlerContext) -> HandlerResult:
             details={"project_id": project_id, "status": prow["status"]},
         )
 
-    # 2. Authorize
-    check_authz(ctx.conn, "project.set_lead", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id)
-
-    if ctx.via == "relayed":
-        policy = get_approval_policy(ctx.conn, "lead_change")
-        if policy == "direct_only":
-            raise MeshError(
-                code=c.CHANNEL_NOT_ALLOWED,
-                exit_code=c.EXIT_APPROVAL_INVALID,
-                message="Approval policy for category 'lead_change' is 'direct_only'; relayed execution not allowed",
-                details={"category": "lead_change", "policy": policy},
-            )
-    elif ctx.actor_kind != "user":
-        if not ctx.approval:
-            apr_info = create_or_get_pending_approval(
-                conn=ctx.conn,
-                category="lead_change",
-                op="project.set_lead",
-                requested_by=ctx.principal["id"],
-                params={"project_id": project_id, "agent": new_lead_name, "reason": reason},
-                summary=f"Change project {project_id} lead to {new_lead_name}",
-                project_id=project_id,
-                dry_run=ctx.dry_run,
-                request_id=ctx.request_id,
-                k_user=ctx.k_user,
-            )
-            raise MeshError(
-                code=c.APPROVAL_REQUIRED,
-                exit_code=c.EXIT_APPROVAL_REQUIRED,
-                message=f"Operation 'project.set_lead' requires user approval (category: lead_change)",
-                details=apr_info,
-            )
-        else:
-            check_and_consume_approval(
-                conn=ctx.conn,
-                approval_id=ctx.approval,
-                op="project.set_lead",
-                category="lead_change",
-                caller_id=ctx.principal["id"],
-                params={"project_id": project_id, "agent": new_lead_name, "reason": reason},
-                project_id=project_id,
-                request_id=ctx.request_id,
-                actor_kind=ctx.actor_kind, via=ctx.via, k_user=ctx.k_user,
-            )
+    res_key = has_project_any_ws_reservation(ctx.conn, project_id)
+    if res_key:
+        raise MeshError(
+            code=c.CONCURRENCY_LIMIT,
+            exit_code=c.EXIT_BUSY,
+            message=f"Cannot change lead of project '{project_id}': workspace operation '{res_key}' is in progress",
+            details={"reservation": res_key, "project_id": project_id},
+        )
 
     # 3. New lead agent validation
     acur = ctx.conn.execute(
@@ -703,9 +709,65 @@ def handle_project_set_lead(ctx: HandlerContext) -> HandlerResult:
 
     # 5. Get current active lead assignment
     old_lead = get_project_active_lead(ctx.conn, project_id)
+    if old_lead and old_lead["agent_id"] == new_lead_id:
+        # Already the active lead: avoid rotating assignment_id, killing an active turn, or consuming approvals.
+        return HandlerResult(
+            data={
+                "project_id": project_id,
+                "old_lead": old_lead["agent_name"],
+                "new_lead": new_lead_name,
+                "assignment_id": old_lead["assignment_id"],
+                "unchanged": True,
+            }
+        )
+
+    # 6. Approval gate after target validation and unchanged noop check
+    if ctx.via == "relayed":
+        policy = get_approval_policy(ctx.conn, "lead_change")
+        if policy == "direct_only":
+            raise MeshError(
+                code=c.CHANNEL_NOT_ALLOWED,
+                exit_code=c.EXIT_APPROVAL_INVALID,
+                message="Approval policy for category 'lead_change' is 'direct_only'; relayed execution not allowed",
+                details={"category": "lead_change", "policy": policy},
+            )
+    elif ctx.actor_kind != "user":
+        if not ctx.approval:
+            apr_info = create_or_get_pending_approval(
+                conn=ctx.conn,
+                category="lead_change",
+                op="project.set_lead",
+                requested_by=ctx.principal["id"],
+                params={"project_id": project_id, "agent": new_lead_name, "reason": reason},
+                summary=f"Change project {project_id} lead to {new_lead_name}",
+                project_id=project_id,
+                dry_run=ctx.dry_run,
+                request_id=ctx.request_id,
+                k_user=ctx.k_user,
+                testing_mode=ctx.testing_mode,
+            )
+            raise MeshError(
+                code=c.APPROVAL_REQUIRED,
+                exit_code=c.EXIT_APPROVAL_REQUIRED,
+                message=f"Operation 'project.set_lead' requires user approval (category: lead_change)",
+                details=apr_info,
+            )
+        else:
+            check_and_consume_approval(
+                conn=ctx.conn,
+                approval_id=ctx.approval,
+                op="project.set_lead",
+                category="lead_change",
+                caller_id=ctx.principal["id"],
+                params={"project_id": project_id, "agent": new_lead_name, "reason": reason},
+                project_id=project_id,
+                request_id=ctx.request_id,
+                actor_kind=ctx.actor_kind, via=ctx.via, k_user=ctx.k_user,
+            )
     old_lead_name = old_lead["agent_name"] if old_lead else "none"
     old_lead_id = old_lead["agent_id"] if old_lead else None
 
+    reason = redact(reason) if isinstance(reason, str) else redact_value(reason)
     now = now_iso_utc()
 
     # Step 1: Close current lead assignment
@@ -863,7 +925,7 @@ def handle_project_set_lead(ctx: HandlerContext) -> HandlerResult:
     )
     recent_events = [dict(r) for r in reversed(evts_cur.fetchall())]
 
-    handover_payload = {
+    handover_payload = redact_value({
         "project_id": project_id,
         "goal": prow["goal"],
         "criteria": criteria_list,
@@ -871,7 +933,7 @@ def handle_project_set_lead(ctx: HandlerContext) -> HandlerResult:
         "notes": notes_list,
         "open_approvals": open_aprs,
         "recent_events": recent_events,
-    }
+    })
 
     handover_msg_id = generate_id("msg")
     handover_channel = "lead_wake" if new_lead_delivery == "launch" else "inbox"
@@ -896,6 +958,11 @@ def handle_project_set_lead(ctx: HandlerContext) -> HandlerResult:
 
     # Also notify old lead if present
     if old_lead_id:
+        lead_changed_payload = redact_value({
+            "project_id": project_id,
+            "new_lead": new_lead_name,
+            "reason": reason,
+        })
         ctx.conn.execute(
             """INSERT INTO outbox (
                 id, event_seq, recipient_id, channel, dedup_key, project_id,
@@ -908,7 +975,7 @@ def handle_project_set_lead(ctx: HandlerContext) -> HandlerResult:
                 old_lead_id,
                 f"lead_changed:{new_asg_id}:{old_lead_id}",
                 project_id,
-                json.dumps({"project_id": project_id, "new_lead": new_lead_name, "reason": reason}),
+                json.dumps(lead_changed_payload),
                 now,
                 now,
             ),
@@ -927,13 +994,7 @@ def handle_project_set_lead(ctx: HandlerContext) -> HandlerResult:
 
 def handle_project_pause(ctx: HandlerContext) -> HandlerResult:
     """Pause a project per plan §6.1 P2."""
-    project_id = ctx.args.get("project_id")
-    if not project_id:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="project_id is required",
-        )
+    project_id = _require_authorized_project_id(ctx, "project.pause")
 
     cur = ctx.conn.execute("SELECT id, status FROM projects WHERE id = ?;", (project_id,))
     row = cur.fetchone()
@@ -961,8 +1022,6 @@ def handle_project_pause(ctx: HandlerContext) -> HandlerResult:
             details={"project_id": project_id, "from": "paused", "to": "paused"},
         )
 
-    check_authz(ctx.conn, "project.pause", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id)
-
     # Lead requires approval category project_control (Checklist B12)
     if ctx.via == "relayed":
         policy = get_approval_policy(ctx.conn, "project_control")
@@ -987,6 +1046,7 @@ def handle_project_pause(ctx: HandlerContext) -> HandlerResult:
                 dry_run=ctx.dry_run,
                 request_id=ctx.request_id,
                 k_user=ctx.k_user,
+                testing_mode=ctx.testing_mode,
             )
             raise MeshError(
                 code=c.APPROVAL_REQUIRED,
@@ -1031,13 +1091,7 @@ def handle_project_pause(ctx: HandlerContext) -> HandlerResult:
 
 def handle_project_resume(ctx: HandlerContext) -> HandlerResult:
     """Resume a paused project per plan §6.1 P3."""
-    project_id = ctx.args.get("project_id")
-    if not project_id:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="project_id is required",
-        )
+    project_id = _require_authorized_project_id(ctx, "project.resume")
 
     cur = ctx.conn.execute("SELECT id, status FROM projects WHERE id = ?;", (project_id,))
     row = cur.fetchone()
@@ -1065,8 +1119,6 @@ def handle_project_resume(ctx: HandlerContext) -> HandlerResult:
             details={"project_id": project_id, "from": status, "to": "active"},
         )
 
-    check_authz(ctx.conn, "project.resume", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id)
-
     if ctx.via == "relayed":
         policy = get_approval_policy(ctx.conn, "project_control")
         if policy == "direct_only":
@@ -1090,6 +1142,7 @@ def handle_project_resume(ctx: HandlerContext) -> HandlerResult:
                 dry_run=ctx.dry_run,
                 request_id=ctx.request_id,
                 k_user=ctx.k_user,
+                testing_mode=ctx.testing_mode,
             )
             raise MeshError(
                 code=c.APPROVAL_REQUIRED,
@@ -1113,6 +1166,10 @@ def handle_project_resume(ctx: HandlerContext) -> HandlerResult:
 
     now = now_iso_utc()
     ctx.conn.execute("UPDATE projects SET status = 'active', updated_at = ? WHERE id = ?;", (now, project_id))
+    # Full review r5 P2-3: the no-response window restarts on resume (no tick may have
+    # run while paused, e.g. meshd down), never 0 s of grace.
+    ctx.conn.execute("UPDATE tasks SET offered_at = ? WHERE project_id = ? AND status = 'queued' "
+                     "AND offered_at IS NOT NULL;", (now, project_id))
 
     record_event(
         conn=ctx.conn,
@@ -1134,13 +1191,7 @@ def handle_project_resume(ctx: HandlerContext) -> HandlerResult:
 
 def handle_project_cancel(ctx: HandlerContext) -> HandlerResult:
     """Cancel a project per plan §6.1 P5."""
-    project_id = ctx.args.get("project_id")
-    if not project_id:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="project_id is required",
-        )
+    project_id = _require_authorized_project_id(ctx, "project.cancel")
 
     cur = ctx.conn.execute("SELECT id, status FROM projects WHERE id = ?;", (project_id,))
     row = cur.fetchone()
@@ -1161,8 +1212,6 @@ def handle_project_cancel(ctx: HandlerContext) -> HandlerResult:
             details={"project_id": project_id, "status": status},
         )
 
-    check_authz(ctx.conn, "project.cancel", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id)
-
     # P5 while a merge runs (coordinator reading, m2-r7): block, never abort a merge or
     # its test step halfway. rc 6, no change (no approval is created either).
     merging = ctx.conn.execute(
@@ -1177,6 +1226,15 @@ def handle_project_cancel(ctx: HandlerContext) -> HandlerResult:
             message=f"Project '{project_id}' cannot be cancelled while task '{merging['id']}' is merging",
             details={"project_id": project_id, "reason": "merge_in_progress",
                      "task_id": merging["id"], "merge_run_id": merging["run_id"]},
+        )
+
+    res_key = has_project_any_ws_reservation(ctx.conn, project_id)
+    if res_key:
+        raise MeshError(
+            code=c.CONCURRENCY_LIMIT,
+            exit_code=c.EXIT_BUSY,
+            message=f"Cannot cancel project '{project_id}': workspace operation '{res_key}' is in progress",
+            details={"reservation": res_key, "project_id": project_id},
         )
 
     if ctx.via == "relayed":
@@ -1202,6 +1260,7 @@ def handle_project_cancel(ctx: HandlerContext) -> HandlerResult:
                 dry_run=ctx.dry_run,
                 request_id=ctx.request_id,
                 k_user=ctx.k_user,
+                testing_mode=ctx.testing_mode,
             )
             raise MeshError(
                 code=c.APPROVAL_REQUIRED,
@@ -1275,6 +1334,19 @@ def handle_project_cancel(ctx: HandlerContext) -> HandlerResult:
         ctx.principal["id"], ctx.actor_kind, ctx.via, "project_cancelled",
         ctx.request_id, ctx.relayed_by, ctx.k_user)
 
+    # Supersede pending/delivering lead_wake messages and terminate any active lead turn.
+    ctx.conn.execute(
+        "UPDATE outbox SET status = 'superseded' "
+        "WHERE project_id = ? AND channel = 'lead_wake' AND status IN ('pending', 'delivering');",
+        (project_id,),
+    )
+    for lrow in ctx.conn.execute(
+        "SELECT id FROM runs WHERE kind = 'lead_turn' AND project_id = ? AND status IN ('starting', 'running');",
+        (project_id,),
+    ).fetchall():
+        ctx.effects.append(Effect("terminate_lead_turn", {"run_id": lrow["id"], "end_reason": cancel_reason}))
+    ctx.effects.append(Effect("cancel_project_merges", {"project_id": project_id}))
+
     record_event(
         conn=ctx.conn,
         type_="project.cancelled",
@@ -1293,6 +1365,13 @@ def handle_project_cancel(ctx: HandlerContext) -> HandlerResult:
     return HandlerResult(data={"id": project_id, "status": "cancelled"})
 
 
+def _unlink_quiet(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def handle_project_deliver(ctx: HandlerContext) -> HandlerResult:
     """`project deliver` (§10.6): fast-forward the base branch to the integration branch.
 
@@ -1301,16 +1380,16 @@ def handle_project_deliver(ctx: HandlerContext) -> HandlerResult:
     and never forces: a base that is not an ancestor of the integration branch is rc 14
     `NOT_FAST_FORWARD` with nothing changed.
     """
+    from mesh.core import repos as _repos
+
+    with _repos.git_budget(_repos.SETUP_INTEGRATION_BUDGET_S):
+        return _handle_project_deliver(ctx)
+
+
+def _handle_project_deliver(ctx: HandlerContext) -> HandlerResult:
     from mesh.core.repos import deliver_to_base
 
-    project_id = ctx.args.get("project_id")
-    if not project_id:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="project_id is required",
-            details={"param": "project_id"},
-        )
+    project_id = _require_authorized_project_id(ctx, "project.deliver")
     row = ctx.conn.execute(
         "SELECT id, status, repo_path, base_branch, integration_branch FROM projects WHERE id = ?;",
         (project_id,),
@@ -1322,7 +1401,6 @@ def handle_project_deliver(ctx: HandlerContext) -> HandlerResult:
             message=f"Project '{project_id}' not found",
             details={"project_id": project_id},
         )
-    check_authz(ctx.conn, "project.deliver", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id)
     if row["status"] == "cancelled":
         raise MeshError(
             code=c.PROJECT_NOT_ACTIVE,
@@ -1373,6 +1451,51 @@ def handle_project_deliver(ctx: HandlerContext) -> HandlerResult:
                                 "merge_commit": v.details["merge_commit"]} for v in unmerged]},
         )
 
+    # Full review r1 P1-5: already delivered (base == integration tip) is a noop that
+    # writes nothing, so it must not consume a single-use approval either.
+    from mesh.core.repos import deliver_heads
+
+    heads = None if ctx.dry_run else deliver_heads(row["repo_path"], row["base_branch"],
+                                                   row["integration_branch"] or integration_branch_name(project_id))
+    if heads is None and not ctx.dry_run:
+        # Full review r2 P2-B: a deliver is always pinned to the heads it read and backed by
+        # an intent; unreadable heads fail before any approval is consumed.
+        raise MeshError(
+            code=c.INTERNAL_ERROR,
+            exit_code=c.EXIT_INTERNAL,
+            message=f"Cannot read the base or integration branch of project '{project_id}'; nothing was changed",
+            details={"project_id": project_id, "reason": "git_failed", "step": "rev-parse heads"},
+        )
+    if not ctx.dry_run:
+        # Full review r4 P1-1: an earlier delivery's intent is settled in its own
+        # transaction before this request (server / lead turn); one still here is
+        # unsettled (or an earlier action of this lead turn, not yet committed). Never
+        # overwrite it.
+        from mesh.core.repos import deliver_intent_path as _dip
+
+        from mesh.daemon import lead_turns as _lt
+
+        # r5 P2-2: checked before the noop shortcut, which must not hide an unsettled
+        # delivery; an intent this lead turn wrote itself (pending commit) allows only a noop.
+        dip = _dip(ctx.home, project_id)
+        own_noop = dip in _lt._PENDING_INTENT_UNLINKS and heads is not None and heads[0] == heads[1]
+        if os.path.lexists(dip) and not own_noop:
+            raise MeshError(
+                code=c.INVALID_TRANSITION,
+                exit_code=c.EXIT_CONFLICT,
+                message=(f"An earlier delivery of project '{project_id}' is not settled yet; "
+                         f"nothing was changed, retry `mesh project deliver`"),
+                details={"project_id": project_id, "reason": "deliver_intent_pending"},
+            )
+
+    if heads is not None and heads[0] == heads[1]:
+        return HandlerResult(
+            data={"project_id": project_id, "base_branch": row["base_branch"],
+                  "integration_branch": row["integration_branch"] or integration_branch_name(project_id),
+                  "old": heads[0], "new": heads[1], "method": "noop", "worktree": None},
+            events=[],
+        )
+
     # Approval gate (§7.4): `deliver_to_base` defaults to `not_required`.
     policy = get_approval_policy(ctx.conn, "deliver_to_base")
     if policy != "not_required":
@@ -1398,6 +1521,7 @@ def handle_project_deliver(ctx: HandlerContext) -> HandlerResult:
                     dry_run=ctx.dry_run,
                     request_id=ctx.request_id,
                     k_user=ctx.k_user,
+                    testing_mode=ctx.testing_mode,
                 )
                 raise MeshError(
                     code=c.APPROVAL_REQUIRED,
@@ -1434,9 +1558,64 @@ def handle_project_deliver(ctx: HandlerContext) -> HandlerResult:
             events=[],
         )
 
-    result = deliver_to_base(row["repo_path"], base, integration)
+    # Full review r1 P1-5: the base branch moves before this transaction commits; a durable
+    # intent lets recovery record the delivery if meshd dies in between. r2 P1-D: it lives
+    # only while this request is in flight (removed on failure, noop, and after commit);
+    # r2 P1-E: it carries the event horizon and the idempotency key of this request.
+    from mesh.core.repos import deliver_intent_path, write_deliver_intent
+
+    assert heads is not None
+    idem = getattr(ctx, "idempotency", None)
+    last = ctx.conn.execute("SELECT COALESCE(MAX(seq), 0) AS m FROM events;").fetchone()
+    intent_path = deliver_intent_path(ctx.home, project_id)
+    intent_written = False
+
+    def _before_write() -> None:
+        nonlocal intent_written
+        try:
+            write_deliver_intent(ctx.home, {
+                "project_id": project_id, "repo": row["repo_path"], "base_branch": base,
+                "integration_branch": integration, "old": heads[0], "new": heads[1],
+                "actor_id": ctx.principal["id"], "actor_kind": ctx.actor_kind, "via": ctx.via,
+                "relayed_by": ctx.relayed_by, "request_id": ctx.request_id,
+                "approval_id": ctx.approval if policy != "not_required" and ctx.actor_kind != "user" else None,
+                "min_event_seq": int(last["m"] if last is not None else 0),
+                "idempotency": ({"principal_id": idem["principal_id"], "key": idem["key"], "cmd": ctx.cmd,
+                                 "request_hash": idem["request_hash"]} if idem and idem.get("key") else None),
+            })
+        except OSError as e:
+            raise MeshError(
+                code=c.INTERNAL_ERROR,
+                exit_code=c.EXIT_INTERNAL,
+                message=f"Cannot record the deliver intent: {e}; nothing was changed",
+                details={"project_id": project_id, "reason": "intent_failed"},
+            )
+        intent_written = True
+
+    try:
+        result = deliver_to_base(row["repo_path"], base, integration, expected=heads, before_write=_before_write)
+    except BaseException as exc:
+        if intent_written:
+            # Devin full-review P2-1: a mismatch read after the ff merge may follow a write;
+            # it keeps the intent unless the base is back at old (settle records it).
+            no_write_err = isinstance(exc, MeshError) and not exc.details.get("after_write") and (
+                exc.code in (c.VERSION_MISMATCH, c.NOT_FAST_FORWARD, c.WORKTREE_DIRTY, c.INVALID_ARGUMENT)
+                or (
+                    exc.details.get("reason") == "git_failed"
+                    and exc.details.get("step") in ("merge --ff-only", "update-ref")
+                )
+            )
+            if no_write_err:
+                _unlink_quiet(intent_path)
+            else:
+                now_heads = deliver_heads(row["repo_path"], base, integration)
+                if now_heads is not None and now_heads[0] == heads[0]:
+                    _unlink_quiet(intent_path)
+        raise
 
     if result["method"] == "noop":
+        if intent_written:
+            _unlink_quiet(intent_path)
         # Already delivered: no git write happened, so there is nothing to record
         # (review m2-r8 MINOR-2).
         return HandlerResult(
@@ -1452,6 +1631,7 @@ def handle_project_deliver(ctx: HandlerContext) -> HandlerResult:
             events=[],
         )
 
+    ctx.effects.append(Effect("unlink_deliver_intent", {"path": intent_path}))
     record_event(
         conn=ctx.conn,
         type_="project.delivered",
@@ -1480,26 +1660,50 @@ def handle_project_deliver(ctx: HandlerContext) -> HandlerResult:
 
 def handle_project_update(ctx: HandlerContext) -> HandlerResult:
     """Update project goal or acceptance criteria per plan §6.1, §7.4 (scope_change)."""
-    project_id = ctx.args.get("project_id")
-    if not project_id:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="project_id is required",
-            details={"param": "project_id"},
-        )
+    project_id = _require_authorized_project_id(ctx, "project.update")
 
     goal = ctx.args.get("goal")
-    criterion = ctx.args.get("criterion") or []
-    if isinstance(criterion, str):
+    criterion = ctx.args.get("criterion")
+    if criterion is None or (
+        isinstance(criterion, list) and not criterion and ctx.args.get("criteria") is not None
+    ):
+        criterion = ctx.args.get("criteria")
+    if criterion is None:
+        criterion = []
+    elif isinstance(criterion, str):
         criterion = [criterion]
 
     if goal is None and not criterion:
+        if isinstance(criterion, list):
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message="At least one of --goal or --criterion must be provided",
+            )
         raise MeshError(
             code=c.INVALID_ARGUMENT,
             exit_code=c.EXIT_USAGE,
-            message="At least one of --goal or --criterion must be provided",
+            message="Each acceptance criterion must be a non-empty string",
+            details={"param": "criterion"},
         )
+    if goal is not None and (not isinstance(goal, str) or not goal.strip()):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Field 'goal' must be a non-empty string",
+            details={"param": "goal"},
+        )
+    has_criterion = "criterion" in ctx.args or "criteria" in ctx.args
+    if has_criterion:
+        if not isinstance(criterion, list) or any(
+            not isinstance(cr, str) or not cr.strip() for cr in criterion
+        ):
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message="Each acceptance criterion must be a non-empty string",
+                details={"param": "criterion"},
+            )
 
     cur = ctx.conn.execute("SELECT id, status, goal, version FROM projects WHERE id = ?;", (project_id,))
     row = cur.fetchone()
@@ -1519,8 +1723,6 @@ def handle_project_update(ctx: HandlerContext) -> HandlerResult:
             message=f"Project '{project_id}' is terminal ({status})",
             details={"project_id": project_id, "status": status},
         )
-
-    check_authz(ctx.conn, "project.update", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id)
 
     # Build canonical params
     canonical_params: Dict[str, Any] = {"project_id": project_id}
@@ -1552,6 +1754,7 @@ def handle_project_update(ctx: HandlerContext) -> HandlerResult:
                 dry_run=ctx.dry_run,
                 request_id=ctx.request_id,
                 k_user=ctx.k_user,
+                testing_mode=ctx.testing_mode,
             )
             raise MeshError(
                 code=c.APPROVAL_REQUIRED,
@@ -1615,13 +1818,7 @@ def handle_project_update(ctx: HandlerContext) -> HandlerResult:
 
 def handle_project_complete(ctx: HandlerContext) -> HandlerResult:
     """Mark a project completed with criteria verification per plan §6.1 P4."""
-    project_id = ctx.args.get("project_id")
-    if not project_id:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="project_id is required",
-        )
+    project_id = _require_authorized_project_id(ctx, "project.complete")
 
     cur = ctx.conn.execute("SELECT id, status, origin_principal_id FROM projects WHERE id = ?;", (project_id,))
     row = cur.fetchone()
@@ -1641,8 +1838,6 @@ def handle_project_complete(ctx: HandlerContext) -> HandlerResult:
             message=f"Project '{project_id}' is {status}, not active",
             details={"project_id": project_id, "status": status},
         )
-
-    check_authz(ctx.conn, "project.complete", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id)
 
     raw_report = ctx.args.get("report")
     if not raw_report:
@@ -1701,8 +1896,8 @@ def handle_project_complete(ctx: HandlerContext) -> HandlerResult:
                 message=f"Criterion '{crit_id}' is not marked met:true",
                 details={"criterion_id": crit_id, "reason": "not_met"},
             )
-        evidence = str(entry.get("evidence", "")).strip()
-        if not evidence:
+        raw_ev = entry.get("evidence")
+        if not isinstance(raw_ev, str) or not raw_ev.strip():
             raise MeshError(
                 code=c.CRITERIA_REPORT_INCOMPLETE,
                 exit_code=c.EXIT_USAGE,
@@ -1755,6 +1950,9 @@ def handle_project_complete(ctx: HandlerContext) -> HandlerResult:
     for ar in acur.fetchall():
         blocking.append(ar["id"])
 
+    # (d) active workspace delete/prune reservations
+    blocking.extend(list_project_ws_reservation_keys(ctx.conn, project_id))
+
     if blocking:
         raise MeshError(
             code=c.COMPLETION_BLOCKED,
@@ -1763,6 +1961,7 @@ def handle_project_complete(ctx: HandlerContext) -> HandlerResult:
             details={"blocking": blocking},
         )
 
+    report = redact_value(report)
     now = now_iso_utc()
     ctx.conn.execute(
         """UPDATE projects SET
@@ -1831,16 +2030,10 @@ def handle_project_complete(ctx: HandlerContext) -> HandlerResult:
 
 def handle_project_note(ctx: HandlerContext) -> HandlerResult:
     """Add an audit note to a project per plan §8."""
-    project_id = ctx.args.get("project_id")
+    project_id = _require_authorized_project_id(ctx, "project.note")
     text = ctx.args.get("text")
 
-    if not project_id:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="project_id is required",
-        )
-    if not text or len(text) > 4000:
+    if not isinstance(text, str) or not text or len(text) > 4000:
         raise MeshError(
             code=c.INVALID_ARGUMENT,
             exit_code=c.EXIT_USAGE,
@@ -1865,8 +2058,6 @@ def handle_project_note(ctx: HandlerContext) -> HandlerResult:
             details={"project_id": project_id, "status": row["status"]},
         )
 
-    check_authz(ctx.conn, "project.note", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id)
-
     record_event(
         conn=ctx.conn,
         type_="project.note",
@@ -1885,14 +2076,7 @@ def handle_project_note(ctx: HandlerContext) -> HandlerResult:
 
 async def handle_project_wait(server: Any, ctx: HandlerContext, reader: Any = None) -> HandlerResult:
     """Block until project reaches completed or terminal state per plan §13."""
-    project_id = ctx.args.get("project_id")
-    if not project_id:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="project_id is required",
-            details={"param": "project_id"},
-        )
+    project_id = _require_authorized_project_id(ctx, "project.wait")
 
     cur = ctx.conn.execute(
         """SELECT pr.id, pr.name, pr.goal, pr.status, pr.created_via,
@@ -1916,9 +2100,14 @@ async def handle_project_wait(server: Any, ctx: HandlerContext, reader: Any = No
             details={"project_id": project_id},
         )
 
-    check_authz(ctx.conn, "project.wait", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id)
-
     until = ctx.args.get("until", "completed")
+    if not isinstance(until, str):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Parameter 'until' must be a string",
+            details={"param": "until", "got": type(until).__name__},
+        )
     from mesh.core.states import PROJECT_TERMINAL_STATES
     if until == "completed":
         match_fn = lambda s: s == "completed"
@@ -1972,12 +2161,13 @@ async def handle_project_wait(server: Any, ctx: HandlerContext, reader: Any = No
                 )
 
             # Blind review P2: re-check credential and access on every pass of the wait.
-            _recheck_credential(ctx)
-            check_authz(ctx.conn, "project.wait", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id)
+            _recheck_wait_authz(ctx, "project.wait", project_id=project_id)
             cur = ctx.conn.execute(
                 """SELECT pr.id, pr.name, pr.goal, pr.status, pr.created_via,
                           pr.created_at, pr.updated_at, pr.completed_at, pr.origin_ref,
-                          op.name as origin, lp.name as lead
+                          op.name as origin, lp.name as lead,
+                          pr.repo_path, pr.base_branch, pr.integration_branch, pr.base_commit,
+                          pr.test_command_json
                    FROM projects pr
                    LEFT JOIN principals op ON pr.origin_principal_id = op.id
                    LEFT JOIN lead_assignments la ON pr.id = la.project_id AND la.ended_at IS NULL
@@ -1988,6 +2178,10 @@ async def handle_project_wait(server: Any, ctx: HandlerContext, reader: Any = No
             row = cur.fetchone()
             if match_fn(row["status"]):
                 data = dict(row)
+                repo_cols = {k: data.pop(k) for k in ("repo_path", "base_branch", "integration_branch",
+                                                      "base_commit", "test_command_json")}
+                if repo_cols["repo_path"]:
+                    data.update(_repo_view(repo_cols))
                 ccur = ctx.conn.execute(
                     """SELECT id, ordinal, text, created_at, superseded_at
                        FROM acceptance_criteria

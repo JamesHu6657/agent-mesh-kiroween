@@ -17,6 +17,9 @@ from unittest import mock
 
 from mesh.daemon import children
 
+# Real /proc scans in TestDeferredRecovery*: hold host-wide /proc lock shared (tests/run_tier.py).
+MESH_PROC_LOCK = "shared"
+
 
 def _git(cwd: str, *args: str) -> str:
     env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
@@ -722,10 +725,6 @@ class TestProbeExitAfterClose(unittest.TestCase):
         self.assertIn("hi", res.stdout)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestCaptureErrorNeverSubmits(unittest.TestCase):
     def test_needs_submit_git_false_on_capture_error(self) -> None:
         from mesh.daemon import supervisor
@@ -737,3 +736,7 @@ class TestCaptureErrorNeverSubmits(unittest.TestCase):
             self.assertTrue(supervisor._needs_submit_git(run, task, {"exit_code": 0, "signal": None}))
             self.assertFalse(supervisor._needs_submit_git(
                 run, task, {"exit_code": 0, "signal": None, "capture_error": "stdout.log: ENOSPC"}))
+
+
+if __name__ == "__main__":
+    unittest.main()

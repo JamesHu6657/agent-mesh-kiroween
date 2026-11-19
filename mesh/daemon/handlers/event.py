@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional
 import mesh.constants as c
 from mesh.core.authz import check_authz, get_agent_capabilities, lead_run_token_scope
 from mesh.core.clock import parse_duration
+from mesh.core.policy import MAX_INT64
+from mesh.core.redact import redact, redact_value
 from mesh.daemon.handlers.base import HandlerContext, HandlerResult
 from mesh.errors import MeshError
 
@@ -18,11 +20,24 @@ def handle_event_list(ctx: HandlerContext) -> HandlerResult:
     return _list_events(ctx, "event.list")
 
 
+def _str_arg(val: Any, name: str) -> Optional[str]:
+    if val is None:
+        return None
+    if not isinstance(val, str):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=f"Field '{name}' must be a string",
+            details={"param": name},
+        )
+    return val
+
+
 def _int_arg(val, name, lo, hi):
     """Full review: validate limit/since (no LIMIT -1 dumps, no INTERNAL_ERROR)."""
     if val is None:
         return None
-    if isinstance(val, bool):
+    if isinstance(val, (bool, float)):
         bad = True
     else:
         try:
@@ -39,9 +54,9 @@ def _int_arg(val, name, lo, hi):
 
 async def handle_event_tail_live(server: Any, ctx: HandlerContext, reader: Any, writer: Any) -> None:
     """Stream live events matching filters as NDJSON over the Unix socket."""
-    project_id = ctx.args.get("project")
-    task_id = ctx.args.get("task")
-    event_type = ctx.args.get("type")
+    project_id = _str_arg(ctx.args.get("project"), "project")
+    task_id = _str_arg(ctx.args.get("task"), "task")
+    event_type = _str_arg(ctx.args.get("type"), "type")
     since_seq = ctx.args.get("since")
     timeout_val = ctx.args.get("timeout")
 
@@ -71,7 +86,7 @@ async def handle_event_tail_live(server: Any, ctx: HandlerContext, reader: Any, 
         row_m = cur_m.fetchone()
         last_seq = row_m["m"] if row_m and row_m["m"] is not None else 0
     else:
-        last_seq = _int_arg(since_seq, "since", 0, None)
+        last_seq = _int_arg(since_seq, "since", 0, MAX_INT64)
 
     start_mono = time.monotonic()
     end_mono = (start_mono + timeout_s) if timeout_s is not None else None
@@ -175,9 +190,9 @@ async def handle_event_tail_live(server: Any, ctx: HandlerContext, reader: Any, 
                     "credential_id": r["credential_id"],
                     "from_state": r["from_state"],
                     "to_state": r["to_state"],
-                    "reason": r["reason"],
-                    "payload": payload,
-                    "request_id": r["request_id"],
+                    "reason": redact(r["reason"]) if isinstance(r["reason"], str) else r["reason"],
+                    "payload": redact_value(payload),
+                    "request_id": redact(r["request_id"]) if isinstance(r["request_id"], str) else r["request_id"],
                     "prev_hash": r["prev_hash"],
                     "hash": r["hash"],
                     "user_mac": r["user_mac"],
@@ -236,6 +251,12 @@ def _stream_still_authorized(ctx: HandlerContext, project_id: Any, task_id: Any)
             prow = ctx.conn.execute("SELECT disabled_at FROM principals WHERE id = ?;", (pid,)).fetchone()
             if prow is None or prow["disabled_at"] is not None:
                 return None
+        if ctx.via == "run_token":
+            run_id = ((ctx.principal or {}).get("scope") or {}).get("run_id")
+            if isinstance(run_id, str) and run_id:
+                rrow = ctx.conn.execute("SELECT status FROM runs WHERE id = ?;", (run_id,)).fetchone()
+                if rrow is not None and rrow["status"] not in ("starting", "running"):
+                    return None
         principal = dict(ctx.principal)
         caps = list(principal.get("capabilities") or [])
         if pid and ctx.actor_kind != "user":
@@ -252,14 +273,14 @@ def _stream_still_authorized(ctx: HandlerContext, project_id: Any, task_id: Any)
 
 def _list_events(ctx: HandlerContext, op: str) -> HandlerResult:
     """Internal event query implementation with strict operation parameter."""
-    project_id = ctx.args.get("project")
-    task_id = ctx.args.get("task")
-    event_type = ctx.args.get("type")
+    project_id = _str_arg(ctx.args.get("project"), "project")
+    task_id = _str_arg(ctx.args.get("task"), "task")
+    event_type = _str_arg(ctx.args.get("type"), "type")
     since_seq = ctx.args.get("since")
     limit = _int_arg(ctx.args.get("limit"), "limit", 1, 10000)
     if limit is None:
         limit = 100 if op == "event.tail" else 50
-    since_seq = _int_arg(since_seq, "since", 0, None)
+    since_seq = _int_arg(since_seq, "since", 0, MAX_INT64)
 
     if op == "event.tail" and since_seq is None:
         cur_m = ctx.conn.execute("SELECT MAX(seq) as m FROM events;")
@@ -338,9 +359,9 @@ def _list_events(ctx: HandlerContext, op: str) -> HandlerResult:
             "credential_id": r["credential_id"],
             "from_state": r["from_state"],
             "to_state": r["to_state"],
-            "reason": r["reason"],
-            "payload": payload,
-            "request_id": r["request_id"],
+            "reason": redact(r["reason"]) if isinstance(r["reason"], str) else r["reason"],
+            "payload": redact_value(payload),
+            "request_id": redact(r["request_id"]) if isinstance(r["request_id"], str) else r["request_id"],
             "prev_hash": r["prev_hash"],
             "hash": r["hash"],
             "user_mac": r["user_mac"],

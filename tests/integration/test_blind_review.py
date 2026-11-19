@@ -146,10 +146,6 @@ class TestRetryOverrideValidation(_Base):
         self.assertIn("pick", resp["error"]["message"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 TOKEN = "gh" + "p_" + "A1b2" * 9
 
 
@@ -310,3 +306,7 @@ class TestOversizeDrainDeadline(_Base):
             self.assertLess(time.monotonic() - t0, 8)
         finally:
             s.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

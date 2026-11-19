@@ -12,7 +12,7 @@ def get_project_active_lead(conn: sqlite3.Connection, project_id: str) -> Option
     """Get the active lead assignment and agent details for a project."""
     cur = conn.execute(
         """SELECT la.id as assignment_id, la.agent_id, la.started_at,
-                  p.name as agent_name, a.delivery, a.can_lead
+                  p.name as agent_name, p.disabled_at, a.delivery, a.can_lead
            FROM lead_assignments la
            JOIN principals p ON la.agent_id = p.id
            JOIN agents a ON la.agent_id = a.id
@@ -31,6 +31,17 @@ def is_project_lead(conn: sqlite3.Connection, project_id: str, principal_id: str
     if lead and lead["agent_id"] == principal_id:
         return True
     return False
+
+
+def is_acting_project_lead(conn: sqlite3.Connection, project_id: str, principal_id: str) -> bool:
+    """The active lead of `project_id` that may still act as a lead (full review r1 P2-1).
+
+    `agent update --no-can-lead` is allowed once the agent's projects are completed or
+    cancelled; their lead assignments stay (history, self-approval checks) but grant no
+    lead rights. `is_project_lead` keeps answering "is the assigned lead" for the
+    self-approval guards."""
+    lead = get_project_active_lead(conn, project_id)
+    return bool(lead and lead["agent_id"] == principal_id and lead["can_lead"])
 
 
 def can_principal_read_project(conn: sqlite3.Connection, principal_id: str, project_id: str) -> bool:
@@ -210,6 +221,34 @@ LEAD_RUN_TOKEN_SCOPED_READS = frozenset({
 })
 
 
+#: Mutating commands in `LEAD_RUN_TOKEN_CMDS`: refused once the project is cancelled.
+LEAD_RUN_TOKEN_MUTATING_CMDS = frozenset({
+    "approval.cancel",
+    "workspace.prune",
+    "workspace.delete",
+    "intake.submit",
+    "project.create",
+    "project.complete",
+    "project.note",
+    "project.deliver",
+    "task.create",
+    "task.assign",
+    "task.reassign",
+    "task.accept",
+    "task.reject",
+    "task.retry",
+    "task.escalate",
+    "task.cancel",
+    "task.close",
+    "task.merge",
+    "dep.add",
+    "dep.remove",
+    "approval.request",
+    "approval.consume",
+    "inbox.ack",
+})
+
+
 def lead_run_token_scope(principal: Dict[str, Any], via: str) -> Optional[str]:
     """The project a lead run token is confined to, or None for every other caller.
 
@@ -261,6 +300,17 @@ def _check_lead_run_token(
     current_id = current["assignment_id"] if current else None
     if not assignment_id or current_id != assignment_id:
         raise _lead_superseded(scope_project, assignment_id, current_id)
+    if not current["can_lead"]:
+        # Full review r2 P2-C: `agent update --no-can-lead` ends the agent's lead rights;
+        # a turn still running under its (kept) assignment is superseded too.
+        raise _lead_superseded(scope_project, assignment_id, None)
+
+    if current is not None and "disabled_at" in current.keys() and current["disabled_at"] is not None:
+        raise MeshError(
+            code=c.TOKEN_INVALID,
+            exit_code=c.EXIT_UNAUTHENTICATED,
+            message="Principal is disabled",
+        )
 
     # (2) The lead column of §7.3 (plus basic caller info commands; never adapter.*).
     if cmd not in LEAD_RUN_TOKEN_CMDS and cmd not in ANY_AUTH_INFO_CMDS:
@@ -311,6 +361,17 @@ def _check_lead_run_token(
                 details={"principal": principal.get("name"), "missing": "intake"},
             )
 
+    if resource_resolved and cmd in LEAD_RUN_TOKEN_MUTATING_CMDS and scope_project:
+        prow = conn.execute("SELECT status FROM projects WHERE id = ?;", (scope_project,)).fetchone()
+        pstatus = prow["status"] if prow else None
+        if pstatus is None or pstatus == "cancelled":
+            raise MeshError(
+                code=c.PROJECT_NOT_ACTIVE,
+                exit_code=c.EXIT_CONFLICT,
+                message=f"Project '{scope_project}' is {pstatus or 'missing'}, not active",
+                details={"project_id": scope_project, "status": pstatus},
+            )
+
 
 def check_authz(
     conn: sqlite3.Connection,
@@ -338,6 +399,18 @@ def check_authz(
     if actor_kind == "user" and via == "direct":
         return
 
+    # 1b. Disabled non-user principals can never act (including internal queued lead merges).
+    if isinstance(conn, sqlite3.Connection) and actor_kind != "user" and principal.get("id"):
+        prow = conn.execute(
+            "SELECT disabled_at FROM principals WHERE id = ?;", (principal["id"],)
+        ).fetchone()
+        if prow is not None and prow["disabled_at"] is not None:
+            raise MeshError(
+                code=c.TOKEN_INVALID,
+                exit_code=c.EXIT_UNAUTHENTICATED,
+                message="Principal is disabled",
+            )
+
     # 2. Config, agent, and audit operations are user-only (direct factor); the agent
     # roster reads are decided by their handler (leads get a roster view).
     if cmd in ROSTER_READ_CMDS and actor_kind == "agent":
@@ -358,6 +431,8 @@ def check_authz(
             current_id = current["assignment_id"] if current else None
             if not scope.get("lead_assignment_id") or current_id != scope.get("lead_assignment_id"):
                 raise _lead_superseded(scope.get("project_id"), scope.get("lead_assignment_id"), current_id)
+            if not current["can_lead"]:  # r2 P2-C
+                raise _lead_superseded(scope.get("project_id"), scope.get("lead_assignment_id"), None)
             return
     if cmd.startswith("config.") or cmd.startswith("agent.") or cmd.startswith("audit."):
         raise MeshError(
@@ -533,7 +608,7 @@ def check_authz(
     # 6. Project operations by lead or user
     if cmd in ("project.complete", "project.note"):
         if project_id:
-            if not is_project_lead(conn, project_id, principal["id"]):
+            if not is_acting_project_lead(conn, project_id, principal["id"]):
                 raise MeshError(
                     code=c.NOT_PROJECT_LEAD,
                     exit_code=c.EXIT_FORBIDDEN,
@@ -546,7 +621,7 @@ def check_authz(
     if cmd in ("project.pause", "project.resume", "project.cancel", "project.set_lead", "project.update",
                "project.deliver"):
         # Lead can execute these via approval
-        if project_id and not is_project_lead(conn, project_id, principal["id"]):
+        if project_id and not is_acting_project_lead(conn, project_id, principal["id"]):
             raise MeshError(
                 code=c.NOT_PROJECT_LEAD,
                 exit_code=c.EXIT_FORBIDDEN,
@@ -568,7 +643,7 @@ def check_authz(
                 message=f"'{cmd}' requires an explicit project for agent '{principal.get('name')}'",
                 details={"param": "project", "agent": principal.get("name")},
             )
-        if project_id and not is_project_lead(conn, project_id, principal["id"]):
+        if project_id and not is_acting_project_lead(conn, project_id, principal["id"]):
             raise MeshError(
                 code=c.NOT_PROJECT_LEAD,
                 exit_code=c.EXIT_FORBIDDEN,
@@ -593,7 +668,7 @@ def check_authz(
         "dep.remove",
     }
     if cmd in task_mutations:
-        if project_id and not is_project_lead(conn, project_id, principal["id"]):
+        if project_id and not is_acting_project_lead(conn, project_id, principal["id"]):
             raise MeshError(
                 code=c.NOT_PROJECT_LEAD,
                 exit_code=c.EXIT_FORBIDDEN,
@@ -699,7 +774,7 @@ def check_authz(
         ).fetchone() is not None:
             # Full review: an assignee lists its own task workspaces (the handler filters rows).
             pass
-        elif cmd in ("project.show", "project.leads", "project.wait", "workspace.list") or (
+        elif cmd in ("project.show", "project.leads", "project.wait", "workspace.list", "approval.list") or (
             cmd in ("run.show", "run.log") and not task_id
         ):
             if project_id and not can_principal_read_project(conn, agent_id, project_id):

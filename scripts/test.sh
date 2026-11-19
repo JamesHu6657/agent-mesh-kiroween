@@ -21,8 +21,8 @@ REPO_KEY="$(printf '%s' "$REPO_ROOT" | cksum | cut -d' ' -f1)"
 TRIPWIRE_FILE="/tmp/mesh-tripwire-suite-$REPO_KEY.log"
 TRIPWIRE_DEFAULT="/tmp/mesh-tripwire-hit.log"
 python3 -c "import os; [os.remove(p) for p in ('$TRIPWIRE_FILE', '$TRIPWIRE_DEFAULT') if os.path.exists(p)]"
-export MESH_TRIPWIRE_FILE="$TRIPWIRE_FILE"
-export MESH_SUITE_TRIPWIRE_FILE="$TRIPWIRE_FILE"
+export _TRIPWIRE_FILE="$TRIPWIRE_FILE"
+export _SUITE_TRIPWIRE_FILE="$TRIPWIRE_FILE"
 
 # Register suite ownership before cleanup, protecting this and concurrent suites.
 MESH_TEST_SUITE_ID="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
@@ -77,8 +77,9 @@ ORIG_PATH="$PATH"
 export PATH="$REPO_ROOT/tests/shims:$REPO_ROOT/bin:$PATH"
 
 # 1. Run unit test tier (pure offline, no real CLIs)
+# (via run_tier.py; replaces discover -s tests/unit)
 echo "=== Running Unit Tests ==="
-python3 -m unittest discover -s tests/unit -t .
+python3 tests/run_tier.py tests/unit
 
 # 2. Run integration tier with PATH prefixed with tripwire shims
 # (via run_tier.py; replaces discover -s tests/integration)

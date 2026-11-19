@@ -265,13 +265,16 @@ def check_run_session(conn: sqlite3.Connection, task_id: str, run_id: Optional[s
     )
 
 
-def get_lease_ttl_s(conn: sqlite3.Connection) -> int:
+def get_lease_ttl_s(conn: sqlite3.Connection, testing_mode: Optional[bool] = None) -> int:
     """Retrieve lease.ttl_s setting from database (default 120s)."""
+    from mesh.core.settings import is_testing_mode
+
     cur = conn.execute("SELECT value_json FROM settings WHERE key = 'lease.ttl_s';")
     row = cur.fetchone()
     if row and row["value_json"]:
         try:
-            return int(json.loads(row["value_json"]))
+            ttl = int(json.loads(row["value_json"]))
+            return ttl if is_testing_mode(testing_mode) else max(10, ttl)
         except Exception:
             return 120
     return 120
