@@ -3,17 +3,38 @@
 A local coordinator for CLI coding agents on one Linux machine.
 
 You describe a project, a lead agent breaks it into tasks, and Mesh hands each task to an
-executor: either a headless CLI it launches itself (droid, kiro-cli, agy, vibe) or an
-agent that polls its inbox (Claude Code, Cursor, Codex, a bot, anything that can run a
-shell command). Mesh tracks every task, run, lease and approval as a state machine, gives
-each code task its own git worktree, and lets the lead review and merge. Important
-decisions (gated actions and permission escalation) wait for the user's
+executor: either a headless CLI it launches itself (droid, kiro-cli, codex, claude, agy,
+vibe) or an agent that polls its inbox (Claude Code, Cursor, Codex, a bot, anything that
+can run a shell command). Mesh tracks every task, run, lease and approval as a state
+machine, gives each code task its own git worktree, and lets the lead review and merge.
+Important decisions (gated actions and permission escalation) wait for the user's
 approval.
 
 It is a daemon (`meshd`) with one SQLite database and a CLI (`mesh`) that talks to it
 over a Unix socket. There is no network listener and no web UI.
 
 Built for [Kiroween 2026](https://kiroween.devpost.com/) (Frankenstein category).
+
+## For Kiroween judges
+
+Mesh runs locally; there is no hosted app to log into. The shortest path through it, on a
+Linux machine with Python 3.11+ and git:
+
+```sh
+git clone https://github.com/JamesHu6657/agent-mesh-kiroween.git agent-mesh
+cd agent-mesh
+sh scripts/install.sh      # puts mesh in ~/.local/bin
+mesh setup                 # passphrase, daemon, lead agent, environment check
+mesh doctor
+bash scripts/test.sh       # unit, integration and recovery tiers, offline
+```
+
+Then follow [Your first project](#your-first-project-inbox-lead): it uses an inbox worker,
+so it needs no vendor CLI, API key or model account. Where to look next:
+
+- Kiro: `.kiro/` (specs, steering, agents, hooks) and [`docs/kiro-usage-log.md`](docs/kiro-usage-log.md).
+- Milestone gates and reviews: `docs/m*-gate-report.md`, `docs/review-r*.md`, `docs/reviews/`.
+- Adapter evidence: the table under [Status](#status), records in `tests/smoke/results/`.
 
 ## Requirements
 
@@ -139,6 +160,11 @@ mesh agent create --user --name kiro1 --adapter kiro \
 Set `MODEL_ID` to an id returned by `adapter models`; listing models may contact
 the vendor, but does not start inference. Creating an agent does not launch it.
 
+codex and claude have no example script yet and no model listing: pass the model ids you
+want with `--allowed-model` and `--default-model` (claude also accepts aliases such as
+`opus`). Commands, permission profiles and limits are in
+[`docs/adapters-codex-claude.md`](docs/adapters-codex-claude.md).
+
 Repo projects (`--repo /abs/path --base-branch main --test-command '["make","test"]'` on
 `intake submit`) give each code task its own worktree and branch, and the lead merges
 accepted work with a test step. Mesh never pushes, rebases or force-updates.
@@ -217,8 +243,22 @@ Current functionality:
   step, `project deliver`, workspace cleanup.
 - **Lead turns:** inbox leads for any agent; launch-mode leads only for the built-in test
   double (vendor CLIs as launch leads are refused until lead-turn recovery covers them).
-- **Adapters:** droid and kiro-cli passed real end-to-end runs; agy and vibe have
-  adapters without smoke evidence yet; hermes and openclaw are stubs.
+- **Adapters:** seven vendor CLIs have launch adapters, with the evidence below.
+
+| CLI (adapter) | Version | Evidence in this repository | Launch (default warn mode) |
+|---|---|---|---|
+| Factory Droid (`droid`) | 1.6.0 | smoke cases and two real end-to-end runs (readonly, code task) | yes |
+| Kiro CLI (`kiro`) | 3.1.0 | smoke cases (headless, session id, SIGTERM) and a readonly end-to-end run | yes |
+| Codex CLI (`codex`) | 0.166.0 (written against) | synthetic stream fixtures; hand-tested on a real machine, smoke evidence not committed yet | yes, with an evidence warning |
+| Claude Code (`claude`) | 2.1.325 (written against) | synthetic stream fixtures; hand-tested on a real machine, smoke evidence not committed yet | yes, with an evidence warning |
+| Antigravity (`agy`) | 1.5.4 | real stream fixtures for parsing; no smoke result | yes, with an evidence warning |
+| Mistral Vibe (`vibe`) | 3.1.0 | help-verified; no smoke result | yes, with an evidence warning |
+| Devin CLI (`devin`) | | experimental, `unrestricted` profile only | no: launch hold, see [docs/adapters-devin.md](docs/adapters-devin.md) |
+| Hermes, OpenClaw | | stub adapters | no; they can join as inbox agents |
+
+In strict mode only droid and kiro launch. Per-capability detail is in
+[`docs/adapters.md`](docs/adapters.md) and
+[`docs/adapters-codex-claude.md`](docs/adapters-codex-claude.md).
 
 Known security and operational limits are described in [the usage guide](docs/usage.md#5-security-model-and-honest-limits).
 
@@ -251,8 +291,9 @@ Agent Mesh was built by a mesh of AI agents coordinated by one person. Kiro wrot
 reviewed plans and specs, reviewed code, and is one of the CLIs Mesh can launch. The
 `.kiro/` directory holds the project's specs (`specs/`), steering files,
 agent configs and hooks (acceptance consistency, affected tests, secret scan). Plans,
-reviews and acceptance reports are kept in `docs/`. The private coordination log, handoff
-notes and raw agent logs are not part of this public snapshot.
+reviews and acceptance reports are kept in `docs/`; how Kiro was used, session by
+session, is in [`docs/kiro-usage-log.md`](docs/kiro-usage-log.md). The private
+coordination log, handoff notes and raw agent logs are not part of this public snapshot.
 
 ## License
 
