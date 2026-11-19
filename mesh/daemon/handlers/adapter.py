@@ -1,6 +1,7 @@
 """Handlers for adapter resource commands: adapter.list, adapter.show, adapter.probe, adapter.models."""
 
 import asyncio
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import mesh.constants as c
@@ -8,13 +9,18 @@ from mesh.adapters.base import Adapter, Probe, record_adapter_probe
 from mesh.adapters.evidence import apply_to_probe, effective_launch
 from mesh.adapters.registry import get_adapter, list_adapters
 from mesh.core.authz import check_authz
+from mesh.core.redact import redact_value
 from mesh.daemon.handlers.base import HandlerContext, HandlerResult
 from mesh.errors import MeshError
 
 
 def _extract_adapter_id(ctx: HandlerContext, required: bool) -> Optional[str]:
-    adapter_id = ctx.args.get("adapter_id") or ctx.args.get("id") or ctx.args.get("adapter")
-    if required and not adapter_id:
+    adapter_id = None
+    for key in ("adapter_id", "id", "adapter"):
+        if key in ctx.args and ctx.args[key] is not None:
+            adapter_id = ctx.args[key]
+            break
+    if required and adapter_id is None:
         raise MeshError(
             code=c.INVALID_ARGUMENT,
             exit_code=c.EXIT_USAGE,
@@ -59,14 +65,20 @@ def _extract_binary_arg(ctx: HandlerContext, allow_on_probe: bool) -> Optional[s
         )
 
     raw_bin = ctx.args.get("binary") if has_binary else ctx.args.get("binary_path")
-    if not isinstance(raw_bin, str) or not raw_bin.strip() or "\x00" in raw_bin:
+    if (
+        not isinstance(raw_bin, str)
+        or not raw_bin.strip()
+        or raw_bin.lstrip().startswith("-")
+        or any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_bin)
+    ):
+        # Same rule as agent.create / validate_adapter_options: no option-like or control-char paths.
         raise MeshError(
             code=c.INVALID_ARGUMENT,
             exit_code=c.EXIT_USAGE,
-            message="Field 'binary' must be a non-empty path string",
+            message="Field 'binary' must be a non-empty path string not starting with '-'",
             details={"param": "binary"},
         )
-    return raw_bin
+    return os.path.abspath(os.path.expanduser(raw_bin.strip()))
 
 
 def _authorize_adapter_cmd(ctx: HandlerContext) -> None:
@@ -124,7 +136,7 @@ async def prepare_adapter_command(ctx: HandlerContext, testing_mode: bool) -> No
 
     if cmd == "adapter.probe":
         binary_path = _extract_binary_arg(ctx, allow_on_probe=True)
-        adapter_id = _extract_adapter_id(ctx, required=False)
+        adapter_id = _extract_adapter_id(ctx, required=bool(binary_path))
         if adapter_id:
             adapter = get_adapter(adapter_id, testing_mode=testing_mode)
             if ctx.dry_run:
@@ -184,7 +196,7 @@ def handle_adapter_list(ctx: HandlerContext, testing_mode: bool) -> HandlerResul
             "results_file": pdata["results_file"],
             "note": note,
         })
-    return HandlerResult(data={"adapters": items, "items": items})
+    return HandlerResult(data=redact_value({"adapters": items, "items": items}, jsonl=True))
 
 
 def handle_adapter_show(ctx: HandlerContext, testing_mode: bool) -> HandlerResult:
@@ -209,14 +221,14 @@ def handle_adapter_show(ctx: HandlerContext, testing_mode: bool) -> HandlerResul
     data["vendor"] = None if adapter.kind in ("test_double", "none") else adapter.id
     if adapter.kind == "test_double":
         data["note"] = "not a vendor integration"
-    return HandlerResult(data=data)
+    return HandlerResult(data=redact_value(data, jsonl=True))  # r5 P1-4: vendor stderr/output
 
 
 def handle_adapter_probe(ctx: HandlerContext, testing_mode: bool) -> HandlerResult:
     """Probe adapter live or return cached verification evidence (ACC: N2)."""
     _authorize_adapter_cmd(ctx)
     binary_path = _extract_binary_arg(ctx, allow_on_probe=True)
-    adapter_id = _extract_adapter_id(ctx, required=False)
+    adapter_id = _extract_adapter_id(ctx, required=bool(binary_path))
 
     if adapter_id:
         adapter = get_adapter(adapter_id, testing_mode=testing_mode)
@@ -229,7 +241,7 @@ def handle_adapter_probe(ctx: HandlerContext, testing_mode: bool) -> HandlerResu
         else:
             adapter, probe = _probe_one_off_db(adapter, binary_path)
 
-        record_adapter_probe(ctx.conn, adapter.id, probe, binary_path or probe.binary_path)
+        record_adapter_probe(ctx.conn, adapter.id, probe, probe.binary_path or binary_path)
         data = apply_to_probe(
             probe.to_dict(),
             adapter,
@@ -239,7 +251,7 @@ def handle_adapter_probe(ctx: HandlerContext, testing_mode: bool) -> HandlerResu
         data["vendor"] = None if adapter.kind in ("test_double", "none") else adapter.id
         if adapter.kind == "test_double":
             data["note"] = "not a vendor integration"
-        return HandlerResult(data=data)
+        return HandlerResult(data=redact_value(data, jsonl=True))  # r5 P1-4: vendor stderr/output
 
     adapters = list_adapters(testing_mode=testing_mode)
     if ctx.dry_run:
@@ -255,14 +267,14 @@ def handle_adapter_probe(ctx: HandlerContext, testing_mode: bool) -> HandlerResu
 
     items = []
     for a, probe in pairs:
-        record_adapter_probe(ctx.conn, a.id, probe, binary_path or probe.binary_path)
+        record_adapter_probe(ctx.conn, a.id, probe, probe.binary_path or binary_path)
         pdict = apply_to_probe(probe.to_dict(), a, effective_launch(ctx.conn, a, testing_mode, binary_path))
         pdict["kind"] = a.kind
         pdict["vendor"] = None if a.kind in ("test_double", "none") else a.id
         if a.kind == "test_double":
             pdict["note"] = "not a vendor integration"
         items.append(pdict)
-    return HandlerResult(data={"probes": items, "items": items})
+    return HandlerResult(data=redact_value({"probes": items, "items": items}, jsonl=True))  # r5 P1-4: vendor stderr/output
 
 
 def handle_adapter_models(ctx: HandlerContext, testing_mode: bool) -> HandlerResult:
@@ -280,4 +292,4 @@ def handle_adapter_models(ctx: HandlerContext, testing_mode: bool) -> HandlerRes
         _, models = prepared[1]
     else:
         models = adapter.list_models()
-    return HandlerResult(data={"adapter": adapter_id, "models": models})
+    return HandlerResult(data=redact_value({"adapter": adapter_id, "models": models}, jsonl=True))

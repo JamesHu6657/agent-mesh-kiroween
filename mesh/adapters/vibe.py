@@ -17,9 +17,14 @@ from mesh.adapters.base import (
     RunRequest,
     RunResult,
     find_missing_flags,
+    is_safe_cli_token,
+    open_run_file_nofollow,
     parse_version_output,
+    read_run_file_nofollow,
     record_adapter_probe,
     run_readonly_cmd,
+    validate_adapter_options,
+    validate_run_request_tokens,
 )
 
 
@@ -60,6 +65,8 @@ class VibeAdapter(Adapter):
         raise ProfileUnsupported(self.id, profile)
 
     def build(self, req: RunRequest) -> CommandSpec:
+        validate_run_request_tokens(req)
+        validate_adapter_options(self.id, req.options, strict_keys=False)
         if req.effort:
             raise EffortUnsupported(self.id)
 
@@ -125,7 +132,9 @@ class VibeAdapter(Adapter):
         # (the stream already has model text; a missing export is not classified as a failed
         # run) and session_id comes from the stream.
         scan = _scan_stream(os.path.join(run_dir, "stdout.log"))
-        export = _read_export(os.path.join(run_dir, "vibe-out", "export.json"))
+        vibe_out_dir = os.path.join(run_dir, "vibe-out")
+        _redact_output_dir(vibe_out_dir)
+        export = _read_export(os.path.join(vibe_out_dir, "export.json"))
         session_id = None
         usage = None
         meaning = None
@@ -134,7 +143,7 @@ class VibeAdapter(Adapter):
             export = None
         if export is not None:
             sid = export.get("session_id")
-            if isinstance(sid, str) and sid:
+            if is_safe_cli_token(sid):
                 session_id = sid
             usage = _export_usage(export)
             meaning = _exit_meaning(export)
@@ -178,7 +187,7 @@ class VibeAdapter(Adapter):
             if not isinstance(event, dict):
                 continue
             sid = event.get("sessionId")
-            if isinstance(sid, str) and sid:
+            if is_safe_cli_token(sid):
                 facts["session_id"] = sid
                 break
         return facts
@@ -259,6 +268,8 @@ class VibeAdapter(Adapter):
         res_h = run_readonly_cmd([bin_path, "--help"], timeout_s=timeout_s)
         if res_h.returncode != 0:
             caps = {name: c.to_dict() for name, c in self.capabilities.items()}
+            for cdict in caps.values():
+                cdict["verification"] = "none"
             probe = Probe(
                 adapter=self.id,
                 version=v,
@@ -352,16 +363,139 @@ _EXPORT_SCALARS = ("cost_usd", "steps", "outcome", "stop_reason", "exit_code")
 
 
 _EXPORT_NOT_OBJECT = object()
+_MAX_VIBE_FILE_BYTES = 50 * 1024 * 1024
+
+
+def _redact_output_dir(out_dir: str) -> None:
+    """Full review r5 P1-4 / r6 P1-5: vibe writes ``--output-dir`` itself (not through
+    runwrap), so all files under it are redacted recursively in place with full JSONL
+    rules; symlinks (including ``vibe-out`` itself) and unrewritable files are unlinked."""
+    import stat
+    import tempfile
+    from mesh.core.paths import resolve_trusted_path
+    from mesh.core.redact import redact_json_text
+
+    if not isinstance(out_dir, str) or not out_dir.strip():
+        return
+    out_clean = out_dir.rstrip(os.sep)
+    if not out_clean:
+        return
+    try:
+        st_top = os.lstat(out_clean)
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+    if stat.S_ISLNK(st_top.st_mode) or not stat.S_ISDIR(st_top.st_mode):
+        try:
+            os.unlink(out_clean)
+        except OSError:
+            pass
+        return
+    parent_real = os.path.realpath(os.path.dirname(out_clean) or ".")
+    trusted_out = resolve_trusted_path(
+        os.path.join(parent_real, os.path.basename(out_clean)),
+        root=parent_real,
+    )
+    if trusted_out is None:
+        return
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        os.chmod(trusted_out, 0o700)
+    except OSError:
+        pass
+    for dirpath, dirnames, _ in os.walk(trusted_out, topdown=True, followlinks=False):
+        if dirpath != trusted_out and resolve_trusted_path(dirpath, root=trusted_out) is None:
+            dirnames[:] = []
+            continue
+        for dname in list(dirnames):
+            dpath = os.path.join(dirpath, dname)
+            if os.path.islink(dpath):
+                try:
+                    os.unlink(dpath)
+                except OSError:
+                    pass
+                dirnames.remove(dname)
+                continue
+            try:
+                os.chmod(dpath, 0o700)
+            except OSError:
+                pass
+    for dirpath, dirnames, filenames in os.walk(trusted_out, topdown=False, followlinks=False):
+        if dirpath != trusted_out and resolve_trusted_path(dirpath, root=trusted_out) is None:
+            continue
+        for dname in dirnames:
+            dpath = os.path.join(dirpath, dname)
+            try:
+                if os.path.islink(dpath):
+                    os.unlink(dpath)
+            except OSError:
+                pass
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            tmp = None
+            try:
+                lst = os.lstat(path)
+                if stat.S_ISLNK(lst.st_mode) or not stat.S_ISREG(lst.st_mode):
+                    os.unlink(path)
+                    continue
+                if lst.st_size > _MAX_VIBE_FILE_BYTES:
+                    os.unlink(path)
+                    continue
+                with open_run_file_nofollow(
+                    path, encoding="utf-8-sig", errors="replace", max_bytes=_MAX_VIBE_FILE_BYTES
+                ) as f:
+                    raw = f.read(_MAX_VIBE_FILE_BYTES + 1)
+                if len(raw) > _MAX_VIBE_FILE_BYTES:
+                    os.unlink(path)
+                    continue
+                red = redact_json_text(raw)
+                if red != raw:
+                    tfd, tmp = tempfile.mkstemp(dir=dirpath, prefix=f".{name}.redact.")
+                    with os.fdopen(tfd, "w", encoding="utf-8") as wf:
+                        wf.write(red)
+                    os.chmod(tmp, 0o600)
+                    if os.path.islink(path):
+                        os.unlink(tmp)
+                        tmp = None
+                        os.unlink(path)
+                        continue
+                    os.replace(tmp, path)
+                    tmp = None
+            except Exception:  # noqa: BLE001 - fail closed
+                if tmp is not None:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                try:
+                    os.chmod(dirpath, 0o700)
+                    os.unlink(path)
+                except OSError:
+                    try:
+                        os.chmod(path, 0o600)
+                        tfd = os.open(path, os.O_WRONLY | os.O_TRUNC | nofollow)
+                        os.close(tfd)
+                    except OSError:
+                        pass
 
 
 def _read_export(path: str) -> Any:
     """vibe-out/export.json as a dict; None if missing, unreadable or not valid JSON;
     _EXPORT_NOT_OBJECT if it is valid JSON but not an object.
 
-    Opened as utf-8-sig so a leading BOM is stripped.
+    Opened as utf-8-sig so a leading BOM is stripped. Symlinks and non-regular files are rejected.
     """
+    if not isinstance(path, str) or not path.strip():
+        return None
+    clean = path.rstrip(os.sep)
+    parent = os.path.dirname(clean)
+    if (parent and os.path.islink(parent)) or os.path.islink(clean):
+        return None
     try:
-        with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+        with open_run_file_nofollow(
+            clean, encoding="utf-8-sig", errors="replace", max_bytes=_MAX_VIBE_FILE_BYTES
+        ) as f:
             data = json.load(f)
     except (OSError, ValueError, RecursionError):
         return None
@@ -457,8 +591,8 @@ def _export_error_set(value: Any) -> bool:
 def _stderr_tail(path: str) -> Optional[str]:
     """Last non-empty line of stderr.log (its last 500 chars), or None if missing/empty/unreadable."""
     try:
-        with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
-            lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
+        raw = read_run_file_nofollow(path, encoding="utf-8-sig", errors="replace")
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
     except OSError:
         return None
     if not lines:
@@ -487,7 +621,7 @@ def _scan_stream(path: str) -> Dict[str, Any]:
     empty = {"session_id": None, "final_text": None, "malformed": 0, "saw_assistant": False}
     scan: Dict[str, Any] = dict(empty)
     try:
-        with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+        with open_run_file_nofollow(path, encoding="utf-8-sig", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -500,7 +634,7 @@ def _scan_stream(path: str) -> Dict[str, Any]:
                 if not isinstance(event, dict):
                     continue
                 sid = event.get("sessionId")
-                if scan["session_id"] is None and isinstance(sid, str) and sid:
+                if scan["session_id"] is None and is_safe_cli_token(sid):
                     scan["session_id"] = sid
                 if event.get("type") == "message" and event.get("role") == "assistant":
                     scan["saw_assistant"] = True

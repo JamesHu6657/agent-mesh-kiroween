@@ -58,8 +58,8 @@ class TestAdaptersIntegration(unittest.TestCase):
             adapters = resp["data"]["adapters"]
             ids = [a["id"] for a in adapters]
 
-            # droid, agy, kiro, vibe, hermes, openclaw (+ none)
-            expected_ids = ["droid", "agy", "kiro", "vibe", "hermes", "openclaw", "none"]
+            # droid, agy, kiro, vibe, codex, claude, devin, hermes, openclaw (+ none)
+            expected_ids = ["droid", "agy", "kiro", "vibe", "codex", "claude", "devin", "hermes", "openclaw", "none"]
             self.assertEqual(ids, expected_ids)
             self.assertNotIn("fake", ids)
 
@@ -70,6 +70,9 @@ class TestAdaptersIntegration(unittest.TestCase):
                 "agy": "1.5.2",
                 "kiro": "3.1.0",
                 "vibe": "3.1.0",
+                "codex": None,
+                "claude": None,
+                "devin": None,
                 "hermes": None,
                 "openclaw": None,
                 "none": None,
@@ -115,6 +118,28 @@ class TestAdaptersIntegration(unittest.TestCase):
                     self.assertEqual(a["status"], "not_installed")
                     self.assertFalse(a["launch_enabled"])
                     self.assertIsNone(a["version"])
+                elif aid in ("codex", "claude", "devin"):
+                    # feat/codex-claude-adapters: no codex/claude stub; a tests/shims tripwire on
+                    # PATH (or no binary at all) counts as not installed.
+                    # launch_enabled follows effective_launch like the other vendors: in the
+                    # default warn evidence mode an evidence gap is a warning, so it may be True
+                    # even when the binary is missing (agent create still probes the binary).
+                    if get_adapter(aid, testing_mode=False).resolve_binary() is None:
+                        self.assertEqual(a["status"], "not_installed")
+                        self.assertIsNone(a["version"])
+                    conn_cc = harness_no_test.db()
+                    try:
+                        ev_cc = effective_launch(conn_cc, get_adapter(aid, testing_mode=False), False, None, env={})
+                    finally:
+                        conn_cc.close()
+                    self.assertEqual(a["launch_enabled"], ev_cc.ok)
+                    if aid == "devin":
+                        # Round 3 B5: devin is held until M5 smoke evidence exists.
+                        self.assertFalse(a["launch_enabled"])
+                        self.assertEqual(a.get("launch_reason"), "launch_held")
+                        self.assertEqual(a["launch_milestone"], LAUNCH_HOLDS["devin"])
+                    else:
+                        self.assertNotEqual(a.get("launch_reason"), "launch_held")
 
             # ACC: N3 - Without testing mode: agent create --adapter fake -> rc 13 TEST_DOUBLE_DISABLED
             rc_fake, resp_fake = harness_no_test.cli(

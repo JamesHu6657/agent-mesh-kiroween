@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import mesh.constants as c
 from mesh.errors import MeshError, SchemaTooNewError
 from mesh.core.auth import parse_kdf_params
-from mesh.core.db import connect
+from mesh.core.db import connect, parse_schema_version
 from mesh.core.schema import CURRENT_SCHEMA_VERSION
 from mesh.core.invariants import check_invariants
 from mesh.core.paths import (
@@ -467,11 +467,13 @@ def _strict_schema_version(conn: sqlite3.Connection, db_path: str) -> int:
     if row is None:
         raise _db_error(db_path, "schema_version missing in meta table")
     raw = row["value"]
-    if isinstance(raw, bool) or not (isinstance(raw, int) or (isinstance(raw, str) and raw.isascii() and raw.isdigit())):
+    version = parse_schema_version(raw)
+    if version is None:
         raise _db_error(db_path, f"schema_version is not an integer: {raw!r}")
-    version = int(raw)
     if version > CURRENT_SCHEMA_VERSION:
         raise SchemaTooNewError(current_version=version, supported_version=CURRENT_SCHEMA_VERSION)
+    if version < 1:
+        raise _db_error(db_path, f"schema_version out of range: {version}")
     return version
 
 
@@ -492,28 +494,33 @@ def _read_home_state(db_path: str) -> Dict[str, Any]:
             qc = conn.execute("PRAGMA quick_check;").fetchall()
             if [tuple(r) for r in qc] != [("ok",)]:
                 raise _db_error(db_path, "quick_check failed: " + "; ".join(str(r[0]) for r in qc[:5]))
-            _strict_schema_version(conn, db_path)
-            krow = conn.execute(
-                "SELECT c.kdf_params FROM credentials c JOIN principals p ON c.principal_id = p.id "
-                "WHERE p.kind = 'user' AND c.kind = 'passphrase' LIMIT 1;"
-            ).fetchone()
-            if krow is None:
-                raise _db_error(db_path, "no user passphrase credential row")
-            # Raw stored value; parsed by parse_kdf_params (fail closed) by the caller.
-            kdf_raw = krow["kdf_params"]
-            row = conn.execute("SELECT value_json FROM settings WHERE key = 'workspaces.root';").fetchone()
-            configured_ws = None
-            if row is not None and row["value_json"]:
-                try:
-                    configured_ws = json.loads(row["value_json"])
-                except ValueError as e:
-                    raise _db_error(db_path, "settings workspaces.root is not valid JSON", e) from e
-                if configured_ws is not None and not isinstance(configured_ws, str):
-                    raise _db_error(db_path, "settings workspaces.root is not a path string")
-            repo_rows = conn.execute(
-                "SELECT DISTINCT repo_path FROM projects WHERE repo_path IS NOT NULL;"
-            ).fetchall()
-            repo_paths = [r[0] for r in repo_rows if r[0]]
+            conn.execute("BEGIN DEFERRED;")
+            try:
+                _strict_schema_version(conn, db_path)
+                krow = conn.execute(
+                    "SELECT c.kdf_params FROM credentials c JOIN principals p ON c.principal_id = p.id "
+                    "WHERE p.kind = 'user' AND c.kind = 'passphrase' LIMIT 1;"
+                ).fetchone()
+                if krow is None:
+                    raise _db_error(db_path, "no user passphrase credential row")
+                # Raw stored value; parsed by parse_kdf_params (fail closed) by the caller.
+                kdf_raw = krow["kdf_params"]
+                row = conn.execute("SELECT value_json FROM settings WHERE key = 'workspaces.root';").fetchone()
+                configured_ws = None
+                if row is not None and row["value_json"]:
+                    try:
+                        configured_ws = json.loads(row["value_json"])
+                    except ValueError as e:
+                        raise _db_error(db_path, "settings workspaces.root is not valid JSON", e) from e
+                    if configured_ws is not None and not isinstance(configured_ws, str):
+                        raise _db_error(db_path, "settings workspaces.root is not a path string")
+                repo_rows = conn.execute(
+                    "SELECT DISTINCT repo_path FROM projects WHERE repo_path IS NOT NULL;"
+                ).fetchall()
+                repo_paths = [r[0] for r in repo_rows if r[0]]
+            finally:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK;")
         except sqlite3.Error as e:
             raise _db_error(db_path, "database query failed", e) from e
     finally:
@@ -624,8 +631,13 @@ def handle_doctor(args: argparse.Namespace) -> Dict[str, Any]:
         try:
             conn = connect(db_path, read_only=True)
             try:
-                _strict_schema_version(conn, db_path)
-                violations = check_invariants(conn)
+                conn.execute("BEGIN DEFERRED;")
+                try:
+                    _strict_schema_version(conn, db_path)
+                    violations = check_invariants(conn)
+                finally:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK;")
             finally:
                 conn.close()
         except sqlite3.Error as e:

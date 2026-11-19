@@ -130,6 +130,8 @@ def run_registered(kind: str, argv: List[str], timeout: Optional[float] = None, 
     """Blocking ``subprocess.run`` equivalent for meshd-owned children (git, probes)."""
     input_data = kwargs.pop("input", None)
     check = kwargs.pop("check", False)
+    if input_data is not None and "stdin" not in kwargs:
+        kwargs["stdin"] = subprocess.PIPE
     if kwargs.pop("capture_output", False):
         kwargs["stdout"] = subprocess.PIPE
         kwargs["stderr"] = subprocess.PIPE
@@ -183,7 +185,22 @@ async def create_subprocess_exec_registered(kind: str, *argv: str, **kwargs: Any
     """
     with spawn_window():
         proc = await asyncio.create_subprocess_exec(*argv, **kwargs)
-        register(proc.pid, kind)
+        try:
+            register(proc.pid, kind)
+        except BaseException:
+            import signal as _signal
+
+            if kwargs.get("start_new_session"):
+                try:
+                    os.killpg(proc.pid, _signal.SIGKILL)
+                except OSError:
+                    pass
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            await proc.wait()
+            raise
     return proc
 
 

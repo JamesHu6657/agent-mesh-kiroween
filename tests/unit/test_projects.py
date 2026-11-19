@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 import mesh.constants as c
+from mesh.core.events import record_event
 from mesh.core.approvals import (
     compute_op_hash,
     compute_user_approval_mac,
@@ -29,6 +30,16 @@ from mesh.daemon.handlers.event import handle_event_list
 from mesh.daemon.handlers.run import handle_workspace_list
 from mesh.daemon.handlers.task import handle_task_list
 from mesh.errors import MeshError
+
+
+def _record_decision(conn, apr_id, actor_id, via="direct"):
+    """R3 P1-1: a consume checks the decision against its hash-chained approval.decided event;
+    fixtures that approve by SQL record that event too."""
+    row = conn.execute("SELECT op_hash, project_id, task_id FROM approvals WHERE id = ?;", (apr_id,)).fetchone()
+    record_event(conn=conn, type_="approval.decided", actor_id=actor_id,
+                 actor_kind="user" if via == "direct" else "agent", via=via,
+                 project_id=row["project_id"], task_id=row["task_id"], approval_id=apr_id,
+                 payload={"approval_id": apr_id, "decision": "approved", "op_hash": row["op_hash"]})
 
 
 class TestApprovalsCore(unittest.TestCase):
@@ -99,6 +110,7 @@ class TestApprovalsCore(unittest.TestCase):
             "UPDATE approvals SET status = 'approved', decided_by = 'usr_1', decided_via = 'direct', decided_at = '2026-01-01T00:00:00Z', user_mac = 'valid_mac' WHERE id = ?;",
             (apr_id,),
         )
+        _record_decision(self.conn, apr_id, "usr_1")
 
         # Consume with different op params should fail OP_HASH_MISMATCH
         with self.assertRaises(MeshError) as cm:
@@ -278,6 +290,7 @@ class TestAuthzMatrix(unittest.TestCase):
 
         # 6. Relayer cannot be current lead of affected project (SELF_APPROVAL)
         self.conn.execute("UPDATE lead_assignments SET agent_id = 'grok' WHERE id = 'asg_1';")
+        self.conn.execute("UPDATE agents SET can_lead = 1 WHERE id = 'grok';")  # a real lead has can_lead
         with self.assertRaises(MeshError) as cm:
             check_authz(self.conn, "project.set_lead", {"id": "grok", "name": "grok", "capabilities": ["intake", "relay"]}, "agent", "relayed", project_id="prj_1")
         self.assertEqual(cm.exception.code, c.SELF_APPROVAL)
@@ -554,7 +567,8 @@ class TestAuthzMatrix(unittest.TestCase):
             check_authz(self.conn, "config.set", lead_principal, "agent", "run_token", project_id="prj_1")
         self.assertEqual(cm.exception.code, c.CAPABILITY_MISSING)
 
-        # The new assignment's own token works again.
+        # The new assignment's own token works again (set-lead requires can_lead).
+        self.conn.execute("UPDATE agents SET can_lead = 1 WHERE id = 'plain';")
         new_principal = {"id": "plain", "name": "plain", "capabilities": ["intake"],
                          "scope": {"role": "lead", "run_id": "run_lt2", "project_id": "prj_1",
                                    "lead_assignment_id": "asg_1b"}}
@@ -680,12 +694,27 @@ class TestAuthzMatrix(unittest.TestCase):
                 # Each handler still works for the requester inside the scope.
                 own_id = "apr_own_" + cmd.split(".")[1] + str(len(caps))
                 status = "approved" if cmd == "approval.consume" else "pending"
-                self.conn.execute(
-                    """INSERT INTO approvals (id, project_id, category, op_type, op_json, op_hash, summary, requested_by, requested_at, expires_at, status, decided_via, decided_at, user_mac)
-                       VALUES (?, 'prj_1', 'deploy', 'external.deploy', '{}', ?, 'S', 'lead1', 'now', '2999-01-01T00:00:00.000Z', ?, 'direct', 'now', 'mac');""",
-                    (own_id, "hash_" + own_id, status),
-                )
-                result = handler(ctx(caps, cmd, own_id))
+                if cmd == "approval.consume":
+                    # R3 P1-1: a consume verifies the row against the hash chain, so this one
+                    # is a real request with a recorded decision.
+                    own = create_or_get_pending_approval(
+                        conn=self.conn, category="deploy", op="external.deploy", requested_by="lead1",
+                        params={"n": own_id}, summary="S", project_id="prj_1")
+                    own_id = own["approval_id"]
+                    self.conn.execute(
+                        "UPDATE approvals SET status = 'approved', decided_by = 'usr_1', decided_via = 'direct', "
+                        "decided_at = 'now', user_mac = 'mac' WHERE id = ?;", (own_id,))
+                    _record_decision(self.conn, own_id, "usr_1")
+                else:
+                    self.conn.execute(
+                        """INSERT INTO approvals (id, project_id, category, op_type, op_json, op_hash, summary, requested_by, requested_at, expires_at, status, decided_via, decided_at, user_mac)
+                           VALUES (?, 'prj_1', 'deploy', 'external.deploy', '{}', ?, 'S', 'lead1', 'now', '2999-01-01T00:00:00.000Z', ?, 'direct', 'now', 'mac');""",
+                        (own_id, "hash_" + own_id, status),
+                    )
+                own_ctx = ctx(caps, cmd, own_id)
+                if cmd == "approval.consume":
+                    own_ctx.args["op_hash"] = own["op_hash"]
+                result = handler(own_ctx)
                 result_id = result.data["id"] if cmd == "approval.show" else result.data["approval_id"]
                 self.assertEqual(result_id, own_id, (caps, cmd))
                 expected = {"approval.consume": "consumed", "approval.cancel": "cancelled"}.get(cmd, status)

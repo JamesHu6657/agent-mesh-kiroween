@@ -46,9 +46,11 @@ a crash during recovery followed by another recovery neither repeats a
 transition nor duplicates a notification (J3).
 """
 
+import contextlib
 import json
 import os
 import sqlite3
+import subprocess
 import time
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
@@ -246,19 +248,35 @@ def _adopt(conn: sqlite3.Connection, home: str, run: Mapping[str, Any], old_hold
     return "adopted"
 
 
-def _close_without_process(conn: sqlite3.Connection, run: Mapping[str, Any], end_reason: str) -> None:
+def _close_without_process(
+    conn: sqlite3.Connection,
+    run: Mapping[str, Any],
+    end_reason: str,
+    testing_mode: Optional[bool] = None,
+) -> None:
     """Close a run none of whose processes exist any more and apply the task transition."""
     status = RECOVERY_END_STATUS[end_reason]
+    pending = supervisor._pending_failure(run) if run["kind"] == "task" else None
     task = conn.execute("SELECT * FROM tasks WHERE id = ?;", (run["task_id"],)).fetchone()
     with transaction(conn):
-        supervisor._close_run(conn, run, status, end_reason, None, {"reason": end_reason})
+        if testing_mode is None:
+            supervisor._close_run(conn, run, status, end_reason, None, {"reason": end_reason})
+        else:
+            supervisor._close_run(
+                conn, run, status, end_reason, None, {"reason": end_reason}, testing_mode=testing_mode
+            )
         if task is None:
             return
         if task["status"] == "cancelling":
             supervisor._task_cancelled(conn, task, run, "cancelled")
         elif task["status"] == "running":
-            tail = supervisor.stderr_tail(run["run_dir"]) if os.path.isdir(run["run_dir"] or "") else []
-            supervisor._task_failed(conn, task, run, end_reason, {}, tail)
+            if pending:
+                supervisor._task_failed(
+                    conn, task, run, "reported", {"message": pending.get("message", "")}, reporter=pending
+                )
+            else:
+                tail = supervisor.stderr_tail(run["run_dir"]) if os.path.isdir(run["run_dir"] or "") else []
+                supervisor._task_failed(conn, task, run, end_reason, {}, tail)
         # submitted: only the run closes (the lead still reviews the submission).
 
 
@@ -297,8 +315,28 @@ def _terminate_group(conn: sqlite3.Connection, home: str, run: Mapping[str, Any]
                f"targets {t.initial_pids}")
 
 
+def _is_spawn_aborted(conn: sqlite3.Connection, run: Mapping[str, Any]) -> bool:
+    """True when `handle_spawn_failure` began a post-Popen abort before meshd died."""
+    run_dir = (run["run_dir"] if "run_dir" in run.keys() else "") or ""
+    seen_doc = _read_json(os.path.join(run_dir, supervisor.SEEN_FILE))
+    if (
+        seen_doc is not None
+        and seen_doc.get(supervisor.SEEN_MARKER_KEY) == "unusable"
+        and seen_doc.get("reason") == "spawn_abort_pending"
+    ):
+        return True
+    if run["status"] != "starting" or not isinstance(conn, sqlite3.Connection):
+        return False
+    revoked = conn.execute(
+        "SELECT 1 FROM credentials WHERE kind = 'run_token' "
+        "AND json_extract(scope_json, '$.run_id') = ? AND revoked_at IS NOT NULL LIMIT 1;",
+        (run["id"],),
+    ).fetchone()
+    return revoked is not None
+
+
 def _recover_run(conn: sqlite3.Connection, home: str, row: Mapping[str, Any], boot_id: str,
-                 live: Optional[_Live] = None) -> str:
+                 live: Optional[_Live] = None, testing_mode: Optional[bool] = None) -> str:
     """``live`` (PR #40 r2/r3): set when the live supervisor retries a deferred run.
     Nothing then blocks: process scans are single passes, the spawn-window wait is one
     check per tick until ``live.wait_until`` (``_StillWaiting``), and an exited run is
@@ -313,6 +351,10 @@ def _recover_run(conn: sqlite3.Connection, home: str, row: Mapping[str, Any], bo
     run_dir = run["run_dir"] or ""
     wrapper = _read_json(os.path.join(run_dir, "wrapper.json"))
     exit_path = os.path.join(run_dir, "exit.json")
+
+    if _is_spawn_aborted(conn, run):
+        return _lost(conn, home, run, "spawn_failed", boot_id, found=found_so_far(), live_ctx=live,
+                     testing_mode=testing_mode)
 
     if _identity_alive(wrapper):
         return _adopt(conn, home, run, old_holder, boot_id, wrapper or {}, found=found_so_far())
@@ -340,9 +382,13 @@ def _recover_run(conn: sqlite3.Connection, home: str, row: Mapping[str, Any], bo
             return "skipped"
         if not fresh["wrapper_pid"]:
             # exit.json without any wrapper identity cannot come from runwrap; treat as lost.
-            return _lost(conn, home, fresh, "lost_on_restart", boot_id, found=found_so_far(), live_ctx=live)
+            return _lost(conn, home, fresh, "lost_on_restart", boot_id, found=found_so_far(), live_ctx=live,
+                         testing_mode=testing_mode)
         _hand_over(home, fresh, found_so_far())
-        supervisor._watch_one(conn, home, fresh)
+        if testing_mode is None:
+            supervisor._watch_one(conn, home, fresh)
+        else:
+            supervisor._watch_one(conn, home, fresh, testing_mode=testing_mode)
         after = _reload_run(conn, run_id)
         chk = supervisor._CLEAR.get(run_id)
         if (live_wait_until is None and after is not None and after["status"] in ("starting", "running")
@@ -351,7 +397,10 @@ def _recover_run(conn: sqlite3.Connection, home: str, row: Mapping[str, Any], bo
             # take the confirming second empty scan one poll later in this call
             # (m3-runtargets-race), so a clean exit is still closed from exit.json.
             time.sleep(max(0.0, chk.first_empty_at + terminate.POLL_S - time.monotonic()))
-            supervisor._watch_one(conn, home, after)
+            if testing_mode is None:
+                supervisor._watch_one(conn, home, after)
+            else:
+                supervisor._watch_one(conn, home, after, testing_mode=testing_mode)
             after = _reload_run(conn, run_id)
         if after is not None and after["status"] in ("starting", "running") \
                 and (run_id in supervisor._SEEN_UNUSABLE or terminate.get(run_id) is not None):
@@ -363,7 +412,8 @@ def _recover_run(conn: sqlite3.Connection, home: str, row: Mapping[str, Any], bo
         return "exit_deferred"
 
     if wrapper:
-        return _lost(conn, home, run, "lost_on_restart", boot_id, found=found_so_far(), live_ctx=live)
+        return _lost(conn, home, run, "lost_on_restart", boot_id, found=found_so_far(), live_ctx=live,
+                     testing_mode=testing_mode)
 
     # No wrapper.json: crash before or during the spawn (§11.7 step 2, last case).
     if live is not None:
@@ -380,7 +430,8 @@ def _recover_run(conn: sqlite3.Connection, home: str, row: Mapping[str, Any], bo
                 return _adopt(conn, home, run, old_holder, boot_id, wrapper, found=dict(live.found))
             if time.monotonic() < live.wait_until:
                 raise _StillWaiting(run_id)
-        return _lost(conn, home, run, "lost_before_spawn", boot_id, found=dict(live.found), live_ctx=live)
+        return _lost(conn, home, run, "lost_before_spawn", boot_id, found=dict(live.found), live_ctx=live,
+                     testing_mode=testing_mode)
     carriers = _env_carriers(run_id)
     if carriers:
         deadline = time.monotonic() + WRAPPER_WAIT_S
@@ -391,11 +442,13 @@ def _recover_run(conn: sqlite3.Connection, home: str, row: Mapping[str, Any], bo
             time.sleep(WRAPPER_POLL_S)
     # Review #20c (Linear): the carriers found above are handed on; a parent that exits
     # while we wait for wrapper.json must not lose its re-parented empty-env child.
-    return _lost(conn, home, run, "lost_before_spawn", boot_id, found=carriers)
+    return _lost(conn, home, run, "lost_before_spawn", boot_id, found=carriers,
+                 testing_mode=testing_mode)
 
 
 def _lost(conn: sqlite3.Connection, home: str, run: Mapping[str, Any], end_reason: str, boot_id: str,
-          found: Optional[Dict[int, int]] = None, live_ctx: Optional[_Live] = None) -> str:
+          found: Optional[Dict[int, int]] = None, live_ctx: Optional[_Live] = None,
+          testing_mode: Optional[bool] = None) -> str:
     """``found``: identities an earlier scan of this recovery found (pid -> starttime);
     kept only while alive with the same starttime and handed to begin() with this scan's."""
     filled = False
@@ -404,6 +457,8 @@ def _lost(conn: sqlite3.Connection, home: str, run: Mapping[str, Any], end_reaso
             "UPDATE leases SET holder = ? WHERE run_id = ? AND holder_kind = 'meshd';",
             (boot_id, run["id"]),
         )
+        if end_reason == "spawn_failed":
+            supervisor.revoke_run_token(conn, run["id"])
         if not run["pgid"]:
             # Round 6 / Round 11: spawn window, TX B never committed: take the identity
             # from wrapper.json so seen markers and group/carrier checks apply.
@@ -421,15 +476,18 @@ def _lost(conn: sqlite3.Connection, home: str, run: Mapping[str, Any], end_reaso
                 filled = True
     if filled:
         run = _reload_run(conn, run["id"]) or run
-    if run["pgid"] and run["kind"] != "lead_turn":
+    if run["pgid"] and run["kind"] in ("task", "lead_turn"):
         # r4b (N18): an adopted run's persisted members keep its group trusted across
         # any number of restarts. While a member recorded in seen.json lives with its
         # starttime, the run stays open, the lease is held and those members (and the
         # rest of the anchored group) are terminated. An unusable seen.json holds the
         # run while the group/session is occupied (supervisor.seen_hold).
         # r4d: one read of the seen state (snapshot) for the members and the hold.
+        if supervisor.wrapper_alive(run):
+            supervisor.establish_adopted_seen(run, home)
         snap = supervisor.seen_snapshot(run, home)
-        supervisor.report_seen_unusable(conn, run, home)
+        if supervisor._SEEN_REASON.get(run["id"]) != "spawn_abort_pending":
+            supervisor.report_seen_unusable(conn, run, home)
         # r6: earlier scans' identities are made durable (marker / seen.json) first;
         # a failed write raises and the retry keeps them.
         _hand_over(home, run, found)
@@ -438,9 +496,20 @@ def _lost(conn: sqlite3.Connection, home: str, run: Mapping[str, Any], end_reaso
         for p, st in sorted(supervisor._load_prior_member_pairs(run)):
             if supervisor._identity_live(p, st):
                 live[p] = st
+        proc_st = run["proc_starttime"] if "proc_starttime" in run.keys() else None
+        if run["wrapper_pid"] and supervisor.known_starttime(proc_st) is not None:
+            wpid = int(run["wrapper_pid"])
+            wst_known = int(proc_st)
+            if supervisor._identity_live(wpid, wst_known):
+                live[wpid] = wst_known
         if live or snap.changed or supervisor.snapshot_hold(run, snap):
+            if supervisor._SEEN_REASON.get(run["id"]) == "spawn_abort_pending":
+                supervisor.report_seen_unusable(conn, run, home)
             _terminate_group(conn, home, run, end_reason, live)
             return "terminating"
+        if supervisor._SEEN_REASON.get(run["id"]) == "spawn_abort_pending":
+            supervisor._SEEN_EVENT_PENDING.pop(run["id"], None)
+            supervisor._SEEN_UNUSABLE.discard(run["id"])
         if supervisor.group_still_ours(int(run["pgid"]), run["proc_starttime"]):
             scanned = supervisor._scan_group(int(run["pgid"]))
             if scanned or getattr(scanned, "uncertain", False):
@@ -462,11 +531,17 @@ def _lost(conn: sqlite3.Connection, home: str, run: Mapping[str, Any], end_reaso
     if carriers or getattr(found, "uncertain", False) or getattr(env_scan, "uncertain", False):
         _terminate_carriers(conn, home, run, end_reason, carriers, wrapper_starttime=wst)
         return "terminating"
-    _close_without_process(conn, run, end_reason)
+    _close_without_process(conn, run, end_reason, testing_mode=testing_mode)
     return RECOVERY_END_STATUS[end_reason]
 
 
-def _step_runs(conn: sqlite3.Connection, home: str, boot_id: str, counts: Dict[str, int]) -> Set[str]:
+def _step_runs(
+    conn: sqlite3.Connection,
+    home: str,
+    boot_id: str,
+    counts: Dict[str, int],
+    testing_mode: Optional[bool] = None,
+) -> Set[str]:
     rows = conn.execute(
         "SELECT r.id, l.holder AS lease_holder FROM runs r JOIN leases l ON l.run_id = r.id "
         "WHERE r.status IN ('starting', 'running') AND l.holder_kind = 'meshd' "
@@ -478,7 +553,10 @@ def _step_runs(conn: sqlite3.Connection, home: str, boot_id: str, counts: Dict[s
     for row in rows:
         try:
             try:
-                outcome = _recover_run(conn, home, row, boot_id)
+                if testing_mode is None:
+                    outcome = _recover_run(conn, home, row, boot_id)
+                else:
+                    outcome = _recover_run(conn, home, row, boot_id, testing_mode=testing_mode)
             except supervisor.CloseHeld as held:
                 # Round 6: the close-safety gate refused a close (any recovery path).
                 supervisor.hold_close(conn, home, _reload_run(conn, row["id"]) or row, held)
@@ -511,7 +589,7 @@ DEFERRED_RETRY_S = 5.0
 DEFERRED_POLL_S = 0.5
 
 
-def retry_deferred(conn: sqlite3.Connection, home: str) -> List[str]:
+def retry_deferred(conn: sqlite3.Connection, home: str, testing_mode: Optional[bool] = None) -> List[str]:
     """Retry recovery of the runs it could not settle (blind review P2). Returns the ids
     that are no longer open. Never blocks (PR #40 r3): see ``_Live``.
 
@@ -521,6 +599,7 @@ def retry_deferred(conn: sqlite3.Connection, home: str) -> List[str]:
     failed release is retried on the next tick."""
     import time
 
+    tmode = supervisor._testing_mode() if testing_mode is None else bool(testing_mode)
     settled: List[str] = []
     now = time.monotonic()
     for run_id, entry in list(DEFERRED.items()):
@@ -534,7 +613,7 @@ def retry_deferred(conn: sqlite3.Connection, home: str) -> List[str]:
         try:
             plain = _reload_run(conn, run_id)
             if plain is None or plain["status"] not in ("starting", "running"):
-                _release_outbox(conn, run_id)
+                _release_outbox(conn, run_id, tmode)
                 DEFERRED.pop(run_id, None)
                 settled.append(run_id)
                 continue
@@ -555,7 +634,10 @@ def retry_deferred(conn: sqlite3.Connection, home: str) -> List[str]:
             continue
         try:
             try:
-                outcome = _recover_run(conn, home, row, boot_id, live=live)
+                if testing_mode is None:
+                    outcome = _recover_run(conn, home, row, boot_id, live=live)
+                else:
+                    outcome = _recover_run(conn, home, row, boot_id, live=live, testing_mode=tmode)
             except supervisor.CloseHeld as held:
                 supervisor.hold_close(conn, home, _reload_run(conn, run_id) or row, held)
                 outcome = "terminating"
@@ -578,7 +660,7 @@ def retry_deferred(conn: sqlite3.Connection, home: str) -> List[str]:
         try:
             still = _reload_run(conn, run_id)
             if still is None or still["status"] not in ("starting", "running"):
-                _release_outbox(conn, run_id)
+                _release_outbox(conn, run_id, tmode)
                 DEFERRED.pop(run_id, None)
                 settled.append(run_id)
             else:
@@ -588,15 +670,62 @@ def retry_deferred(conn: sqlite3.Connection, home: str) -> List[str]:
     return settled
 
 
-def _release_outbox(conn: sqlite3.Connection, run_id: str) -> None:
+def _reconcile_delivering_rows(
+    conn: sqlite3.Connection,
+    rows: List[sqlite3.Row],
+    testing_mode: bool,
+) -> int:
+    from mesh.daemon import lead_turns
+
+    if not rows:
+        return 0
+    max_attempts = int(lead_turns._setting(conn, "outbox.max_attempts", 3) or 3)
+    requeued = 0
+    wake_groups: Dict[Tuple[Optional[str], Optional[str]], List[sqlite3.Row]] = {}
+    inbox_rows: List[sqlite3.Row] = []
+    for row in rows:
+        if row["channel"] == "lead_wake":
+            rid = row["delivering_run_id"]
+            pid = row["project_id"]
+            if not pid and rid:
+                rrow = conn.execute("SELECT project_id FROM runs WHERE id = ?;", (rid,)).fetchone()
+                if rrow is not None:
+                    pid = rrow["project_id"]
+            wake_groups.setdefault((rid, pid), []).append(row)
+        else:
+            inbox_rows.append(row)
+    for (rid, pid), group in wake_groups.items():
+        counts = lead_turns._release_lead_wake_rows(conn, group, False, pid, rid, testing_mode)
+        requeued += counts["pending"]
+    for row in inbox_rows:
+        attempts = int(row["attempts"] or 0) + 1
+        if attempts >= max_attempts:
+            conn.execute(
+                "UPDATE outbox SET status = 'dead', attempts = ?, delivering_run_id = NULL, "
+                "last_error = ? WHERE id = ? AND status = 'delivering';",
+                (attempts, "max attempts exceeded", row["id"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE outbox SET status = 'pending', attempts = ?, delivering_run_id = NULL "
+                "WHERE id = ? AND status = 'delivering';",
+                (attempts, row["id"]),
+            )
+            requeued += 1
+    return requeued
+
+
+def _release_outbox(conn: sqlite3.Connection, run_id: str, testing_mode: Optional[bool] = None) -> None:
     """PR #40 r2: boot kept a deferred run's delivering messages (the run was still
     open); once it closes they are requeued, as boot reconciliation (_step_outbox) does."""
+    tmode = supervisor._testing_mode() if testing_mode is None else bool(testing_mode)
     with transaction(conn):
-        conn.execute(
-            "UPDATE outbox SET status = 'pending', attempts = attempts + 1, delivering_run_id = NULL "
+        rows = conn.execute(
+            "SELECT id, attempts, channel, project_id, delivering_run_id FROM outbox "
             "WHERE delivering_run_id = ? AND status = 'delivering';",
             (run_id,),
-        )
+        ).fetchall()
+        _reconcile_delivering_rows(conn, rows, tmode)
 
 
 def _step_merge_runs(conn: sqlite3.Connection, home: str, counts: Dict[str, int]) -> None:
@@ -650,9 +779,9 @@ def _step_merging(conn: sqlite3.Connection, home: str, counts: Dict[str, int]) -
         counts[f"merge_{outcome}"] = counts.get(f"merge_{outcome}", 0) + 1
 
 
-def _step_agent_leases(conn: sqlite3.Connection) -> int:
+def _step_agent_leases(conn: sqlite3.Connection, testing_mode: Optional[bool] = None) -> int:
     now_ts = time.time()
-    floor = now_iso_utc(now_ts + get_lease_ttl_s(conn))
+    floor = now_iso_utc(now_ts + get_lease_ttl_s(conn, testing_mode=testing_mode))
     extended = 0
     with transaction(conn):
         for lease in conn.execute(
@@ -665,21 +794,42 @@ def _step_agent_leases(conn: sqlite3.Connection) -> int:
     return extended
 
 
-def _step_outbox(conn: sqlite3.Connection, adopted: Set[str]) -> int:
-    requeued = 0
+def _step_inbox_offered(conn: sqlite3.Connection) -> int:
+    """Full review r6 P2-5: reset ``offered_at`` on queued inbox tasks after downtime."""
+    now_ts = time.time()
+    now = now_iso_utc(now_ts)
+    reset = 0
     with transaction(conn):
-        for row in conn.execute(
-            "SELECT id, delivering_run_id FROM outbox WHERE status = 'delivering';"
-        ).fetchall():
-            if row["delivering_run_id"] and row["delivering_run_id"] in adopted:
-                continue
-            conn.execute(
-                "UPDATE outbox SET status = 'pending', attempts = attempts + 1, delivering_run_id = NULL "
-                "WHERE id = ? AND status = 'delivering';",
-                (row["id"],),
-            )
-            requeued += 1
-    return requeued
+        rows = conn.execute(
+            """SELECT t.id, t.offered_at FROM tasks t
+               JOIN agents a ON a.id = t.assignee_agent_id
+               WHERE t.status = 'queued' AND a.delivery = 'inbox' AND t.offered_at IS NOT NULL;"""
+        ).fetchall()
+        for row in rows:
+            try:
+                stale = parse_utc(row["offered_at"]).timestamp() < now_ts
+            except Exception:
+                stale = True
+            if stale:
+                conn.execute(
+                    "UPDATE tasks SET offered_at = ? WHERE id = ? AND status = 'queued';",
+                    (now, row["id"]),
+                )
+                reset += 1
+    return reset
+
+
+def _step_outbox(conn: sqlite3.Connection, adopted: Set[str], testing_mode: bool = False) -> int:
+    with transaction(conn):
+        rows = [
+            row
+            for row in conn.execute(
+                "SELECT id, attempts, channel, project_id, delivering_run_id "
+                "FROM outbox WHERE status = 'delivering';"
+            ).fetchall()
+            if not (row["delivering_run_id"] and row["delivering_run_id"] in adopted)
+        ]
+        return _reconcile_delivering_rows(conn, rows, testing_mode)
 
 
 def _step_cancelling(conn: sqlite3.Connection) -> int:
@@ -719,18 +869,485 @@ def _step_cancelling(conn: sqlite3.Connection) -> int:
     return done
 
 
-def recover(conn: sqlite3.Connection, home: str, boot_id: str) -> Dict[str, Any]:
+def _step_ws_reservations(conn: sqlite3.Connection, home: str, counts: Dict[str, int]) -> None:
+    """Reconcile leftover ``ws_res:*`` workspace delete/prune reservations from a prior crash."""
+    from mesh.core.gitops import run_git
+    from mesh.core.redact import redact_value
+    from mesh.core.workspaces import get_workspaces_root, load_ws_reservations
+
+    for res_key, doc in load_ws_reservations(conn):
+        try:
+            kind = doc.get("kind")
+            if kind == "delete":
+                from mesh.core.workspaces import allowed_workspace_roots
+                from mesh.daemon.handlers.run import (
+                    _match_task_workspace_with_roots,
+                    _path_confirmed_absent,
+                    _unlink_best_effort,
+                    _verify_workspace_ancestors_not_symlinked,
+                    _ws_delete_marker_started,
+                )
+
+                task_id = doc.get("task_id")
+                project_id = doc.get("project_id")
+                path = doc.get("path")
+                stripped = doc.get("stripped") or (path.rstrip(os.sep) if isinstance(path, str) else None)
+                matched_root = doc.get("matched_root")
+                expected_real = doc.get("real")
+                branch = doc.get("branch")
+                repo_path = doc.get("repo_path")
+                approval_id = doc.get("approval_id")
+                requested_by = doc.get("requested_by")
+                request_id = doc.get("request_id")
+                ancestors_valid = False
+                if isinstance(stripped, str) and stripped.strip() and project_id and task_id:
+                    tasks_dir = os.path.dirname(stripped.rstrip(os.sep))
+                    if not os.path.islink(tasks_dir) and os.path.isdir(tasks_dir):
+                        if isinstance(matched_root, str) and matched_root.strip():
+                            vreal = _verify_workspace_ancestors_not_symlinked(
+                                stripped, matched_root, project_id, task_id
+                            )
+                            ancestors_valid = vreal is not None and (
+                                not isinstance(expected_real, str) or vreal == expected_real
+                            )
+                        else:
+                            match = _match_task_workspace_with_roots(
+                                allowed_workspace_roots(conn, home),
+                                project_id,
+                                task_id,
+                                stripped,
+                            )
+                            ancestors_valid = match is not None and (
+                                not isinstance(expected_real, str) or match[1] == expected_real
+                            )
+                check_paths = [
+                    p.rstrip(os.sep)
+                    for p in (doc.get("real"), doc.get("stripped"), path)
+                    if isinstance(p, str) and p.strip()
+                ]
+                # Review PR45 R5 P2: finalize only when the worker durably recorded that
+                # rmtree started AND every path is provably ENOENT (EACCES is "unknown").
+                rmtree_marker = doc.get("rmtree_marker")
+                rmtree_started = _ws_delete_marker_started(rmtree_marker)
+                all_absent = bool(check_paths) and all(_path_confirmed_absent(p) for p in check_paths)
+                if rmtree_started and ancestors_valid and all_absent:
+                    if repo_path and os.path.isdir(repo_path):
+                        try:
+                            run_git(["worktree", "prune"], cwd=repo_path)
+                        except Exception:
+                            pass
+                    now = now_iso_utc()
+                    with transaction(conn):
+                        if conn.execute("SELECT 1 FROM meta WHERE key = ?;", (res_key,)).fetchone() is None:
+                            continue
+                        if approval_id and doc.get("actor_kind") != "user":
+                            from mesh.core.approvals import record_consumed_event
+
+                            changed = conn.execute(
+                                """UPDATE approvals SET
+                                    status = 'consumed',
+                                    consumed_at = COALESCE(consumed_at, ?),
+                                    consumed_by = COALESCE(consumed_by, ?),
+                                    consumed_request_id = COALESCE(consumed_request_id, ?)
+                                WHERE id = ? AND status = 'approved'
+                                  AND category = 'delete' AND project_id IS ?;""",
+                                (now, requested_by or "system", request_id, approval_id, project_id),
+                            ).rowcount
+                            if changed:  # R1 P1-2: audit verify needs the consumption event
+                                arow = conn.execute("SELECT * FROM approvals WHERE id = ?;",
+                                                    (approval_id,)).fetchone()
+                                record_consumed_event(conn, arow, "system", "system", "system",
+                                                      request_id, None)
+                        record_event(
+                            conn=conn,
+                            type_="workspace.deleted",
+                            actor_id="system",
+                            actor_kind="system",
+                            via="system",
+                            project_id=project_id,
+                            task_id=task_id,
+                            payload={
+                                "task_id": task_id,
+                                "path": path,
+                                "branch": branch,
+                                "branch_kept": True,
+                                "recovered": True,
+                            },
+                            request_id=request_id,
+                        )
+                        idem = doc.get("idempotency")
+                        if (
+                            isinstance(idem, dict)
+                            and idem.get("principal_id")
+                            and idem.get("key")
+                            and idem.get("request_hash")
+                        ):
+                            from mesh.daemon.server import _idempotency_record, _store_idempotency_row
+
+                            cmd = idem.get("cmd") or "workspace.delete"
+                            env = {
+                                "ok": True,
+                                "data": redact_value({
+                                    "task_id": task_id,
+                                    "path": path,
+                                    "deleted": True,
+                                    "branch": branch,
+                                    "branch_kept": True,
+                                }),
+                                "warnings": [],
+                                "request_id": request_id,
+                                "idempotent_replay": False,
+                                "dry_run": False,
+                                "exit_code": 0,
+                            }
+                            _store_idempotency_row(
+                                conn,
+                                idem["principal_id"],
+                                idem["key"],
+                                cmd,
+                                idem["request_hash"],
+                                json.dumps(_idempotency_record(cmd, env)),
+                                0,
+                                ignore_conflict=True,
+                            )
+                        conn.execute("DELETE FROM meta WHERE key = ?;", (res_key,))
+                    counts["workspace_deletes_finalized"] = counts.get("workspace_deletes_finalized", 0) + 1
+                    _unlink_best_effort(rmtree_marker if isinstance(rmtree_marker, str) else None)
+                else:
+                    with transaction(conn):
+                        if conn.execute("SELECT 1 FROM meta WHERE key = ?;", (res_key,)).fetchone() is None:
+                            continue
+                        record_event(
+                            conn=conn,
+                            type_="workspace.delete_rolled_back",
+                            actor_id="system",
+                            actor_kind="system",
+                            via="system",
+                            project_id=project_id,
+                            task_id=task_id,
+                            payload={
+                                "task_id": task_id,
+                                "path": path,
+                                "branch": branch,
+                                "recovered": True,
+                            },
+                            request_id=request_id,
+                        )
+                        conn.execute("DELETE FROM meta WHERE key = ?;", (res_key,))
+                    counts["workspace_deletes_rolled_back"] = counts.get("workspace_deletes_rolled_back", 0) + 1
+                    _unlink_best_effort(rmtree_marker if isinstance(rmtree_marker, str) else None)
+
+            elif kind == "prune":
+                from mesh.daemon.handlers.run import reconcile_prune_checkpoint
+
+                ckpt_path = doc.get("checkpoint_path")
+                ckpt = _read_json(ckpt_path) if isinstance(ckpt_path, str) and ckpt_path else None
+                rec = reconcile_prune_checkpoint(conn, home, doc, ckpt)
+                removed = rec["removed"]
+                skipped = rec["skipped"]
+                completed = rec["completed"]
+                root_val = rec["root"]
+                request_id = doc.get("request_id")
+                with transaction(conn):
+                    if conn.execute("SELECT 1 FROM meta WHERE key = ?;", (res_key,)).fetchone() is None:
+                        continue
+                    for entry in removed:
+                        if not isinstance(entry, dict) or not entry.get("task_id"):
+                            continue
+                        if request_id and conn.execute(
+                            "SELECT 1 FROM events WHERE type = 'workspace.pruned' AND task_id = ? AND request_id = ? LIMIT 1;",
+                            (entry["task_id"], request_id),
+                        ).fetchone():
+                            continue
+                        record_event(
+                            conn=conn,
+                            type_="workspace.pruned",
+                            actor_id="system",
+                            actor_kind="system",
+                            via="system",
+                            project_id=entry.get("project_id"),
+                            task_id=entry["task_id"],
+                            payload={
+                                "task_id": entry["task_id"],
+                                "path": entry.get("path"),
+                                "branch": entry.get("branch"),
+                                "recovered": True,
+                            },
+                            request_id=request_id,
+                        )
+                    if completed:
+                        idem = doc.get("idempotency")
+                        if (
+                            isinstance(idem, dict)
+                            and idem.get("principal_id")
+                            and idem.get("key")
+                            and idem.get("request_hash")
+                        ):
+                            from mesh.daemon.server import _idempotency_record, _store_idempotency_row
+
+                            cmd = idem.get("cmd") or "workspace.prune"
+                            env = {
+                                "ok": True,
+                                "data": redact_value({
+                                    "root": root_val,
+                                    "dry_run": False,
+                                    "removed": removed,
+                                    "skipped": skipped,
+                                }),
+                                "warnings": [],
+                                "request_id": request_id,
+                                "idempotent_replay": False,
+                                "dry_run": False,
+                                "exit_code": 0,
+                            }
+                            _store_idempotency_row(
+                                conn,
+                                idem["principal_id"],
+                                idem["key"],
+                                cmd,
+                                idem["request_hash"],
+                                json.dumps(_idempotency_record(cmd, env)),
+                                0,
+                                ignore_conflict=True,
+                            )
+                        counts["workspace_prunes_finalized"] = counts.get("workspace_prunes_finalized", 0) + 1
+                    else:
+                        record_event(
+                            conn=conn,
+                            type_="workspace.prune_rolled_back",
+                            actor_id="system",
+                            actor_kind="system",
+                            via="system",
+                            project_id=doc.get("project_id"),
+                            payload={
+                                "project_id": doc.get("project_id"),
+                                "projects": doc.get("projects") or [],
+                                "task_ids": doc.get("task_ids") or [],
+                                "removed_count": len(removed),
+                                "recovered": True,
+                            },
+                            request_id=request_id,
+                        )
+                        counts["workspace_prunes_rolled_back"] = counts.get("workspace_prunes_rolled_back", 0) + 1
+                    conn.execute("DELETE FROM meta WHERE key = ?;", (res_key,))
+                if isinstance(ckpt_path, str) and ckpt_path:
+                    try:
+                        os.unlink(ckpt_path)
+                    except OSError:
+                        pass
+            else:
+                with transaction(conn):
+                    conn.execute("DELETE FROM meta WHERE key = ?;", (res_key,))
+        except Exception as exc:
+            _log(home, f"workspace reservation {res_key} failed: {type(exc).__name__}: {exc}")
+            counts["errors"] = counts.get("errors", 0) + 1
+
+
+class DeliverIntentUnresolved(OSError):
+    """The intent's repository or base branch cannot be read now: keep the intent."""
+
+
+def reconcile_deliver_intent(conn: sqlite3.Connection, doc: Mapping[str, Any],
+                             own_tx: bool = True, skip_idempotency_key: Optional[str] = None) -> str:
+    """One deliver intent (full review r1 P1-5): ``"recorded"`` when the base is at the
+    intent's ``new`` with no `project.delivered` recorded since the intent was written
+    (the event, approval consumption and idempotency replay are recorded now), else
+    ``"done"``. r3 P1-4: an unreadable repository or base ref raises
+    `DeliverIntentUnresolved` (the intent is kept, never read as "not delivered").
+    ``own_tx=False`` records inside the caller's transaction (online, `project deliver`)."""
+    from mesh.core.gitops import run_git
+    from mesh.core.repos import remaining_git_budget
+
+    def _budgeted_git(args: List[str], cwd: str) -> Any:
+        rem = remaining_git_budget(30.0)
+        if rem <= 0:
+            raise DeliverIntentUnresolved(f"git budget exhausted checking {args[0]}")
+        return run_git(args, cwd=cwd, timeout_s=rem)
+
+    project_id, new = doc["project_id"], doc.get("new")
+    row = conn.execute("SELECT repo_path, base_branch FROM projects WHERE id = ?;", (project_id,)).fetchone()
+    at_new = False
+    if row is not None and isinstance(new, str) and doc.get("old") != new:
+        if not row["repo_path"] or not os.path.isdir(row["repo_path"]):
+            raise DeliverIntentUnresolved(f"repository of project {project_id} is not readable")
+        ref = f"refs/heads/{row['base_branch']}"
+        try:  # r5 P2-1: a git timeout or launch failure keeps the intent too
+            cp = _budgeted_git(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], cwd=row["repo_path"])
+            if cp.returncode not in (0, 1):
+                raise DeliverIntentUnresolved(f"git rev-parse {ref} failed (rc={cp.returncode})")
+            if cp.returncode == 1:
+                chk = _budgeted_git(["show-ref", "--verify", "--quiet", ref], cwd=row["repo_path"])
+                if chk.returncode not in (0, 1):
+                    raise DeliverIntentUnresolved(f"git show-ref {ref} failed (rc={chk.returncode})")
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise DeliverIntentUnresolved(f"git check on {ref} failed: {type(exc).__name__}") from exc
+        cur = (cp.stdout or "").strip() if cp.returncode == 0 else ""
+        at_new = bool(cur) and cur == new
+        if cur and not at_new and cur != doc.get("old"):
+            # Full review r7 (R3-P2-1): the base moved on past the delivered commit before
+            # this settle (the user committed on top while meshd was down): the delivery
+            # still happened, and its approval was used. Only "base still at old" or "new is
+            # not in the base's history" means it never landed.
+            try:
+                anc = _budgeted_git(["merge-base", "--is-ancestor", new, cur], cwd=row["repo_path"])
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                raise DeliverIntentUnresolved(f"git merge-base on {ref} failed: {type(exc).__name__}") from exc
+            if anc.returncode not in (0, 1):
+                raise DeliverIntentUnresolved(f"git merge-base on {ref} failed (rc={anc.returncode})")
+            at_new = anc.returncode == 0
+    # r2 P1-E: only a delivery recorded after the intent was written counts; an
+    # older one to the same commit (base reset, then delivered again) does not.
+    horizon = doc.get("min_event_seq")
+    recorded = conn.execute(
+        "SELECT 1 FROM events WHERE type = 'project.delivered' AND project_id = ? "
+        "AND json_extract(payload_json, '$.new') = ? AND seq > ? LIMIT 1;",
+        (project_id, new, horizon if isinstance(horizon, int) else 0)).fetchone() is not None
+    if at_new and not recorded and doc.get("old") != new:
+        now = now_iso_utc()
+        with (transaction(conn) if own_tx else contextlib.nullcontext()):
+            approval_id = doc.get("approval_id")
+            if approval_id and doc.get("actor_kind") != "user":
+                from mesh.core.approvals import record_consumed_event
+
+                changed = conn.execute(
+                    """UPDATE approvals SET status = 'consumed', consumed_at = COALESCE(consumed_at, ?),
+                           consumed_by = COALESCE(consumed_by, ?),
+                           consumed_request_id = COALESCE(consumed_request_id, ?)
+                       WHERE id = ? AND status = 'approved'
+                         AND category = 'deliver_to_base' AND project_id IS ?;""",
+                    (now, doc.get("actor_id") or "system", doc.get("request_id"), approval_id, project_id),
+                ).rowcount
+                if changed:
+                    arow = conn.execute("SELECT * FROM approvals WHERE id = ?;", (approval_id,)).fetchone()
+                    record_consumed_event(conn, arow, "system", "system", "system",
+                                          doc.get("request_id"), None)
+            record_event(
+                conn=conn, type_="project.delivered", actor_id="system", actor_kind="system",
+                via="system", project_id=project_id,
+                payload={"old": doc.get("old"), "new": new, "method": "recovered", "recovered": True,
+                         "requested_by": doc.get("actor_id"), "requested_via": doc.get("via")},
+                request_id=doc.get("request_id"),
+            )
+            idem = doc.get("idempotency")
+            if (isinstance(idem, dict) and idem.get("principal_id") and idem.get("key")
+                    and idem.get("request_hash") and idem.get("key") != skip_idempotency_key):
+                from mesh.daemon.server import _idempotency_record, _store_idempotency_row
+
+                cmd = idem.get("cmd") or "project.deliver"
+                env = {"ok": True,
+                       "data": {"project_id": project_id, "base_branch": doc.get("base_branch"),
+                                "integration_branch": doc.get("integration_branch"),
+                                "old": doc.get("old"), "new": new, "method": "recovered",
+                                "worktree": None},
+                       "warnings": [], "request_id": doc.get("request_id"),
+                       "idempotent_replay": False, "dry_run": False, "exit_code": 0}
+                _store_idempotency_row(conn, idem["principal_id"], idem["key"], cmd,
+                                       idem["request_hash"], json.dumps(_idempotency_record(cmd, env)),
+                                       0, ignore_conflict=True)
+        return "recorded"
+    return "done"
+
+
+_INTENT_CORRUPT = object()
+
+
+def _read_intent(path: str) -> Any:
+    """Full review r5 P2-1: a deliver intent, None when gone, `_INTENT_CORRUPT` when it is
+    not a JSON object; any other read error raises `DeliverIntentUnresolved` (the intent
+    is kept, never taken for a corrupt one)."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (ValueError, RecursionError):
+        return _INTENT_CORRUPT
+    except OSError as exc:
+        raise DeliverIntentUnresolved(f"cannot read deliver intent: {type(exc).__name__}") from exc
+    return data if isinstance(data, dict) else _INTENT_CORRUPT
+
+
+def settle_deliver_intent(conn: sqlite3.Connection, home: str, project_id: Any) -> None:
+    """Full review r4 P1-1: settle the deliver intent an earlier request of
+    ``project_id`` left (its transaction was lost while meshd stayed up) in its own
+    committed transaction, then drop it, before a new `project deliver` runs: the new
+    request never shares a transaction or the intent file with the old delivery, and a
+    retry of the old request finds its stored idempotent response. Raises
+    `DeliverIntentUnresolved` when the repository cannot be read (the intent is kept)."""
+    from mesh.core.repos import SETUP_INTEGRATION_BUDGET_S, deliver_intent_path, git_budget
+
+    if (not isinstance(project_id, str) or not project_id or "/" in project_id
+            or "\\" in project_id or project_id.startswith(".")):
+        return
+    path = deliver_intent_path(home, project_id)
+    if not os.path.lexists(path):
+        return
+    doc = _read_intent(path)
+    if doc is None:
+        return
+    if isinstance(doc, dict) and doc.get("project_id") == project_id:
+        with git_budget(SETUP_INTEGRATION_BUDGET_S):
+            reconcile_deliver_intent(conn, doc)
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def _step_deliver_intents(conn: sqlite3.Connection, home: str, counts: Dict[str, int]) -> None:
+    """Full review r1 P1-5: reconcile `project deliver` intents left by a crash.
+
+    The base branch moved (it is at the intent's `new`) but no `project.delivered` event
+    records it: the request's transaction was lost after the git write. Record the event
+    (and consume the approval the request used) as `system`, marked `recovered`. Any
+    other intent (delivered and recorded, or never applied) is dropped.
+    """
+    from mesh.core.repos import DELIVER_INTENT_DIR, SETUP_INTEGRATION_BUDGET_S, git_budget
+
+    folder = os.path.join(home, DELIVER_INTENT_DIR)
+    try:
+        names = sorted(n for n in os.listdir(folder) if n.endswith(".json") and not n.startswith("."))
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(folder, name)
+        try:
+            doc = _read_intent(path)
+            if doc is None:
+                continue
+            if not isinstance(doc, dict) or not doc.get("project_id"):
+                os.unlink(path)
+                continue
+            with git_budget(SETUP_INTEGRATION_BUDGET_S):
+                if reconcile_deliver_intent(conn, doc) == "recorded":
+                    counts["deliveries_recovered"] = counts.get("deliveries_recovered", 0) + 1
+            os.unlink(path)
+        except Exception as e:  # keep the intent for the next start; never block recovery
+            _log(home, f"deliver intent {name}: {type(e).__name__}: {e}")
+            counts["deliver_intent_errors"] = counts.get("deliver_intent_errors", 0) + 1
+
+
+def recover(
+    conn: sqlite3.Connection,
+    home: str,
+    boot_id: str,
+    testing_mode: Optional[bool] = None,
+) -> Dict[str, Any]:
     """Run §11.7 steps 2–7. Returns the counts recorded in ``daemon.recovered``."""
     from mesh.daemon.scheduler import sweep_expired_approvals
 
+    tmode = supervisor._testing_mode() if testing_mode is None else bool(testing_mode)
     counts: Dict[str, int] = {}
     # r4d: persisted seen holds (a held run whose seen.json was deleted stays held).
     supervisor.refresh_persisted_holds(conn, home)
-    adopted = _step_runs(conn, home, boot_id, counts)
+    adopted = _step_runs(conn, home, boot_id, counts, testing_mode=testing_mode)
     _step_merge_runs(conn, home, counts)
-    agent_leases = _step_agent_leases(conn)
-    outbox = _step_outbox(conn, adopted)
+    agent_leases = _step_agent_leases(conn, testing_mode=tmode)
+    _step_inbox_offered(conn)
+    outbox = _step_outbox(conn, adopted, tmode)
     _step_merging(conn, home, counts)
+    _step_ws_reservations(conn, home, counts)
+    _step_deliver_intents(conn, home, counts)
     cancelled = _step_cancelling(conn)
     approvals = sweep_expired_approvals(conn, home)
     summary: Dict[str, Any] = {
@@ -751,6 +1368,11 @@ def recover(conn: sqlite3.Connection, home: str, boot_id: str) -> Dict[str, Any]
         "merges_interrupted": counts.get("merge_interrupted", 0),
         "merges_reconciled": counts.get("merge_reconciled", 0),
         "merge_errors": counts.get("merge_errors", 0),
+        "workspace_deletes_finalized": counts.get("workspace_deletes_finalized", 0),
+        "workspace_deletes_rolled_back": counts.get("workspace_deletes_rolled_back", 0),
+        "workspace_prunes_finalized": counts.get("workspace_prunes_finalized", 0),
+        "workspace_prunes_rolled_back": counts.get("workspace_prunes_rolled_back", 0),
+        "deliveries_recovered": counts.get("deliveries_recovered", 0),
         "agent_leases_extended": agent_leases,
         "outbox_requeued": outbox,
         "tasks_cancelled": cancelled,

@@ -22,7 +22,7 @@ def handle_config_list(ctx: HandlerContext) -> HandlerResult:
             exit_code=c.EXIT_FORBIDDEN,
             message="config.list is user-only (direct factor required)",
         )
-    defaults = get_default_settings(ctx.home)
+    defaults = get_default_settings(ctx.home, testing_mode=ctx.testing_mode)
 
     cur = ctx.conn.execute("SELECT key, value_json FROM settings;")
     db_settings: Dict[str, Any] = {}
@@ -57,9 +57,9 @@ def handle_config_get(ctx: HandlerContext) -> HandlerResult:
             message="config.get is user-only (direct factor required)",
         )
     key = ctx.args.get("key")
-    defaults = get_default_settings(ctx.home)
+    defaults = get_default_settings(ctx.home, testing_mode=ctx.testing_mode)
 
-    if not key or key not in defaults:
+    if not isinstance(key, str) or not key or key not in defaults:
         raise MeshError(
             code=c.INVALID_SETTING,
             exit_code=c.EXIT_USAGE,
@@ -103,6 +103,7 @@ def handle_config_set(ctx: HandlerContext) -> HandlerResult:
         home=ctx.home,
         current_settings=current_settings,
         db_conn=ctx.conn,
+        testing_mode=ctx.testing_mode,
     )
 
     if key == "workspaces.root":
@@ -130,9 +131,9 @@ def handle_config_set(ctx: HandlerContext) -> HandlerResult:
     if not ctx.dry_run:
         if key == "workspaces.root":
             # Keep the previous and the new root unredacted for the token guard.
-            remember_protected_path(ctx.conn, get_workspaces_root(ctx.conn, ctx.home))
+            remember_protected_path(ctx.conn, os.path.realpath(get_workspaces_root(ctx.conn, ctx.home)))
             if isinstance(validated_val, str):
-                remember_protected_path(ctx.conn, validated_val)
+                remember_protected_path(ctx.conn, os.path.realpath(validated_val))
         ctx.conn.execute(
             """INSERT INTO settings (key, value_json, updated_at, updated_by)
                VALUES (?, ?, ?, ?)

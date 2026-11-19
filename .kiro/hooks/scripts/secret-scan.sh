@@ -13,7 +13,7 @@
 #   3. Absolute home paths (/home/<user>/, the root home, /Users/<user>/): for the whole tree in
 #      --dir mode; in staged mode only for staged files under .kiro/ (nothing personal under .kiro/).
 # Findings are reported as file:line; matched secret text is never printed.
-# Exit: 0 clean, 1 findings, 2 tool missing or usage error (fail closed).
+# Exit: 0 clean, 1 findings, 2 tool missing, scan error, or usage error (fail closed).
 
 set -o pipefail
 
@@ -55,8 +55,11 @@ fi
 HOMEP='(/home/[A-Za-z0-9._-]+/|/roo[t]/|/Users/[A-Za-z0-9._-]+/)'
 
 OUT="$(mktemp /tmp/mesh-secret-scan-XXXXXX)" || exit 2
-trap 'rm -f "$OUT"' EXIT
+BLOB="$(mktemp /tmp/mesh-secret-blob-XXXXXX)" || { rm -f "$OUT"; exit 2; }
+FILE_LIST="$(mktemp /tmp/mesh-secret-files-XXXXXX)" || { rm -f "$OUT" "$BLOB"; exit 2; }
+trap 'rm -f "$OUT" "$BLOB" "$FILE_LIST"' EXIT
 findings=0
+scan_err=0
 
 report_gitleaks() {
   # $1 = gitleaks rc, $2 = label
@@ -67,6 +70,29 @@ report_gitleaks() {
     grep -E 'RuleID|File|Line|Fingerprint|ERR|FTL|error' "$OUT" | head -40
     findings=$((findings + 1))
   fi
+}
+
+run_grep_list() {
+  local pat="$1" batch=() f rc=1 r out
+  while IFS= read -r -d '' f; do
+    batch+=("$f")
+    if [ "${#batch[@]}" -ge 500 ]; then
+      out="$(grep -naHoE "$pat" -- "${batch[@]}")"
+      r=$?
+      [ -n "$out" ] && printf '%s\n' "$out"
+      [ "$r" -gt 1 ] && rc="$r"
+      [ "$r" -eq 0 ] && [ "$rc" -le 1 ] && rc=0
+      batch=()
+    fi
+  done
+  if [ "${#batch[@]}" -gt 0 ]; then
+    out="$(grep -naHoE "$pat" -- "${batch[@]}")"
+    r=$?
+    [ -n "$out" ] && printf '%s\n' "$out"
+    [ "$r" -gt 1 ] && rc="$r"
+    [ "$r" -eq 0 ] && [ "$rc" -le 1 ] && rc=0
+  fi
+  return "$rc"
 }
 
 if [ "$MODE" = staged ]; then
@@ -81,11 +107,16 @@ if [ "$MODE" = staged ]; then
   # be read is a finding, never an empty pass.
   while IFS= read -r -d '' f; do
     [ -n "$f" ] || continue
-    if ! content="$(git show ":$f" 2>/dev/null)"; then
+    if ! git show ":$f" >"$BLOB" 2>/dev/null; then
       echo "secret-scan: cannot read staged $f"
       findings=$((findings + 1)); continue
     fi
-    lines="$(printf '%s\n' "$content" | grep -nIE "$P" | cut -d: -f1 | tr '\n' ' ')"
+    lines="$(grep -naE "$P" -- "$BLOB" | cut -d: -f1 | tr '\n' ' ')"
+    rc=$?
+    if [ "$rc" -gt 1 ]; then
+      echo "secret-scan: pattern scan failed on staged $f (grep rc $rc)"
+      scan_err=1
+    fi
     if [ -n "$lines" ]; then
       echo "secret-scan: pattern hit in staged $f at line(s) $lines"
       findings=$((findings + 1))
@@ -93,7 +124,12 @@ if [ "$MODE" = staged ]; then
     case "$f" in
       .kiro/agents/*) ;;  # agent permission paths (allowedPaths) are not secrets
       .kiro/*)
-        homes="$(printf '%s\n' "$content" | grep -nIoE "$HOMEP" | tr '\n' ' ')"
+        homes="$(grep -naoE "$HOMEP" -- "$BLOB" | tr '\n' ' ')"
+        rc=$?
+        if [ "$rc" -gt 1 ]; then
+          echo "secret-scan: absolute home path scan failed on staged $f (grep rc $rc)"
+          scan_err=1
+        fi
         if [ -n "$homes" ]; then
           echo "secret-scan: absolute home path in staged $f: $homes"
           findings=$((findings + 1))
@@ -105,28 +141,63 @@ else
   "$GL" dir --no-banner --redact --baseline-path "$BASELINE" "$DIR" >"$OUT" 2>&1
   report_gitleaks "$?" "dir $DIR"
 
-  pat="$(grep -rnIE "$P" -- "$DIR" | cut -d: -f1,2)"
+  pat="$(grep -rnaE "$P" -- "$DIR" | cut -d: -f1,2)"
+  pat_rc=$?
+  if [ "$pat_rc" -gt 1 ]; then
+    echo "secret-scan: pattern scan failed (dir $DIR, grep rc $pat_rc)"
+    scan_err=1
+  fi
   if [ -n "$pat" ]; then
     echo "secret-scan: pattern hits (file:line):"
     printf '%s\n' "$pat"
     findings=$((findings + 1))
-  else
+  elif [ "$pat_rc" -le 1 ]; then
     echo "secret-scan: pattern scan clean (dir $DIR)"
   fi
 
-  homes="$(grep -rnIoE "$HOMEP" --exclude-dir=agents -- "$DIR")"  # .kiro/agents allowedPaths are permission paths, not secrets
-  if [ -n "$homes" ]; then
-    echo "secret-scan: absolute home paths (file:line:path):"
-    printf '%s\n' "$homes"
-    findings=$((findings + 1))
+  # .kiro/agents allowedPaths are permission paths, not secrets; scope exclusion to .kiro/agents/* only.
+  if ! DIR_ABS="$(cd "$DIR" && pwd -P)"; then
+    echo "secret-scan: cannot resolve dir $DIR"
+    scan_err=1
   else
-    echo "secret-scan: no absolute home paths (dir $DIR)"
+    case "$DIR_ABS" in
+      "$ROOT"|"$ROOT"/*) excl="$ROOT/.kiro/agents" ;;
+      */.kiro) excl="$DIR_ABS/agents" ;;
+      *) excl="$DIR_ABS/.kiro/agents" ;;
+    esac
+    find "$DIR_ABS" -path "$excl" -prune -o -type f -print0 >"$FILE_LIST"
+    find_rc=$?
+    if [ "$find_rc" -ne 0 ]; then
+      echo "secret-scan: absolute home path walk failed (dir $DIR, find rc $find_rc)"
+      scan_err=1
+    fi
+    homes=""
+    homes_rc=1
+    if [ -s "$FILE_LIST" ]; then
+      homes="$(run_grep_list "$HOMEP" <"$FILE_LIST")"
+      homes_rc=$?
+    fi
+    if [ "$homes_rc" -gt 1 ]; then
+      echo "secret-scan: absolute home path scan failed (dir $DIR, grep rc $homes_rc)"
+      scan_err=1
+    fi
+    if [ -n "$homes" ]; then
+      echo "secret-scan: absolute home paths (file:line:path):"
+      printf '%s\n' "$homes"
+      findings=$((findings + 1))
+    elif [ "$find_rc" -eq 0 ] && [ "$homes_rc" -le 1 ]; then
+      echo "secret-scan: no absolute home paths (dir $DIR)"
+    fi
   fi
 fi
 
 if [ "$findings" -gt 0 ]; then
   echo "secret-scan: FAIL ($findings finding group(s))"
   exit 1
+fi
+if [ "$scan_err" -gt 0 ]; then
+  echo "secret-scan: FAIL (scan error)"
+  exit 2
 fi
 echo "secret-scan: OK"
 exit 0

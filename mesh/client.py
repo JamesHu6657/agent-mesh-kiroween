@@ -29,17 +29,26 @@ class MeshClient:
         if (mesh_socket and not os.environ.get("MESH_HOME") and not EXPLICIT_HOME
                 and self.home == default_home):
             self.socket_path = mesh_socket
+            sock_real = os.path.realpath(mesh_socket)
+            sock_dir = os.path.dirname(sock_real)
+            if os.path.basename(sock_real) == "mesh.sock" and os.path.basename(sock_dir) == "run":
+                derived_home = os.path.dirname(sock_dir)
+                if derived_home and derived_home != os.sep:
+                    self.home = derived_home
         else:
             self.socket_path = os.path.join(self.home, "run", "mesh.sock")
         self.timeout = timeout
 
-    def send_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Send a JSON request and read a JSON response from meshd."""
+    def _connect_socket(self, timeout: Optional[float]) -> socket.socket:
+        from mesh.core.paths import check_socket_path_length
+
+        check_socket_path_length(self.socket_path)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            sock.settimeout(self.timeout)
+            sock.settimeout(timeout)
             sock.connect(self.socket_path)
-        except (FileNotFoundError, ConnectionRefusedError, socket.timeout) as exc:
+            return sock
+        except OSError as exc:
             sock.close()
             raise MeshError(
                 code=c.DAEMON_UNAVAILABLE,
@@ -47,6 +56,10 @@ class MeshClient:
                 message=f"Daemon unavailable at {self.socket_path}: {exc}. Hint: mesh daemon start",
             ) from exc
 
+    def send_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Send a JSON request and read a JSON response from meshd."""
+        sock = self._connect_socket(self.timeout)
+        f = None
         try:
             req_data = (json.dumps(payload) + "\n").encode("utf-8")
             sock.sendall(req_data)
@@ -67,7 +80,24 @@ class MeshClient:
                 exit_code=c.EXIT_DAEMON_UNAVAILABLE,
                 message=f"Daemon response timeout at {self.socket_path}: {exc}",
             ) from exc
+        except OSError as exc:
+            raise MeshError(
+                code=c.DAEMON_UNAVAILABLE,
+                exit_code=c.EXIT_DAEMON_UNAVAILABLE,
+                message=f"Daemon communication error at {self.socket_path}: {exc}",
+            ) from exc
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise MeshError(
+                code=c.DAEMON_UNAVAILABLE,
+                exit_code=c.EXIT_DAEMON_UNAVAILABLE,
+                message=f"Invalid response from daemon at {self.socket_path}: {exc}",
+            ) from exc
         finally:
+            if f is not None:
+                try:
+                    f.close()
+                except OSError:
+                    pass
             sock.close()
 
     def resolve_auth(self, args: Any) -> Dict[str, Any]:
@@ -111,20 +141,14 @@ class MeshClient:
         if token_file:
             # Linear round 4 P2: also refuse tokens inside the configured workspaces.root
             # and registered repositories, not only the default locations.
+            from mesh.core.paths import read_token_file_secure
             from mesh.core.token_roots import configured_roots
 
             ws_root, repo_paths = configured_roots(self.home)
-            check_token_file_secure(token_file, home=self.home, workspaces_root=ws_root, repo_paths=repo_paths)
-            try:
-                with open(token_file, "r", encoding="utf-8") as f:
-                    token = f.read().strip()
-                return {"type": "token", "token": token}
-            except Exception as exc:
-                raise MeshError(
-                    code=c.TOKEN_INVALID,
-                    exit_code=c.EXIT_UNAUTHENTICATED,
-                    message=f"Failed to read token file '{token_file}': {exc}",
-                )
+            token = read_token_file_secure(
+                token_file, home=self.home, workspaces_root=ws_root, repo_paths=repo_paths
+            )
+            return {"type": "token", "token": token}
 
         if "MESH_TOKEN" in os.environ:
             return {"type": "token", "token": os.environ["MESH_TOKEN"].strip()}
@@ -162,20 +186,36 @@ class MeshClient:
             payload["evidence_ref"] = getattr(args, "evidence_ref", None)
         if getattr(args, "if_version", None) is not None:
             payload["if_version"] = getattr(args, "if_version")
+        if getattr(args, "_replay_only", False):
+            payload["replay_only"] = True
 
-        timeout_val = cmd_args.get("timeout") if isinstance(cmd_args, dict) else None
-        if not timeout_val and hasattr(args, "timeout"):
-            timeout_val = getattr(args, "timeout", None)
-        if timeout_val:
+        has_cmd_timeout = isinstance(cmd_args, dict) and cmd_args.get("timeout") is not None
+        if cmd == "task.create":
+            timeout_val = None
+        else:
+            timeout_val = cmd_args["timeout"] if has_cmd_timeout else getattr(args, "timeout", None)
+        if timeout_val is not None:
             try:
                 from mesh.core.clock import parse_duration
                 dur = parse_duration(timeout_val)
-                if cmd.endswith(".wait"):
-                    self.timeout = float(dur) + 15.0
-                else:
-                    self.timeout = max(self.timeout or 0.0, float(dur) + 15.0)
-            except Exception:
-                pass
+            except (ValueError, TypeError) as exc:
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Invalid --timeout value '{timeout_val}': {exc}",
+                    details={"param": "timeout", "value": timeout_val},
+                ) from exc
+            if cmd.endswith(".wait") or cmd == "event.tail":
+                self.timeout = float(dur) + 15.0
+            else:
+                if dur <= 0:
+                    raise MeshError(
+                        code=c.INVALID_ARGUMENT,
+                        exit_code=c.EXIT_USAGE,
+                        message=f"--timeout must be positive for client requests, got '{timeout_val}'",
+                        details={"param": "timeout", "value": timeout_val},
+                    )
+                self.timeout = float(dur)
         elif cmd == "event.tail":
             self.timeout = None
 
@@ -227,27 +267,34 @@ class MeshClient:
             payload["user_statement"] = getattr(args, "user_statement", None)
             payload["evidence_ref"] = getattr(args, "evidence_ref", None)
 
-        timeout_val = cmd_args.get("timeout") or getattr(args, "timeout", None)
-        sock_timeout = None
-        if timeout_val:
+        has_cmd_timeout = isinstance(cmd_args, dict) and cmd_args.get("timeout") is not None
+        timeout_val = cmd_args["timeout"] if has_cmd_timeout else getattr(args, "timeout", None)
+        sock_timeout = None if cmd == "event.tail" else self.timeout
+        if timeout_val is not None:
             try:
                 from mesh.core.clock import parse_duration
                 dur = parse_duration(timeout_val)
+            except (ValueError, TypeError) as exc:
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Invalid --timeout value '{timeout_val}': {exc}",
+                    details={"param": "timeout", "value": timeout_val},
+                ) from exc
+            if cmd.endswith(".wait") or cmd == "event.tail":
                 sock_timeout = float(dur) + 15.0
-            except Exception:
-                pass
+            else:
+                if dur <= 0:
+                    raise MeshError(
+                        code=c.INVALID_ARGUMENT,
+                        exit_code=c.EXIT_USAGE,
+                        message=f"--timeout must be positive for client requests, got '{timeout_val}'",
+                        details={"param": "timeout", "value": timeout_val},
+                    )
+                sock_timeout = float(dur)
 
-        try:
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.settimeout(sock_timeout)
-            sock.connect(self.socket_path)
-        except (FileNotFoundError, ConnectionRefusedError, socket.timeout) as exc:
-            raise MeshError(
-                code=c.DAEMON_UNAVAILABLE,
-                exit_code=c.EXIT_DAEMON_UNAVAILABLE,
-                message=f"Daemon unavailable at {self.socket_path}: {exc}. Hint: mesh daemon start",
-            ) from exc
-
+        sock = self._connect_socket(sock_timeout)
+        f = None
         try:
             req_data = (json.dumps(payload) + "\n").encode("utf-8")
             sock.sendall(req_data)
@@ -284,5 +331,16 @@ class MeshClient:
                 exit_code=c.EXIT_DAEMON_UNAVAILABLE,
                 message=f"Daemon response timeout at {self.socket_path}: {exc}",
             ) from exc
+        except (OSError, UnicodeDecodeError) as exc:
+            raise MeshError(
+                code=c.DAEMON_UNAVAILABLE,
+                exit_code=c.EXIT_DAEMON_UNAVAILABLE,
+                message=f"Daemon communication error at {self.socket_path}: {exc}",
+            ) from exc
         finally:
+            if f is not None:
+                try:
+                    f.close()
+                except OSError:
+                    pass
             sock.close()

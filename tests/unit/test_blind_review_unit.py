@@ -138,10 +138,6 @@ class TestLogFile(unittest.TestCase):
         self.assertLess(os.path.getsize(os.path.join(self.home, "logs", "meshd.log")), 1100)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestStreamRedactorR1(unittest.TestCase):
     """PR #40 r1: forced cuts and multiline exact values."""
 
@@ -296,7 +292,7 @@ class TestStreamRedactorR4(unittest.TestCase):
         exact = [("MULTI", sec), ("PLAIN", "plainsecretvalue")]
         begin, end = "-----BEGIN " + "PRIVATE KEY-----\n", "-----END " + "PRIVATE KEY-----\n"
         frags = [
-            "Bearer" + " " * 65 + "X" * 40, "Bearer " + "Y" * 5000, "Bearer\n\n" + "X" * 30,
+            "Bearer" + " " * 65 + "X" * 40, "Bearer " + "Y" * 5000, "\nBearer\n\n" + "X" * 30,
             "sk" + "-" + "Z" * 6000, "gh" + "p_" + "Z" * 9000, "password  :  " + "V" * 5000,
             "api_key=" + "V" * 20, begin + "QUJD" * 4500 + "\n" + end, begin + "QUJD" * 50,
             sec, "plainsecretvalue", "word ", "\n", " " * 70, "ok:", "e" * 3000, "bearer of news ",
@@ -359,7 +355,7 @@ class TestLineRedactionR5(unittest.TestCase):
         exact = [("MULTI", sec), ("PLAIN", "plainsecretvalue")]
         begin, end = "-----BEGIN " + "PRIVATE KEY-----\n", "-----END " + "PRIVATE KEY-----\n"
         frags = [
-            "Bearer" + " " * 65 + "X" * 40, "Bearer " + "Y" * 300, "Bearer\n\n" + "X" * 30, "Bearer\n",
+            "Bearer" + " " * 65 + "X" * 40, "Bearer " + "Y" * 300, "\nidle\nBearer\n\n" + "X" * 30, "Bearer\n",
             "sk" + "-" + "Z" * 60, "gh" + "p_" + "Z" * 40, "fk" + "-" + "Z" * 20, "xox" + "b-" + "Z" * 12,
             "password  :  " + "V" * 50, "api_key=" + "V" * 20, "secret: " + "V" * 30, "passwd=", "password\n",
             "password=sk" + "-" + "Z" * 16 + ":VVVVVVVVVV",
@@ -403,3 +399,7 @@ class TestLineRedactionR6(unittest.TestCase):
             self.assertTrue(whole.endswith("next\n") or whole.endswith("[REDACTED]\n"), whole[-80:])
             for steps in ([1], [7], [4096], [LINE_CAP], [len(text)]):
                 self.assertEqual(self.stream(text, steps, exact), whole, steps)
+
+
+if __name__ == "__main__":
+    unittest.main()

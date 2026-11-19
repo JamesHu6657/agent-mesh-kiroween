@@ -9,6 +9,9 @@ from mesh.core.events import verify_event_chain
 from mesh.daemon import merge, recovery
 from tests.unit import test_merge as tm
 
+# Calls recovery._step_merge_runs scanning real /proc and inherits merge test fixtures.
+MESH_PROC_LOCK = "shared"
+
 
 class CurrentRefsRecoveryTest(tm.TaskBranchCase):
     def test_no_merge_head_uses_current_refs(self) -> None:
@@ -27,17 +30,12 @@ class CurrentRefsRecoveryTest(tm.TaskBranchCase):
                 self.assertEqual((out["outcome"], out["reason"]), ("failed", "interrupted"))
                 self.assertEqual(out["pre_head"], current)
                 self.assertEqual(out["details"]["recorded_pre_head"], self.base)
-                # Carbon P1-2: what an interrupted (noop-merge) test step left in the Mesh-owned
-                # integration tree is cleared by recovery, so the tree is restored either way.
-                self.assertIs(out["details"]["restored"], True, out)
+                self.assertIs(out["details"]["restored"], not dirty)
                 self.assertNotIn("head_moved", out["details"])
                 self.assertFalse(self.fixture.has_merge_head(self.repo))
                 self.assertEqual(self.fixture.head(self.repo), current)
                 if dirty:
-                    self.assertNotIn("dirty_files", out["details"])
-                    self.assertEqual(out["details"]["cleanup"]["removed"], ["untracked.txt"])
-                    self.assertFalse(os.path.exists(os.path.join(self.repo, "untracked.txt")))
-                    self.assertTrue(self.fixture.is_clean(self.repo))
+                    self.assertEqual(out["details"]["dirty_files"], ["untracked.txt"])
         with mock.patch.object(merge, "_dirty_paths", side_effect=merge._GitFailed("verify status")):
             out = merge.decide_recovery(self.repo, self.TASK, self.BRANCH, self.base)
         self.assertEqual(out["pre_head"], current)
@@ -83,11 +81,15 @@ class BlockedRecoveryTest(tm.MergeDbCase):
         """ACC: K14 - step 2 and step 5 persist the current baseline and stale probe separately."""
         tm.PipelineDetailsTest.setUp(self)
         current = self.fixture.head(self.repo)
+        ws_root = merge.get_workspaces_root(self.conn, self.tmp)
+        integ = merge.integration_worktree_path(ws_root, "prj_1")
+        os.makedirs(os.path.dirname(integ), mode=0o700, exist_ok=True)
+        self.fixture.git(self.repo, "worktree", "add", "-b", "mesh/prj_1/integration", integ, current)
+        self.conn.execute("UPDATE projects SET repo_path = ? WHERE id = 'prj_1';", (self.repo,))
         counts = {}
         with mock.patch.object(merge.terminate, "run_targets", return_value={}):
             recovery._step_merge_runs(self.conn, self.tmp, counts)
-        with mock.patch.object(merge, "integration_worktree_path", return_value=self.repo):
-            recovery._step_merging(self.conn, self.tmp, counts)
+        recovery._step_merging(self.conn, self.tmp, counts)
         self.assertEqual((counts["merge_run_lost"], counts["merge_interrupted"]), (1, 1))
         row = self.conn.execute("SELECT status, merge_json FROM tasks WHERE id = 'tsk_a';").fetchone()
         self.assertEqual(row["status"], "merge_failed")
@@ -106,6 +108,33 @@ class BlockedRecoveryTest(tm.MergeDbCase):
         recovery._step_merge_runs(self.conn, self.tmp, {})
         recovery._step_merging(self.conn, self.tmp, {})
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM events;").fetchone()[0], before)
+
+    def test_untrusted_or_rewritten_integration_worktree_fails_closed(self) -> None:
+        """P1-3: step 5 rejects an unregistered or .git-rewritten integration worktree (fail closed)."""
+        tm.PipelineDetailsTest.setUp(self)
+        current = self.fixture.head(self.repo)
+        ws_root = merge.get_workspaces_root(self.conn, self.tmp)
+        integ = merge.integration_worktree_path(ws_root, "prj_1")
+        os.makedirs(os.path.dirname(integ), mode=0o700, exist_ok=True)
+        self.fixture.git(self.repo, "worktree", "add", "-b", "mesh/prj_1/integration", integ, current)
+        self.conn.execute("UPDATE projects SET repo_path = ? WHERE id = 'prj_1';", (self.repo,))
+        self.assertFalse(merge._verify_integration_worktree(self.repo, self.repo, ws_root))
+        with open(os.path.join(integ, ".git"), "w", encoding="utf-8") as f:
+            f.write(f"gitdir: {os.path.join(self.repo, '.git')}\n")
+        counts = {}
+        with mock.patch.object(merge.terminate, "run_targets", return_value={}):
+            recovery._step_merge_runs(self.conn, self.tmp, counts)
+        recovery._step_merging(self.conn, self.tmp, counts)
+        self.assertEqual((counts["merge_run_lost"], counts["merge_interrupted"]), (1, 1))
+        row = self.conn.execute("SELECT status, merge_json FROM tasks WHERE id = 'tsk_a';").fetchone()
+        self.assertEqual(row["status"], "merge_failed")
+        mj = json.loads(row["merge_json"])
+        self.assertEqual(mj["pre_head"], "a" * 40)
+        self.assertIs(mj["details"]["foreign_repository"], True)
+        self.assertIs(mj["details"]["restored"], False)
+        self.assertNotIn("recorded_pre_head", mj["details"])
+        self.assertEqual(self.fixture.head(self.repo), current)
+        self.assertTrue(self.fixture.is_clean(self.repo))
 
     def test_blocked_event_deduplicates_across_restarts_and_errors(self) -> None:
         """ACC: K14 - one durable event per task/error, with no transition or lease release."""

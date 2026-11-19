@@ -378,8 +378,8 @@ class TestSkeleton(unittest.TestCase):
 
         try:
             env = dict(os.environ)
-            env["MESH_TRIPWIRE_FILE"] = tripwire
-            env["MESH_SUITE_TRIPWIRE_FILE"] = tripwire
+            env["_TRIPWIRE_FILE"] = tripwire
+            env["_SUITE_TRIPWIRE_FILE"] = tripwire
             for shim in shims:
                 shim_path = os.path.join(self.repo_root, "tests", "shims", shim)
                 proc = subprocess.run([shim_path, "--test-flag"], env=env, capture_output=True, text=True)
@@ -395,7 +395,7 @@ class TestSkeleton(unittest.TestCase):
                 os.remove(tripwire)
 
     def test_suite_tripwire_propagation(self):
-        """Verify shim execution propagates to suite-level tripwire file when MESH_SUITE_TRIPWIRE_FILE is set."""
+        """Verify shim execution propagates to suite-level tripwire file when _SUITE_TRIPWIRE_FILE is set."""
         shim_tripwire = f"/tmp/tripwire-per-harness-{os.getpid()}.log"
         suite_tripwire = f"/tmp/tripwire-suite-test-{os.getpid()}.log"
         for p in (shim_tripwire, suite_tripwire):
@@ -404,8 +404,8 @@ class TestSkeleton(unittest.TestCase):
 
         try:
             env = dict(os.environ)
-            env["MESH_TRIPWIRE_FILE"] = shim_tripwire
-            env["MESH_SUITE_TRIPWIRE_FILE"] = suite_tripwire
+            env["_TRIPWIRE_FILE"] = shim_tripwire
+            env["_SUITE_TRIPWIRE_FILE"] = suite_tripwire
 
             droid_shim = os.path.join(self.repo_root, "tests", "shims", "droid")
             proc = subprocess.run([droid_shim, "--version"], env=env, capture_output=True, text=True)

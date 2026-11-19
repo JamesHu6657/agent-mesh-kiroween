@@ -49,7 +49,7 @@ elif args == ["exec", "--help"]:
         sys.stdout.buffer.write(fp.read())
     sys.exit(0)
 else:
-    trip = os.environ.get("MESH_TRIPWIRE_FILE") or {trip_path!r}
+    trip = os.environ.get("_TRIPWIRE_FILE") or {trip_path!r}
     with open(trip, "a", encoding="utf-8") as fp:
         fp.write(f"UNAUTHORIZED_DROID_INVOCATION: {{args}}\\n")
     sys.exit(99)
@@ -77,7 +77,7 @@ elif args == ["models"]:
         sys.stdout.buffer.write(fp.read())
     sys.exit(0)
 else:
-    trip = os.environ.get("MESH_TRIPWIRE_FILE") or {trip_path!r}
+    trip = os.environ.get("_TRIPWIRE_FILE") or {trip_path!r}
     with open(trip, "a", encoding="utf-8") as fp:
         fp.write(f"UNAUTHORIZED_AGY_INVOCATION: {{args}}\\n")
     sys.exit(99)
@@ -110,7 +110,7 @@ elif args == ["chat", "--list-models", "-f", "json"]:
         sys.stdout.buffer.write(fp.read())
     sys.exit(0)
 else:
-    trip = os.environ.get("MESH_TRIPWIRE_FILE") or {trip_path!r}
+    trip = os.environ.get("_TRIPWIRE_FILE") or {trip_path!r}
     with open(trip, "a", encoding="utf-8") as fp:
         fp.write(f"UNAUTHORIZED_KIRO_INVOCATION: {{args}}\\n")
     sys.exit(99)
@@ -133,7 +133,7 @@ elif args == ["--help"]:
         sys.stdout.buffer.write(fp.read())
     sys.exit(0)
 else:
-    trip = os.environ.get("MESH_TRIPWIRE_FILE") or {trip_path!r}
+    trip = os.environ.get("_TRIPWIRE_FILE") or {trip_path!r}
     with open(trip, "a", encoding="utf-8") as fp:
         fp.write(f"UNAUTHORIZED_VIBE_INVOCATION: {{args}}\\n")
     sys.exit(99)

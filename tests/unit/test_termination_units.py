@@ -14,6 +14,9 @@ import uuid
 from mesh.core.proc import get_proc_environ, get_proc_stat, parse_proc_stat
 from mesh.daemon import children, terminate
 
+# Real /proc scans: hold the runner's host-wide /proc lock shared (tests/run_tier.py).
+MESH_PROC_LOCK = "shared"
+
 # Unique per test process: run ids carried as a real MESH_RUN_ID must not collide
 # with another tier run on the same host (dogfood concurrency).
 _RUN_SFX = f"_{os.getpid()}"

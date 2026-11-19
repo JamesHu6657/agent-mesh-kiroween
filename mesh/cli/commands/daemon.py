@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import sys
 import subprocess
 import time
 from typing import Any, Dict
@@ -129,7 +130,7 @@ def handle_daemon_start(args: argparse.Namespace) -> Dict[str, Any]:
     from mesh.core.paths import get_mesh_bin_dir
     bin_mesh = os.path.join(get_mesh_bin_dir(), "mesh")
 
-    env = dict(os.environ)
+    env = {k: v for k, v in os.environ.items() if k not in DAEMON_SECRET_ENV}
     # Detached spawn
     proc = subprocess.Popen(
         [bin_mesh, "--home", args.home, "daemon", "run"],
@@ -177,9 +178,25 @@ def handle_daemon_start(args: argparse.Namespace) -> Dict[str, Any]:
     }
 
 
+#: Full review r3 P1-6: credentials of the CLI caller. meshd never reads them (users
+#: authenticate per request), but a process's initial environment stays readable in
+#: /proc/<pid>/environ for its whole life, by every same-uid agent and test command.
+DAEMON_SECRET_ENV = ("MESH_PASSPHRASE", "MESH_PASSPHRASE_FILE", "MESH_TOKEN")
+
+
+def _exec_without_secret_env() -> None:
+    """Re-exec this `daemon run` with the caller's credentials removed from the
+    environment (the kernel keeps the exec-time block; only a new exec drops it)."""
+    if not any(k in os.environ for k in DAEMON_SECRET_ENV):
+        return
+    env = {k: v for k, v in os.environ.items() if k not in DAEMON_SECRET_ENV}
+    os.execve(sys.executable, [sys.executable, "-P", "-s", "-m", "mesh", *sys.argv[1:]], env)
+
+
 def handle_daemon_run(args: argparse.Namespace) -> Dict[str, Any]:
     """Run meshd in the foreground."""
     _refuse_dry_run(args, "mesh daemon run")
+    _exec_without_secret_env()
     # Imported here: every other CLI verb skips asyncio and the daemon (startup cost, A1).
     import asyncio
 

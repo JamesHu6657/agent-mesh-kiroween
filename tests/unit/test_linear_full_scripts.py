@@ -187,14 +187,11 @@ class TestKiroRunner(RepoCase):
 
 class TestSecretScanQuotedNames(RepoCase):
     def test_d8_non_ascii_name_is_scanned(self):
-        bindir = os.path.join(self.tmp, "bin")
-        write(os.path.join(bindir, "gitleaks"), "#!/bin/sh\nexit 0\n", 0o755)
-        if os.path.exists("/tmp/gitleaks"):
-            self.skipTest("/tmp/gitleaks takes precedence over PATH")
+        gl = os.path.join(self.tmp, "bin", "gitleaks")
+        write(gl, "#!/bin/sh\nexit 0\n", 0o755)
         write(os.path.join(self.repo, ".kiro", "中文.md"), "see /home/alice/notes\n")
         git(self.repo, "add", "-A")
-        r = self.run_sh(".kiro/hooks/scripts/secret-scan.sh",
-                        env={"PATH": bindir + os.pathsep + os.environ["PATH"]})
+        r = self.run_sh(".kiro/hooks/scripts/secret-scan.sh", env={"GITLEAKS": gl})
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("absolute home path", r.stdout)
 

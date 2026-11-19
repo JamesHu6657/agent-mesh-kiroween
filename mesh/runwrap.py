@@ -24,11 +24,17 @@ Merge test step (m2-r6, §10.5 step 3) options:
   needs the install root on ``PYTHONPATH`` to start; the test command must not see it.
 """
 
+import codecs
+import errno
+import io
 import json
 import os
+import selectors
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -42,20 +48,53 @@ ACTIVITY_TOUCH_INTERVAL_S = 1.0
 PIPE_DRAIN_GRACE_S = 5.0
 
 
-def atomic_write_json(path: str, obj: Dict[str, Any]) -> None:
-    """Write JSON atomically (tmp + fsync + rename) with mode 0600."""
-    tmp_path = f"{path}.tmp.{os.getpid()}"
-    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+def _open_regular_nofollow(path: str, flags: int, mode: int = 0o600, label: str = "file") -> int:
+    """Open a regular file without following symlinks or blocking on FIFOs."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags | nofollow | nonblock, mode)
     try:
-        os.write(fd, (json.dumps(obj, sort_keys=True) + "\n").encode("utf-8"))
-        os.fsync(fd)
-    finally:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EINVAL, f"Refusing non-regular {label}", path)
+        if nonblock:
+            try:
+                import fcntl
+
+                fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+                if fl & nonblock:
+                    fcntl.fcntl(fd, fcntl.F_SETFL, fl & ~nonblock)
+            except OSError:
+                pass
+        return fd
+    except BaseException:
         os.close(fd)
-    os.replace(tmp_path, path)
+        raise
+
+
+def atomic_write_json(path: str, obj: Dict[str, Any]) -> None:
+    """Write JSON atomically (mkstemp O_EXCL|O_NOFOLLOW + fsync + rename) with mode 0600."""
+    parent = os.path.dirname(os.path.abspath(path)) or "."
+    base = os.path.basename(path)
+    fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=f".{base}.tmp.", suffix=".json")
     try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+        try:
+            os.fchmod(fd, 0o600)
+            payload = (json.dumps(obj, sort_keys=True) + "\n").encode("utf-8")
+            view = memoryview(payload)
+            while view:
+                n = os.write(fd, view)
+                view = view[n:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def load_spec(run_dir: str) -> Dict[str, Any]:
@@ -72,6 +111,31 @@ def redaction_values(spec: Dict[str, Any], env: Dict[str, str]) -> List[Tuple[st
 READ_CHUNK_BYTES = 64 * 1024
 
 
+def _utf8_safe_prefix(data: bytes, limit: int) -> bytes:
+    """Slice UTF-8 *data* to at most *limit* bytes without splitting a multi-byte codepoint."""
+    if limit <= 0:
+        return b""
+    if len(data) <= limit:
+        return data
+    end = limit
+    pos = end - 1
+    while pos >= 0 and (data[pos] & 0xC0) == 0x80 and (end - pos) < 4:
+        pos -= 1
+    if pos >= 0 and (data[pos] & 0xC0) == 0xC0:
+        lead = data[pos]
+        if (lead & 0xE0) == 0xC0:
+            need = 2
+        elif (lead & 0xF0) == 0xE0:
+            need = 3
+        elif (lead & 0xF8) == 0xF0:
+            need = 4
+        else:
+            need = 1
+        if end - pos < need:
+            return data[:pos]
+    return data[:end]
+
+
 def _pump_stream(
     pipe: Any,
     log_path: str,
@@ -79,26 +143,29 @@ def _pump_stream(
     activity_path: str,
     cap_bytes: int,
     errors: Optional[List[str]] = None,
+    drain_wake_fd: Optional[int] = None,
+    drain_deadline: Optional[List[Optional[float]]] = None,
 ) -> None:
     """Copy one child stream into its log, redacted, capped.
 
-    Blind review: reads are bounded (``read1``), so output without newlines neither
-    grows memory nor stalls activity; redaction is stateful (``StreamRedactor``), so a
-    secret spanning lines (a PEM key) is still redacted. A capture failure (the log can't
-    be opened or written) is recorded in ``errors`` and the stream is still drained, so
-    the child is never blocked on a full pipe."""
-    import codecs
-
+    Reads are non-blocking via ``PollSelector`` with a post-exit drain deadline so
+    output without newlines updates activity, escaped descendants holding pipes past
+    ``PIPE_DRAIN_GRACE_S`` still flush buffered ``StreamRedactor`` lines before
+    ``exit.json`` is written, and capture errors drain safely without deadlocking."""
     written = 0
     truncated = False
     last_touch = 0.0
-    redactor = StreamRedactor(exact_values)
+    redactor = StreamRedactor(exact_values, jsonl=True)  # full review r1 P1-1
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     log_file = None
     try:
-        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        os.fchmod(fd, 0o600)
-        log_file = os.fdopen(fd, "wb")
+        fd = _open_regular_nofollow(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600, label="log file")
+        try:
+            os.fchmod(fd, 0o600)
+            log_file = os.fdopen(fd, "wb")
+        except BaseException:
+            os.close(fd)
+            raise
     except OSError as exc:
         if errors is not None:
             errors.append(f"{os.path.basename(log_path)}: {type(exc).__name__}: {exc.strerror or exc}")
@@ -117,7 +184,7 @@ def _pump_stream(
         else:
             room = cap_bytes - written
             if len(data) > room:
-                data = data[:room] + b"\n[runwrap] log cap reached; output truncated\n"
+                data = _utf8_safe_prefix(data, room) + b"\n[runwrap] log cap reached; output truncated\n"
                 truncated = True
         try:
             log_file.write(data)
@@ -133,24 +200,111 @@ def _pump_stream(
             return
         written += len(data)
 
+    def handle_chunk(chunk: bytes) -> None:
+        nonlocal last_touch
+        now = time.monotonic()
+        if now - last_touch >= ACTIVITY_TOUCH_INTERVAL_S:
+            try:
+                if os.utime in os.supports_follow_symlinks:
+                    os.utime(activity_path, None, follow_symlinks=False)
+                else:
+                    st_act = os.lstat(activity_path)
+                    if stat.S_ISREG(st_act.st_mode):
+                        os.utime(activity_path, None)
+            except OSError:
+                pass
+            last_touch = now
+        if log_file is None or (truncated and written >= cap_bytes):
+            return  # drain only
+        write(redactor.feed(decoder.decode(chunk)).encode("utf-8", "replace"))
+
+    def past_deadline() -> bool:
+        dl = drain_deadline[0] if drain_deadline else None
+        return dl is not None and time.monotonic() >= dl
+
+    sel = None
     try:
-        while True:
-            chunk = pipe.read1(READ_CHUNK_BYTES) if hasattr(pipe, "read1") else os.read(pipe.fileno(), READ_CHUNK_BYTES)
-            if not chunk:
-                break
-            now = time.monotonic()
-            if now - last_touch >= ACTIVITY_TOUCH_INTERVAL_S:
-                try:
-                    os.utime(activity_path, None)
-                except OSError:
-                    pass
-                last_touch = now
-            if log_file is None or (truncated and written >= cap_bytes):
-                continue  # drain only
-            write(redactor.feed(decoder.decode(chunk)).encode("utf-8"))
-        write(redactor.feed(decoder.decode(b"", final=True)).encode("utf-8"))
-        write(redactor.flush().encode("utf-8"))
+        pipe_fd: Optional[int] = None
+        if hasattr(pipe, "fileno"):
+            try:
+                pipe_fd = pipe.fileno()
+            except (AttributeError, ValueError, io.UnsupportedOperation, OSError):
+                pipe_fd = None
+
+        if pipe_fd is not None and (drain_wake_fd is not None or drain_deadline is not None):
+            os.set_blocking(pipe_fd, False)
+            sel = selectors.PollSelector()
+            sel.register(pipe_fd, selectors.EVENT_READ, data="pipe")
+            wake_watched = False
+            if drain_wake_fd is not None:
+                sel.register(drain_wake_fd, selectors.EVENT_READ, data="wake")
+                wake_watched = True
+
+            eof = False
+            while not eof:
+                dl = drain_deadline[0] if drain_deadline else None
+                if dl is not None:
+                    if wake_watched:
+                        try:
+                            sel.unregister(drain_wake_fd)
+                        except (KeyError, ValueError):
+                            pass
+                        wake_watched = False
+                    remaining = dl - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    timeout: Optional[float] = remaining
+                else:
+                    timeout = None
+
+                events = sel.select(timeout)
+                if not events:
+                    break
+                pipe_ready = False
+                for key, _ in events:
+                    if key.data == "wake":
+                        if wake_watched:
+                            try:
+                                sel.unregister(drain_wake_fd)
+                            except (KeyError, ValueError):
+                                pass
+                            wake_watched = False
+                    elif key.data == "pipe":
+                        pipe_ready = True
+                if not pipe_ready:
+                    continue
+                while True:
+                    try:
+                        chunk = os.read(pipe_fd, READ_CHUNK_BYTES)
+                    except BlockingIOError:
+                        break
+                    except InterruptedError:
+                        continue
+                    except OSError:
+                        eof = True
+                        break
+                    if not chunk:
+                        eof = True
+                        break
+                    handle_chunk(chunk)
+                    if past_deadline():
+                        eof = True
+                        break
+        else:
+            while True:
+                chunk = pipe.read1(READ_CHUNK_BYTES) if hasattr(pipe, "read1") else os.read(pipe.fileno(), READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                handle_chunk(chunk)
+
+        write(redactor.feed(decoder.decode(b"", final=True)).encode("utf-8", "replace"))
+        write(redactor.flush().encode("utf-8", "replace"))
     finally:
+        if sel is not None:
+            try:
+                sel.close()
+            except OSError:
+                pass
         if log_file is not None:
             try:
                 log_file.close()
@@ -167,7 +321,10 @@ def run(run_dir: str) -> int:
     if isinstance(delay, (int, float)) and 0 < delay <= 10:
         time.sleep(float(delay))
     activity_path = os.path.join(run_dir, "activity")
-    open(activity_path, "a", encoding="utf-8").close()
+    act_fd = _open_regular_nofollow(
+        activity_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600, label="activity file"
+    )
+    os.close(act_fd)
 
     try:
         stat_info = get_proc_stat(os.getpid())
@@ -242,24 +399,56 @@ def run(run_dir: str) -> int:
     else:
         streams = [(child.stdout, "stdout.log"), (child.stderr, "stderr.log")]
     capture_errors: List[str] = []
+    wake_r, wake_w = os.pipe()
+    wake_w_open = True
+    drain_deadline: List[Optional[float]] = [None]
     threads = [
         threading.Thread(
             target=_pump_stream,
-            args=(pipe, os.path.join(run_dir, name), exact_values, activity_path, cap_bytes, capture_errors),
+            args=(pipe, os.path.join(run_dir, name), exact_values, activity_path, cap_bytes,
+                  capture_errors, wake_r, drain_deadline),
             daemon=True,
         )
         for pipe, name in streams
     ]
-    for thread in threads:
-        thread.start()
+    try:
+        for thread in threads:
+            thread.start()
 
-    returncode = child.wait()
-    # A descendant that escaped may keep the pipes open; do not let it hold back
-    # exit.json (the supervisor deals with leftovers, plan §11.3).
-    join_deadline = time.monotonic() + PIPE_DRAIN_GRACE_S
-    for thread in threads:
-        thread.join(max(0.0, join_deadline - time.monotonic()))
+        returncode = child.wait()
+        # A descendant that escaped may keep the pipes open; let pump threads drain until
+        # PIPE_DRAIN_GRACE_S, flush buffered lines and close logs before writing exit.json.
+        drain_deadline[0] = time.monotonic() + PIPE_DRAIN_GRACE_S
+        try:
+            os.close(wake_w)
+            wake_w_open = False
+        except OSError:
+            pass
+        join_deadline = drain_deadline[0] + 1.0
+        for thread in threads:
+            thread.join(max(0.0, join_deadline - time.monotonic()))
+    finally:
+        if wake_w_open:
+            try:
+                os.close(wake_w)
+            except OSError:
+                pass
+        try:
+            os.close(wake_r)
+        except OSError:
+            pass
+        for (pipe, _), thread in zip(streams, threads):
+            if pipe is not None and not thread.is_alive():
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
 
+    # Full review r5 P2-6: a pump still running past its deadline did not write the end
+    # of the output; the run is not a clean success on its exit code alone.
+    hung = [os.path.basename(name) for (_, name), thread in zip(streams, threads) if thread.is_alive()]
+    if hung:
+        capture_errors.append("output capture did not finish: " + ", ".join(hung))
     exit_code: Optional[int] = returncode if returncode >= 0 else None
     term_signal: Optional[int] = -returncode if returncode < 0 else None
     exit_doc: Dict[str, Any] = {

@@ -44,28 +44,42 @@ def _require_open_project(conn, project_id):
             details={"project_id": project_id, "status": row["status"]},
         )
 
+def _require_task_str(val: Any, param: str, msg: str) -> str:
+    if not isinstance(val, str) or not val.strip():
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=msg,
+            details={"param": param},
+        )
+    return val.strip()
+
+
 def handle_dep_add(ctx: HandlerContext) -> HandlerResult:
     """Add a prerequisite dependency: task depends on on_task."""
-    task_id = ctx.args.get("task_id")
-    on_task_id = ctx.args.get("on") or ctx.args.get("on_arg") or ctx.args.get("depends_on")
+    task_id = _require_task_str(ctx.args.get("task_id"), "task_id", "Missing task_id")
+    raw_on = (
+        ctx.args.get("on")
+        if ctx.args.get("on") is not None
+        else (ctx.args.get("on_arg") if ctx.args.get("on_arg") is not None else ctx.args.get("depends_on"))
+    )
+    on_task_id = _require_task_str(raw_on, "on", "Missing prerequisite task id (--on)")
 
-    if not task_id or not str(task_id).strip():
+    t1 = ctx.conn.execute(
+        "SELECT id, project_id, status FROM tasks WHERE id = ?;",
+        (task_id,),
+    ).fetchone()
+    if t1 is None:
+        check_authz(ctx.conn, "dep.add", ctx.principal, ctx.actor_kind, ctx.via, resource_resolved=False)
         raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="Missing task_id",
-            details={"param": "task_id"},
-        )
-    if not on_task_id or not str(on_task_id).strip():
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="Missing prerequisite task id (--on)",
-            details={"param": "on"},
+            code=c.NOT_FOUND,
+            exit_code=c.EXIT_NOT_FOUND,
+            message=f"Task '{task_id}' not found",
+            details={"task_id": task_id},
         )
 
-    task_id = str(task_id).strip()
-    on_task_id = str(on_task_id).strip()
+    project_id = t1["project_id"]
+    check_authz(ctx.conn, "dep.add", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id, task_id=task_id)
 
     if task_id == on_task_id:
         raise MeshError(
@@ -75,30 +89,17 @@ def handle_dep_add(ctx: HandlerContext) -> HandlerResult:
             details={"task_id": task_id, "on": on_task_id},
         )
 
-    # Fetch both tasks
-    cur = ctx.conn.execute(
-        "SELECT id, project_id, status FROM tasks WHERE id IN (?, ?);",
-        (task_id, on_task_id),
-    )
-    rows = {r["id"]: r for r in cur.fetchall()}
-
-    if task_id not in rows:
-        raise MeshError(
-            code=c.NOT_FOUND,
-            exit_code=c.EXIT_NOT_FOUND,
-            message=f"Task '{task_id}' not found",
-            details={"task_id": task_id},
-        )
-    if on_task_id not in rows:
+    t2 = ctx.conn.execute(
+        "SELECT id, project_id, status FROM tasks WHERE id = ?;",
+        (on_task_id,),
+    ).fetchone()
+    if t2 is None:
         raise MeshError(
             code=c.NOT_FOUND,
             exit_code=c.EXIT_NOT_FOUND,
             message=f"Task '{on_task_id}' not found",
             details={"task_id": on_task_id},
         )
-
-    t1 = rows[task_id]
-    t2 = rows[on_task_id]
 
     if t1["project_id"] != t2["project_id"]:
         raise MeshError(
@@ -107,9 +108,6 @@ def handle_dep_add(ctx: HandlerContext) -> HandlerResult:
             message="Tasks must belong to the same project",
             details={"task_id": task_id, "on": on_task_id},
         )
-
-    project_id = t1["project_id"]
-    check_authz(ctx.conn, "dep.add", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id, task_id=task_id)
 
     # Check for cycle (ACC: F5)
     if _dfs_cycle_check(ctx.conn, task_id, on_task_id):
@@ -120,67 +118,69 @@ def handle_dep_add(ctx: HandlerContext) -> HandlerResult:
             details={"task_id": task_id, "on": on_task_id},
         )
 
-    # Pre-public review P2: T4 checks deps only on the way into queued, so a new
-    # unfinished prerequisite on an already-queued task would never block it.
-    # Reject that instead of silently letting the task start.
-    if t1["status"] == "queued" and t2["status"] not in ("accepted", "merged"):
+    # Pre-public review P2 + r3 P2-11: T4 checks deps only on the way into queued, so a new
+    # unfinished prerequisite on an already-queued or post-queue task would never block it.
+    if (
+        t1["status"] in ("queued", "running", "submitted", "accepted", "merging", "merged", "cancelling", "cancelled")
+        and t2["status"] not in ("accepted", "merged")
+    ):
         raise MeshError(
             code=c.INVALID_TRANSITION,
             exit_code=c.EXIT_CONFLICT,
             message=(
-                f"Task '{task_id}' is already queued; it cannot gain unfinished "
-                f"prerequisite '{on_task_id}' (status '{t2['status']}'). "
-                "Reassign it back to assigned first, or wait for the prerequisite."
+                f"Task '{task_id}' is '{t1['status']}'; it cannot gain unfinished "
+                f"prerequisite '{on_task_id}' (status '{t2['status']}')."
             ),
-            details={"task_id": task_id, "on": on_task_id, "task_status": "queued",
+            details={"task_id": task_id, "on": on_task_id, "task_status": t1["status"],
                      "on_status": t2["status"]},
         )
 
     _require_open_project(ctx.conn, t1["project_id"])
     # Insert into task_deps if not already present
-    ctx.conn.execute(
+    cur = ctx.conn.execute(
         "INSERT OR IGNORE INTO task_deps (task_id, depends_on_task_id) VALUES (?, ?);",
         (task_id, on_task_id),
     )
 
-    record_event(
-        conn=ctx.conn,
-        type_="dep.added",
-        actor_id=ctx.principal["id"],
-        actor_kind=ctx.actor_kind,
-        via=ctx.via,
-        relayed_by=ctx.relayed_by,
-        project_id=project_id,
-        task_id=task_id,
-        payload={"task_id": task_id, "depends_on_task_id": on_task_id},
-        request_id=ctx.request_id,
-        k_user=ctx.k_user,
-    )
+    events: List[str] = []
+    if cur.rowcount > 0:
+        record_event(
+            conn=ctx.conn,
+            type_="dep.added",
+            actor_id=ctx.principal["id"],
+            actor_kind=ctx.actor_kind,
+            via=ctx.via,
+            relayed_by=ctx.relayed_by,
+            project_id=project_id,
+            task_id=task_id,
+            payload={"task_id": task_id, "depends_on_task_id": on_task_id},
+            request_id=ctx.request_id,
+            k_user=ctx.k_user,
+        )
+        events.append("dep.added")
 
     return HandlerResult(
-        data={"task_id": task_id, "depends_on": on_task_id},
-        events=["dep.added"],
+        data={"task_id": task_id, "depends_on": on_task_id, "added": cur.rowcount > 0},
+        events=events,
     )
 
 
 def handle_dep_remove(ctx: HandlerContext) -> HandlerResult:
     """Remove a prerequisite dependency."""
-    task_id = ctx.args.get("task_id")
-    on_task_id = ctx.args.get("on") or ctx.args.get("on_arg") or ctx.args.get("depends_on")
+    task_id = _require_task_str(ctx.args.get("task_id"), "task_id", "Missing task_id")
+    raw_on = (
+        ctx.args.get("on")
+        if ctx.args.get("on") is not None
+        else (ctx.args.get("on_arg") if ctx.args.get("on_arg") is not None else ctx.args.get("depends_on"))
+    )
+    on_task_id = _require_task_str(raw_on, "on", "Missing prerequisite task id (--on)")
 
-    if not task_id or not on_task_id:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="Both task_id and --on are required",
-        )
-
-    task_id = str(task_id).strip()
-    on_task_id = str(on_task_id).strip()
-
-    cur = ctx.conn.execute("SELECT id, project_id FROM tasks WHERE id = ?;", (task_id,))
-    trow = cur.fetchone()
-    if not trow:
+    t1 = ctx.conn.execute(
+        "SELECT id, project_id FROM tasks WHERE id = ?;",
+        (task_id,),
+    ).fetchone()
+    if t1 is None:
+        check_authz(ctx.conn, "dep.remove", ctx.principal, ctx.actor_kind, ctx.via, resource_resolved=False)
         raise MeshError(
             code=c.NOT_FOUND,
             exit_code=c.EXIT_NOT_FOUND,
@@ -188,48 +188,59 @@ def handle_dep_remove(ctx: HandlerContext) -> HandlerResult:
             details={"task_id": task_id},
         )
 
-    project_id = trow["project_id"]
+    project_id = t1["project_id"]
     check_authz(ctx.conn, "dep.remove", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id, task_id=task_id)
+
+    t2 = ctx.conn.execute(
+        "SELECT id, project_id FROM tasks WHERE id = ?;",
+        (on_task_id,),
+    ).fetchone()
+    if t2 is None:
+        raise MeshError(
+            code=c.NOT_FOUND,
+            exit_code=c.EXIT_NOT_FOUND,
+            message=f"Task '{on_task_id}' not found",
+            details={"task_id": on_task_id},
+        )
+
     _require_open_project(ctx.conn, project_id)
 
-    ctx.conn.execute(
+    del_cur = ctx.conn.execute(
         "DELETE FROM task_deps WHERE task_id = ? AND depends_on_task_id = ?;",
         (task_id, on_task_id),
     )
 
-    record_event(
-        conn=ctx.conn,
-        type_="dep.removed",
-        actor_id=ctx.principal["id"],
-        actor_kind=ctx.actor_kind,
-        via=ctx.via,
-        relayed_by=ctx.relayed_by,
-        project_id=project_id,
-        task_id=task_id,
-        payload={"task_id": task_id, "depends_on_task_id": on_task_id},
-        request_id=ctx.request_id,
-        k_user=ctx.k_user,
-    )
+    events: List[str] = []
+    if del_cur.rowcount > 0:
+        record_event(
+            conn=ctx.conn,
+            type_="dep.removed",
+            actor_id=ctx.principal["id"],
+            actor_kind=ctx.actor_kind,
+            via=ctx.via,
+            relayed_by=ctx.relayed_by,
+            project_id=project_id,
+            task_id=task_id,
+            payload={"task_id": task_id, "depends_on_task_id": on_task_id},
+            request_id=ctx.request_id,
+            k_user=ctx.k_user,
+        )
+        events.append("dep.removed")
 
     return HandlerResult(
-        data={"task_id": task_id, "removed": on_task_id},
-        events=["dep.removed"],
+        data={"task_id": task_id, "removed": on_task_id, "removed_count": del_cur.rowcount},
+        events=events,
     )
 
 
 def handle_dep_list(ctx: HandlerContext) -> HandlerResult:
     """List dependencies for a task."""
-    task_id = ctx.args.get("task_id")
-    if not task_id:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="Missing task_id",
-        )
+    task_id = _require_task_str(ctx.args.get("task_id"), "task_id", "Missing task_id")
 
     cur = ctx.conn.execute("SELECT id, project_id FROM tasks WHERE id = ?;", (task_id,))
     trow = cur.fetchone()
     if not trow:
+        check_authz(ctx.conn, "dep.list", ctx.principal, ctx.actor_kind, ctx.via, resource_resolved=False)
         raise MeshError(
             code=c.NOT_FOUND,
             exit_code=c.EXIT_NOT_FOUND,

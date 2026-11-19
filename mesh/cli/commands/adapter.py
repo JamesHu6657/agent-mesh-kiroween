@@ -1,9 +1,12 @@
 """Adapter resource commands: list, show, probe, models."""
 
 import argparse
+import os
 from typing import Any, Dict
 
+import mesh.constants as c
 from mesh.client import MeshClient
+from mesh.errors import MeshError
 
 
 def register_adapter_commands(subparsers: argparse._SubParsersAction, parent_parser: argparse.ArgumentParser) -> None:
@@ -75,12 +78,28 @@ def handle_adapter_show(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def handle_adapter_probe(args: argparse.Namespace) -> Dict[str, Any]:
+    raw_bin = getattr(args, "binary", None)
+    if raw_bin is not None and not args.adapter_id:
+        raise MeshError(
+            c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="'adapter_id' is required when '--binary' is specified",
+            details={"param": "adapter_id"},
+        )
     client = MeshClient(home=args.home)
     payload: Dict[str, Any] = {}
-    if args.adapter_id:
+    if args.adapter_id is not None:
         payload["adapter_id"] = args.adapter_id
-    if getattr(args, "binary", None):
-        payload["binary"] = args.binary
+    if raw_bin is not None:
+        if (
+            isinstance(raw_bin, str)
+            and raw_bin.strip()
+            and not any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_bin)
+            and not raw_bin.lstrip().startswith("-")
+        ):
+            payload["binary"] = os.path.abspath(os.path.expanduser(raw_bin.strip()))
+        else:
+            payload["binary"] = raw_bin
     resp = client.execute_cmd(args, "adapter.probe", payload)
     return resp.get("data", {})
 

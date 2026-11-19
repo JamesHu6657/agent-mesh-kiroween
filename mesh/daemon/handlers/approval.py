@@ -1,6 +1,5 @@
 """Approval command handlers per plan §7.4 and §13.3."""
 
-import hashlib
 import json
 import sqlite3
 from typing import Any, Dict, List, Optional
@@ -17,17 +16,27 @@ from mesh.core.approvals import (
     get_delegated_self_approve,
     create_or_get_pending_approval,
     get_approval_policy,
+    get_row_approval_policy,
+    validate_delegated_decision_at_consume,
+    requested_event_problem,
+    verify_row_for_consume,
+    is_legacy_consumed_approval,
+    verify_approval_event_history,
+    verify_stored_op_json,
 )
 from mesh.core.authz import (
     can_principal_read_project,
     check_authz,
+    get_agent_capabilities,
     get_project_active_lead,
+    is_acting_project_lead,
     is_project_lead,
     lead_run_token_scope,
 )
-from mesh.core.canonical import canonical_json, check_no_floats
+from mesh.core.canonical import check_no_floats
 from mesh.core.clock import now_iso_utc, parse_duration
 from mesh.core.events import record_event
+from mesh.core.workspaces import is_approval_pinned_by_ws_reservation
 from mesh.daemon.handlers.base import HandlerContext, HandlerResult
 from mesh.errors import MeshError
 
@@ -35,19 +44,198 @@ from mesh.errors import MeshError
 def _check_approval_run_scope(ctx: HandlerContext, row: sqlite3.Row) -> None:
     """Confine approval IDs before requester, project-read, or relay authority."""
     scope_project = lead_run_token_scope(ctx.principal, ctx.via)
-    if scope_project is not None and row["project_id"] != scope_project:
+    if scope_project is not None:
+        if row["project_id"] != scope_project:
+            raise MeshError(
+                code=c.SCOPE_MISMATCH,
+                exit_code=c.EXIT_FORBIDDEN,
+                message="Lead run token cannot access an approval outside its run scope",
+                details={"approval_id": row["id"], "project_id": row["project_id"],
+                         "scope_project_id": scope_project},
+            )
+        check_authz(ctx.conn, ctx.cmd, ctx.principal, ctx.actor_kind, ctx.via, project_id=scope_project)
+
+
+def _require_nonempty_str(value: Any, param: str, message: str) -> str:
+    if not isinstance(value, str) or not value.strip():
         raise MeshError(
-            code=c.SCOPE_MISMATCH,
-            exit_code=c.EXIT_FORBIDDEN,
-            message="Lead run token cannot access an approval outside its run scope",
-            details={"approval_id": row["id"], "project_id": row["project_id"],
-                     "scope_project_id": scope_project},
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=message,
+            details={"param": param},
         )
+    return value
+
+
+def _validate_optional_str(value: Any, param: str, *, max_len: Optional[int] = None) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str) or (max_len is not None and len(value) > max_len):
+        msg = (
+            f"Field '{param}' must be a string up to {max_len} characters"
+            if max_len is not None
+            else f"Field '{param}' must be a string"
+        )
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=msg,
+            details={"param": param},
+        )
+    return value
+
+
+def _validate_evidence_ref(value: Any) -> Optional[str]:
+    validated = _validate_optional_str(value, "evidence_ref", max_len=4000)
+    return redact(validated) if validated else validated
 
 
 def _redact_opt(value: Any) -> Any:
     """Redact free text supplied with a decision (evidence references included)."""
     return redact(value) if isinstance(value, str) and value else value
+
+
+def check_approval_replay_authz(
+    conn: sqlite3.Connection,
+    cmd: str,
+    principal: Dict[str, Any],
+    actor_kind: str,
+    via: str,
+    args: Any,
+    stored_envelope: Any,
+) -> None:
+    """Re-verify fine-grained approval command authority on idempotent replay."""
+    if not cmd.startswith("approval."):
+        return
+    req_args = args if isinstance(args, dict) else {}
+    data = stored_envelope.get("data") if isinstance(stored_envelope, dict) else {}
+    raw_aid = req_args.get("approval_id")
+    approval_id = raw_aid if isinstance(raw_aid, str) and raw_aid else (
+        data.get("approval_id") if isinstance(data, dict) and isinstance(data.get("approval_id"), str) else None
+    )
+    if actor_kind != "user" and principal.get("id"):
+        caps = get_agent_capabilities(conn, principal["id"])
+        effective_principal = dict(principal)
+        effective_principal["capabilities"] = caps
+    else:
+        caps = principal.get("capabilities")
+        effective_principal = principal
+    caps = caps if isinstance(caps, list) else []
+
+    ctx = HandlerContext(
+        conn=conn,
+        principal=effective_principal,
+        actor_kind=actor_kind,
+        via=via,
+        request_id="replay_authz",
+        home="",
+        cmd=cmd,
+        args=dict(req_args),
+    )
+
+    if cmd == "approval.request":
+        raw_proj = req_args.get("project_id") or req_args.get("project")
+        project_id = raw_proj if isinstance(raw_proj, str) and raw_proj else None
+        raw_task = req_args.get("task_id") or req_args.get("task")
+        task_id = raw_task if isinstance(raw_task, str) and raw_task else None
+        if task_id and not project_id:
+            trow = conn.execute("SELECT project_id FROM tasks WHERE id = ?;", (task_id,)).fetchone()
+            project_id = trow["project_id"] if trow else None
+        if not project_id and approval_id:
+            arow = conn.execute("SELECT project_id FROM approvals WHERE id = ?;", (approval_id,)).fetchone()
+            project_id = arow["project_id"] if arow else None
+        if actor_kind == "user":
+            return
+        if lead_run_token_scope(effective_principal, via) is not None:
+            check_authz(conn, "approval.request", effective_principal, actor_kind, via, project_id=project_id)
+            if project_id is None:
+                raise MeshError(
+                    code=c.SCOPE_MISMATCH,
+                    exit_code=c.EXIT_FORBIDDEN,
+                    message="Lead run token can request approvals only for a project inside its run scope",
+                )
+            return
+        if via == "run_token":
+            raise MeshError(
+                code=c.CREDENTIAL_NOT_ALLOWED_IN_RUN,
+                exit_code=c.EXIT_FORBIDDEN,
+                message="Executor run tokens cannot request approvals",
+            )
+        check_authz(conn, "approval.request", effective_principal, actor_kind, via, project_id=project_id, task_id=task_id)
+        has_relay = "relay" in caps
+        if project_id:
+            if not (has_relay or is_acting_project_lead(conn, project_id, effective_principal["id"])):
+                raise MeshError(
+                    code=c.CAPABILITY_MISSING,
+                    exit_code=c.EXIT_FORBIDDEN,
+                    message=f"Agent '{effective_principal.get('name')}' must lead project '{project_id}' or hold 'relay'",
+                )
+        else:
+            leads_any = conn.execute(
+                "SELECT 1 FROM lead_assignments la JOIN agents a ON a.id = la.agent_id "
+                "WHERE la.agent_id = ? AND la.ended_at IS NULL AND a.can_lead = 1 LIMIT 1;",
+                (effective_principal["id"],),
+            ).fetchone() is not None
+            if not (has_relay or leads_any):
+                raise MeshError(
+                    code=c.CAPABILITY_MISSING,
+                    exit_code=c.EXIT_FORBIDDEN,
+                    message="Agent without project must lead at least one project or hold 'relay'",
+                )
+        return
+    if not approval_id:
+        return
+    row = conn.execute("SELECT * FROM approvals WHERE id = ?;", (approval_id,)).fetchone()
+    if row is None:
+        return
+    _check_approval_run_scope(ctx, row)
+    if cmd in ("approval.approve", "approval.reject"):
+        human_confirmed = req_args.get("human_confirmed")
+        delegated = human_confirmed is not None
+        if delegated:
+            _check_delegated_decision(ctx, row, human_confirmed)
+            return
+        if actor_kind != "user" and via != "relayed":
+            raise MeshError(
+                code=c.CAPABILITY_MISSING,
+                exit_code=c.EXIT_FORBIDDEN,
+                message="Agent caller must use --relayed for approval decisions",
+            )
+        if via == "relayed":
+            if "relay" not in caps:
+                raise MeshError(
+                    code=c.RELAY_NOT_ALLOWED,
+                    exit_code=c.EXIT_FORBIDDEN,
+                    message=f"Principal '{effective_principal.get('name')}' lacks 'relay' capability",
+                )
+            if effective_principal["id"] == row["requested_by"] or (row["project_id"] and is_project_lead(conn, row["project_id"], effective_principal["id"])):
+                raise MeshError(
+                    code=c.SELF_APPROVAL,
+                    exit_code=c.EXIT_FORBIDDEN,
+                    message="Relayer cannot decide its own or its led project's approval",
+                )
+            blocking_cat, policy = get_row_approval_policy(conn, row)
+            if policy == "direct_only":
+                raise MeshError(
+                    code=c.CHANNEL_NOT_ALLOWED,
+                    exit_code=c.EXIT_APPROVAL_INVALID,
+                    message=f"Category '{blocking_cat}' requires direct user approval",
+                )
+    elif cmd == "approval.cancel":
+        is_lead = bool(row["project_id"] and is_acting_project_lead(conn, row["project_id"], effective_principal["id"]))
+        if actor_kind != "user" and row["requested_by"] != effective_principal["id"] and not is_lead:
+            raise MeshError(
+                code=c.NOT_REQUESTER,
+                exit_code=c.EXIT_FORBIDDEN,
+                message="Only the requester, project lead, or user can cancel an approval request",
+            )
+    elif cmd == "approval.consume":
+        if row["requested_by"] != effective_principal["id"]:
+            raise MeshError(
+                code=c.NOT_REQUESTER,
+                exit_code=c.EXIT_FORBIDDEN,
+                message="Only the requester can consume an approval",
+            )
 
 
 def _decision_channel(conn: sqlite3.Connection, ctx: HandlerContext, row: sqlite3.Row) -> str:
@@ -62,7 +250,7 @@ def _decision_channel(conn: sqlite3.Connection, ctx: HandlerContext, row: sqlite
         return "direct"
     if ctx.via not in ("token", "relayed"):
         return "user_only"
-    policy = get_approval_policy(conn, row["category"])
+    _, policy = get_row_approval_policy(conn, row)
     if policy == "direct_only":
         return "user_only"
     pid = row["project_id"]
@@ -71,7 +259,8 @@ def _decision_channel(conn: sqlite3.Connection, ctx: HandlerContext, row: sqlite
             and is_project_lead(conn, pid, me)
             and (me != row["requested_by"] or get_delegated_self_approve(conn))):
         lead = get_project_active_lead(conn, pid)
-        if lead and lead.get("delivery") == "inbox" and lead.get("can_lead"):
+        if (lead and lead.get("delivery") == "inbox" and lead.get("disabled_at") is None
+                and lead.get("can_lead")):
             return "delegated"
     caps = ctx.principal.get("capabilities", [])
     if ("relay" in caps and me != row["requested_by"]
@@ -160,13 +349,13 @@ def _check_delegated_decision(ctx: HandlerContext, row: sqlite3.Row, human_confi
             message="A launch-mode lead has no channel to the human; delegated approval needs an inbox lead",
             details={"project_id": project_id},
         )
-    policy = get_approval_policy(ctx.conn, row["category"])
+    blocking_cat, policy = get_row_approval_policy(ctx.conn, row)
     if policy == "direct_only":
         raise MeshError(
             code=c.CHANNEL_NOT_ALLOWED,
             exit_code=c.EXIT_APPROVAL_INVALID,
-            message=f"Category '{row['category']}' requires direct user approval (passphrase), even in delegated mode",
-            details={"category": row["category"], "policy": policy},
+            message=f"Category '{blocking_cat}' requires direct user approval (passphrase), even in delegated mode",
+            details={"category": blocking_cat, "policy": policy},
         )
     if row["requested_by"] == ctx.principal["id"] and not get_delegated_self_approve(ctx.conn):
         # Sakana PR #4 P1-1: the lead deciding its own request is allowed by default (it
@@ -185,23 +374,32 @@ def _check_delegated_decision(ctx: HandlerContext, row: sqlite3.Row, human_confi
 
 def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResult:
     """Decide (approve or reject) a pending approval request per plan §7.3 and §7.4."""
-    approval_id = ctx.args.get("approval_id")
-    op_hash = ctx.args.get("op_hash")
-    note = _redact_opt(ctx.args.get("note"))  # blind review P2 / Carbon: never store a recognized secret
-
-    if not approval_id:
+    approval_id = _require_nonempty_str(ctx.args.get("approval_id"), "approval_id", "approval_id is required")
+    op_hash = _require_nonempty_str(ctx.args.get("op_hash"), "op_hash", "--op-hash is required")
+    raw_note = _validate_optional_str(ctx.args.get("note"), "note", max_len=4000)
+    note = redact(raw_note) if raw_note else raw_note  # blind review P2 / Carbon: never store a recognized secret
+    arg_ev_ref = _validate_optional_str(ctx.args.get("evidence_ref"), "evidence_ref", max_len=4000)
+    env_ev_ref = _validate_optional_str(ctx.evidence_ref, "evidence_ref", max_len=4000)
+    if arg_ev_ref is not None and env_ev_ref is not None and arg_ev_ref != env_ev_ref:
         raise MeshError(
             code=c.INVALID_ARGUMENT,
             exit_code=c.EXIT_USAGE,
-            message="approval_id is required",
+            message="Conflicting 'evidence_ref' values in args and request envelope",
+            details={"param": "evidence_ref"},
         )
-    if not op_hash:
+    raw_ev_ref = arg_ev_ref if arg_ev_ref is not None else env_ev_ref
+    validated_ev_ref = redact(raw_ev_ref) if raw_ev_ref else raw_ev_ref
+    arg_stmt = _validate_optional_str(ctx.args.get("user_statement"), "user_statement", max_len=4000)
+    env_stmt = _validate_optional_str(ctx.user_statement, "user_statement", max_len=4000)
+    if arg_stmt is not None and env_stmt is not None and arg_stmt != env_stmt:
         raise MeshError(
             code=c.INVALID_ARGUMENT,
             exit_code=c.EXIT_USAGE,
-            message="--op-hash is required",
-            details={"param": "op_hash"},
+            message="Conflicting 'user_statement' values in args and request envelope",
+            details={"param": "user_statement"},
         )
+    raw_stmt = env_stmt if env_stmt is not None else arg_stmt
+    relayed_stmt = redact(raw_stmt) if raw_stmt else raw_stmt
 
     cur = ctx.conn.execute("SELECT * FROM approvals WHERE id = ?;", (approval_id,))
     row = cur.fetchone()
@@ -262,27 +460,41 @@ def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResu
             )
 
         # (4) category policy is direct_only -> 12 CHANNEL_NOT_ALLOWED
-        policy = get_approval_policy(ctx.conn, row["category"])
+        blocking_cat, policy = get_row_approval_policy(ctx.conn, row)
         if policy == "direct_only":
             raise MeshError(
                 code=c.CHANNEL_NOT_ALLOWED,
                 exit_code=c.EXIT_APPROVAL_INVALID,
-                message=f"Category '{row['category']}' requires direct user approval; relayed decision disallowed",
-                details={"category": row["category"], "policy": policy},
+                message=f"Category '{blocking_cat}' requires direct user approval; relayed decision disallowed",
+                details={"category": blocking_cat, "policy": policy},
+            )
+        if not delegated and (not isinstance(raw_stmt, str) or not raw_stmt.strip()):
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message="Field '--user-statement' is required and non-empty when using --relayed",
+                details={"param": "user_statement"},
             )
 
     # (5) op_hash check:
     # First, verify stored op_json re-hash to detect DB corruption (defect d and plan §7.4 step 3)
+    # R2 P1-2: the shared check (also used by audit verify); a forged `_redacted`
+    # envelope or a document that does not describe this row vouches for nothing.
     try:
-        stored_op_doc = json.loads(row["op_json"])
-        if isinstance(stored_op_doc, dict) and stored_op_doc.get("_redacted") is True:
-            # PR #40 r1: a redacted copy (the operation held a secret) cannot be re-hashed;
-            # it carries the hash it was stored with.
-            recomputed_hash = stored_op_doc.get("op_hash")
-        else:
-            recomputed_hash = "sha256:" + hashlib.sha256(canonical_json(stored_op_doc)).hexdigest()
+        recomputed_hash = verify_stored_op_json(row)
     except Exception:
         recomputed_hash = None
+    # R2 P1-3: the row (category, op, requester, project, task, op_hash) must be the one
+    # the hash-chained approval.requested event recorded; a rewritten category could
+    # otherwise dodge a direct_only policy checked above.
+    req_problem = requested_event_problem(ctx.conn, row)
+    if req_problem:
+        raise MeshError(
+            code=c.OP_HASH_MISMATCH,
+            exit_code=c.EXIT_APPROVAL_INVALID,
+            message=f"Database corruption detected: {req_problem}",
+            details={"approval_id": row["id"], "reason": req_problem},
+        )
     if recomputed_hash != row["op_hash"]:
         raise MeshError(
             code=c.OP_HASH_MISMATCH,
@@ -299,9 +511,76 @@ def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResu
             details={"expected": row["op_hash"], "got": op_hash},
         )
 
-    # (6) State checks:
+    if is_approval_pinned_by_ws_reservation(ctx.conn, approval_id):
+        raise MeshError(
+            code=c.CONCURRENCY_LIMIT,
+            exit_code=c.EXIT_BUSY,
+            message=f"Approval '{approval_id}' is pinned by an in-progress workspace operation",
+            details={"approval_id": approval_id},
+        )
+
+    # (6) State checks (cross-checked against hash-chained approval.* events):
     now = now_iso_utc()
     status = row["status"]
+    ev_rows = ctx.conn.execute(
+        "SELECT seq, type, actor_id, via, payload_json FROM events "
+        "WHERE approval_id = ? AND type IN ('approval.decided', 'approval.cancelled', 'approval.expired', 'approval.consumed') "
+        "ORDER BY seq ASC;",
+        (approval_id,),
+    ).fetchall()
+    ev_dec, ev_terminal, hist_err = verify_approval_event_history(ev_rows)
+    if hist_err:
+        raise MeshError(
+            code=c.APPROVAL_INVALID,
+            exit_code=c.EXIT_APPROVAL_INVALID,
+            message=f"Database corruption detected: {hist_err}",
+            details={"approval_id": approval_id, "reason": "decision_event_mismatch"},
+        )
+    if ev_terminal == "expired":
+        raise MeshError(
+            code=c.APPROVAL_EXPIRED,
+            exit_code=c.EXIT_APPROVAL_INVALID,
+            message=f"Approval '{approval_id}' has expired",
+            details={"approval_id": approval_id, "expires_at": row["expires_at"]},
+        )
+    if ev_terminal == "consumed":
+        raise MeshError(
+            code=c.APPROVAL_CONSUMED,
+            exit_code=c.EXIT_APPROVAL_INVALID,
+            message=f"Approval '{approval_id}' was already consumed",
+            details={"approval_id": approval_id},
+        )
+    if ev_terminal == "cancelled":
+        raise MeshError(
+            code=c.APPROVAL_CANCELLED,
+            exit_code=c.EXIT_APPROVAL_INVALID,
+            message=f"Approval '{approval_id}' was cancelled",
+            details={"approval_id": approval_id},
+        )
+    if ev_terminal in ("approved", "rejected") and ev_terminal != decision:
+        raise MeshError(
+            code=c.DECISION_CONFLICT,
+            exit_code=c.EXIT_CONFLICT,
+            message=f"Approval '{approval_id}' was already {ev_terminal}; cannot {decision}",
+            details={"approval_id": approval_id, "status": ev_terminal},
+        )
+    has_consumed_ev = any(r["type"] == "approval.consumed" for r in ev_rows)
+    if ev_terminal == decision and status != decision:
+        ev_chan = ("relayed" if ev_dec["via"] == "delegated" else ev_dec["via"]) if ev_dec else None
+        is_valid_upgrade = (
+            decision == "approved"
+            and ev_chan == "relayed"
+            and not delegated
+            and ctx.actor_kind == "user"
+            and ctx.via == "direct"
+        )
+        if not is_valid_upgrade and not is_legacy_consumed_approval(status, ev_terminal, ev_dec, has_consumed_ev):
+            raise MeshError(
+                code=c.APPROVAL_INVALID,
+                exit_code=c.EXIT_APPROVAL_INVALID,
+                message="Database corruption detected: approval row status differs from event chain",
+                details={"approval_id": approval_id, "row_status": status, "event_state": ev_terminal},
+            )
 
     if row["expires_at"] < now or status == "expired":
         raise MeshError(
@@ -373,7 +652,7 @@ def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResu
                 ctx.principal["id"],
                 ctx.credential_id,
                 redact(human_confirmed),
-                _redact_opt(ctx.args.get("evidence_ref") or ctx.evidence_ref),
+                validated_ev_ref,
                 note,
                 now,
                 approval_id,
@@ -400,8 +679,8 @@ def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResu
                 ctx.principal["id"],
                 ctx.principal["id"],
                 ctx.credential_id,
-                redact(ctx.user_statement) if ctx.user_statement else ctx.user_statement,
-                _redact_opt(ctx.evidence_ref),
+                relayed_stmt,
+                validated_ev_ref,
                 note,
                 now,
                 approval_id,
@@ -445,9 +724,8 @@ def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResu
     payload: Dict[str, Any] = {"decision": decision, "note": note, "approval_id": approval_id,
                                "category": row["category"], "op": row["op_type"], "op_hash": row["op_hash"]}
     if delegated or ctx.via == "relayed":
-        payload["user_statement"] = _redact_opt(human_confirmed if delegated else
-                                             ctx.args.get("user_statement") or ctx.user_statement)
-        payload["evidence_ref"] = _redact_opt(ctx.args.get("evidence_ref") or ctx.evidence_ref)
+        payload["user_statement"] = redact(human_confirmed) if delegated else relayed_stmt
+        payload["evidence_ref"] = validated_ev_ref
     if upgrade_to_direct:
         payload["upgraded_from"] = "relayed"
     if delegated:
@@ -499,13 +777,9 @@ def handle_approval_reject(ctx: HandlerContext) -> HandlerResult:
 
 def handle_approval_cancel(ctx: HandlerContext) -> HandlerResult:
     """Cancel a pending approval request (requester only) per plan §7.4."""
-    approval_id = ctx.args.get("approval_id")
-    if not approval_id:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="approval_id is required",
-        )
+    approval_id = _require_nonempty_str(ctx.args.get("approval_id"), "approval_id", "approval_id is required")
+    raw_reason = _validate_optional_str(ctx.args.get("reason"), "reason", max_len=4000)
+    cancel_reason = redact(raw_reason) if (raw_reason and raw_reason.strip()) else None
 
     cur = ctx.conn.execute("SELECT * FROM approvals WHERE id = ?;", (approval_id,))
     row = cur.fetchone()
@@ -519,26 +793,40 @@ def handle_approval_cancel(ctx: HandlerContext) -> HandlerResult:
 
     _check_approval_run_scope(ctx, row)
 
-    # The user may also withdraw an approved, unconsumed request.
-    if ctx.actor_kind != "user" and row["requested_by"] != ctx.principal["id"]:
+    # User, requester, or current project lead may cancel pending or unconsumed approved rows.
+    # Full review r2 P2-C: a lead whose can_lead was revoked keeps no lead right here either.
+    is_lead = bool(row["project_id"] and is_acting_project_lead(ctx.conn, row["project_id"], ctx.principal["id"]))
+    is_requester = row["requested_by"] == ctx.principal["id"]
+    if ctx.actor_kind != "user" and not is_requester and not is_lead:
         raise MeshError(
             code=c.NOT_REQUESTER,
             exit_code=c.EXIT_FORBIDDEN,
-            message="Only the requester or user can cancel an approval request",
+            message="Only the requester, project lead, or user can cancel an approval request",
             details={"approval_id": approval_id, "requested_by": row["requested_by"], "caller": ctx.principal["id"]},
         )
 
-    # Pending or approved -> cancelled; consumed decisions remain immutable.
+    if is_approval_pinned_by_ws_reservation(ctx.conn, approval_id):
+        raise MeshError(
+            code=c.CONCURRENCY_LIMIT,
+            exit_code=c.EXIT_BUSY,
+            message=f"Approval '{approval_id}' is pinned by an in-progress workspace operation",
+            details={"approval_id": approval_id},
+        )
+
+    # pending / unconsumed approved -> cancelled only
     status = row["status"]
-    if status not in ("pending", "approved"):
+    if status not in ("pending", "approved") or row["consumed_at"] is not None:
         raise MeshError(
             code=c.INVALID_TRANSITION,
             exit_code=c.EXIT_CONFLICT,
-            message=f"Approval '{approval_id}' is '{status}'; only pending or approved approvals can be cancelled",
+            message=f"Approval '{approval_id}' is '{status}'; only pending or unconsumed approved approvals can be cancelled",
             details={"approval_id": approval_id, "status": status},
         )
 
-    now = now_iso_utc()
+    default_reason = (
+        "cancelled_by_requester" if is_requester
+        else ("cancelled_by_user" if ctx.actor_kind == "user" else "cancelled_by_lead")
+    )
     ctx.conn.execute("UPDATE approvals SET status = 'cancelled' WHERE id = ?;", (approval_id,))
 
     record_event(
@@ -549,7 +837,7 @@ def handle_approval_cancel(ctx: HandlerContext) -> HandlerResult:
         via=ctx.via,
         project_id=row["project_id"],
         approval_id=approval_id,
-        payload={"approval_id": approval_id, "reason": ctx.args.get("reason") or "cancelled_by_requester",
+        payload={"reason": cancel_reason or default_reason, "approval_id": approval_id,
                  "from_status": status, "category": row["category"], "op": row["op_type"]},
         request_id=ctx.request_id,
         k_user=ctx.k_user,
@@ -560,12 +848,8 @@ def handle_approval_cancel(ctx: HandlerContext) -> HandlerResult:
 
 def handle_approval_check(ctx: HandlerContext) -> HandlerResult:
     """Check approval status and trust level without consuming it per plan §7.4."""
-    approval_id = ctx.args.get("approval_id")
-    op_hash = ctx.args.get("op_hash")
-    if not approval_id:
-        raise MeshError(code=c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="approval_id is required")
-    if not op_hash:
-        raise MeshError(code=c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="--op-hash is required", details={"param": "op_hash"})
+    approval_id = _require_nonempty_str(ctx.args.get("approval_id"), "approval_id", "approval_id is required")
+    op_hash = _require_nonempty_str(ctx.args.get("op_hash"), "op_hash", "--op-hash is required")
 
     cur = ctx.conn.execute("SELECT * FROM approvals WHERE id = ?;", (approval_id,))
     row = cur.fetchone()
@@ -587,6 +871,16 @@ def handle_approval_check(ctx: HandlerContext) -> HandlerResult:
     if op_hash != row["op_hash"]:
         raise MeshError(code=c.OP_HASH_MISMATCH, exit_code=c.EXIT_APPROVAL_INVALID, message="Provided op-hash does not match stored approval op-hash", details={"expected": row["op_hash"], "got": op_hash})
 
+    if row["status"] == "expired" or (
+        row["status"] in ("pending", "approved") and row["expires_at"] < now_iso_utc()
+    ):
+        raise MeshError(
+            code=c.APPROVAL_EXPIRED,
+            exit_code=c.EXIT_APPROVAL_INVALID,
+            message="Approval has expired",
+            details={"approval_id": approval_id, "expires_at": row["expires_at"]},
+        )
+
     decided_via = row["decided_via"]
     trust = "direct_verified" if decided_via == "direct" else ("relayed_unverified" if decided_via == "relayed" else None)
     return HandlerResult(data={
@@ -600,12 +894,8 @@ def handle_approval_check(ctx: HandlerContext) -> HandlerResult:
 
 def handle_approval_consume(ctx: HandlerContext) -> HandlerResult:
     """Consume an approved approval token before external action execution per plan §7.4."""
-    approval_id = ctx.args.get("approval_id")
-    op_hash = ctx.args.get("op_hash")
-    if not approval_id:
-        raise MeshError(code=c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="approval_id is required")
-    if not op_hash:
-        raise MeshError(code=c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message="--op-hash is required", details={"param": "op_hash"})
+    approval_id = _require_nonempty_str(ctx.args.get("approval_id"), "approval_id", "approval_id is required")
+    op_hash = _require_nonempty_str(ctx.args.get("op_hash"), "op_hash", "--op-hash is required")
 
     cur = ctx.conn.execute("SELECT * FROM approvals WHERE id = ?;", (approval_id,))
     row = cur.fetchone()
@@ -630,6 +920,14 @@ def handle_approval_consume(ctx: HandlerContext) -> HandlerResult:
             exit_code=c.EXIT_APPROVAL_INVALID,
             message="Provided op-hash does not match stored approval op-hash",
             details={"expected": row["op_hash"], "got": op_hash},
+        )
+
+    if is_approval_pinned_by_ws_reservation(ctx.conn, approval_id):
+        raise MeshError(
+            code=c.CONCURRENCY_LIMIT,
+            exit_code=c.EXIT_BUSY,
+            message=f"Approval '{approval_id}' is pinned by an in-progress workspace operation",
+            details={"approval_id": approval_id},
         )
 
     # 3. State checks (expired, pending, consumed, rejected, cancelled, invalid)
@@ -703,17 +1001,22 @@ def handle_approval_consume(ctx: HandlerContext) -> HandlerResult:
             details={"approval_id": approval_id},
         )
 
+    # Carbon review (public PR #2): a delegated decision cannot outlive its lead assignment
+    # (A->B->A included) or a lead that lost can_lead.
+    verify_row_for_consume(ctx.conn, row)  # R3 P1-1
     ensure_delegated_decider_current(ctx.conn, row)
 
-    # 4. Policy check
-    policy = get_approval_policy(ctx.conn, row["category"])
+    # 4. Policy and delegated authority checks
+    blocking_cat, policy = get_row_approval_policy(ctx.conn, row)
     if row["decided_via"] == "relayed" and policy == "direct_only":
         raise MeshError(
             code=c.CHANNEL_NOT_ALLOWED,
             exit_code=c.EXIT_APPROVAL_INVALID,
-            message=f"Category '{row['category']}' requires direct approval; relayed decision disallowed",
-            details={"category": row["category"], "policy": policy},
+            message=f"Category '{blocking_cat}' requires direct approval; relayed decision disallowed",
+            details={"category": blocking_cat, "policy": policy},
         )
+
+    validate_delegated_decision_at_consume(ctx.conn, row)
 
     # 5. Consume
     ctx.conn.execute(
@@ -792,15 +1095,33 @@ def handle_approval_request(ctx: HandlerContext) -> HandlerResult:
     category = ctx.args.get("category")
     summary = ctx.args.get("summary")
     operation = ctx.args.get("operation")
-    project_id = ctx.args.get("project_id") or ctx.args.get("project")
-    task_id = ctx.args.get("task_id") or ctx.args.get("task")
-    expires_in = ctx.args.get("expires_in")
-
-    if not category:
+    raw_proj_id = _validate_optional_str(ctx.args.get("project_id"), "project_id")
+    raw_proj = _validate_optional_str(ctx.args.get("project"), "project")
+    if raw_proj_id and raw_proj and raw_proj_id != raw_proj:
         raise MeshError(
             code=c.INVALID_ARGUMENT,
             exit_code=c.EXIT_USAGE,
-            message="--category is required",
+            message="Conflicting 'project_id' and 'project' arguments",
+            details={"param": "project"},
+        )
+    project_id = raw_proj_id or raw_proj
+    raw_task_id = _validate_optional_str(ctx.args.get("task_id"), "task_id")
+    raw_task = _validate_optional_str(ctx.args.get("task"), "task")
+    if raw_task_id and raw_task and raw_task_id != raw_task:
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Conflicting 'task_id' and 'task' arguments",
+            details={"param": "task"},
+        )
+    task_id = raw_task_id or raw_task
+    expires_in = ctx.args.get("expires_in")
+
+    if not category or not isinstance(category, str):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="--category is required and must be a string",
             details={"param": "category"},
         )
     if category not in DEFAULT_POLICIES:
@@ -931,7 +1252,7 @@ def handle_approval_request(ctx: HandlerContext) -> HandlerResult:
         caps = ctx.principal.get("capabilities", [])
         has_relay = "relay" in caps
         if project_id:
-            if not (has_relay or is_project_lead(ctx.conn, project_id, ctx.principal["id"])):
+            if not (has_relay or is_acting_project_lead(ctx.conn, project_id, ctx.principal["id"])):
                 raise MeshError(
                     code=c.CAPABILITY_MISSING,
                     exit_code=c.EXIT_FORBIDDEN,
@@ -939,7 +1260,11 @@ def handle_approval_request(ctx: HandlerContext) -> HandlerResult:
                     details={"principal": ctx.principal.get("name"), "project_id": project_id},
                 )
         else:
-            cur_l = ctx.conn.execute("SELECT 1 FROM lead_assignments WHERE agent_id = ? AND ended_at IS NULL LIMIT 1;", (ctx.principal["id"],))
+            cur_l = ctx.conn.execute(
+                """SELECT 1 FROM lead_assignments la JOIN agents a ON a.id = la.agent_id
+                   WHERE la.agent_id = ? AND la.ended_at IS NULL AND a.can_lead = 1 LIMIT 1;""",
+                (ctx.principal["id"],),
+            )
             leads_any = cur_l.fetchone() is not None
             if not (has_relay or leads_any):
                 raise MeshError(
@@ -951,9 +1276,16 @@ def handle_approval_request(ctx: HandlerContext) -> HandlerResult:
 
     # TTL validation:
     ttl_seconds = None
-    if expires_in:
+    if expires_in is not None:
+        if not isinstance(expires_in, str) or not expires_in.strip():
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message=f"Invalid duration for --expires-in '{expires_in}': expected a duration string",
+                details={"param": "expires_in", "got": expires_in},
+            )
         try:
-            ttl_seconds = parse_duration(str(expires_in))
+            ttl_seconds = parse_duration(expires_in)
         except Exception as e:
             raise MeshError(
                 code=c.INVALID_ARGUMENT,
@@ -988,6 +1320,7 @@ def handle_approval_request(ctx: HandlerContext) -> HandlerResult:
         via=ctx.via,
         request_id=ctx.request_id,
         k_user=ctx.k_user,
+        testing_mode=ctx.testing_mode,
     )
 
     if ctx.dry_run:
@@ -1004,13 +1337,7 @@ def handle_approval_request(ctx: HandlerContext) -> HandlerResult:
 
 def handle_approval_show(ctx: HandlerContext) -> HandlerResult:
     """Show details, hash, and status of an approval per plan §7.4."""
-    approval_id = ctx.args.get("approval_id")
-    if not approval_id:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="approval_id is required",
-        )
+    approval_id = _require_nonempty_str(ctx.args.get("approval_id"), "approval_id", "approval_id is required")
 
     cur = ctx.conn.execute("SELECT * FROM approvals WHERE id = ?;", (approval_id,))
     row = cur.fetchone()
@@ -1048,8 +1375,8 @@ def handle_approval_show(ctx: HandlerContext) -> HandlerResult:
 
 def handle_approval_list(ctx: HandlerContext) -> HandlerResult:
     """List approvals with optional status and project filters."""
-    status_filter = ctx.args.get("status")
-    project_filter = ctx.args.get("project")
+    status_filter = _validate_optional_str(ctx.args.get("status"), "status")
+    project_filter = _validate_optional_str(ctx.args.get("project"), "project")
     scope_project = lead_run_token_scope(ctx.principal, ctx.via)
     if scope_project is not None:
         # Review m2-r9c N1: a lead run token lists only its own project's approvals,
@@ -1057,6 +1384,9 @@ def handle_approval_list(ctx: HandlerContext) -> HandlerResult:
         check_authz(ctx.conn, "approval.list", ctx.principal, ctx.actor_kind, ctx.via,
                     project_id=project_filter)
         project_filter = scope_project
+    elif project_filter is not None:
+        check_authz(ctx.conn, "approval.list", ctx.principal, ctx.actor_kind, ctx.via,
+                    project_id=project_filter)
 
     query = "SELECT * FROM approvals WHERE 1=1"
     params: List[Any] = []

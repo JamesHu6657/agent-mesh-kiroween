@@ -7,6 +7,7 @@ looked up on PATH, never executed (run `mesh adapter probe` for a live probe).
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import sqlite3
@@ -15,6 +16,9 @@ import sys
 from typing import Any, Dict, List, Optional
 
 from mesh.core.db import sqlite_ro_uri
+
+MIN_RECOMMENDED_GIT = (2, 36)
+MIN_FALLBACK_GIT = (2, 31)
 
 
 def _check(name: str, ok: bool, detail: str, hint: Optional[str] = None, level: str = "error") -> Dict[str, Any]:
@@ -95,6 +99,21 @@ def environment_checks(home_dir: str, db_present: bool, testing_mode: bool = Fal
             gver = f"{git} does not run ({exc.__class__.__name__})"
     checks.append(_check("git", git_ok, gver or "not found on PATH",
                          "install git; repo projects and task worktrees need it", level="warning"))
+    if git_ok:
+        m = re.match(r"git version (\d+)\.(\d+)", gver)
+        if m:
+            gv = (int(m.group(1)), int(m.group(2)))
+            if gv >= MIN_FALLBACK_GIT:
+                checks.append(_check("git_version", gv >= MIN_RECOMMENDED_GIT, f"{gv[0]}.{gv[1]}",
+                                     "git 2.36 or newer is recommended (`git worktree list -z`); "
+                                     "git 2.31 to 2.35 uses the newline-delimited fallback", level="warning"))
+            else:
+                checks.append(_check("git_version", False, f"{gv[0]}.{gv[1]} (older than 2.31)",
+                                     "git older than 2.31 is not supported: `git worktree list --porcelain` "
+                                     "has no `prunable` line there, so a removed worktree that was not pruned "
+                                     "blocks `mesh project deliver` until `git worktree prune`, and Mesh cannot "
+                                     "turn `core.fsmonitor` off for its git calls (GIT_CONFIG_COUNT needs git "
+                                     "2.31); upgrade to git 2.36 or newer", level="warning"))
     checks.append(_check("initialized", db_present, os.path.join(home_dir, "mesh.db"),
                          "run `mesh setup` (or `mesh init`)"))
     running = _daemon_running(home_dir) if db_present else False

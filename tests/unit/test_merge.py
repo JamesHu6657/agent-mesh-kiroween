@@ -5,6 +5,7 @@ mesh.db built by init_db (full schema). ACC: K4, K6, K8, A8.
 """
 
 import json
+from datetime import datetime, timezone
 import os
 import shutil
 import tempfile
@@ -17,6 +18,9 @@ from mesh.core.db import init_db
 from mesh.daemon import merge
 from mesh.errors import MeshError
 from tests.gitfixture import GitFixture
+
+# merge.run_test_step scans real /proc for leftovers: hold host-wide /proc lock shared (tests/run_tier.py).
+MESH_PROC_LOCK = "shared"
 
 NOW = "2026-11-09T00:00:00Z"
 SECRET = "sk-" + "B" * 24
@@ -89,6 +93,8 @@ class PipelineDetailsTest(unittest.TestCase):
 
 
 class MergeDbCase(unittest.TestCase):
+    mesh_proc_lock = "shared"
+
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="mh-mu-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
@@ -222,7 +228,9 @@ class ReviewR5bR6MinorsTest(MergeDbCase):
         """ACC: B5 (§13.4) - a key already taken inside the final TX: nothing rolls back, the store is skipped."""
         self.conn.execute(
             "INSERT INTO idempotency (principal_id, key, cmd, request_hash, response_json, exit_code, created_at) "
-            "VALUES ('usr_1', 'k1', 'task.merge', 'other', '{}', 0, ?);", (NOW,))
+            "VALUES ('usr_1', 'k1', 'task.merge', 'other', '{}', 0, ?);",
+            # fresh row: a fixed past NOW would fall outside IDEMPOTENCY_TTL_S and be treated as expired
+            (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),))
         self.conn.commit()
         plan = self.plan()
         result = {"outcome": "merged", "noop": False, "pre_head": "a" * 40, "merge_commit": "b" * 40}
@@ -257,10 +265,6 @@ class ReviewR5bR6MinorsTest(MergeDbCase):
         with open(short, "w", encoding="utf-8") as f:
             f.write("a\nb\n")
         self.assertEqual(merge.log_tail_capped(short), (["a", "b"], False))
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +396,7 @@ class RecoveryMergeRunsTest(MergeDbCase):
 class TaskBranchCase(unittest.TestCase):
     """A gitfixture K0 repo on main (the integration worktree) with a task branch one commit ahead."""
 
+    mesh_proc_lock = "shared"
     TASK = "tsk_rcv1"
     BRANCH = "mesh/prj_1/tsk_rcv1"
 
@@ -505,3 +510,7 @@ class PipelineTagShadowTest(TaskBranchCase):
         self.assertEqual(parents, [self.base, self.tip])
         self.assertEqual(self.fixture.git(self.repo, "rev-parse", f"refs/tags/{self.BRANCH}").stdout.strip(),
                          self.base)
+
+
+if __name__ == "__main__":
+    unittest.main()

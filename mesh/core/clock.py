@@ -10,7 +10,8 @@ import re
 import time
 from typing import Union
 
-DURATION_PATTERN = re.compile(r"^(\d+)([smhd]?)$")
+DURATION_PATTERN = re.compile(r"\A(\d+)([smhd]?)\Z")
+MAX_DURATION_S = 100 * 365 * 86400  # 100-year upper bound
 
 
 def now_utc() -> str:
@@ -26,7 +27,10 @@ def now_iso_utc(ts: Union[float, int, datetime.datetime, None] = None) -> str:
     if isinstance(ts, bool):
         raise ValueError("Expected a timestamp, got bool")
     if isinstance(ts, (int, float)):
-        dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
+        try:
+            dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
+        except (OverflowError, OSError, ValueError) as e:
+            raise ValueError(f"Timestamp out of range: {ts}") from e
         return format_utc(dt)
     if isinstance(ts, datetime.datetime):
         return format_utc(ts)
@@ -96,6 +100,8 @@ def parse_duration(val: Union[str, int]) -> int:
     if isinstance(val, int):
         if val < 0:
             raise ValueError(f"Duration cannot be negative, got {val}")
+        if val > MAX_DURATION_S:
+            raise ValueError(f"Duration '{val}' exceeds maximum supported limit ({MAX_DURATION_S}s)")
         return val
 
     if not isinstance(val, str):
@@ -110,15 +116,18 @@ def parse_duration(val: Union[str, int]) -> int:
     num = int(num_str)
 
     if unit == "" or unit == "s":
-        return num
+        res = num
     elif unit == "m":
-        return num * 60
+        res = num * 60
     elif unit == "h":
-        return num * 3600
+        res = num * 3600
     elif unit == "d":
-        return num * 86400
+        res = num * 86400
     else:
         raise ValueError(f"Unknown duration unit '{unit}' in '{val}'")
+    if res > MAX_DURATION_S:
+        raise ValueError(f"Duration '{val}' exceeds maximum supported limit ({MAX_DURATION_S}s)")
+    return res
 
 
 def format_duration(seconds: int) -> str:

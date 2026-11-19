@@ -1,0 +1,86 @@
+# Batch 7 PR #46 Round-1 Implementation Notes
+
+This note records verification against the codebase and documentation (`docs/requirements.md`, `docs/usage.md`, `docs/plan.md`), root-cause fixes, design decisions, and verification runs for the seven round-1 review findings in `review.md` on branch `pr46-r1`.
+
+All seven findings (1x P1, 5x P2, 1x P3) were verified as real against the base revision `77783f2`, reproduced with failing regression tests in [tests/unit/test_batch7_pr46_r1.py](tests/unit/test_batch7_pr46_r1.py) and [tests/integration/test_batch7_pr46_r1.py](tests/integration/test_batch7_pr46_r1.py) (plus the updated assertion in [tests/integration/test_batch7_g5.py](tests/integration/test_batch7_g5.py)), and fixed with minimal root-cause changes.
+
+## Verified Findings and Fixes
+
+### 1. [P1] `agent onboard` / `agent token issue` with `--idempotency-key` and existing `--out` wrote DB / leaked credentials before refusing
+
+- **Doc & Code Verification:** Confirmed real. Both `docs/usage.md` (§2.2, §4.1) and the `mesh agent onboard --help` epilog promise `--out` is refused if the file exists unless `--force`, checked before anything is created. In `77783f2`, `handle_agent_token_issue` and `handle_agent_onboard` ([mesh/cli/commands/agent.py](mesh/cli/commands/agent.py)) passed `allow_existing=has_idem` unconditionally to `_check_out_path`. On a fresh key against an existing `--out` without `--force`:
+  - `agent token issue` minted and committed a live `agent_token` in SQLite before `_write_out(..., force=False)` raised `FileExistsError` -> exit `1` (`INTERNAL_ERROR`).
+  - `agent onboard` created an orphan agent (`principals` + `agents`) on the first attempt before post-create refusal (`INVALID_ARGUMENT`), and on retry with the same key `agent.create` set `_idempotent_replay=True`, skipping the guard and minting an unrevoked `cred_...` before failing in `_write_out` with exit `1`.
+- **Root Cause & Fix:**
+  - **Protocol `replay_only` envelope flag:** Added optional top-level boolean `"replay_only"` in [mesh/client.py](mesh/client.py) (`MeshClient.execute_cmd`) and [mesh/daemon/server.py](mesh/daemon/server.py) (`DaemonServer._handle_client`), intentionally excluded from `cmd_and_args` (`req_hash`) so idempotent retries match the originally stored `request_hash`. The daemon validates `isinstance(replay_only, bool)`, requires `idempotency_key`, forbids combining `replay_only` with `dry_run`, and rejects idempotency misses with `MeshError(INVALID_ARGUMENT, EXIT_USAGE, details={"param": "idempotency_key", "reason": "replay_only_miss"})` both at pre-TX lookup (prior to state-dependent checks or long operations) and under `BEGIN IMMEDIATE;` re-lookup.
+  - **Client pre-flight & translation:** In [mesh/cli/commands/agent.py](mesh/cli/commands/agent.py), set `allow_existing=(has_idem and not dry_run)` so `--dry-run` with an existing `--out` refuses pre-RPC; added `_sync_req_meta` and used `copy.copy(args)` with `_replay_only = bool(path is not None and existed_before and not force)` on `agent.token.issue`, `agent.create`, and onboard step-2 `agent.token.issue` (keeping `who_args._replay_only = False` for `whoami` verification); translated server `replay_only_miss` into exit 2 (`INVALID_ARGUMENT`, `details={"param": "out", "token_file": path}`); and added a defense-in-depth `if existed_before and not force` guard before `_write_out`.
+
+### 2. [P2] `--input ""`, optional JSON argument types, `nargs="+"`, and `--expires-in` validation gaps returning exit `1` (`INTERNAL_ERROR`)
+
+- **Doc & Code Verification:** Confirmed real. `docs/plan.md` §13.1–§13.2 requires all CLI usage/validation errors (including JSON stdin / argparse usage errors) to return exit `2` (`EXIT_USAGE`), never exit `1` (`INTERNAL_ERROR`). In `77783f2`:
+  1. `parse_and_apply_input_file` ([mesh/cli/main.py](mesh/cli/main.py)) exited silently on `if not input_source:`, allowing `--input ""` / `--input=` after `has_input` already relaxed required args -> unhandled `TypeError` or exit `0` on optional-only commands (`status --input ""`).
+  2. String type checking for `act.type is None` lived inside the `_orig_required` loop, skipping all optional fields (`agent create --binary`, `setup --lead-name`, `task create` `project`/`title`/`spec`, `task close --reason`, `agent token issue --expires-in`, etc.).
+  3. `act.nargs == "+"` (e.g., `inbox ack <messages...>`) checked truthiness only, letting `{"messages": 123}` pass to the server and crash with `'int' object is not iterable`.
+  4. `handle_agent_token_issue` ([mesh/daemon/handlers/agent.py](mesh/daemon/handlers/agent.py)) called `parse_duration(expires_in_raw)` without catching `ValueError`/`TypeError`, skipped falsy values (`""`), accepted `0s`, and allowed non-string integers on direct RPC.
+- **Fix:**
+  - [mesh/cli/main.py](mesh/cli/main.py): Distinguished `input_source is None` from non-string/empty/whitespace `--input` values (raises `INVALID_ARGUMENT`, exit `2`). Expanded `from_json` type validation to all actions: `_StoreTrueAction`/`_StoreFalseAction` require `bool`; `_AppendAction` and `nargs in ("+", "*")` require `list` (non-empty for `"+"`) with typed element checks (`int` non-bool, `float` non-bool, `choices`, or `str` when `act.type is None`); scalar `act.type is None` actions require `str` while preserving documented exemptions (`config set` `value`, `task submit` `deliverable`, `agent *` `max_concurrency` so server returns `INVALID_CONCURRENCY`, `approval request` `operation` / `project complete` `report` allowing `(str, dict)`, `ack_timeout` / `idle_timeout` allowing non-bool `(str, int)`, and `agent create|update` `option|options` allowing `dict` or `list[str]`). Also checked `not isinstance(cur_val, list)` in the `_orig_required` `nargs == "+"` guard.
+  - [mesh/daemon/handlers/agent.py](mesh/daemon/handlers/agent.py): Validated `expires_in` in `handle_agent_token_issue` prior to token generation, requiring a non-empty `str`, catching `(ValueError, TypeError)` from `parse_duration`, and requiring `dur_s > 0` (`INVALID_ARGUMENT`, exit `2`). (Wait/config timeout parameters already validate in `MeshClient`, `validate_ack_timeout`, or `handle_approval_request`.)
+
+### 3. [P2] `smoke_schema._has_symlink` checking `os.path.islink(cur)` before allowlist boundary breaks
+
+- **Doc & Code Verification:** Confirmed real. Comparing [tests/tierlib.py](tests/tierlib.py) (`_check_no_symlinks`) with [mesh/adapters/smoke_schema.py](mesh/adapters/smoke_schema.py) (`_has_symlink`): `_has_symlink` checked `os.path.islink(cur)` before testing `stop` or the system symlink boundary allowlist (`("/tmp", "/var", "/private", "/private/tmp", "/private/var", "/home")`), and [mesh/adapters/evidence.py](mesh/adapters/evidence.py) called `smoke_schema._check_sidecar(path)` without `root=`. On systems where `/tmp`, `/var`, or `/home` is a symlink (e.g., macOS `/tmp -> private/tmp`, `/var -> private/var`), valid smoke results failed as `evidence_invalid`.
+- **Fix:**
+  - [mesh/adapters/smoke_schema.py](mesh/adapters/smoke_schema.py): Moved both `stop` and `("/tmp", "/var", "/private", "/private/tmp", "/private/var", "/home")` break checks before `if os.path.islink(cur):` in `_has_symlink`, preserving the explicit `root` symlink check on line 90.
+  - [mesh/adapters/evidence.py](mesh/adapters/evidence.py): Updated `load_evidence` to pass `root=str(rdir)` to `smoke_schema._check_sidecar(path, root=str(rdir))`.
+
+### 4. [P2] `parse_version_output` lookahead breaking sentence-ending periods and swallowing trailing dots after prereleases
+
+- **Doc & Code Verification:** Confirmed real. `smoke_schema.version_ok` expects clean dotted numeric versions (`\d+(?:\.\d+)*\Z`) without trailing dots, and `parse_version_output` (`mesh/adapters/base.py`) feeds probe/evidence version matching (`docs/plan.md` §14.10). Replacing `\b` with `(?![.\w])` in `77783f2` caused `"droid version 1.6.0."` to fail completely (`None`) and `"version 2.10.3.4-rc1."` to capture `"2.10.3.4-rc1."` with the trailing period inside `(?:-...)`.
+- **Fix:**
+  - [mesh/adapters/base.py](mesh/adapters/base.py): Updated `parse_version_output` to match:
+    `r"(?<![a-zA-Z0-9._])(?:version\s+|v)?(\d+(?:\.\d+)+(?:-[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)*)?)(?![a-zA-Z0-9_])(?!\.[a-zA-Z0-9])"`
+    This requires internal dots in prerelease suffixes to be followed by alphanumerics, rejects adjacent version/identifier characters or dot+alphanumeric continuations, ignores leading path/version fragments like `/opt/python3.11/bin/droid`, and preserves sentence-ending punctuation outside the captured group.
+
+### 5. [P2] `_vendor_nonzero_failure` promoting nonfatal `tool_denied` over `exit_nonzero` and persisting up to 200 KB unredacted/unbounded stderr
+
+- **Doc & Code Verification:** Confirmed real. `docs/plan.md` §14.5 (`model_or_effort_rejected`) specifies mapping Kiro's `"failed to set effort … model does not support additional fields"` on non-zero exit to `model_or_effort_rejected`, whereas `mesh/adapters/kiro.py` documents `[denied]` (`tool_denied`) as a nonfatal mid-run event under `--no-interactive` where the process continues running. In `77783f2`, `_vendor_nonzero_failure` ([mesh/daemon/supervisor.py](mesh/daemon/supervisor.py)) promoted `tool_denied` over `"exit_nonzero"` and merged up to 200 KB of unredacted, unbounded `details["stderr"]` into `tasks.failure_json` and `events.payload_json`.
+- **Fix & Design Decision:**
+  - [mesh/daemon/supervisor.py](mesh/daemon/supervisor.py): Defined `_NONFATAL_STDERR_REASONS = frozenset({"tool_denied"})` and `_STDERR_DETAIL_MAX_CHARS = 2000`. `_vendor_nonzero_failure` runs `redact_value(parsed)` **before** bounding string lengths via `_bound_vendor_value` / `_bound_stderr_text` (so secrets spanning truncation boundaries cannot evade redaction, preserving trailing diagnostics). Fatal stderr reasons (e.g., `model_or_effort_rejected`) still promote cleanly while nonfatal reasons (`tool_denied`) keep `reason="exit_nonzero"` and record the bounded, redacted payload under `extra["stderr_error"]`.
+
+### 6. [P2] `tests/*/test_batch7_g5.py` failing without `droid` in `PATH` and integration test intercepted by `argparse`
+
+- **Doc & Code Verification:** Confirmed real. In `handle_agent_create` ([mesh/daemon/handlers/agent.py](mesh/daemon/handlers/agent.py)), `adapter.is_installed()` ran before pure parameter validation (`delivery`, `max_concurrency`, `allowed_models`/`default_model`, `allowed_efforts`/`default_effort`, profiles, capabilities, `ack_timeout`), causing invalid arguments like `allowed_models=["--skip-permissions-unsafe"]` to fail with `ADAPTER_NOT_INSTALLED` (exit 13) when `droid` was absent in `PATH`, instead of `INVALID_ARGUMENT` (exit 2). Meanwhile [tests/integration/test_batch7_g5.py](tests/integration/test_batch7_g5.py) passed `--allowed-model --skip-permissions-unsafe` as separate argv items, tripping client `argparse` instead of reaching `meshd`. (`adapter.is_installed()` remains prior to DB writes and before runtime launch checks per `docs/plan.md` §6.2; `TEST_DOUBLE_DISABLED` and `validate_adapter_options` still run first as before.)
+- **Fix:**
+  - [mesh/daemon/handlers/agent.py](mesh/daemon/handlers/agent.py): Moved `adapter.is_installed(binary_path=binary_override)` in `handle_agent_create` after pure parameter validation (right after `_ack_timeout_arg(ctx, delivery)`), so invalid agent definitions deterministically return `INVALID_ARGUMENT` (exit `2`) regardless of whether external vendor CLIs are installed, while valid definitions without an installed binary still raise `AdapterNotInstalled` (exit `13`).
+  - [tests/integration/test_batch7_g5.py](tests/integration/test_batch7_g5.py): Updated `d_bad` to use `--allowed-model=--skip-permissions-unsafe` and `--default-model=--skip-permissions-unsafe` and asserted `resp["error"]["details"].get("param") == "allowed_models"`.
+
+### 7. [P3] `handle_agent_create` using `or []` on `allowed_models` / `allowed_efforts`, bypassing type validation for falsy non-lists
+
+- **Doc & Code Verification:** Confirmed real. Whereas `handle_agent_create` used explicit key presence for `options` and `handle_agent_update` used `is not None`, lines 240 and 297 of [mesh/daemon/handlers/agent.py](mesh/daemon/handlers/agent.py) used `ctx.args.get(...) or ... or []`, converting `False`, `0`, `""`, and `{}` into `[]` instead of raising `INVALID_ARGUMENT`.
+- **Fix:**
+  - [mesh/daemon/handlers/agent.py](mesh/daemon/handlers/agent.py): Replaced `or []` on `allowed_models`/`allowed_model` and `allowed_efforts`/`allowed_effort` with explicit `"key" in ctx.args and ctx.args["key"] is not None` checks; also added `isinstance` type checks for `delivery`, `default_profile`, `max_unapproved_profile`, and `capabilities` elements prior to `dict.fromkeys` so non-list/non-string inputs return `INVALID_ARGUMENT` (exit `2`).
+
+## Decisions Made Without User Prompting
+
+1. **Dedicated `replay_only` envelope field outside `req_hash`:** Added `replay_only` at the top level of the daemon JSON envelope rather than mutating args or duplicating SQLite lookup logic in client commands; excluded it from `req_hash` so retried commands match the stored idempotency row unchanged.
+2. **CLI JSON validation exemptions aligned with existing behavior:** Exempted `config set` `value`, `task submit` `deliverable` (`task.py` validates dict), `agent *` `max_concurrency` (`INVALID_CONCURRENCY` code expected by `test_agents.py`), `approval request` `operation` / `project complete` `report` (`str` or `dict`), `ack_timeout` / `idle_timeout` (`int` or `str`, non-bool), and `agent create|update` `option|options` (`dict` or `list[str]`) from generic string enforcement in `mesh/cli/main.py` so existing CLI/daemon error contracts remain intact.
+3. **Allowlist vs nonfatal stderr promotion:** Kept `_NONFATAL_STDERR_REASONS` scoped to `{"tool_denied"}` and censored secrets before truncating strings to 2,000 chars (`_STDERR_DETAIL_MAX_CHARS`), preserving existing `model_or_effort_rejected` behavior while bounding `failure_json` and audit `events.payload_json`.
+
+## Verification
+
+### Pre-fix baseline failure confirmation (on `77783f2` prior to production fixes)
+
+- `python3 -m unittest tests/integration/test_batch7_pr46_r1.py`: 4/4 failed reproducing Findings #1, #2, #5, #6/#7 (`onboard` retry exit `1` leaking `cred_...`, `--input ""` exit `1`, `tool_denied` overriding `exit_nonzero`, `d_bad` / falsy non-lists not returning server validation errors).
+- `python3 -m unittest tests/unit/test_batch7_pr46_r1.py`: 14/15 failed/errored (only `test_valid_special_json_types_preserved` passed).
+
+### Post-fix verification runs
+
+1. **New regression tests (3 consecutive runs, including `PATH=/usr/bin:/bin`):**
+   - `python3 -m unittest tests/unit/test_batch7_pr46_r1.py tests/integration/test_batch7_pr46_r1.py` -> **Ran 20 tests, OK** (3 runs: 20/20 pass).
+2. **PR #46 G5 tests without vendor binaries on `PATH`:**
+   - `PATH=/usr/bin:/bin python3 -m unittest tests/unit/test_batch7_pr46_r1.py tests/integration/test_batch7_pr46_r1.py tests/unit/test_batch7_g5.py tests/integration/test_batch7_g5.py` -> **Ran 58 tests, OK** (20 + 38 pass).
+3. **Related unit suites (`umask 0022` noted — under the container's default `umask 0000`, pre-existing `test_cli_usability.TestTokenOutChecks.test_inside_git_work_tree_refused` creates a `0o777` dir that triggers permissions checks before git-work-tree checks):**
+   - `umask 0022 && python3 -m unittest tests/unit/test_pr37_fixes.py tests/unit/test_pr39_r1.py tests/unit/test_pr39_r2.py tests/unit/test_adapters.py tests/unit/test_adapter_evidence.py tests/unit/test_adapters_kiro_real.py tests/unit/test_adapters_agy_real.py tests/unit/test_adapters_droid_real.py tests/unit/test_adapters_vibe_real.py tests/unit/test_vendor_failure_meaning.py tests/unit/test_redact.py tests/unit/test_pr40_r7_redact.py tests/unit/test_cli_usability.py tests/unit/test_inbox_worker_kit.py tests/unit/test_linear_full_cli.py tests/unit/test_batch7_pr43_r2.py tests/unit/test_batch7_pr44_r1.py tests/unit/test_batch7_pr44_r2.py tests/unit/test_batch7_pr45_r1.py tests/unit/test_docs_m3.py tests/unit/test_docs_m19.py tests/unit/test_helpdiff.py tests/unit/test_smoke_harness.py tests/unit/test_tierlib.py tests/unit/test_launch_hold.py` -> **Ran 329 tests, OK**.
+   - `python3 -m unittest tests/unit/test_evidence_mode.py tests/unit/test_smoke_cases.py tests/unit/test_smoke_kiro.py tests/unit/test_probe_offline.py tests/unit/test_paths.py tests/unit/test_doctor.py tests/unit/test_worker_friction.py` -> **Ran 79 tests, OK**.
+4. **Related integration suites:**
+   - `python3 -m unittest tests/integration/test_pr37_fixes.py tests/integration/test_pr39_r1.py tests/integration/test_pr39_r2.py tests/integration/test_pr39_r3.py tests/integration/test_adapters.py tests/integration/test_adapter_evidence.py tests/integration/test_vendor_exit_meaning.py tests/integration/test_cli_usability.py tests/integration/test_agents.py tests/integration/test_tasks.py tests/integration/test_approvals.py tests/integration/test_worker_friction.py tests/integration/test_linear_full_cli.py tests/integration/test_batch7_pr43_r2.py tests/integration/test_batch7_pr44_r1.py tests/integration/test_batch7_pr45_r1.py` -> **Ran 125 tests, OK**.

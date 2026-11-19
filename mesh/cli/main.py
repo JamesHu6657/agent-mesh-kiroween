@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import secrets
 import sys
@@ -261,8 +262,16 @@ def get_active_subparser(parser: argparse.ArgumentParser, args: argparse.Namespa
     return parser
 
 
+def _argv_before_double_dash(argv: Optional[List[str]]) -> List[str]:
+    if not argv:
+        return []
+    return list(argv[:argv.index("--")]) if "--" in argv else list(argv)
+
+
 def relax_required_actions(parser: argparse.ArgumentParser) -> None:
     for action in parser._actions:
+        if action.required and not isinstance(action, argparse._SubParsersAction):
+            setattr(action, "_orig_required", True)
         action.required = False
         if isinstance(action, argparse._SubParsersAction):
             for sub in action.choices.values():
@@ -276,8 +285,15 @@ def parse_and_apply_input_file(
 ) -> None:
     """Process --input FILE|-."""
     input_source = getattr(args, "input", None)
-    if not input_source:
+    if input_source is None:
         return
+    if not isinstance(input_source, str) or not input_source.strip():
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="--input requires a non-empty file path or '-'",
+            details={"param": "input"},
+        )
 
     try:
         if input_source == "-":
@@ -318,7 +334,7 @@ def parse_and_apply_input_file(
             valid_params.add(action.dest)
     # Commands where timeout is also a valid command parameter
     sub_prog = getattr(active_sub, "prog", "")
-    if any(cmd in sub_prog for cmd in ("task create", "task wait", "inbox wait", "project wait")):
+    if any(cmd in sub_prog for cmd in ("task create", "task wait", "inbox wait", "project wait", "event tail")):
         valid_params.add("timeout")
 
     # Add known synonyms
@@ -326,27 +342,48 @@ def parse_and_apply_input_file(
         if canonical in valid_params:
             valid_params.add(syn)
 
-    # Track flags specified directly on CLI argv
+    # Track flags specified directly on CLI argv (only options before "--")
     cli_specified_flags = set()
-    if argv:
-        for a in argv:
-            if a.startswith("--"):
-                flag_name = a[2:].split("=")[0].replace("-", "_")
-                cli_specified_flags.add(flag_name)
+    opt_argv = _argv_before_double_dash(argv)
+    opt_takes_val: Dict[str, bool] = {}
+    for a in active_sub._actions:
+        for o in a.option_strings:
+            opt_takes_val[o] = (
+                not isinstance(a, (argparse._StoreTrueAction, argparse._StoreFalseAction,
+                                   argparse.BooleanOptionalAction,
+                                   argparse._CountAction, argparse._HelpAction, argparse._VersionAction))
+                and a.nargs != 0
+            )
+    i = 0
+    while i < len(opt_argv):
+        tok = opt_argv[i]
+        if tok.startswith("--") and len(tok) > 2:
+            flag = tok.split("=", 1)[0]
+            exact_or_pref = [
+                a for a in active_sub._actions
+                if any(o == flag or o.startswith(flag) for o in a.option_strings if o.startswith("--"))
+            ]
+            exact = [a for a in exact_or_pref if flag in a.option_strings]
+            matched = exact or (exact_or_pref if len({a.dest for a in exact_or_pref}) == 1 else [])
+            if matched:
+                act = matched[0]
+                if act.dest in valid_params or act.dest == "input":
+                    cli_specified_flags.add(act.dest)
+                if "=" not in tok and any(opt_takes_val.get(o, True) for o in act.option_strings if o.startswith(flag)):
+                    i += 2
+                    continue
+            else:
+                cli_specified_flags.add(flag[2:].replace("-", "_"))
+        i += 1
 
     # Linear full review C2: a target given on the command line (a positional, or a flag
     # through any of its spellings such as --proj) must not be silently replaced by JSON.
     for action in active_sub._actions:
-        if action.dest in GLOBAL_FLAG_DESTS or action.dest == "help":
+        if (action.dest in GLOBAL_FLAG_DESTS and action.dest not in valid_params) or action.dest == "help":
             continue
         if not action.option_strings:
             if getattr(args, action.dest, None) not in (None, action.default):
                 cli_specified_flags.add(action.dest)
-            continue
-        # argparse also accepts unambiguous prefixes (--proj for --project): match those too.
-        if argv and any(a.startswith("--") and len(a.split("=", 1)[0]) > 2 and o.startswith(a.split("=", 1)[0])
-                        for a in argv for o in action.option_strings if o.startswith("--")):
-            cli_specified_flags.add(action.dest)
 
     from_json = set()
     for key, val in json_obj.items():
@@ -366,6 +403,13 @@ def parse_and_apply_input_file(
                 message=f"Parameter '{key}' provided both via command-line flag and JSON input",
                 details={"param": key},
             )
+        if canonical_key in from_json or key in from_json:
+            raise MeshError(
+                code=c.DUPLICATE_PARAM,
+                exit_code=c.EXIT_USAGE,
+                message=f"Parameter '{key}' conflicts with synonym already provided in JSON input",
+                details={"param": key},
+            )
 
         setattr(args, key, val)
         if canonical_key != key:
@@ -373,13 +417,210 @@ def parse_and_apply_input_file(
         from_json.add(key)
         from_json.add(canonical_key)
 
+    # Validate types, choices, and originally-required fields after JSON merge.
+    action_by_dest = {
+        a.dest: a for a in active_sub._actions
+        if not isinstance(a, argparse._SubParsersAction) and a.dest != "help"
+    }
+    if "timeout" in from_json:
+        tval = getattr(args, "timeout", None)
+        if tval is not None and (isinstance(tval, bool) or not isinstance(tval, (str, int))):
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message="Parameter 'timeout' must be a duration string or integer seconds",
+                details={"param": "timeout", "got": type(tval).__name__},
+            )
+    is_agent_mut = sub_prog.endswith(" agent create") or sub_prog.endswith(" agent update")
+    is_agent_mut_or_onboard = is_agent_mut or sub_prog.endswith(" agent onboard")
+    for canonical_key in sorted(from_json):
+        act = action_by_dest.get(canonical_key)
+        if act is None or canonical_key in GLOBAL_FLAG_DESTS:
+            continue
+        val = getattr(args, canonical_key, None)
+        allow_null_val = (
+            (sub_prog.endswith(" config set") and canonical_key == "value")
+            or (sub_prog.endswith(" task submit") and canonical_key == "deliverable")
+            or (sub_prog.endswith(" agent update") and canonical_key in ("default_model", "default_effort"))
+            or (is_agent_mut_or_onboard and canonical_key == "max_concurrency")
+        )
+        if val is None:
+            if act.default not in (None, argparse.SUPPRESS) and not allow_null_val:
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Parameter '{canonical_key}' cannot be null",
+                    details={"param": canonical_key, "got": "NoneType"},
+                )
+            continue
+        if isinstance(act, (argparse._StoreTrueAction, argparse._StoreFalseAction, argparse.BooleanOptionalAction)):
+            if not isinstance(val, bool):
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Parameter '{canonical_key}' must be a boolean",
+                    details={"param": canonical_key, "got": type(val).__name__},
+                )
+            continue
+        is_list_action = isinstance(act, argparse._AppendAction) or act.nargs in ("+", "*")
+        if is_list_action:
+            if is_agent_mut and canonical_key == "option":
+                if not (isinstance(val, dict) or (isinstance(val, list) and all(isinstance(x, str) for x in val))):
+                    raise MeshError(
+                        code=c.INVALID_ARGUMENT,
+                        exit_code=c.EXIT_USAGE,
+                        message="Parameter 'options' must be an object or list of strings",
+                        details={"param": canonical_key, "got": type(val).__name__},
+                    )
+                continue
+            if not isinstance(val, list):
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Parameter '{canonical_key}' must be a list",
+                    details={"param": canonical_key, "got": type(val).__name__},
+                )
+            if act.nargs == "+" and len(val) == 0:
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Parameter '{canonical_key}' must be a non-empty list",
+                    details={"param": canonical_key},
+                )
+            items = val
+        else:
+            items = (val,)
+
+        for item in items:
+            if act.type is int:
+                if isinstance(item, bool) or not isinstance(item, int):
+                    raise MeshError(
+                        code=c.INVALID_ARGUMENT,
+                        exit_code=c.EXIT_USAGE,
+                        message=f"Parameter '{canonical_key}' must be an integer",
+                        details={"param": canonical_key, "got": type(item).__name__},
+                    )
+            elif act.type is float:
+                if isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item):
+                    raise MeshError(
+                        code=c.INVALID_ARGUMENT,
+                        exit_code=c.EXIT_USAGE,
+                        message=f"Parameter '{canonical_key}' must be a finite number",
+                        details={"param": canonical_key, "got": type(item).__name__},
+                    )
+            elif act.choices is not None:
+                if item not in act.choices:
+                    raise MeshError(
+                        code=c.INVALID_ARGUMENT,
+                        exit_code=c.EXIT_USAGE,
+                        message=f"Invalid value for '{canonical_key}': {item!r}; expected one of {list(act.choices)}",
+                        details={"param": canonical_key, "choices": list(act.choices)},
+                    )
+            elif is_list_action and act.type is None:
+                if not isinstance(item, str):
+                    raise MeshError(
+                        code=c.INVALID_ARGUMENT,
+                        exit_code=c.EXIT_USAGE,
+                        message=f"Parameter '{canonical_key}' items must be strings",
+                        details={"param": canonical_key, "got": type(item).__name__},
+                    )
+
+        if not is_list_action and act.type is None and act.nargs in (None, "?"):
+            if sub_prog.endswith(" config set") and canonical_key == "value":
+                pass  # arbitrary JSON value (including null/int/bool/object/array)
+            elif sub_prog.endswith(" task submit") and canonical_key == "deliverable":
+                pass  # validated in task.py (dict vs null/non-dict)
+            elif is_agent_mut_or_onboard and canonical_key == "max_concurrency":
+                pass  # validated in server/handler with INVALID_CONCURRENCY
+            elif (
+                (sub_prog.endswith(" approval request") and canonical_key == "operation")
+                or (sub_prog.endswith(" project complete") and canonical_key == "report")
+            ):
+                if not isinstance(val, (str, dict)):
+                    raise MeshError(
+                        code=c.INVALID_ARGUMENT,
+                        exit_code=c.EXIT_USAGE,
+                        message=f"Parameter '{canonical_key}' must be a string or JSON object",
+                        details={"param": canonical_key, "got": type(val).__name__},
+                    )
+            elif (
+                (is_agent_mut_or_onboard and canonical_key == "ack_timeout")
+                or (sub_prog.endswith(" task create") and canonical_key == "idle_timeout")
+            ):
+                if isinstance(val, bool) or not isinstance(val, (str, int)):
+                    raise MeshError(
+                        code=c.INVALID_ARGUMENT,
+                        exit_code=c.EXIT_USAGE,
+                        message=f"Parameter '{canonical_key}' must be a duration string or integer seconds",
+                        details={"param": canonical_key, "got": type(val).__name__},
+                    )
+            elif not isinstance(val, str):
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Parameter '{canonical_key}' must be a string",
+                    details={"param": canonical_key, "got": type(val).__name__},
+                )
+
+    for act in active_sub._actions:
+        if not getattr(act, "_orig_required", False):
+            continue
+        dest = act.dest
+        cur_val = getattr(args, dest, None)
+        allow_null_json = sub_prog.endswith(" config set") and dest == "value" and dest in from_json
+        if act.nargs == "+":
+            if not isinstance(cur_val, list) or not cur_val:
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Missing required parameter '{dest}'" if not cur_val else f"Parameter '{dest}' must be a non-empty list",
+                    details={"param": dest},
+                )
+        elif not allow_null_json and cur_val is None:
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message=f"Missing required parameter '{dest}'",
+                details={"param": dest},
+            )
+        elif (
+            not allow_null_json
+            and act.type is None
+            and act.nargs is None
+            and not (sub_prog.endswith(" approval request") and dest == "operation")
+            and not (sub_prog.endswith(" project complete") and dest == "report")
+            and not isinstance(cur_val, str)
+        ):
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message=f"Parameter '{dest}' must be a string",
+                details={"param": dest, "got": type(cur_val).__name__},
+            )
+
     setattr(args, "_from_json", from_json)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     """Main CLI entry point."""
-    if argv is None:
+    in_process = argv is not None
+    if not in_process:
+        from mesh.cli.entry import ensure_isolated_process
+
+        ensure_isolated_process()
         argv = sys.argv[1:]
+        os.umask(0o077)
+        return _run_cli(argv)
+
+    old_umask = os.umask(0o077)
+    try:
+        return _run_cli(argv)
+    finally:
+        os.umask(old_umask)
+
+
+def _run_cli(argv: List[str]) -> int:
+    """Run parsed CLI dispatch under process umask 0o077."""
 
     parser = build_parser()
 
@@ -393,7 +634,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     from mesh.cli import stdin as _stdin
     _stdin.reset()
 
-    has_input = any(arg == "--input" or arg.startswith("--input=") for arg in argv)
+    opt_argv = _argv_before_double_dash(argv)
+    has_input = any(
+        "--input".startswith(arg.split("=", 1)[0]) and len(arg.split("=", 1)[0]) >= 4
+        for arg in opt_argv
+        if arg.startswith("--")
+    )
     if has_input:
         relax_required_actions(parser)
 
@@ -465,8 +711,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Check for subcommand function
     func = getattr(args, "func", None)
     if func is None:
-        # If resource given without verb, print resource help
-        parser.print_help()
+        sub = get_active_subparser(parser, args)
+        if text_fmt:
+            sub.print_help()
+        else:
+            format_error_response(
+                code=c.INVALID_ARGUMENT,
+                message=f"Missing subcommand for '{sub.prog}'. Run '{sub.prog} --help' for usage.",
+                exit_code=c.EXIT_USAGE,
+                details={"command": sub.prog},
+                request_id=req_id,
+                text_format=False,
+            )
         return c.EXIT_USAGE
 
     try:

@@ -84,7 +84,12 @@ class MeshHarness:
         self.daemon_proc: Optional[subprocess.Popen] = None
         self._daemon_record = None
         self._daemon_identity = None
-        self.suite_tripwire_file = os.environ.get("MESH_SUITE_TRIPWIRE_FILE") or os.environ.get("MESH_TRIPWIRE_FILE")
+        self.suite_tripwire_file = (
+            os.environ.get("_SUITE_TRIPWIRE_FILE")
+            or os.environ.get("_TRIPWIRE_FILE")
+            or os.environ.get("MESH_SUITE_TRIPWIRE_FILE")
+            or os.environ.get("MESH_TRIPWIRE_FILE")
+        )
         self.tripwire_file = f"/tmp/mesh-tripwire-{self.rand_id}.log"
         if os.path.exists(self.tripwire_file):
             os.remove(self.tripwire_file)
@@ -122,9 +127,9 @@ class MeshHarness:
             env["MESH_TESTING"] = "1"
         else:
             env.pop("MESH_TESTING", None)
-        env["MESH_TRIPWIRE_FILE"] = self.tripwire_file
+        env["_TRIPWIRE_FILE"] = self.tripwire_file
         if self.suite_tripwire_file:
-            env["MESH_SUITE_TRIPWIRE_FILE"] = self.suite_tripwire_file
+            env["_SUITE_TRIPWIRE_FILE"] = self.suite_tripwire_file
         return env
 
     def cli(

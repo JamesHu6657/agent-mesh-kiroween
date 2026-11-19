@@ -17,6 +17,11 @@ import unittest
 
 from mesh.cli.main import build_parser
 
+# The worker spawns many short-lived processes (sleep/ps/subshells) in its own session; a
+# concurrent real-/proc scanner can catch one mid-exec (transient EACCES on environ) and
+# report an uncertain leftover scan. Hold the host-wide /proc lock exclusively.
+MESH_PROC_LOCK = "exclusive"
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SCRIPT = os.path.join(ROOT, "scripts", "inbox-worker-example.sh")
 GUIDE = os.path.join(ROOT, "docs", "inbox-workers.md")
@@ -68,15 +73,24 @@ case "$1 $2" in
     echo '{"ok": true, "data": {"items": [{"id": "msg_1", "type": "task.offered", "payload": {"task_id": "tsk_1"}}]}}' ;;
   "inbox ack") echo '{"ok": true, "data": {"acked": 1}}' ;;
   "task start")
-    printf '{"ok": true, "data": {"run_id": "run_1", "fence": 3, "workspace": "%s", "branch": "mesh/p/t", "session": "ses_x", "heartbeat_every_s": 1}}\n' "$D/ws" ;;
+    hb_every=1
+    [ -f "$D/hb-every" ] && hb_every="$(cat "$D/hb-every")"
+    printf '{"ok": true, "data": {"run_id": "run_1", "fence": 3, "workspace": "%s", "branch": "mesh/p/t", "session": "ses_x", "heartbeat_every_s": %s}}\n' "$D/ws" "$hb_every" ;;
   "task show") echo '{"ok": true, "data": {"spec": "do the thing"}}' ;;
-  "task heartbeat")
-    if [ -f "$D/hb-fail-once" ] && [ ! -f "$D/hb-failed" ]; then
-      : > "$D/hb-failed"; echo '{"ok": false, "error": {"code": "DAEMON_UNAVAILABLE"}}'; exit 10
+  "task heartbeat"|"task submit"|"task fail")
+    if [ "${MESH_SESSION:-}" != "ses_x" ]; then
+      echo '{"ok": false, "error": {"code": "FENCE_MISMATCH", "details": {"reason": "session_mismatch"}}}'
+      exit 9
     fi
-    if [ -f "$D/lose" ]; then echo '{"ok": false, "error": {"code": "LEASE_EXPIRED"}}'; exit 9; fi
-    echo '{"ok": true, "data": {}}' ;;
-  "task submit"|"task fail") echo '{"ok": true, "data": {}}' ;;
+    case "$1 $2" in
+      "task heartbeat")
+        if [ -f "$D/hb-fail-once" ] && [ ! -f "$D/hb-failed" ]; then
+          : > "$D/hb-failed"; echo '{"ok": false, "error": {"code": "DAEMON_UNAVAILABLE"}}'; exit 10
+        fi
+        if [ -f "$D/lose" ]; then echo '{"ok": false, "error": {"code": "LEASE_EXPIRED"}}'; exit 9; fi
+        echo '{"ok": true, "data": {}}' ;;
+      *) echo '{"ok": true, "data": {}}' ;;
+    esac ;;
   *) echo '{"ok": false, "error": {"code": "INVALID_ARGUMENT"}}'; exit 2 ;;
 esac
 """
@@ -270,6 +284,105 @@ class InboxWorkerScriptRunTest(unittest.TestCase):
         self.assertIn("inbox wait failed (exit 3)", result.stderr)
         self.assertIn("TOKEN_REVOKED", result.stderr)
         self.assertEqual(len([c for c in self.calls() if c.startswith("inbox wait")]), 1)
+
+    def test_stub_enforces_mesh_session_and_worker_sets_it(self):
+        # Batch 7 G6 (Finding 4): stub must enforce MESH_SESSION on heartbeat/submit/fail.
+        for verb in ("heartbeat", "submit", "fail"):
+            bad = subprocess.run(
+                [self.stub, "task", verb, "tsk_1"],
+                capture_output=True, text=True,
+                env=dict(self.env, MESH_SESSION="wrong_ses"),
+            )
+            self.assertEqual(bad.returncode, 9, f"{verb}: {bad.stdout}")
+            self.assertIn("FENCE_MISMATCH", bad.stdout)
+        res_fail = self.run_script("sh", "-c", "exit 7")
+        self.assertEqual(res_fail.returncode, 1, res_fail.stderr)
+        self.assertNotIn("FENCE_MISMATCH", res_fail.stderr)
+
+    def test_daemon_unavailable_preserves_exit_10_and_11(self):
+        import time
+        for rc in ("10", "11"):
+            with open(os.path.join(self.dir, "wait-rc"), "w", encoding="utf-8") as handle:
+                handle.write(rc)
+            t0 = time.monotonic()
+            result = self.run_script("true", timeout=10)
+            elapsed = time.monotonic() - t0
+            self.assertEqual(result.returncode, int(rc), result.stderr)
+            self.assertNotIn("no task offered", result.stderr)
+            self.assertLess(elapsed, 4.0, result.stderr)
+
+    def test_child_env_strips_token_and_session(self):
+        env = dict(self.env, MESH_TOKEN="tok_dummy_env_value")
+        env["OUT_JSON"] = os.path.join(self.dir, "child-env.json")
+        py = (
+            "import json, os; "
+            "open(os.environ['OUT_JSON'], 'w').write(json.dumps("
+            "{k: os.environ.get(k) for k in ('MESH_TOKEN_FILE', 'MESH_SESSION', 'MESH_TOKEN', "
+            "'MESH_TASK_ID', 'MESH_RUN_ID', 'MESH_FENCE')}))"
+        )
+        result = self.run_script("python3", "-c", py, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(env["OUT_JSON"], encoding="utf-8") as handle:
+            got = json.load(handle)
+        self.assertIsNone(got["MESH_TOKEN_FILE"])
+        self.assertIsNone(got["MESH_SESSION"])
+        self.assertIsNone(got["MESH_TOKEN"])
+        self.assertEqual(got["MESH_TASK_ID"], "tsk_1")
+        self.assertEqual(got["MESH_RUN_ID"], "run_1")
+        self.assertEqual(got["MESH_FENCE"], "3")
+
+    def test_heartbeat_sleep_is_reaped_and_pipes_close_promptly(self):
+        with open(os.path.join(self.dir, "hb-every"), "w", encoding="utf-8") as handle:
+            handle.write("40")
+        result = self.run_script("true", timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_early_usr1_and_sigterm_ignoring_child_cleanup(self):
+        isolated_tmp = os.path.join(self.dir, "worker-tmp")
+        os.makedirs(isolated_tmp)
+        open(os.path.join(self.dir, "lose"), "w").close()
+        with open(os.path.join(self.dir, "hb-every"), "w", encoding="utf-8") as handle:
+            handle.write("0")
+        env = dict(self.env, TMPDIR=isolated_tmp, KILL_GRACE_S="1")
+        py = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(20)"
+        result = self.run_script("python3", "-c", py, env=env, timeout=10)
+        self.assertEqual(result.returncode, 9, result.stderr)
+        self.assertEqual(os.listdir(isolated_tmp), [], "temp dir leaked after USR1/cleanup")
+
+    def test_sigterm_kills_process_group_and_cleans_up(self):
+        import signal, time
+        isolated_tmp = os.path.join(self.dir, "worker-tmp-term")
+        os.makedirs(isolated_tmp)
+        ready = os.path.join(self.dir, "ws", "ready")
+        late = os.path.join(self.dir, "ws", "late")
+        child = f"import time; time.sleep(1.5); open({late!r}, 'w').write('x')"
+        parent = (
+            f"import subprocess, sys, time; "
+            f"subprocess.Popen([sys.executable, '-c', {child!r}]); "
+            f"open({ready!r}, 'w').write('ok'); "
+            f"time.sleep(20)"
+        )
+        env = dict(self.env, TMPDIR=isolated_tmp, KILL_GRACE_S="1")
+        proc = subprocess.Popen(
+            ["bash", SCRIPT, "--", "python3", "-c", parent],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not os.path.exists(ready):
+                time.sleep(0.05)
+            self.assertTrue(os.path.exists(ready), "child never started")
+            time.sleep(0.1)
+            proc.send_signal(signal.SIGTERM)
+            _out, err = proc.communicate(timeout=10)
+        except Exception:
+            proc.kill()
+            proc.communicate()
+            raise
+        self.assertEqual(proc.returncode, 143, err)
+        self.assertEqual(os.listdir(isolated_tmp), [], "temp dir leaked after SIGTERM")
+        time.sleep(1.8)
+        self.assertFalse(os.path.exists(late), "grandchild survived SIGTERM on PGID")
 
 
 if __name__ == "__main__":

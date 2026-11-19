@@ -74,7 +74,30 @@ def _sha_file(path: str) -> str:
         return hashlib.sha256(f.read()).hexdigest()
 
 
-def _check_sidecar(path: str) -> Optional[str]:
+def _has_symlink(path: str, root: Optional[str] = None) -> Optional[str]:
+    if os.path.islink(path):
+        return f"symlink not allowed: {path}"
+    cur = os.path.dirname(os.path.abspath(path))
+    stop = os.path.abspath(root).rstrip(os.sep) if root else None
+    while cur and cur != os.path.dirname(cur):
+        if stop is not None and cur.rstrip(os.sep) == stop:
+            break
+        if stop is None and cur in ("/tmp", "/var", "/private", "/private/tmp", "/private/var", "/home"):
+            break
+        if os.path.islink(cur):
+            return f"symlinked directory not allowed: {cur}"
+        cur = os.path.dirname(cur)
+    if root and os.path.islink(root.rstrip(os.sep) or root):
+        return f"symlinked root directory not allowed: {root}"
+    return None
+
+
+def _check_sidecar(path: str, *, root: Optional[str] = None) -> Optional[str]:
+    sym = _has_symlink(path, root=root)
+    if sym:
+        return sym
+    if not os.path.isfile(path):
+        return "missing target file"
     side = path + SIDECAR_SUFFIX
     if not os.path.isfile(side) or os.path.islink(side):
         return "missing sidecar"
@@ -189,8 +212,8 @@ def validate(doc: Any, repo_root: str, fixture_root: Optional[str] = None) -> Li
         if fx is None:
             if fsha is not None:
                 errs.append(f"{where}: fixture_sha256 without fixture")
-            if status == "pass" and cid in ("S-X-1",):
-                errs.append(f"{where}: a passing S-X-1 needs a fixture")
+            if status == "pass" and cid in CASE_CAPS:
+                errs.append(f"{where}: a passing {cid} needs a fixture")
             continue
         if not isinstance(fx, str):
             errs.append(f"{where}: fixture must be a string or null")
@@ -206,11 +229,16 @@ def validate(doc: Any, repo_root: str, fixture_root: Optional[str] = None) -> Li
         if not _FIXTURE_NAME_RE.match(parts[5]):
             errs.append(f"{where}: fixture must be a smoke-S-*-stdout.jsonl capture: {fx}")
             continue
+        check_root = root if fixture_root else os.path.abspath(repo_root)
         path = os.path.join(root, adapter, version, parts[5])
-        if not os.path.isfile(path) or os.path.islink(path):
+        sym = _has_symlink(path, root=check_root)
+        if sym:
+            errs.append(f"{where}: {fx}: {sym}")
+            continue
+        if not os.path.isfile(path):
             errs.append(f"{where}: fixture file missing: {fx}")
             continue
-        problem = _check_sidecar(path)
+        problem = _check_sidecar(path, root=check_root)
         if problem:
             errs.append(f"{where}: {fx}: {problem}")
         actual = _sha_file(path)
@@ -261,7 +289,7 @@ def load_latest(results_dir: str, adapter: str, version: Optional[str] = None) -
 
 
 def _load_latest(results_dir: str, adapter: str, version: Optional[str]) -> Optional[str]:
-    if not results_dir or not os.path.isdir(results_dir):
+    if not results_dir or os.path.islink(results_dir.rstrip(os.sep) or results_dir) or not os.path.isdir(results_dir):
         return None
     best: Optional[Tuple[Tuple[str, int], str]] = None
     for name in os.listdir(results_dir):
@@ -269,7 +297,7 @@ def _load_latest(results_dir: str, adapter: str, version: Optional[str]) -> Opti
         if parsed is None or (version is not None and parsed[0] != version):
             continue
         path = os.path.join(results_dir, name)
-        if not os.path.isfile(path):
+        if os.path.islink(path) or not os.path.isfile(path):
             continue
         key = (parsed[1], parsed[2])
         if best is None or key > best[0]:

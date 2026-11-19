@@ -18,8 +18,8 @@ class attribute.
 
 Launch hold (L11): an adapter in :data:`LAUNCH_HOLDS` stays off even when its evidence passes,
 with reason ``launch_held`` and the milestone from the table. kiro was held from M3 (James
-sign-off 2026-11-12 19:32) until its real end-to-end run N13 passed in M4 (m4-kiro-n13); the
-table is empty again and the mechanism stays for future holds. Testing mode only (read from
+sign-off 2026-11-12 19:32) until its real end-to-end run N13 passed in M4 (m4-kiro-n13);
+devin is held until M5 (docs/adapters-devin.md). Testing mode only (read from
 the same env as the results override, ignored outside testing mode):
 ``MESH_TEST_LAUNCH_HOLD`` adds holds (``"kiro:M4,agy:M5"``; no milestone means ``M4``) and
 ``MESH_TEST_LAUNCH_UNHOLD`` lifts holds (comma-separated adapter ids).
@@ -54,8 +54,11 @@ HOLD_ENV = "MESH_TEST_LAUNCH_HOLD"
 REASONS = ("no_probe_version", "no_smoke_evidence", "evidence_stale", "evidence_invalid", "launch_cases_failed",
            "launch_held")
 #: L11: vendor adapters whose launch stays off whatever the evidence says -> milestone that lifts it.
-#: Empty since M4 (kiro N13 passed, m4-kiro-n13); kept as a tool for future holds.
-LAUNCH_HOLDS: Dict[str, str] = {}
+#: kiro left at M4 (N13 passed, m4-kiro-n13). devin: held until it has real smoke evidence; its
+#: plain-text output has no smoke fixture path yet. Only unrestricted is mapped: readonly and
+#: edit are unsupported because a skill loaded during the run grants it a shell (measured
+#: 2026-11-19, docs/adapters-devin.md).
+LAUNCH_HOLDS: Dict[str, str] = {"devin": "M5"}
 REPO_ROOT = Path(mesh.__file__).resolve().parents[1]
 #: Productize: a checkout holding tests/smoke/results and tests/fixtures/real, for installs
 #: where the package is not run from a clone (pipx/uv tool install). Default: REPO_ROOT.
@@ -193,7 +196,7 @@ def load_evidence(adapter_id: str, testing_mode: bool, probed_version: Optional[
     root = REPO_ROOT if testing_mode else evidence_root(env)
     try:
         errors = smoke_schema.validate(doc, str(root), fixture_root=str(froot) if froot else None)
-        side = smoke_schema._check_sidecar(path)
+        side = smoke_schema._check_sidecar(path, root=str(rdir))
     except OSError as exc:
         ev.reason, ev.errors = "evidence_invalid", [f"cannot read smoke evidence: {exc}"]
         return ev

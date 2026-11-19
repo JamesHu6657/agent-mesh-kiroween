@@ -11,16 +11,27 @@ from mesh.core.auth import generate_agent_token
 from mesh.core.clock import now_iso_utc, parse_duration
 from mesh.core.events import insert_event
 from mesh.core.ids import new_id
-from mesh.core.policy import parse_positive_int
+from mesh.core.policy import (
+    AGY_EFFORT_SUFFIXES,
+    check_adapter_effort_values,
+    check_agy_model_effort_conflict,
+    parse_positive_int,
+)
 from mesh.core.settings import get_agent_ack_timeout_s, set_agent_ack_timeout_s, validate_ack_timeout
-from mesh.adapters.registry import get_adapter, is_testing_mode
-from mesh.adapters.base import AdapterNotInstalled, EffortNotAllowed, EffortUnsupported
+from mesh.adapters.registry import get_adapter
+from mesh.adapters.base import (
+    AdapterNotInstalled,
+    EffortNotAllowed,
+    EffortUnsupported,
+    validate_adapter_options,
+    validate_cli_token,
+)
 from mesh.daemon.handlers.base import HandlerContext, HandlerResult
 
 
 VALID_PROFILES = {"readonly", "edit", "dev", "elevated", "unrestricted"}
-VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
-EFFORT_SUFFIXES = ("-low", "-medium", "-high", "-xhigh", "-max")
+VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max", "ultra", "ultracode"}
+EFFORT_SUFFIXES = AGY_EFFORT_SUFFIXES
 VALID_CAPABILITIES = {"intake", "relay"}
 
 
@@ -40,10 +51,15 @@ def _ack_timeout_arg(ctx: HandlerContext, delivery: str) -> Optional[int]:
             message="--ack-timeout applies to inbox agents only (launch agents are started by meshd)",
             details={"param": "ack_timeout", "delivery": delivery},
         )
-    return validate_ack_timeout(raw)
+    return validate_ack_timeout(raw, testing_mode=ctx.testing_mode)
 
 
-def _ack_timeout_view(conn: Any, own: Optional[int], delivery: str = "inbox") -> Dict[str, Any]:
+def _ack_timeout_view(
+    conn: Any,
+    own: Optional[int],
+    delivery: str = "inbox",
+    testing_mode: Optional[bool] = None,
+) -> Dict[str, Any]:
     """The ack window an inbox agent gets, and where it comes from."""
     if delivery != "inbox":
         return {}
@@ -51,7 +67,10 @@ def _ack_timeout_view(conn: Any, own: Optional[int], delivery: str = "inbox") ->
         return {"ack_timeout_s": own, "ack_timeout_source": "agent"}
     from mesh.daemon.scheduler import get_inbox_ack_timeout_s
 
-    return {"ack_timeout_s": get_inbox_ack_timeout_s(conn), "ack_timeout_source": "inbox.ack_timeout_s"}
+    return {
+        "ack_timeout_s": get_inbox_ack_timeout_s(conn, testing_mode=testing_mode),
+        "ack_timeout_source": "inbox.ack_timeout_s",
+    }
 
 
 #: Fields a lead sees in `agent list/show` (the roster view): what it needs to pick an
@@ -95,14 +114,81 @@ def _check_direct_user_only(ctx: HandlerContext, op_name: str) -> None:
         )
 
 
-def _validate_model_name(model: str) -> None:
-    if not model or len(model) > 256 or any(ch.isspace() or ord(ch) < 32 for ch in model):
+def _validate_model_name(model: Any) -> None:
+    if (
+        not isinstance(model, str)
+        or not model
+        or len(model) > 256
+        or model.startswith("-")
+        or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in model)
+    ):
         raise MeshError(
             code=c.INVALID_ARGUMENT,
             exit_code=c.EXIT_USAGE,
-            message=f"Invalid model name '{model}': must be 1-256 characters without whitespace or control chars",
+            message=f"Invalid model name '{model}': must be 1-256 characters without leading '-', whitespace, or control chars",
             details={"param": "allowed_models", "value": model},
         )
+
+
+def _validate_default_profile(val: Any) -> str:
+    if not isinstance(val, str) or val not in VALID_PROFILES:
+        if isinstance(val, str) and val in VALID_EFFORTS:
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message=f"Reasoning effort '{val}' cannot be used as a permission profile",
+                details={"param": "default_profile", "value": val},
+            )
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=f"Invalid default_profile '{val}': must be one of {sorted(VALID_PROFILES)}",
+            details={"param": "default_profile", "value": val},
+        )
+    return val
+
+
+def _validate_max_unapproved_profile(val: Any) -> str:
+    if not isinstance(val, str) or val not in VALID_PROFILES:
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=f"Invalid max_unapproved_profile '{val}': must be one of {sorted(VALID_PROFILES)}",
+            details={"param": "max_unapproved_profile", "value": val},
+        )
+    return val
+
+
+def _parse_capabilities_arg(raw_caps: Any) -> List[str]:
+    caps = [raw_caps] if isinstance(raw_caps, str) else raw_caps
+    if not isinstance(caps, list):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Agent 'capabilities' must be a list of strings",
+            details={"param": "capabilities"},
+        )
+    for cap in caps:
+        if not isinstance(cap, str) or cap not in VALID_CAPABILITIES:
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message=f"Invalid capability '{cap}': must be in {sorted(VALID_CAPABILITIES)}",
+                details={"param": "capabilities", "value": cap},
+            )
+    return list(dict.fromkeys(caps))
+
+
+def _require_str_ident(val: Any, param: str, label: str) -> str:
+    """Require a non-empty string identifier (rejects non-strings and whitespace-only values)."""
+    if not isinstance(val, str) or not val.strip():
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=f"{label} is required and must be a non-empty string",
+            details={"param": param},
+        )
+    return val
 
 
 def handle_agent_create(ctx: HandlerContext) -> HandlerResult:
@@ -110,11 +196,16 @@ def handle_agent_create(ctx: HandlerContext) -> HandlerResult:
     _check_direct_user_only(ctx, "agent.create")
 
     name = ctx.args.get("name")
-    if not name or not isinstance(name, str):
+    if (
+        not isinstance(name, str)
+        or not name
+        or len(name) > 128
+        or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in name)
+    ):
         raise MeshError(
             code=c.INVALID_ARGUMENT,
             exit_code=c.EXIT_USAGE,
-            message="Agent 'name' is required and must be a string",
+            message="Agent 'name' must be a non-empty string (max 128 chars) without whitespace or control characters",
             details={"param": "name"},
         )
 
@@ -138,29 +229,62 @@ def handle_agent_create(ctx: HandlerContext) -> HandlerResult:
         )
 
     # Check adapter validity and test double status
-    testing_mode = bool(getattr(ctx, "testing_mode", False) or is_testing_mode())
-    options_raw = ctx.args.get("options") or ctx.args.get("option") or {}
+    testing_mode = bool(getattr(ctx, "testing_mode", False))
+    if "options" in ctx.args:
+        options_raw = ctx.args["options"]
+    elif "option" in ctx.args:
+        options_raw = ctx.args["option"]
+    else:
+        options_raw = {}
     options: Dict[str, Any] = {}
     if isinstance(options_raw, list):
         for item in options_raw:
-            if isinstance(item, str) and "=" in item:
-                k, v = item.split("=", 1)
-                try:
-                    options[k.strip()] = json.loads(v.strip())
-                except json.JSONDecodeError:
-                    options[k.strip()] = v.strip()
+            if not isinstance(item, str) or "=" not in item:
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message="Each adapter option must be formatted as KEY=VALUE",
+                    details={"param": "options"},
+                )
+            k, v = item.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            try:
+                options[k] = json.loads(v)
+            except json.JSONDecodeError:
+                options[k] = v
     elif isinstance(options_raw, dict):
         options = dict(options_raw)
+    else:
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Agent 'options' must be an object or list of KEY=VALUE strings",
+            details={"param": "options"},
+        )
+    options = validate_adapter_options(adapter_name, options, strict_keys=True)
 
     adapter = get_adapter(adapter_name, testing_mode=testing_mode, options=options)
-    binary_override = options.get("binary") or ctx.args.get("binary")
-    if not adapter.is_installed(binary_path=binary_override):
-        from mesh.adapters.base import AdapterNotInstalled
-        raise AdapterNotInstalled(adapter_name)
+    binary_override = ctx.args.get("binary") if ctx.args.get("binary") is not None else options.get("binary")
+    if binary_override is not None:
+        if (
+            not isinstance(binary_override, str)
+            or not binary_override.strip()
+            or "\x00" in binary_override
+            or binary_override.lstrip().startswith("-")
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in binary_override)
+        ):
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message="Agent 'binary' path must be a non-empty path string not starting with '-'",
+                details={"param": "binary"},
+            )
+        binary_override = binary_override.strip()
 
     # Delivery mode
     delivery = ctx.args.get("delivery", "launch")
-    if delivery not in ("launch", "inbox"):
+    if not isinstance(delivery, str) or delivery not in ("launch", "inbox"):
         raise MeshError(
             code=c.INVALID_ARGUMENT,
             exit_code=c.EXIT_USAGE,
@@ -181,14 +305,33 @@ def handle_agent_create(ctx: HandlerContext) -> HandlerResult:
                        if "max_concurrency" in ctx.args else 1)
 
     # Allowed models & Default model
-    allowed_models = ctx.args.get("allowed_models") or ctx.args.get("allowed_model") or []
+    if "allowed_models" in ctx.args and ctx.args["allowed_models"] is not None:
+        allowed_models = ctx.args["allowed_models"]
+    elif "allowed_model" in ctx.args and ctx.args["allowed_model"] is not None:
+        allowed_models = ctx.args["allowed_model"]
+    else:
+        allowed_models = []
     if isinstance(allowed_models, str):
         allowed_models = [allowed_models]
-    allowed_models = list(dict.fromkeys(allowed_models))  # deduplicate preserving order
+    if not isinstance(allowed_models, list):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Agent 'allowed_models' must be a list of strings",
+            details={"param": "allowed_models"},
+        )
     for m in allowed_models:
         _validate_model_name(m)
+    allowed_models = list(dict.fromkeys(allowed_models))  # deduplicate preserving order
 
     default_model = ctx.args.get("default_model")
+    if default_model is not None and not isinstance(default_model, str):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Agent 'default_model' must be a string",
+            details={"param": "default_model"},
+        )
 
     if delivery == "launch":
         if not allowed_models:
@@ -213,7 +356,11 @@ def handle_agent_create(ctx: HandlerContext) -> HandlerResult:
             allowed_models = []
             default_model = None
         else:
-            if default_model and allowed_models and default_model not in allowed_models:
+            if default_model == "":
+                default_model = None
+            if default_model is not None:
+                _validate_model_name(default_model)
+            if default_model and default_model not in allowed_models:
                 raise MeshError(
                     code=c.DEFAULT_MODEL_NOT_ALLOWED,
                     exit_code=c.EXIT_USAGE,
@@ -222,12 +369,28 @@ def handle_agent_create(ctx: HandlerContext) -> HandlerResult:
                 )
 
     # Allowed efforts & Default effort
-    allowed_efforts = ctx.args.get("allowed_efforts") or ctx.args.get("allowed_effort") or []
+    if "allowed_efforts" in ctx.args and ctx.args["allowed_efforts"] is not None:
+        allowed_efforts = ctx.args["allowed_efforts"]
+    elif "allowed_effort" in ctx.args and ctx.args["allowed_effort"] is not None:
+        allowed_efforts = ctx.args["allowed_effort"]
+    else:
+        allowed_efforts = []
     if isinstance(allowed_efforts, str):
         allowed_efforts = [allowed_efforts]
+    if not isinstance(allowed_efforts, list):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Agent 'allowed_efforts' must be a list of strings",
+            details={"param": "allowed_efforts"},
+        )
+    for eff in allowed_efforts:
+        validate_cli_token(eff, "allowed_efforts", max_len=64)
     allowed_efforts = list(dict.fromkeys(allowed_efforts))
 
     default_effort = ctx.args.get("default_effort")
+    if default_effort is not None:
+        validate_cli_token(default_effort, "default_effort", max_len=64)
 
     # Check effort vs profile separation (G24)
     for eff in allowed_efforts:
@@ -252,8 +415,10 @@ def handle_agent_create(ctx: HandlerContext) -> HandlerResult:
     if effort_cap and effort_cap.supported == "no":
         if default_effort or allowed_efforts:
             raise EffortUnsupported(adapter_name)
+    check_adapter_effort_values(adapter, allowed_efforts, "allowed_efforts")
+    check_adapter_effort_values(adapter, [default_effort] if default_effort else [], "default_effort")
 
-    if default_effort and allowed_efforts and default_effort not in allowed_efforts:
+    if default_effort and default_effort not in allowed_efforts:
         raise MeshError(
             code=c.EFFORT_NOT_ALLOWED,
             exit_code=c.EXIT_USAGE,
@@ -262,67 +427,42 @@ def handle_agent_create(ctx: HandlerContext) -> HandlerResult:
         )
 
     # AGY model effort encoding rule (D17, §14.4)
-    if adapter_name == "agy" and default_effort and default_model:
-        for suffix in EFFORT_SUFFIXES:
-            if default_model.endswith(suffix):
-                raise EffortNotAllowed(
-                    f"Model '{default_model}' already encodes reasoning effort; cannot specify effort '{default_effort}'",
-                    details={"reason": "model_encodes_effort", "model": default_model, "effort": default_effort},
-                )
+    check_agy_model_effort_conflict(adapter_name, default_model, default_effort)
 
     # Permission profiles
-    default_profile = ctx.args.get("default_profile", "edit")
-    if default_profile not in VALID_PROFILES:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message=f"Invalid default_profile '{default_profile}': must be one of {sorted(VALID_PROFILES)}",
-            details={"param": "default_profile", "value": default_profile},
-        )
-    if default_profile in VALID_EFFORTS:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message=f"Reasoning effort '{default_profile}' cannot be used as a permission profile",
-            details={"param": "default_profile", "value": default_profile},
-        )
+    default_profile = _validate_default_profile(ctx.args.get("default_profile", "edit"))
+    max_unapproved_profile = _validate_max_unapproved_profile(ctx.args.get("max_unapproved_profile", "dev"))
 
-    max_unapproved_profile = ctx.args.get("max_unapproved_profile", "dev")
-    if max_unapproved_profile not in VALID_PROFILES:
+    raw_can_lead = ctx.args.get("can_lead")
+    if raw_can_lead is not None and not isinstance(raw_can_lead, bool):
         raise MeshError(
             code=c.INVALID_ARGUMENT,
             exit_code=c.EXIT_USAGE,
-            message=f"Invalid max_unapproved_profile '{max_unapproved_profile}': must be one of {sorted(VALID_PROFILES)}",
-            details={"param": "max_unapproved_profile", "value": max_unapproved_profile},
+            message="Agent 'can_lead' must be a boolean",
+            details={"param": "can_lead", "got": type(raw_can_lead).__name__},
         )
-
-    can_lead = 1 if ctx.args.get("can_lead") else 0
+    can_lead = 1 if raw_can_lead else 0
 
     if "capabilities" in ctx.args and ctx.args["capabilities"] is not None:
-        capabilities = ctx.args["capabilities"]
+        raw_caps = ctx.args["capabilities"]
     elif "capability" in ctx.args and ctx.args["capability"] is not None:
-        capabilities = ctx.args["capability"]
+        raw_caps = ctx.args["capability"]
     else:
-        capabilities = None
-    explicit_caps = capabilities is not None
-    if capabilities is None:
+        raw_caps = None
+    explicit_caps = raw_caps is not None
+    if raw_caps is None:
         capabilities = [] if ctx.args.get("no_intake") else list(DEFAULT_CAPABILITIES)
-    if isinstance(capabilities, str):
-        capabilities = [capabilities]
-    capabilities = list(dict.fromkeys(capabilities))
+    else:
+        capabilities = _parse_capabilities_arg(raw_caps)
     if ctx.args.get("no_intake"):
         capabilities = [cap for cap in capabilities if cap != "intake"]
-    for cap in capabilities:
-        if cap not in VALID_CAPABILITIES:
-            raise MeshError(
-                code=c.INVALID_ARGUMENT,
-                exit_code=c.EXIT_USAGE,
-                message=f"Invalid capability '{cap}': must be in {sorted(VALID_CAPABILITIES)}",
-                details={"param": "capabilities", "value": cap},
-            )
 
-    binary_path = ctx.args.get("binary")
+    binary_path = binary_override
     ack_timeout_s = _ack_timeout_arg(ctx, delivery)
+
+    if not adapter.is_installed(binary_path=binary_override):
+        from mesh.adapters.base import AdapterNotInstalled
+        raise AdapterNotInstalled(adapter_name)
 
     now = now_iso_utc()
     agent_id = new_id("agt")
@@ -396,7 +536,7 @@ def handle_agent_create(ctx: HandlerContext) -> HandlerResult:
         "default_profile": default_profile,
         "max_unapproved_profile": max_unapproved_profile,
         "options": options,
-        **_ack_timeout_view(ctx.conn, ack_timeout_s, delivery),
+        **_ack_timeout_view(ctx.conn, ack_timeout_s, delivery, testing_mode=ctx.testing_mode),
         "version": 1,
         "created_at": now,
         "updated_at": now,
@@ -410,7 +550,7 @@ def handle_agent_create(ctx: HandlerContext) -> HandlerResult:
     if delivery == "inbox" and ack_timeout_s is None:
         from mesh.daemon.scheduler import get_inbox_ack_timeout_s
 
-        global_ack = get_inbox_ack_timeout_s(ctx.conn)
+        global_ack = get_inbox_ack_timeout_s(ctx.conn, testing_mode=ctx.testing_mode)
         if global_ack < 3600:
             warnings.append(
                 f"inbox agent {name} uses the global ack window inbox.ack_timeout_s = {global_ack}s: an offer "
@@ -424,11 +564,11 @@ def handle_agent_update(ctx: HandlerContext) -> HandlerResult:
     _check_direct_user_only(ctx, "agent.update")
 
     name = ctx.args.get("name")
-    if not name:
+    if not name or not isinstance(name, str):
         raise MeshError(
             code=c.INVALID_ARGUMENT,
             exit_code=c.EXIT_USAGE,
-            message="Agent 'name' is required",
+            message="Agent 'name' is required and must be a string",
             details={"param": "name"},
         )
 
@@ -448,18 +588,37 @@ def handle_agent_update(ctx: HandlerContext) -> HandlerResult:
             details={"name": name},
         )
 
-    # Optimistic concurrency check (B9)
-    if_version = ctx.args.get("if_version")
-    if if_version is not None:
+    # Optimistic concurrency check (B9): honor both args.if_version and top-level envelope if_version
+    def _parse_if_version(val: Any) -> int:
+        if isinstance(val, (bool, float)):
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message=f"Invalid --if-version '{val}'",
+                details={"param": "if_version", "value": val},
+            )
         try:
-            if_version_int = int(if_version)
+            return int(val)
         except (ValueError, TypeError):
             raise MeshError(
                 code=c.INVALID_ARGUMENT,
                 exit_code=c.EXIT_USAGE,
-                message=f"Invalid --if-version '{if_version}'",
-                details={"param": "if_version", "value": if_version},
+                message=f"Invalid --if-version '{val}'",
+                details={"param": "if_version", "value": val},
             )
+
+    arg_if_version = ctx.args.get("if_version")
+    arg_iv = _parse_if_version(arg_if_version) if arg_if_version is not None else None
+    env_iv = _parse_if_version(ctx.if_version) if ctx.if_version is not None else None
+    if arg_iv is not None and env_iv is not None and arg_iv != env_iv:
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Conflicting 'if_version' values in request envelope and args",
+            details={"param": "if_version"},
+        )
+    if_version_int = arg_iv if arg_iv is not None else env_iv
+    if if_version_int is not None:
         if if_version_int != row["version"]:
             raise MeshError(
                 code=c.VERSION_MISMATCH,
@@ -486,7 +645,7 @@ def handle_agent_update(ctx: HandlerContext) -> HandlerResult:
 
     # Concurrency
     max_concurrency = row["max_concurrency"]
-    if "max_concurrency" in ctx.args and ctx.args["max_concurrency"] is not None:
+    if "max_concurrency" in ctx.args:
         max_concurrency = parse_positive_int(ctx.args["max_concurrency"], "max_concurrency")
 
     # Allowed models & Default model
@@ -495,13 +654,30 @@ def handle_agent_update(ctx: HandlerContext) -> HandlerResult:
         allowed_models = ctx.args["allowed_models"]
         if isinstance(allowed_models, str):
             allowed_models = [allowed_models]
-        allowed_models = list(dict.fromkeys(allowed_models))
+        if not isinstance(allowed_models, list):
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message="Agent 'allowed_models' must be a list of strings",
+                details={"param": "allowed_models"},
+            )
         for m in allowed_models:
             _validate_model_name(m)
+        allowed_models = list(dict.fromkeys(allowed_models))
 
     default_model = row["default_model"]
-    if "default_model" in ctx.args and ctx.args["default_model"] is not None:
-        default_model = ctx.args["default_model"]
+    if "default_model" in ctx.args:
+        val_dm = ctx.args["default_model"]
+        if val_dm is not None and not isinstance(val_dm, str):
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message="Agent 'default_model' must be a string",
+                details={"param": "default_model"},
+            )
+        default_model = None if val_dm in (None, "") else val_dm
+        if default_model is not None and row["adapter"] != "none":
+            _validate_model_name(default_model)
 
     if row["delivery"] == "launch":
         if not allowed_models:
@@ -518,6 +694,17 @@ def handle_agent_update(ctx: HandlerContext) -> HandlerResult:
                 message=f"Default model '{default_model}' is not in allowed models list",
                 details={"default_model": default_model, "allowed": allowed_models},
             )
+    else:
+        if row["adapter"] == "none":
+            allowed_models = []
+            default_model = None
+        elif default_model and default_model not in allowed_models:
+            raise MeshError(
+                code=c.DEFAULT_MODEL_NOT_ALLOWED,
+                exit_code=c.EXIT_USAGE,
+                message=f"Default model '{default_model}' is not in allowed models list",
+                details={"default_model": default_model, "allowed": allowed_models},
+            )
 
     # Allowed efforts & Default effort
     allowed_efforts = json.loads(row["allowed_efforts_json"])
@@ -525,15 +712,63 @@ def handle_agent_update(ctx: HandlerContext) -> HandlerResult:
         allowed_efforts = ctx.args["allowed_efforts"]
         if isinstance(allowed_efforts, str):
             allowed_efforts = [allowed_efforts]
+        if not isinstance(allowed_efforts, list):
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message="Agent 'allowed_efforts' must be a list of strings",
+                details={"param": "allowed_efforts"},
+            )
+        for eff in allowed_efforts:
+            validate_cli_token(eff, "allowed_efforts", max_len=64)
         allowed_efforts = list(dict.fromkeys(allowed_efforts))
 
     default_effort = row["default_effort"]
-    if "default_effort" in ctx.args and ctx.args["default_effort"] is not None:
-        default_effort = ctx.args["default_effort"]
+    if "default_effort" in ctx.args:
+        val_de = ctx.args["default_effort"]
+        if val_de is not None and not isinstance(val_de, str):
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message="Agent 'default_effort' must be a string",
+                details={"param": "default_effort"},
+            )
+        default_effort = None if val_de in (None, "") else val_de
+        if default_effort is not None:
+            validate_cli_token(default_effort, "default_effort", max_len=64)
+
+    # Check effort vs profile separation (G24)
+    for eff in allowed_efforts:
+        if eff in VALID_PROFILES:
+            raise MeshError(
+                code=c.EFFORT_NOT_ALLOWED,
+                exit_code=c.EXIT_USAGE,
+                message=f"Permission profile '{eff}' cannot be used as an effort level",
+                details={"param": "allowed_efforts", "value": eff},
+            )
+    if default_effort:
+        if default_effort in VALID_PROFILES:
+            raise MeshError(
+                code=c.EFFORT_NOT_ALLOWED,
+                exit_code=c.EXIT_USAGE,
+                message=f"Permission profile '{default_effort}' cannot be used as an effort level",
+                details={"param": "default_effort", "value": default_effort},
+            )
+
+    # Check adapter effort support (e.g. vibe / none have none)
+    testing_mode = bool(getattr(ctx, "testing_mode", False))
+    adapter_opts = json.loads(row["adapter_options_json"]) if row["adapter_options_json"] else {}
+    adapter = get_adapter(row["adapter"], testing_mode=testing_mode, options=adapter_opts)
+    effort_cap = adapter.capabilities.get("reasoning_effort")
+    if effort_cap and effort_cap.supported == "no":
+        if default_effort or allowed_efforts:
+            raise EffortUnsupported(row["adapter"])
+    check_adapter_effort_values(adapter, allowed_efforts, "allowed_efforts")
+    check_adapter_effort_values(adapter, [default_effort] if default_effort else [], "default_effort")
 
     # Blind review P2: validate the resolved pair, not only the changed field; narrowing
     # allowed_efforts must not leave a default outside it.
-    if default_effort and allowed_efforts and default_effort not in allowed_efforts:
+    if default_effort and default_effort not in allowed_efforts:
         raise MeshError(
             code=c.EFFORT_NOT_ALLOWED,
             exit_code=c.EXIT_USAGE,
@@ -543,19 +778,22 @@ def handle_agent_update(ctx: HandlerContext) -> HandlerResult:
         )
 
     # AGY model effort encoding rule (D17, §14.4)
-    if row["adapter"] == "agy" and default_effort and default_model:
-        for suffix in EFFORT_SUFFIXES:
-            if default_model.endswith(suffix):
-                raise EffortNotAllowed(
-                    f"Model '{default_model}' already encodes reasoning effort; cannot specify effort '{default_effort}'",
-                    details={"reason": "model_encodes_effort", "model": default_model, "effort": default_effort},
-                )
+    check_agy_model_effort_conflict(row["adapter"], default_model, default_effort)
 
     can_lead = row["can_lead"]
     if "can_lead" in ctx.args and ctx.args["can_lead"] is not None:
+        if not isinstance(ctx.args["can_lead"], bool):
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message="Agent 'can_lead' must be a boolean",
+                details={"param": "can_lead", "got": type(ctx.args["can_lead"]).__name__},
+            )
         can_lead = 1 if ctx.args["can_lead"] else 0
         if not can_lead and ctx.conn.execute(
-                "SELECT 1 FROM lead_assignments WHERE agent_id=? AND ended_at IS NULL",
+                "SELECT 1 FROM lead_assignments la JOIN projects p ON p.id = la.project_id "
+                "WHERE la.agent_id = ? AND la.ended_at IS NULL "
+                "AND p.status NOT IN ('completed', 'cancelled')",
                 (row["id"],)).fetchone():
             raise MeshError(code=c.INVALID_TRANSITION, exit_code=c.EXIT_CONFLICT,
                             message="Hand over active projects before revoking can_lead",
@@ -563,46 +801,27 @@ def handle_agent_update(ctx: HandlerContext) -> HandlerResult:
 
     capabilities = json.loads(row["capabilities_json"])
     if "capabilities" in ctx.args and ctx.args["capabilities"] is not None:
-        capabilities = ctx.args["capabilities"]
-        if isinstance(capabilities, str):
-            capabilities = [capabilities]
-        for cap in capabilities:
-            if cap not in VALID_CAPABILITIES:
-                raise MeshError(
-                    code=c.INVALID_ARGUMENT,
-                    exit_code=c.EXIT_USAGE,
-                    message=f"Invalid capability '{cap}': must be in {sorted(VALID_CAPABILITIES)}",
-                    details={"param": "capabilities", "value": cap},
-                )
-        capabilities = list(dict.fromkeys(capabilities))
+        capabilities = _parse_capabilities_arg(ctx.args["capabilities"])
+    elif "capability" in ctx.args and ctx.args["capability"] is not None:
+        capabilities = _parse_capabilities_arg(ctx.args["capability"])
     if ctx.args.get("no_intake"):
         capabilities = [cap for cap in capabilities if cap != "intake"]
 
     ack_raw = ctx.args.get("ack_timeout")
     ack_change = ack_raw is not None
-    ack_timeout_s = _ack_timeout_arg(ctx, row["delivery"]) if ack_change else get_agent_ack_timeout_s(ctx.conn, row["id"])
+    ack_timeout_s = (
+        _ack_timeout_arg(ctx, row["delivery"])
+        if ack_change
+        else get_agent_ack_timeout_s(ctx.conn, row["id"], testing_mode=ctx.testing_mode)
+    )
 
     default_profile = row["default_profile"]
     if "default_profile" in ctx.args and ctx.args["default_profile"] is not None:
-        default_profile = ctx.args["default_profile"]
-        if default_profile not in VALID_PROFILES:
-            raise MeshError(
-                code=c.INVALID_ARGUMENT,
-                exit_code=c.EXIT_USAGE,
-                message=f"Invalid default_profile '{default_profile}'",
-                details={"param": "default_profile"},
-            )
+        default_profile = _validate_default_profile(ctx.args["default_profile"])
 
     max_unapproved_profile = row["max_unapproved_profile"]
     if "max_unapproved_profile" in ctx.args and ctx.args["max_unapproved_profile"] is not None:
-        max_unapproved_profile = ctx.args["max_unapproved_profile"]
-        if max_unapproved_profile not in VALID_PROFILES:
-            raise MeshError(
-                code=c.INVALID_ARGUMENT,
-                exit_code=c.EXIT_USAGE,
-                message=f"Invalid max_unapproved_profile '{max_unapproved_profile}'",
-                details={"param": "max_unapproved_profile"},
-            )
+        max_unapproved_profile = _validate_max_unapproved_profile(ctx.args["max_unapproved_profile"])
 
     now = now_iso_utc()
     new_version = row["version"] + 1
@@ -665,7 +884,7 @@ def handle_agent_update(ctx: HandlerContext) -> HandlerResult:
         "max_concurrency": max_concurrency,
         "default_profile": default_profile,
         "max_unapproved_profile": max_unapproved_profile,
-        **_ack_timeout_view(ctx.conn, ack_timeout_s, row["delivery"]),
+        **_ack_timeout_view(ctx.conn, ack_timeout_s, row["delivery"], testing_mode=ctx.testing_mode),
         "version": new_version,
         "updated_at": now,
     }
@@ -673,7 +892,11 @@ def handle_agent_update(ctx: HandlerContext) -> HandlerResult:
     if ack_change and row["delivery"] == "inbox":
         from mesh.daemon.scheduler import get_inbox_ack_timeout_s, offers_kept_by_window
 
-        new_window = ack_timeout_s if ack_timeout_s is not None else get_inbox_ack_timeout_s(ctx.conn)
+        new_window = (
+            ack_timeout_s
+            if ack_timeout_s is not None
+            else get_inbox_ack_timeout_s(ctx.conn, testing_mode=ctx.testing_mode)
+        )
         kept = offers_kept_by_window(ctx.conn, row["id"], new_window)
         if kept:
             data["offers_keeping_window"] = kept
@@ -693,14 +916,7 @@ def handle_agent_update(ctx: HandlerContext) -> HandlerResult:
 def handle_agent_show(ctx: HandlerContext) -> HandlerResult:
     """Show details and capability status for an agent (leads get the roster view)."""
     roster = _roster_view(ctx, "agent.show")
-    name = ctx.args.get("name")
-    if not name:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="Agent 'name' is required",
-            details={"param": "name"},
-        )
+    name = _require_str_ident(ctx.args.get("name"), "name", "Agent 'name'")
 
     cur = ctx.conn.execute(
         """SELECT p.id, p.name, p.disabled_at, a.*
@@ -733,7 +949,12 @@ def handle_agent_show(ctx: HandlerContext) -> HandlerResult:
         "default_profile": row["default_profile"],
         "max_unapproved_profile": row["max_unapproved_profile"],
         "options": json.loads(row["adapter_options_json"]),
-        **_ack_timeout_view(ctx.conn, get_agent_ack_timeout_s(ctx.conn, row["id"]), row["delivery"]),
+        **_ack_timeout_view(
+            ctx.conn,
+            get_agent_ack_timeout_s(ctx.conn, row["id"], testing_mode=ctx.testing_mode),
+            row["delivery"],
+            testing_mode=ctx.testing_mode,
+        ),
         "version": row["version"],
         "disabled": row["disabled_at"] is not None,
         "created_at": row["created_at"],
@@ -773,7 +994,11 @@ def handle_agent_list(ctx: HandlerContext) -> HandlerResult:
             "created_at": row["created_at"],
         })
         items[-1].update(_ack_timeout_view(
-            ctx.conn, get_agent_ack_timeout_s(ctx.conn, row["id"]), row["delivery"]))
+            ctx.conn,
+            get_agent_ack_timeout_s(ctx.conn, row["id"], testing_mode=ctx.testing_mode),
+            row["delivery"],
+            testing_mode=ctx.testing_mode,
+        ))
         if roster:
             item = items[-1]
             item["allowed_models"] = json.loads(row["allowed_models_json"] or "[]")
@@ -787,7 +1012,7 @@ def handle_agent_disable(ctx: HandlerContext) -> HandlerResult:
     """Disable an agent. Direct user only."""
     _check_direct_user_only(ctx, "agent.disable")
 
-    name = ctx.args.get("name")
+    name = _require_str_ident(ctx.args.get("name"), "name", "Agent 'name'")
     cur = ctx.conn.execute("SELECT id FROM principals WHERE name = ? AND kind = 'agent';", (name,))
     row = cur.fetchone()
     if not row:
@@ -817,8 +1042,8 @@ def handle_agent_enable(ctx: HandlerContext) -> HandlerResult:
     """Re-enable a disabled agent. Direct user only."""
     _check_direct_user_only(ctx, "agent.enable")
 
-    name = ctx.args.get("name")
-    cur = ctx.conn.execute("SELECT id FROM principals WHERE name = ? AND kind = 'agent';", (name,))
+    name = _require_str_ident(ctx.args.get("name"), "name", "Agent 'name'")
+    cur = ctx.conn.execute("SELECT id, disabled_at FROM principals WHERE name = ? AND kind = 'agent';", (name,))
     row = cur.fetchone()
     if not row:
         raise MeshError(
@@ -829,6 +1054,11 @@ def handle_agent_enable(ctx: HandlerContext) -> HandlerResult:
         )
 
     ctx.conn.execute("UPDATE principals SET disabled_at = NULL WHERE id = ?;", (row["id"],))
+    if row["disabled_at"] is not None:
+        # Full review r5 P2-3: the no-response window restarts on enable (no tick may
+        # have run while disabled, e.g. meshd down), never 0 s of grace.
+        ctx.conn.execute("UPDATE tasks SET offered_at = ? WHERE assignee_agent_id = ? AND status = 'queued' "
+                         "AND offered_at IS NOT NULL;", (now_iso_utc(), row["id"]))
     insert_event(
         ctx.conn,
         type_="agent.enabled",
@@ -846,7 +1076,7 @@ def handle_agent_token_issue(ctx: HandlerContext) -> HandlerResult:
     """Issue a new agent token. Direct user only (ACC: C9, G5)."""
     _check_direct_user_only(ctx, "agent.token.issue")
 
-    name = ctx.args.get("name")
+    name = _require_str_ident(ctx.args.get("name"), "name", "Agent 'name'")
     cur = ctx.conn.execute("SELECT id, disabled_at FROM principals WHERE name = ? AND kind = 'agent';", (name,))
     row = cur.fetchone()
     if not row:
@@ -865,16 +1095,38 @@ def handle_agent_token_issue(ctx: HandlerContext) -> HandlerResult:
             details={"name": name},
         )
 
+    expires_at = None
+    if "expires_in" in ctx.args and ctx.args["expires_in"] is not None:
+        expires_in_raw = ctx.args["expires_in"]
+        if not isinstance(expires_in_raw, str) or not expires_in_raw.strip():
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message=f"Invalid duration for --expires-in '{expires_in_raw}': expected a positive duration string (e.g. '30s', '2h', '7d')",
+                details={"param": "expires_in", "got": expires_in_raw},
+            )
+        try:
+            dur_s = parse_duration(expires_in_raw)
+        except (ValueError, TypeError) as e:
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message=f"Invalid duration for --expires-in '{expires_in_raw}': {e}",
+                details={"param": "expires_in", "got": expires_in_raw},
+            ) from e
+        if dur_s <= 0:
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message=f"--expires-in must be positive; got '{expires_in_raw}' ({dur_s}s)",
+                details={"param": "expires_in", "got": expires_in_raw},
+            )
+        import time
+        expires_at = now_iso_utc(time.time() + dur_s)
+
     token, lookup, secret_hash = generate_agent_token()
     cred_id = new_id("cred")
     now = now_iso_utc()
-
-    expires_at = None
-    expires_in_raw = ctx.args.get("expires_in")
-    if expires_in_raw:
-        dur_s = parse_duration(expires_in_raw)
-        import time
-        expires_at = now_iso_utc(time.time() + dur_s)
 
     ctx.conn.execute(
         """INSERT INTO credentials (
@@ -909,7 +1161,7 @@ def handle_agent_token_list(ctx: HandlerContext) -> HandlerResult:
     """List issued credentials for an agent. Direct user only (ACC: C9)."""
     _check_direct_user_only(ctx, "agent.token.list")
 
-    name = ctx.args.get("name")
+    name = _require_str_ident(ctx.args.get("name"), "name", "Agent 'name'")
     cur = ctx.conn.execute("SELECT id FROM principals WHERE name = ? AND kind = 'agent';", (name,))
     row = cur.fetchone()
     if not row:
@@ -943,14 +1195,7 @@ def handle_agent_token_revoke(ctx: HandlerContext) -> HandlerResult:
     """Revoke an agent credential. Direct user only (ACC: G18)."""
     _check_direct_user_only(ctx, "agent.token.revoke")
 
-    cred_arg = ctx.args.get("credential")
-    if not cred_arg:
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message="Credential identifier is required",
-            details={"param": "credential"},
-        )
+    cred_arg = _require_str_ident(ctx.args.get("credential"), "credential", "Credential identifier")
 
     cur = ctx.conn.execute(
         """SELECT id, principal_id, revoked_at

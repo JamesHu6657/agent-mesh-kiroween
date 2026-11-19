@@ -43,8 +43,17 @@ def configured_roots(home: str) -> Tuple[Optional[str], List[str]]:
     fails closed with TOKEN_FILE_INSECURE rather than silently protecting nothing.
     """
     db = os.path.join(home, "mesh.db")
-    if not os.path.exists(db):
+    try:
+        os.lstat(db)
+    except FileNotFoundError:
         return None, []
+    except OSError as exc:
+        raise MeshError(
+            code=c.TOKEN_FILE_INSECURE,
+            exit_code=c.EXIT_UNAUTHENTICATED,
+            message=f"Cannot inspect database '{db}' for token path check: {exc}",
+            details={"home": home},
+        ) from exc
     try:
         conn = sqlite3.connect(sqlite_ro_uri(db), uri=True, timeout=5.0)
         try:

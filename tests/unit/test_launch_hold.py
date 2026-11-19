@@ -12,11 +12,11 @@ def _ok():
 
 
 class TestLaunchHoldTable(unittest.TestCase):
-    def test_table_empty_since_m4(self):
-        """ACC: N19, N13 - M4: kiro N13 passed, so no adapter is held in production; launch_held stays a known reason."""
-        self.assertEqual(evidence.LAUNCH_HOLDS, {})
+    def test_table_holds_only_devin_since_m4(self):
+        """ACC: N19, N13 - M4: kiro N13 passed; only devin is held (until M5 smoke evidence); launch_held stays a known reason."""
+        self.assertEqual(evidence.LAUNCH_HOLDS, {"devin": "M5"})
         self.assertIn("launch_held", evidence.REASONS)
-        self.assertEqual(evidence.effective_holds(False, {evidence.HOLD_ENV: "kiro:M4"}), {})
+        self.assertEqual(evidence.effective_holds(False, {evidence.HOLD_ENV: "kiro:M4"}), {"devin": "M5"})
 
     def test_committed_kiro_evidence_launches_again(self):
         """ACC: N19, N13 - outside testing mode the committed kiro 3.1.0 evidence opens kiro launch again."""
@@ -29,8 +29,8 @@ class TestLaunchHoldTable(unittest.TestCase):
     def test_hold_env_testing_only(self):
         """ACC: N19 - MESH_TEST_LAUNCH_HOLD adds holds in testing mode only; default milestone M4; unhold wins."""
         env = {evidence.HOLD_ENV: " kiro:M4 , agy , vibe:M5 "}
-        self.assertEqual(evidence.effective_holds(True, env), {"kiro": "M4", "agy": "M4", "vibe": "M5"})
-        self.assertEqual(evidence.effective_holds(False, env), {})
+        self.assertEqual(evidence.effective_holds(True, env), {"devin": "M5", "kiro": "M4", "agy": "M4", "vibe": "M5"})
+        self.assertEqual(evidence.effective_holds(False, env), {"devin": "M5"})
         self.assertIsNone(evidence.held_milestone("kiro", False, env))
         self.assertEqual(evidence.held_milestone("vibe", True, env), "M5")
         env[evidence.UNHOLD_ENV] = "kiro"

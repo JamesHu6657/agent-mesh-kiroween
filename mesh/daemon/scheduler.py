@@ -4,27 +4,33 @@ import datetime
 import json
 import os
 import sqlite3
+import time
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+import mesh.constants as c
 from mesh.adapters.registry import get_adapter
 from mesh.core.clock import now_iso_utc, parse_utc
 from mesh.core.db import transaction
+from mesh.core.policy import parse_json_str_list, resolve_model_and_effort, validate_resolved_effort
 from mesh.core.redact import redact
 from mesh.core.events import last_rejection, record_event
 from mesh.core.settings import get_agent_ack_timeout_s
+from mesh.errors import MeshError
+from mesh.core.settings import get_agent_ack_timeout_s, is_testing_mode
 
 #: M3 gate re-review P2 (L11): T6 failure reason for a queued launch task whose adapter is
 #: held (``evidence.LAUNCH_HOLDS``), e.g. a kiro task queued before the hold landed.
 LAUNCH_HELD_REASON = "launch_held"
 
 
-def get_inbox_ack_timeout_s(conn: sqlite3.Connection) -> int:
+def get_inbox_ack_timeout_s(conn: sqlite3.Connection, testing_mode: Optional[bool] = None) -> int:
     """Retrieve inbox.ack_timeout_s setting from database (default 600s)."""
     cur = conn.execute("SELECT value_json FROM settings WHERE key = 'inbox.ack_timeout_s';")
     row = cur.fetchone()
     if row and row["value_json"]:
         try:
-            return int(json.loads(row["value_json"]))
+            val = int(json.loads(row["value_json"]))
+            return val if is_testing_mode(testing_mode) else max(10, val)
         except Exception:
             return 600
     return 600
@@ -271,7 +277,7 @@ def promote_tasks(conn: sqlite3.Connection, home: str = "", testing_mode: bool =
                             "title": task["title"],
                             "spec": task["spec"],
                             "fence": task["fence_seq"] + 1,
-                            "ack_timeout_s": ack_window_now(conn, task["assignee_agent_id"])[0],
+                            "ack_timeout_s": ack_window_now(conn, task["assignee_agent_id"], testing_mode=testing_mode)[0],
                             "last_rejection": last_rejection(conn, task_id),
                         },
                     )
@@ -409,12 +415,16 @@ def fail_held_launch_tasks(conn: sqlite3.Connection, home: str = "", testing_mod
     return failed
 
 
-def ack_window_now(conn: sqlite3.Connection, agent_id: Optional[str]) -> Tuple[int, bool]:
+def ack_window_now(
+    conn: sqlite3.Connection,
+    agent_id: Optional[str],
+    testing_mode: Optional[bool] = None,
+) -> Tuple[int, bool]:
     """The ack window an offer made now gets: (seconds, set per agent?)."""
-    own = get_agent_ack_timeout_s(conn, agent_id) if agent_id else None
+    own = get_agent_ack_timeout_s(conn, agent_id, testing_mode=testing_mode) if agent_id else None
     if own is not None:
         return own, True
-    return get_inbox_ack_timeout_s(conn), False
+    return get_inbox_ack_timeout_s(conn, testing_mode=testing_mode), False
 
 
 def offered_ack_window(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
@@ -431,11 +441,16 @@ def offered_ack_window(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
         return None
 
 
-def effective_ack_window(conn: sqlite3.Connection, task_id: str, agent_id: Optional[str]) -> Tuple[int, bool, Optional[int]]:
+def effective_ack_window(
+    conn: sqlite3.Connection,
+    task_id: str,
+    agent_id: Optional[str],
+    testing_mode: Optional[bool] = None,
+) -> Tuple[int, bool, Optional[int]]:
     """Window used for the no_response decision: never shorter than the one the offer was
     made with. Lowering inbox.ack_timeout_s or `--ack-timeout` applies to new offers only;
     raising it also extends offers already out. Returns (seconds, per_agent, offered)."""
-    now_s, per_agent = ack_window_now(conn, agent_id)
+    now_s, per_agent = ack_window_now(conn, agent_id, testing_mode=testing_mode)
     offered = offered_ack_window(conn, task_id)
     if offered is not None and offered > now_s:
         return offered, per_agent, offered
@@ -510,10 +525,12 @@ def check_queued_tasks_t6(conn: sqlite3.Connection, home: str = "", testing_mode
         List of task IDs that failed in this pass.
     """
     cur = conn.execute(
-        """SELECT t.id, t.project_id, t.title, t.spec, t.model, t.fence_seq,
+        """SELECT t.id, t.project_id, t.title, t.spec, t.model, t.effort, t.fence_seq,
                   t.attempt, t.max_attempts, t.offered_at,
-                  a.id as assignee_id, a.delivery, a.adapter, a.binary_path, a.allowed_models_json,
-                  p.name as assignee_name
+                  a.id as assignee_id, a.delivery, a.adapter, a.binary_path,
+                  a.allowed_models_json, a.default_model,
+                  a.allowed_efforts_json, a.default_effort,
+                  p.name as assignee_name, p.disabled_at as assignee_disabled_at
            FROM tasks t
            JOIN agents a ON t.assignee_agent_id = a.id
            LEFT JOIN principals p ON p.id = a.id
@@ -531,25 +548,33 @@ def check_queued_tasks_t6(conn: sqlite3.Connection, home: str = "", testing_mode
             reason = None
             details: Dict[str, Any] = {}
 
-            # 1. Model check: task model must be in allowed_models
-            allowed_models: List[str] = []
-            if task["allowed_models_json"]:
-                try:
-                    allowed_models = json.loads(task["allowed_models_json"])
-                except Exception:
-                    allowed_models = []
+            resolved_model, resolved_effort = resolve_model_and_effort(
+                model=task["model"],
+                default_model=task["default_model"],
+                effort=task["effort"],
+                default_effort=task["default_effort"],
+            )
 
-            if task["model"] and task["model"] not in allowed_models:
+            # 1. Model check: resolved model must be in allowed_models
+            allowed_models = parse_json_str_list(task["allowed_models_json"])
+            if resolved_model and resolved_model not in allowed_models:
                 reason = "model_not_allowed"
-                details = {"model": task["model"], "allowed": allowed_models}
+                details = {"model": resolved_model, "allowed": allowed_models}
             elif task["delivery"] == "inbox" and task["offered_at"]:
                 # 2. Inbox ack timeout check. E17 reading (run 3): the clock runs only
                 # while the assignee could actually `task start` the task. While the
                 # project is paused or the agent is at its concurrency limit, a start
                 # would be refused (T5 guards), so `offered_at` is moved to now and
                 # no_response is never decided for those ticks.
+                from mesh.core.workspaces import has_task_ws_reservation
+
                 _pos, blocked = compute_queue_info(conn, task_id)
-                if blocked in ("project_paused", "concurrency_limit"):
+                # Full review r4 P2-2 + R2 P2-8: disabled assignee or active ws reservation pauses timeout.
+                if (
+                    blocked in ("project_paused", "concurrency_limit")
+                    or task["assignee_disabled_at"]
+                    or has_task_ws_reservation(conn, task_id, project_id)
+                ):
                     conn.execute(
                         "UPDATE tasks SET offered_at = ? WHERE id = ? AND status = 'queued';",
                         (now_iso_utc(), task_id),
@@ -557,7 +582,9 @@ def check_queued_tasks_t6(conn: sqlite3.Connection, home: str = "", testing_mode
                     continue
                 try:
                     offered_dt = parse_utc(task["offered_at"])
-                    window_s, per_agent, _offered = effective_ack_window(conn, task_id, task["assignee_id"])
+                    window_s, per_agent, _offered = effective_ack_window(
+                        conn, task_id, task["assignee_id"], testing_mode=testing_mode
+                    )
                     if now_dt > offered_dt + datetime.timedelta(seconds=window_s):
                         reason = "no_response"
                         details = no_response_details(task_id, task["assignee_name"], task["offered_at"],
@@ -573,19 +600,44 @@ def check_queued_tasks_t6(conn: sqlite3.Connection, home: str = "", testing_mode
                     reason = LAUNCH_HELD_REASON
                     details = held
                 else:
-                    # 4. Launch adapter installed check
+                    # 3. Effort check for launch tasks: capability, allowed_efforts, and AGY suffix rule (D17)
+                    allowed_efforts = parse_json_str_list(task["allowed_efforts_json"])
+                    adapter = None
+                    adapter_err = False
                     try:
                         adapter = get_adapter(task["adapter"], testing_mode=testing_mode)
-                        if adapter.kind == "test_double" and not testing_mode:
+                    except Exception:
+                        adapter = None
+                        adapter_err = True
+
+                    try:
+                        validate_resolved_effort(
+                            adapter_id=task["adapter"],
+                            resolved_model=resolved_model,
+                            resolved_effort=resolved_effort,
+                            allowed_efforts=allowed_efforts,
+                            agent_name=task["assignee_name"],
+                            adapter=adapter,
+                            testing_mode=testing_mode,
+                        )
+                    except MeshError as exc:
+                        reason = "effort_unsupported" if exc.code == c.EFFORT_UNSUPPORTED else "effort_not_allowed"
+                        details = dict(exc.details or {})
+                    else:
+                        # 4. Launch adapter installed check
+                        if adapter_err or adapter is None:
+                            installed = False
+                        elif adapter.kind == "test_double" and not testing_mode:
                             installed = False
                         else:
-                            installed = adapter.is_installed(binary_path=task["binary_path"])
-                    except Exception:
-                        installed = False
+                            try:
+                                installed = adapter.is_installed(binary_path=task["binary_path"])
+                            except Exception:
+                                installed = False
 
-                    if not installed:
-                        reason = "adapter_unavailable"
-                        details = {"adapter": task["adapter"]}
+                        if not installed:
+                            reason = "adapter_unavailable"
+                            details = {"adapter": task["adapter"]}
 
             if not reason:
                 continue
@@ -614,10 +666,17 @@ def sweep_expired_approvals(conn: sqlite3.Connection, home: str = "") -> List[st
     candidates = cur.fetchall()
     expired_ids: List[str] = []
 
+    from mesh.core.workspaces import is_approval_pinned_by_ws_reservation, pinned_approval_ids
+
+    pinned = pinned_approval_ids(conn)
     for row in candidates:
         apr_id = row["id"]
+        if apr_id in pinned:
+            continue
         try:
             with transaction(conn):
+                if is_approval_pinned_by_ws_reservation(conn, apr_id):
+                    continue
                 cur_upd = conn.execute(
                     "UPDATE approvals SET status = 'expired' WHERE id = ? AND status IN ('pending', 'approved');",
                     (apr_id,),
@@ -778,6 +837,21 @@ def sweep_expired_inbox_leases(conn: sqlite3.Connection, home: str = "") -> List
     return expired_tasks
 
 
+def sweep_expired_idempotency(
+    conn: sqlite3.Connection,
+    home: str = "",
+    now_ts: Optional[float] = None,
+) -> List[str]:
+    """Prune idempotency keys older than 7 days per plan §13.4."""
+    if not isinstance(conn, sqlite3.Connection):
+        return []
+    ts = time.time() if now_ts is None else now_ts
+    cutoff = now_iso_utc(ts - c.IDEMPOTENCY_TTL_S)
+    with transaction(conn):
+        cur = conn.execute("DELETE FROM idempotency WHERE created_at < ?;", (cutoff,))
+    return [f"idempotency:{cur.rowcount}"] if cur.rowcount > 0 else []
+
+
 def _injected_failure(home: str, name: str, testing_mode: bool) -> None:
     """Testing hook (like ``run/launch_hold``): ``$MESH_HOME/run/scheduler_fail_step``
     naming a step makes that step raise. Never honoured outside testing mode."""
@@ -815,7 +889,9 @@ def run_scheduler_tick(conn: sqlite3.Connection, home: str = "", testing_mode: b
     counted (`mesh daemon status`, `mesh doctor`) and does not stop the other steps."""
     expired_aprs = _step(home, "approval_expiry", sweep_expired_approvals, testing_hook=testing_mode, conn=conn, home=home)
     expired_leases = _step(home, "lease_expiry", sweep_expired_inbox_leases, testing_hook=testing_mode, conn=conn, home=home)
-    closed = _step(home, "supervisor_watch", watch_launch_runs_tick, testing_hook=testing_mode, conn=conn, home=home)
+    _step(home, "idempotency_expiry", sweep_expired_idempotency, testing_hook=testing_mode, conn=conn, home=home)
+    closed = _step(home, "supervisor_watch", watch_launch_runs_tick, testing_hook=testing_mode,
+                   conn=conn, home=home, testing_mode=testing_mode)
     failed, t6_ok = _step_ok(home, "t6_check", check_queued_tasks_t6, testing_hook=testing_mode, conn=conn, home=home,
                              testing_mode=testing_mode)
     promoted = _step(home, "promote", promote_tasks, testing_hook=testing_mode, conn=conn, home=home, testing_mode=testing_mode)
@@ -851,12 +927,16 @@ def start_lead_turns_tick(conn: sqlite3.Connection, home: str = "",
         return []
 
 
-def watch_launch_runs_tick(conn: sqlite3.Connection, home: str = "") -> List[str]:
+def watch_launch_runs_tick(
+    conn: sqlite3.Connection,
+    home: str = "",
+    testing_mode: Optional[bool] = None,
+) -> List[str]:
     """Supervisor watch pass (plan §11.3): exit handling, lost wrappers, lease renewal."""
     from mesh.daemon.supervisor import watch_launch_runs
 
     try:
-        return watch_launch_runs(conn, home)
+        return watch_launch_runs(conn, home, testing_mode=testing_mode)
     except Exception as e:
         _sweep_error(home, "supervisor_watch", e)
         return []

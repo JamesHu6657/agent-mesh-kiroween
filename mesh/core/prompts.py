@@ -10,7 +10,9 @@ DELIVERABLE_FENCE_RE = re.compile(r"```mesh-deliverable[ \t]*\r?\n([\s\S]*?)```"
 _DELIVERABLE_OPEN_RE = re.compile(r"```mesh-deliverable[ \t]*\r?\n")
 FALLBACK_SUMMARY_CHARS = 4000
 
-FILE_PROMPT_ADAPTERS = ("droid", "vibe")
+#: Adapters whose prompt never travels in argv: droid/vibe read prompt.md, claude/codex
+#: get it on stdin (full review r3 P2-2), devin via --prompt-file, so no argv limit applies.
+FILE_PROMPT_ADAPTERS = ("droid", "vibe", "claude", "codex", "devin")
 
 
 def pointer_prompt(run_dir: str) -> str:
@@ -218,6 +220,22 @@ def parse_deliverable(final_text: str) -> Dict[str, Any]:
     return {"summary": text[-FALLBACK_SUMMARY_CHARS:], "structured": False}
 
 
+def deliverable_summary(deliverable_json: Any) -> str:
+    """Extract deliverable summary text from stored `tasks.deliverable_json`."""
+    if not deliverable_json:
+        return ""
+    try:
+        stored = json.loads(deliverable_json) if isinstance(deliverable_json, str) else deliverable_json
+        deliverable = stored.get("deliverable") if isinstance(stored, dict) else None
+        if isinstance(deliverable, dict):
+            return deliverable.get("summary") or ""
+        if isinstance(stored, dict):
+            return stored.get("summary") or ""
+    except (ValueError, TypeError):
+        return ""
+    return ""
+
+
 def read_rework_feedback(conn: Any, task_id: str) -> Optional[Dict[str, str]]:
     """Load the rework reason and the previous deliverable summary (§12.5).
 
@@ -244,19 +262,9 @@ def read_rework_feedback(conn: Any, task_id: str) -> Optional[Dict[str, str]]:
             except (ValueError, TypeError):
                 reason = ""
 
-    summary = ""
     cur_t = conn.execute("SELECT deliverable_json FROM tasks WHERE id = ?;", (task_id,))
     trow = cur_t.fetchone()
-    if trow and trow["deliverable_json"]:
-        try:
-            stored = json.loads(trow["deliverable_json"])
-            deliverable = stored.get("deliverable") if isinstance(stored, dict) else None
-            if isinstance(deliverable, dict):
-                summary = deliverable.get("summary") or ""
-            elif isinstance(stored, dict):
-                summary = stored.get("summary") or ""
-        except (ValueError, TypeError):
-            summary = ""
+    summary = deliverable_summary(trow["deliverable_json"]) if trow else ""
 
     if not reason and not summary:
         return None

@@ -20,8 +20,13 @@ Built for [Kiroween 2026](https://kiroween.devpost.com/) (Frankenstein category)
 - **Linux only.** Mesh relies on `/proc`, Unix sockets and process groups. macOS and
   Windows are not supported (WSL2 is untested).
 - Python 3.11 or newer. Standard library only: no dependencies.
-- git, for repo projects and per-task worktrees.
-- Optional: the agent CLIs you want Mesh to launch (droid, kiro-cli, agy, vibe).
+- git, for repo projects and per-task worktrees. git 2.36 or newer is recommended;
+  git 2.31 to 2.35 works through a fallback and `mesh doctor` warns about it. git older
+  than 2.31 is not supported: a removed worktree that was not pruned blocks
+  `mesh project deliver` there until you run `git worktree prune`.
+- Optional: the agent CLIs you want Mesh to launch (droid, kiro-cli, agy, vibe, codex, claude, devin).
+  devin is on a launch hold for now and does not launch outside testing mode; see
+  [docs/adapters-devin.md](docs/adapters-devin.md).
 
 ## Install
 

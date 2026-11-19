@@ -3,6 +3,7 @@
 import json
 import os
 import sqlite3
+import stat
 from typing import Any, Dict, Optional
 
 import mesh.constants as c
@@ -55,15 +56,63 @@ def init_mesh_home(home: str, passphrase: str) -> Dict[str, Any]:
     install_root = get_install_root()
     check_install_path_secure(install_root=install_root, home=home)
 
-    # Create directories with mode 0700
+    # Create directories with mode 0700 and verify ownership/permissions (fails closed
+    # with INSECURE_PERMISSIONS exit 2 on foreign-owned or unwritable dirs).
     subdirs = ["run", "runs", "workspaces", "logs", "merges"]
-    os.makedirs(home, mode=0o700, exist_ok=True)
-    os.chmod(home, 0o700)
+    old_umask = os.umask(0o077)
+    try:
+        try:
+            if os.path.lexists(home):
+                st_home = os.lstat(home)
+                if stat.S_ISLNK(st_home.st_mode) or not stat.S_ISDIR(st_home.st_mode):
+                    raise MeshError(
+                        code=c.INSECURE_PERMISSIONS,
+                        exit_code=c.EXIT_USAGE,
+                        message=f"Storage root '{home}' must be a real directory, not a symlink or file",
+                        details={"home": home},
+                    )
+            os.makedirs(home, mode=0o700, exist_ok=True)
+            os.chmod(home, 0o700)
+            check_home_permissions(home)
 
-    for sub in subdirs:
-        subpath = os.path.join(home, sub)
-        os.makedirs(subpath, mode=0o700, exist_ok=True)
-        os.chmod(subpath, 0o700)
+            for sub in subdirs:
+                subpath = os.path.join(home, sub)
+                if os.path.lexists(subpath):
+                    st_sub = os.lstat(subpath)
+                    if stat.S_ISLNK(st_sub.st_mode) or not stat.S_ISDIR(st_sub.st_mode):
+                        raise MeshError(
+                            code=c.INSECURE_PERMISSIONS,
+                            exit_code=c.EXIT_USAGE,
+                            message=f"Storage subdirectory '{subpath}' must be a real directory, not a symlink or file",
+                            details={"home": home, "path": subpath},
+                        )
+                    if st_sub.st_uid != os.getuid():
+                        raise MeshError(
+                            code=c.INSECURE_PERMISSIONS,
+                            exit_code=c.EXIT_USAGE,
+                            message=f"Storage subdirectory '{subpath}' is not owned by current uid {os.getuid()}",
+                            details={"home": home, "path": subpath, "owner_uid": st_sub.st_uid, "current_uid": os.getuid()},
+                        )
+                else:
+                    os.makedirs(subpath, mode=0o700, exist_ok=True)
+                os.chmod(subpath, 0o700)
+        except (FileExistsError, NotADirectoryError) as exc:
+            raise MeshError(
+                code=c.INSECURE_PERMISSIONS,
+                exit_code=c.EXIT_USAGE,
+                message=f"Storage root '{home}' must be a real directory, not a symlink or file",
+                details={"home": home},
+            ) from exc
+        except PermissionError as exc:
+            check_home_permissions(home)
+            raise MeshError(
+                code=c.INSECURE_PERMISSIONS,
+                exit_code=c.EXIT_USAGE,
+                message=f"Permission denied initializing storage root '{home}': {exc.strerror or exc}",
+                details={"home": home},
+            ) from exc
+    finally:
+        os.umask(old_umask)
 
     # Derive user keys
     verifier, k_user, salt, kdf_params = derive_user_keys(passphrase, testing_kdf=testing)

@@ -1,14 +1,17 @@
 """Base adapter interface and data structures per plan §14.1."""
 
 from dataclasses import dataclass, field
+import errno
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, TextIO, Tuple
 
 import mesh.constants as c
 from mesh.constants import build_external_env
@@ -36,7 +39,11 @@ def parse_version_output(text: str) -> Optional[str]:
     """
     if not text:
         return None
-    m = re.search(r"(?:version\s+|v)?(\d+\.\d+(?:\.\d+)?(?:-[a-zA-Z0-9.]+)?)\b", text, re.IGNORECASE)
+    m = re.search(
+        r"(?<![a-zA-Z0-9._])(?:version\s+|v)?(\d+(?:\.\d+)+(?:-[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)*)?)(?![a-zA-Z0-9_])(?!\.[a-zA-Z0-9])",
+        text,
+        re.IGNORECASE,
+    )
     if m:
         return m.group(1)
     return None
@@ -257,8 +264,14 @@ def record_adapter_probe(
         return
     try:
         from mesh.core.clock import now_utc
+        from mesh.core.redact import redact_value
+
         probed_at = probe.probed_at or now_utc()
         probe.probed_at = probed_at
+        red_bin = redact_value(binary_path or probe.binary_path, jsonl=True)
+        red_ver = redact_value(probe.version, jsonl=True)
+        red_flags = redact_value(probe.flags, jsonl=True)
+        red_models = redact_value(probe.models, jsonl=True) if probe.models is not None else None
         conn.execute(
             """
             INSERT OR REPLACE INTO adapter_probes (
@@ -268,11 +281,11 @@ def record_adapter_probe(
             (
                 adapter,
                 probed_at,
-                binary_path or probe.binary_path,
-                probe.version,
+                red_bin,
+                red_ver,
                 probe.help_sha256,
-                json.dumps(probe.flags),
-                json.dumps(probe.models) if probe.models is not None else None,
+                json.dumps(red_flags),
+                json.dumps(red_models) if red_models is not None else None,
                 probe.status,
             ),
         )
@@ -299,6 +312,123 @@ def positional_prompt(text: str) -> str:
     prompts start with "# Agent Mesh task" or "Read the file", so this only matters for a
     caller-supplied prompt file (m4-p3-cleanup)."""
     return "\n" + text if text.startswith("-") else text
+
+
+ADAPTER_ALLOWED_OPTIONS: Dict[str, frozenset] = {
+    "droid": frozenset({"binary"}),
+    "claude": frozenset({"binary"}),  # r3 P2-2: build() reads options.binary
+    "codex": frozenset({"binary"}),
+    "devin": frozenset({"binary"}),
+    "agy": frozenset({"binary", "sandbox", "agent"}),
+    "kiro": frozenset({"binary", "agent"}),
+    "vibe": frozenset({"binary", "trust_workdir", "max_turns", "max_price_usd", "max_tokens"}),
+    "fake": frozenset({"binary", "resume_verified"}),
+    "hermes": frozenset({"binary"}),
+    "openclaw": frozenset({"binary"}),
+    "none": frozenset(),
+}
+
+_BOOL_OPTION_KEYS = frozenset({"sandbox", "trust_workdir", "resume_verified"})
+_POS_INT_OPTION_KEYS = frozenset({"max_turns", "max_tokens"})
+
+
+def is_safe_cli_token(val: Any) -> bool:
+    """True for non-empty str without leading '-' or whitespace/control characters."""
+    if not isinstance(val, str) or not val:
+        return False
+    if val.startswith("-"):
+        return False
+    return not any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in val)
+
+
+def validate_cli_token(val: Any, param: str, *, max_len: Optional[int] = None) -> str:
+    """Validate a CLI flag argument string (no leading '-', whitespace, or control chars)."""
+    if not is_safe_cli_token(val) or (max_len is not None and len(val) > max_len):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=f"Invalid '{param}': must be a non-empty string without leading '-', whitespace, or control characters",
+            details={"param": param},
+        )
+    return val
+
+
+def validate_adapter_options(adapter_id: str, options: Any, *, strict_keys: bool = True) -> Dict[str, Any]:
+    """Validate per-adapter option types/bounds and (when strict_keys=True) allowed keys."""
+    if not isinstance(options, dict):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Adapter 'options' must be a JSON object",
+            details={"param": "options"},
+        )
+    allowed = ADAPTER_ALLOWED_OPTIONS.get(adapter_id, frozenset())
+    for k, v in options.items():
+        if not isinstance(k, str) or not k:
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message="Adapter option keys must be non-empty strings",
+                details={"param": "options"},
+            )
+        if strict_keys and k not in allowed:
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message=f"Unsupported option '{k}' for adapter '{adapter_id}'",
+                details={"param": f"options.{k}", "adapter": adapter_id, "key": k},
+            )
+        if k == "binary":
+            if (
+                not isinstance(v, str)
+                or not v.strip()
+                or "\x00" in v
+                or v.lstrip().startswith("-")
+                or any(ord(ch) < 32 or ord(ch) == 127 for ch in v)
+            ):
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message="Option 'binary' must be a non-empty path string not starting with '-'",
+                    details={"param": "options.binary"},
+                )
+        elif k in ("run_id", "agent"):
+            validate_cli_token(v, f"options.{k}")
+        elif k in _BOOL_OPTION_KEYS:
+            if not isinstance(v, bool):
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Option '{k}' must be a boolean",
+                    details={"param": f"options.{k}"},
+                )
+        elif k in _POS_INT_OPTION_KEYS:
+            if not isinstance(v, int) or isinstance(v, bool) or v <= 0:
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Option '{k}' must be a positive integer",
+                    details={"param": f"options.{k}"},
+                )
+        elif k == "max_price_usd":
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v) or v <= 0:
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message="Option 'max_price_usd' must be a positive finite number",
+                    details={"param": "options.max_price_usd"},
+                )
+    return dict(options)
+
+
+def validate_run_request_tokens(req: "RunRequest") -> None:
+    """Validate flag-argument tokens carried in RunRequest before building argv."""
+    if req.model is not None:
+        validate_cli_token(req.model, "model", max_len=256)
+    if req.effort is not None:
+        validate_cli_token(req.effort, "effort", max_len=64)
+    if req.resume_session_id is not None:
+        validate_cli_token(req.resume_session_id, "resume_session_id")
 
 class AdapterUnsupported(MeshError):
     """Raised when an adapter cannot launch or is disabled."""
@@ -471,6 +601,8 @@ class Adapter:
     capabilities: Dict[str, Capability] = {}
     liveness: str = "none"  # 'stream' | 'none'
     max_argv_prompt_bytes: int = 100_000
+    #: The exact effort values the vendor CLI accepts; None = no fixed list (checked elsewhere).
+    supported_efforts: Optional[Tuple[str, ...]] = None
     launch_enabled: bool = False
     launch_milestone: Optional[str] = "M3"
 
@@ -542,3 +674,57 @@ class Adapter:
     def profile_flags(self, profile: str) -> List[str]:
         """Map permission profile to adapter command line flags."""
         raise ProfileUnsupported(self.id, profile)
+
+
+DEFAULT_MAX_RUN_FILE_BYTES = 50 * 1024 * 1024 + 65536
+
+
+def open_run_file_nofollow(
+    path: str,
+    *,
+    encoding: str = "utf-8",
+    errors: str = "replace",
+    max_bytes: Optional[int] = DEFAULT_MAX_RUN_FILE_BYTES,
+) -> TextIO:
+    """Open a regular file inside a run dir safely without following symlinks or blocking on FIFOs."""
+    if not isinstance(path, str) or not path.strip() or "\x00" in path or path.endswith(os.sep):
+        raise OSError(errno.EINVAL, "Invalid run file path", path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EINVAL, "Refusing non-regular run file", path)
+        if max_bytes is not None and st.st_size > max_bytes:
+            raise OSError(errno.EFBIG, f"Run file exceeds {max_bytes} bytes", path)
+        nonblock = getattr(os, "O_NONBLOCK", 0)
+        if nonblock:
+            try:
+                import fcntl
+
+                fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+                if fl & nonblock:
+                    fcntl.fcntl(fd, fcntl.F_SETFL, fl & ~nonblock)
+            except OSError:
+                pass
+        return os.fdopen(fd, "r", encoding=encoding, errors=errors)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_run_file_nofollow(
+    path: str,
+    *,
+    encoding: str = "utf-8",
+    errors: str = "replace",
+    max_bytes: Optional[int] = DEFAULT_MAX_RUN_FILE_BYTES,
+) -> str:
+    """Read a regular run-dir file safely via ``open_run_file_nofollow`` with a bounded read."""
+    with open_run_file_nofollow(path, encoding=encoding, errors=errors, max_bytes=max_bytes) as f:
+        if max_bytes is None:
+            return f.read()
+        text = f.read(max_bytes + 1)
+        if len(text) > max_bytes:
+            raise OSError(errno.EFBIG, f"Run file exceeds {max_bytes} bytes", path)
+        return text

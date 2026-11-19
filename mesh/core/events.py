@@ -88,9 +88,11 @@ def record_event(
     if ts is None:
         ts = now_utc()
 
-    # Plan §15.2: event reason and payload are redacted before they are stored.
+    # Plan §15.2: event reason, request_id, and payload are redacted before they are stored.
     if reason:
         reason = redact(reason)
+    if isinstance(request_id, str) and request_id:
+        request_id = redact(request_id)
     payload_json = json.dumps(redact_value(payload or {}), sort_keys=True, separators=(",", ":"))
 
     event_dict = {
@@ -152,7 +154,9 @@ def _get_project_lead_info(conn: sqlite3.Connection, project_id: str) -> Optiona
         """SELECT la.id as assignment_id, la.agent_id, a.delivery
            FROM lead_assignments la
            JOIN agents a ON la.agent_id = a.id
-           WHERE la.project_id = ? AND la.ended_at IS NULL
+           JOIN projects pr ON pr.id = la.project_id
+           WHERE la.project_id = ? AND la.ended_at IS NULL AND pr.status != 'cancelled'
+             AND a.can_lead = 1  -- full review r2 P2-C: a revoked lead gets no lead events
            LIMIT 1;""",
         (project_id,),
     )
@@ -316,7 +320,10 @@ def fan_out_event(conn: sqlite3.Connection, event: Dict[str, Any]) -> None:
         requester = arow["requested_by"] if arow else payload.get("requested_by")
         status = arow["status"] if arow else payload.get("status", "decided")
         if requester:
-            dedup = f"apr_dec:{approval_id}:{status}"
+            # R1 P2-2: a direct upgrade of a relayed approval is a second decision with the
+            # same status; give it its own deterministic key so it is not dropped.
+            upgrade_tag = ":direct" if payload.get("upgraded_from") else ""
+            dedup = f"apr_dec:{approval_id}:{status}{upgrade_tag}"
             _insert_outbox_msg(conn, event_seq, requester, "inbox", dedup, project_id, etype, payload_raw, now)
             # Keep inbox delivery, and let the normal debounced scheduler consume
             # a wake only when the requester is this project's launch-mode lead.
@@ -361,12 +368,17 @@ def fan_out_event(conn: sqlite3.Connection, event: Dict[str, Any]) -> None:
     elif etype in ("security.credential_in_run", "auth.credential_in_run"):
         user_id = _get_user_id(conn)
         lead = _get_project_lead_info(conn, project_id) if project_id else None
-        recipients = [r for r in [user_id, lead["agent_id"] if lead else None] if r]
+        targets = []
+        if user_id:
+            targets.append((user_id, "inbox"))
+        if lead and lead["agent_id"] and lead["agent_id"] != user_id:
+            lead_ch = "lead_wake" if lead["delivery"] == "launch" else "inbox"
+            targets.append((lead["agent_id"], lead_ch))
         # The audit event is auth.credential_in_run; the inbox message type is
         # security.credential_in_run (§7.1, §12.2), one per run and recipient.
-        for r in recipients:
+        for r, channel in targets:
             dedup = f"cred_in_run:{run_id or event_id}:{r}"
-            _insert_outbox_msg(conn, event_seq, r, "inbox", dedup, project_id, "security.credential_in_run",
+            _insert_outbox_msg(conn, event_seq, r, channel, dedup, project_id, "security.credential_in_run",
                                payload_raw, now)
 
     # 11. lead.action_result with ok=false -> the current lead, as lead.action_failed (§12.4).
@@ -392,6 +404,44 @@ def verify_event_chain(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     cursor = conn.execute("SELECT * FROM events ORDER BY seq ASC;")
     rows = cursor.fetchall()
 
+    direct_user_only_events = {
+        "system.init",
+        "config.updated",
+        "agent.created",
+        "agent.updated",
+        "agent.disabled",
+        "agent.enabled",
+        "agent.token_issued",
+        "agent.token_revoked",
+        "run.seen_release_forced",
+        "run.merge_release_forced",
+    }
+    has_init_markers = conn.execute(
+        "SELECT 1 FROM principals WHERE id = 'principal_system' "
+        "UNION ALL SELECT 1 FROM credentials WHERE kind = 'passphrase' LIMIT 1;"
+    ).fetchone() is not None
+    if has_init_markers and (not rows or rows[0]["seq"] != 1 or rows[0]["type"] != "system.init"):
+        violations.append({
+            "invariant": "I7",
+            "seq": rows[0]["seq"] if rows else 1,
+            "event_id": rows[0]["id"] if rows else None,
+            "message": "Missing genesis 'system.init' event at seq 1",
+        })
+
+    has_seq_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence' LIMIT 1;"
+    ).fetchone() is not None
+    if has_seq_table:
+        seq_row = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'events';").fetchone()
+        expected_max = rows[-1]["seq"] if rows else 0
+        if seq_row is not None and seq_row[0] != expected_max:
+            violations.append({
+                "invariant": "I7",
+                "seq": seq_row[0],
+                "event_id": None,
+                "message": f"Event sequence counter ({seq_row[0]}) does not match max event seq ({expected_max})",
+            })
+
     prev_hash = "genesis"
     for idx, row in enumerate(rows):
         row_dict = dict(row)
@@ -399,6 +449,14 @@ def verify_event_chain(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         event_id = row_dict["id"]
         row_prev = row_dict["prev_hash"]
         row_hash = row_dict["hash"]
+
+        if seq != idx + 1:
+            violations.append({
+                "invariant": "I7",
+                "seq": seq,
+                "event_id": event_id,
+                "message": f"Event {event_id} (seq {seq}) breaks contiguous sequence (expected seq {idx + 1})",
+            })
 
         if row_prev != prev_hash:
             violations.append({
@@ -415,6 +473,23 @@ def verify_event_chain(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
                 "seq": seq,
                 "event_id": event_id,
                 "message": f"Event {event_id} (seq {seq}) hash '{row_hash}' does not match recomputed hash '{expected_hash}'",
+            })
+
+        if row_dict.get("type") in direct_user_only_events and (
+            row_dict.get("actor_kind") != "user" or row_dict.get("via") != "direct"
+        ):
+            violations.append({
+                "invariant": "I7",
+                "seq": seq,
+                "event_id": event_id,
+                "message": f"Event {event_id} (seq {seq}, type '{row_dict.get('type')}') requires direct user actor/via",
+            })
+        elif row_dict.get("actor_kind") == "user" and row_dict.get("via") != "direct":
+            violations.append({
+                "invariant": "I7",
+                "seq": seq,
+                "event_id": event_id,
+                "message": f"Event {event_id} (seq {seq}) has actor_kind 'user' with non-direct via '{row_dict.get('via')}'",
             })
 
         prev_hash = row_hash

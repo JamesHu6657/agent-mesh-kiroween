@@ -1,0 +1,2 @@
+Error: Unknown model: 'no-such-model'
+Available: adaptive, swe-2, swe-2-flash

@@ -209,7 +209,7 @@ def handle_project_wait(args: argparse.Namespace) -> Dict[str, Any]:
 
 def _abs_repo(repo: Any) -> Any:
     """The daemon has its own cwd: send the repo as an absolute path (realpath is the daemon's job)."""
-    if isinstance(repo, str) and repo:
+    if isinstance(repo, str) and repo.strip() and "\x00" not in repo:
         return os.path.abspath(repo)
     return repo
 

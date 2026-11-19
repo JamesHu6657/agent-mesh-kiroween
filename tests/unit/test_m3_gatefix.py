@@ -3895,10 +3895,11 @@ class TestCarbonRoP1b(unittest.TestCase):
            "test_command_json, test_timeout_s, created_by, created_via, created_at, updated_at) "
            "VALUES ('prj_m','PM','g','active',?,'main','mesh/prj_m/integration',?,?, 'usr_m','cli',?,?);",
            (repo, json.dumps(test_argv), test_timeout_s, now, now))
+        reviewed = run_git(["rev-parse", "HEAD"], cwd=wt).stdout.strip()  # full review r1 P0-1
         ex("INSERT INTO tasks (id, project_id, title, spec, kind, status, profile, timeout_s, max_attempts, "
-           "attempt, fence_seq, workspace_path, branch, created_by, created_at, updated_at) "
-           "VALUES ('tsk_m','prj_m','tm','s','code','accepted','edit',600,1,1,1,?,'mesh/prj_m/tsk_m','usr_m',?,?);",
-           (wt, now, now))
+           "attempt, fence_seq, workspace_path, branch, deliverable_json, created_by, created_at, updated_at) "
+           "VALUES ('tsk_m','prj_m','tm','s','code','accepted','edit',600,1,1,1,?,'mesh/prj_m/tsk_m',?,'usr_m',?,?);",
+           (wt, json.dumps({"deliverable": {"git": {"head": reviewed}}}), now, now))
         self.conn.commit()
 
         logs = []
@@ -4639,10 +4640,6 @@ class TestCarbonRoP1b(unittest.TestCase):
         self.assertTrue(_wait(lambda: not _alive(wpid, wst), 10))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestCarbonRoP1bCoverage(unittest.TestCase):
     """ACC: N18, A8 (Quest p1b review P3-4: surviving mutants M2, M4)."""
     # Host-global /proc scans + same-uid non-dumpable escapees: run serially so a
@@ -5316,3 +5313,7 @@ class TestP1cFinalHasMm(unittest.TestCase):
         self.assertFalse(_has_mm(b"Name:\tx\nVmSize:\t       0 kB\n"))
         self.assertFalse(_has_mm(b"Name:\tx\nState:\tZ\n"))
         self.assertTrue(_has_mm(b"Name:\tx\nVmSize:\tgarbage\n"))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -105,8 +105,23 @@ def write_capture(staging: str, rel_path: str, data: bytes, command: Sequence[st
     return path
 
 
+def _check_no_symlinks(path: str) -> None:
+    if os.path.islink(path):
+        raise TierError(f"refused symlink {path}")
+    cur = os.path.dirname(os.path.abspath(path))
+    while cur and cur != os.path.dirname(cur):
+        if cur in ("/tmp", "/var", "/private", "/private/tmp", "/private/var", "/home"):
+            break
+        if os.path.islink(cur):
+            raise TierError(f"refused symlinked directory {cur}")
+        cur = os.path.dirname(cur)
+
+
 def read_sidecar(data_path: str) -> Dict[str, object]:
     """Load and validate ``<data_path>.meta.json`` against the data file."""
+    _check_no_symlinks(data_path)
+    if not os.path.isfile(data_path):
+        raise TierError(f"missing file for sidecar check: {data_path}")
     side = data_path + SIDECAR_SUFFIX
     if not os.path.isfile(side) or os.path.islink(side):
         raise TierError(f"missing sidecar for {data_path}")

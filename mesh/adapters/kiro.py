@@ -17,10 +17,20 @@ from mesh.adapters.base import (
     RunRequest,
     RunResult,
     find_missing_flags,
+    is_safe_cli_token,
+    open_run_file_nofollow,
     parse_version_output,
     record_adapter_probe,
     run_readonly_cmd,
+    validate_adapter_options,
+    validate_run_request_tokens,
 )
+from mesh.adapters.project_layer import refuse_project_layer
+
+#: Full review r7 (R4-P1-1): `.kiro/` entries kiro-cli loads that start processes (MCP
+#: servers, agent configs with mcpServers/hooks); see mesh.adapters.project_layer.
+KIRO_PROJECT_LAYER = ("settings/mcp.json", "agents")
+KIRO_USER_DIR = "~/.kiro"
 
 
 class KiroAdapter(Adapter):
@@ -61,6 +71,9 @@ class KiroAdapter(Adapter):
         raise ProfileUnsupported(self.id, profile)
 
     def build(self, req: RunRequest) -> CommandSpec:
+        validate_run_request_tokens(req)
+        refuse_project_layer(self.id, req, ".kiro", KIRO_PROJECT_LAYER, KIRO_USER_DIR)
+        validate_adapter_options(self.id, req.options, strict_keys=False)
         binary = req.options.get("binary") or self.binary_names[0]
         if req.options.get("binary"):
             # Linear full review C9: run the path validation resolved (~, relative), not the raw string.
@@ -102,7 +115,8 @@ class KiroAdapter(Adapter):
                     adapter=self.id,
                     profile=req.profile,
                 )
-            prompt_content = f"Read the file {req.prompt_path} and follow the instructions in it exactly. It is your complete task."
+            prompt_abs = os.path.abspath(req.prompt_path)
+            prompt_content = f"Read the file {prompt_abs} and follow the instructions in it exactly. It is your complete task."
 
         # m4-p3-cleanup (Carbon r10 P3): the prompt is the last, positional argv item. Neither
         # CLI's real help fixture documents `--`, so a prompt that starts with "-" gets a
@@ -140,7 +154,8 @@ class KiroAdapter(Adapter):
         # Linear full review C6: a finalText that is only a truncated prefix of the streamed
         # message text loses the end of the answer; keep the complete stream instead.
         streamed = scan["message_text"] or ""
-        if final_text and len(streamed) > len(final_text) and streamed.startswith(final_text.rstrip().rstrip(".…")):
+        prefix = final_text.rstrip().rstrip(".…") if final_text else ""
+        if prefix and len(streamed) > len(final_text) and streamed.startswith(prefix):
             final_text = streamed
         return RunResult(
             final_text=final_text or "",
@@ -283,6 +298,8 @@ class KiroAdapter(Adapter):
         res_h = run_readonly_cmd([bin_path, "--help"], timeout_s=timeout_s)
         if res_h.returncode != 0:
             caps = {name: c.to_dict() for name, c in self.capabilities.items()}
+            for cdict in caps.values():
+                cdict["verification"] = "none"
             probe = Probe(
                 adapter=self.id,
                 version=v,
@@ -300,6 +317,25 @@ class KiroAdapter(Adapter):
 
         # 3. Chat help check: kiro-cli chat --help
         res_ch = run_readonly_cmd([bin_path, "chat", "--help"], timeout_s=timeout_s)
+        if res_ch.returncode != 0:
+            caps = {name: c.to_dict() for name, c in self.capabilities.items()}
+            for cdict in caps.values():
+                cdict["verification"] = "none"
+            err_kind = "timeout" if res_ch.returncode == -1 else "chat_help_check_failed"
+            probe = Probe(
+                adapter=self.id,
+                version=v,
+                status="error",
+                launch_enabled=self.launch_enabled,
+                launch_milestone=self.launch_milestone,
+                capabilities=caps,
+                flags=[],
+                models=None,
+                binary_path=bin_path,
+                details={"error": err_kind, "exit_code": res_ch.returncode, "stderr": res_ch.stderr},
+            )
+            record_adapter_probe(conn, self.id, probe, bin_path)
+            return probe
 
         # 4. Model list: kiro-cli chat --list-models -f json
         res_m = run_readonly_cmd([bin_path, "chat", "--list-models", "-f", "json"], timeout_s=timeout_s)
@@ -388,7 +424,7 @@ def _scan_lines(lines) -> Dict[str, Any]:
         etype = event.get("type")
         data = event.get("data") if isinstance(event.get("data"), dict) else {}
         sid = data.get("sessionId")
-        if isinstance(sid, str) and sid and not out["session_id"]:
+        if is_safe_cli_token(sid) and not out["session_id"]:
             out["session_id"] = sid
         if etype == "runStarted":
             out["run_started"] = True
@@ -490,7 +526,7 @@ def _scan_lines(lines) -> Dict[str, Any]:
 
 def _scan_stream(path: str) -> Dict[str, Any]:
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
+        with open_run_file_nofollow(path, encoding="utf-8", errors="replace") as f:
             return _scan_lines(f)
     except OSError:
         return _scan_lines([])

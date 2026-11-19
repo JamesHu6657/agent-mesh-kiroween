@@ -6,15 +6,34 @@ set -eu
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)"
 DEST="${MESH_BIN_DIR:-$HOME/.local/bin}"
 
-if [ "${1:-}" = "--uninstall" ]; then
-  if [ -L "$DEST/mesh" ] && [ "$(readlink "$DEST/mesh")" = "$ROOT/bin/mesh" ]; then
-    rm -f "$DEST/mesh"; echo "removed $DEST/mesh"
-  else
-    echo "nothing to remove at $DEST/mesh (not a link to this clone)"
-  fi
-  echo "data is kept: stop the daemon first (mesh daemon stop --user), then delete ~/.agent-mesh and ~/.config/agent-mesh yourself if you want"
-  exit 0
-fi
+case "$#" in
+  0) ;;
+  1)
+    case "$1" in
+      -h|--help)
+        echo "usage: sh scripts/install.sh [--uninstall|-h|--help]"
+        exit 0
+        ;;
+      --uninstall)
+        if [ -L "$DEST/mesh" ] && [ "$(readlink "$DEST/mesh")" = "$ROOT/bin/mesh" ]; then
+          rm -f "$DEST/mesh"; echo "removed $DEST/mesh"
+        else
+          echo "nothing to remove at $DEST/mesh (not a link to this clone)"
+        fi
+        echo "data is kept: stop the daemon first (mesh daemon stop --user), then delete ~/.agent-mesh and ~/.config/agent-mesh yourself if you want"
+        exit 0
+        ;;
+      *)
+        echo "install: unknown option: $1 (try --help)" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  *)
+    echo "install: unexpected arguments (try --help)" >&2
+    exit 2
+    ;;
+esac
 
 fail() { echo "install: $*" >&2; exit 1; }
 [ "$(uname -s)" = "Linux" ] || fail "Agent Mesh supports Linux only (found $(uname -s))"
@@ -24,7 +43,12 @@ python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' \
 command -v git >/dev/null 2>&1 || echo "install: warning: git not found; repo projects need it" >&2
 
 mkdir -p "$DEST"
-if [ -e "$DEST/mesh" ] && ! [ -L "$DEST/mesh" ]; then
+if [ -L "$DEST/mesh" ]; then
+  target="$(readlink "$DEST/mesh")"
+  if [ "$target" != "$ROOT/bin/mesh" ]; then
+    fail "$DEST/mesh is already a link to $target (not this clone); remove it or set MESH_BIN_DIR"
+  fi
+elif [ -e "$DEST/mesh" ]; then
   fail "$DEST/mesh exists and is not a link; remove it or set MESH_BIN_DIR"
 fi
 ln -sfn "$ROOT/bin/mesh" "$DEST/mesh"

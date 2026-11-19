@@ -43,7 +43,7 @@ def handle_intake_submit(args: argparse.Namespace) -> Dict[str, Any]:
     client = MeshClient(home=args.home)
     payload = {
         # The daemon has its own cwd: send an absolute path (realpath is the daemon's job).
-        "repo": os.path.abspath(repo) if isinstance(repo, str) and repo else repo,
+        "repo": os.path.abspath(repo) if isinstance(repo, str) and repo.strip() and "\x00" not in repo else repo,
         "title": getattr(args, "title", None),
         "goal": getattr(args, "goal", None),
         "criterion": getattr(args, "criterion", None) or getattr(args, "criteria", None) or [],

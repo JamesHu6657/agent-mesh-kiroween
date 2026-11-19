@@ -7,9 +7,10 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import mesh.constants as c
-from mesh.core.authz import check_authz, lead_run_token_scope
+from mesh.core.authz import check_authz, get_agent_capabilities, lead_run_token_scope
 from mesh.core.clock import now_iso_utc, parse_duration
 from mesh.core.db import transaction
+from mesh.core.redact import redact_value
 from mesh.daemon.handlers.base import HandlerContext, HandlerResult
 from mesh.errors import MeshError
 
@@ -23,7 +24,9 @@ def _lead_scope_filter(ctx: HandlerContext) -> Tuple[Optional[str], str, List[An
     """
     scope_project = lead_run_token_scope(ctx.principal, ctx.via)
     if scope_project is None:
-        return None, "", []
+        # Full review r4 P1-6: `lead_wake` rows are the daemon's wake queue for lead
+        # turns; no inbox command (any credential) lists, delivers or acks them.
+        return None, " AND channel <> 'lead_wake'", []
     return scope_project, " AND project_id = ? AND channel <> 'lead_wake'", [scope_project]
 
 
@@ -81,7 +84,7 @@ def handle_inbox_list(ctx: HandlerContext) -> HandlerResult:
             "project_id": r["project_id"],
             "channel": r["channel"],
             "status": r["status"],
-            "payload": payload,
+            "payload": redact_value(payload),
             "created_at": r["created_at"],
             "delivered_at": r["delivered_at"],
             "acked_at": r["acked_at"],
@@ -115,15 +118,31 @@ def handle_inbox_ack(ctx: HandlerContext) -> HandlerResult:
     check_authz(ctx.conn, "inbox.ack", ctx.principal, ctx.actor_kind, ctx.via)
 
     principal_id = ctx.principal["id"]
-    messages = ctx.args.get("messages") or []
+    if "messages" in ctx.args and ctx.args["messages"] is not None:
+        messages = ctx.args["messages"]
+    else:
+        messages = []
     if isinstance(messages, str):
         messages = [messages]
-
+    if not isinstance(messages, list):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Field 'messages' must be a list of message identifiers",
+            details={"param": "messages"},
+        )
     if not messages:
         raise MeshError(
             code=c.INVALID_ARGUMENT,
             exit_code=c.EXIT_USAGE,
             message="No message identifiers provided to ack",
+            details={"param": "messages"},
+        )
+    if any(not isinstance(m, str) or not m.strip() for m in messages):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Each message identifier must be a non-empty string",
             details={"param": "messages"},
         )
 
@@ -143,8 +162,8 @@ def handle_inbox_ack(ctx: HandlerContext) -> HandlerResult:
                 message=f"Message '{mid}' not found",
                 details={"message": mid},
             )
-        if scope_project is not None and (row["project_id"] != scope_project
-                                          or row["channel"] == "lead_wake"):
+        if row["channel"] == "lead_wake" or (scope_project is not None
+                                             and row["project_id"] != scope_project):
             # Review m2-r9 finding 1(d): a lead turn cannot ack outside its project,
             # and never a `lead_wake` row (the turn owns those).
             raise MeshError(
@@ -170,24 +189,91 @@ def handle_inbox_ack(ctx: HandlerContext) -> HandlerResult:
     return HandlerResult(data={"acked": len(messages)})
 
 
-def _recheck_credential(ctx: HandlerContext) -> None:
+def _recheck_credential(ctx: HandlerContext, *, require_active_run_row: bool = False) -> None:
     """Raise rc 3 (TOKEN_REVOKED / TOKEN_EXPIRED / TOKEN_INVALID) when the request's
     credential stopped being valid after authentication. No-op without a credential id."""
-    cred_id = (ctx.principal or {}).get("credential_id")
-    if not cred_id:
-        return
-    row = ctx.conn.execute(
-        "SELECT c.revoked_at, c.expires_at, p.disabled_at FROM credentials c "
-        "JOIN principals p ON c.principal_id = p.id WHERE c.id = ?;", (cred_id,)).fetchone()
-    if row is None or row["revoked_at"] is not None:
-        raise MeshError(code=c.TOKEN_REVOKED, exit_code=c.EXIT_UNAUTHENTICATED,
-                        message="Token has been revoked")
-    if row["expires_at"] is not None and row["expires_at"] < now_iso_utc():
-        raise MeshError(code=c.TOKEN_EXPIRED, exit_code=c.EXIT_UNAUTHENTICATED,
-                        message="Token has expired")
-    if row["disabled_at"] is not None:
-        raise MeshError(code=c.TOKEN_INVALID, exit_code=c.EXIT_UNAUTHENTICATED,
-                        message="Principal is disabled")
+    cred_id = (ctx.principal or {}).get("credential_id") or getattr(ctx, "credential_id", None)
+    if cred_id:
+        row = ctx.conn.execute(
+            "SELECT c.revoked_at, c.expires_at, p.disabled_at FROM credentials c "
+            "JOIN principals p ON c.principal_id = p.id WHERE c.id = ?;", (cred_id,)).fetchone()
+        if row is None or row["revoked_at"] is not None:
+            raise MeshError(code=c.TOKEN_REVOKED, exit_code=c.EXIT_UNAUTHENTICATED,
+                            message="Token has been revoked")
+        if row["expires_at"] is not None and row["expires_at"] < now_iso_utc():
+            raise MeshError(code=c.TOKEN_EXPIRED, exit_code=c.EXIT_UNAUTHENTICATED,
+                            message="Token has expired")
+        if row["disabled_at"] is not None:
+            raise MeshError(code=c.TOKEN_INVALID, exit_code=c.EXIT_UNAUTHENTICATED,
+                            message="Principal is disabled")
+    if ctx.via == "run_token":
+        run_id = ((ctx.principal or {}).get("scope") or {}).get("run_id")
+        if run_id:
+            rrow = ctx.conn.execute("SELECT status FROM runs WHERE id = ?;", (run_id,)).fetchone()
+            if (rrow is None and require_active_run_row) or (
+                rrow is not None and rrow["status"] not in ("starting", "running")
+            ):
+                raise MeshError(code=c.TOKEN_REVOKED, exit_code=c.EXIT_UNAUTHENTICATED,
+                                message="Run token is no longer active")
+
+
+def recheck_tx_credential_and_authz(ctx: HandlerContext, cmd: Optional[str] = None) -> None:
+    """Re-verify credential liveness, refresh capabilities, and re-run command authz inside TX."""
+    if not getattr(ctx, "_queued_lead_merge", False):
+        _recheck_credential(ctx, require_active_run_row=True)
+    principal_id = (ctx.principal or {}).get("id")
+    if ctx.actor_kind != "user" and principal_id:
+        arow = ctx.conn.execute(
+            "SELECT capabilities_json FROM agents WHERE id = ?;", (principal_id,)
+        ).fetchone()
+        if arow is not None:
+            try:
+                ctx.principal["capabilities"] = list(json.loads(arow["capabilities_json"] or "[]") or [])
+            except Exception:
+                ctx.principal["capabilities"] = []
+    if ctx.via == "relayed" and "relay" not in ((ctx.principal or {}).get("capabilities") or []):
+        raise MeshError(
+            code=c.RELAY_NOT_ALLOWED,
+            exit_code=c.EXIT_FORBIDDEN,
+            message=f"Principal '{(ctx.principal or {}).get('name')}' lacks 'relay' capability",
+            details={"principal": (ctx.principal or {}).get("name"), "missing": "relay"},
+        )
+    resolved_cmd = getattr(ctx, "cmd", None) or cmd
+    if not isinstance(resolved_cmd, str) or not resolved_cmd:
+        raise AttributeError("HandlerContext missing 'cmd' for recheck_tx_credential_and_authz")
+    check_authz(
+        ctx.conn,
+        resolved_cmd,
+        ctx.principal,
+        ctx.actor_kind,
+        ctx.via,
+        relayed_by=getattr(ctx, "relayed_by", None),
+        resource_resolved=False,
+    )
+
+
+def _recheck_wait_authz(
+    ctx: HandlerContext,
+    cmd: str,
+    *,
+    project_id: Optional[str] = None,
+    task_id: Optional[str] = None,
+) -> None:
+    """Re-verify credential validity and live DB capabilities on wait wakeup."""
+    _recheck_credential(ctx)
+    principal = ctx.principal
+    if ctx.actor_kind != "user" and principal.get("id"):
+        principal = dict(principal)
+        principal["capabilities"] = list(get_agent_capabilities(ctx.conn, principal["id"]) or [])
+    check_authz(
+        ctx.conn,
+        cmd,
+        principal,
+        ctx.actor_kind,
+        ctx.via,
+        project_id=project_id,
+        task_id=task_id,
+    )
 
 
 async def handle_inbox_wait(server: Any, ctx: HandlerContext, reader: Any = None) -> HandlerResult:
@@ -232,15 +318,17 @@ async def handle_inbox_wait(server: Any, ctx: HandlerContext, reader: Any = None
 
     max_count = ctx.args.get("max", 1)
     try:
+        if isinstance(max_count, (bool, float)):
+            raise ValueError()
         max_count = int(max_count)
-        if max_count <= 0:
+        if not (1 <= max_count <= 10_000):
             raise ValueError()
     except (ValueError, TypeError):
         raise MeshError(
             code=c.INVALID_ARGUMENT,
             exit_code=c.EXIT_USAGE,
-            message="Max messages must be a positive integer",
-            details={"param": "max"},
+            message="Max messages must be an integer between 1 and 10000",
+            details={"param": "max", "expected": "1..10000"},
         )
 
     start_mono = time.monotonic()
@@ -254,7 +342,7 @@ async def handle_inbox_wait(server: Any, ctx: HandlerContext, reader: Any = None
                 return HandlerResult(data={"items": []})
             # Linear full review B6: the credential was checked when the wait began; a
             # revoke, expiry or disable during the wait ends it before anything is delivered.
-            _recheck_credential(ctx)
+            _recheck_wait_authz(ctx, "inbox.wait")
 
             cur = ctx.conn.execute(
                 """SELECT id, event_seq, recipient_id, channel, dedup_key, project_id,
@@ -287,7 +375,7 @@ async def handle_inbox_wait(server: Any, ctx: HandlerContext, reader: Any = None
                         "project_id": r["project_id"],
                         "channel": r["channel"],
                         "status": r["status"],
-                        "payload": payload,
+                        "payload": redact_value(payload),
                         "created_at": r["created_at"],
                         "delivered_at": r["delivered_at"],
                         "acked_at": r["acked_at"],

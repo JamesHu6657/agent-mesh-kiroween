@@ -16,10 +16,22 @@ from mesh.adapters.base import (
     RunRequest,
     RunResult,
     find_missing_flags,
+    is_safe_cli_token,
+    open_run_file_nofollow,
     parse_version_output,
     record_adapter_probe,
     run_readonly_cmd,
+    validate_adapter_options,
+    validate_run_request_tokens,
 )
+from mesh.adapters.project_layer import refuse_project_layer
+
+#: Full review r7 (R4-P1-1): `.factory/` entries droid loads that start processes (hooks,
+#: MCP servers); see mesh.adapters.project_layer. `mcp.json` is also read from every
+#: ancestor directory of the project.
+DROID_PROJECT_LAYER = ("hooks.json", "hooks", "settings.json", "settings.local.json", "mcp.json")
+DROID_ANCESTOR_LAYER = ("mcp.json",)
+DROID_USER_DIR = "~/.factory"
 
 
 class DroidAdapter(Adapter):
@@ -58,6 +70,10 @@ class DroidAdapter(Adapter):
         raise ProfileUnsupported(self.id, profile)
 
     def build(self, req: RunRequest) -> CommandSpec:
+        validate_run_request_tokens(req)
+        refuse_project_layer(self.id, req, ".factory", DROID_PROJECT_LAYER, DROID_USER_DIR,
+                             ancestor_names=DROID_ANCESTOR_LAYER)
+        validate_adapter_options(self.id, req.options, strict_keys=False)
         binary = req.options.get("binary") or self.binary_names[0]
         if req.options.get("binary"):
             # Linear full review C9: run the path validation resolved (~, relative), not the raw string.
@@ -206,6 +222,8 @@ class DroidAdapter(Adapter):
         res_h = run_readonly_cmd([bin_path, "--help"], timeout_s=timeout_s)
         if res_h.returncode != 0:
             caps = {name: c.to_dict() for name, c in self.capabilities.items()}
+            for cdict in caps.values():
+                cdict["verification"] = "none"
             probe = Probe(
                 adapter=self.id,
                 version=v,
@@ -223,7 +241,26 @@ class DroidAdapter(Adapter):
 
         # 3. Exec help check & models: droid exec --help
         res_eh = run_readonly_cmd([bin_path, "exec", "--help"], timeout_s=timeout_s)
-        models = self.parse_models_from_help(res_eh.help_text) if res_eh.returncode == 0 else None
+        if res_eh.returncode != 0:
+            caps = {name: c.to_dict() for name, c in self.capabilities.items()}
+            for cdict in caps.values():
+                cdict["verification"] = "none"
+            err_kind = "timeout" if res_eh.returncode == -1 else "exec_help_check_failed"
+            probe = Probe(
+                adapter=self.id,
+                version=v,
+                status="error",
+                launch_enabled=self.launch_enabled,
+                launch_milestone=self.launch_milestone,
+                capabilities=caps,
+                flags=[],
+                models=None,
+                binary_path=bin_path,
+                details={"error": err_kind, "exit_code": res_eh.returncode, "stderr": res_eh.stderr},
+            )
+            record_adapter_probe(conn, self.id, probe, bin_path)
+            return probe
+        models = self.parse_models_from_help(res_eh.help_text)
 
         # Compare help sha256 with plan §14.11
         expected_help = EXPECTED_HELP_HASHES.get("droid")
@@ -285,7 +322,7 @@ def _scan_stream(path: str) -> Dict[str, Any]:
     """
     scan: Dict[str, Any] = {"session_id": None, "final_text": None, "usage": None, "malformed": 0}
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
+        with open_run_file_nofollow(path, encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -300,7 +337,7 @@ def _scan_stream(path: str) -> Dict[str, Any]:
                 etype = event.get("type")
                 if etype == "system" and event.get("subtype") == "init":
                     sid = event.get("session_id")
-                    if scan["session_id"] is None and isinstance(sid, str) and sid:
+                    if scan["session_id"] is None and is_safe_cli_token(sid):
                         scan["session_id"] = sid
                 elif etype == "completion":
                     text = event.get("finalText")

@@ -15,7 +15,9 @@ N=$(git rev-list --count $R); [ "$N" -gt 0 ] || { echo "nothing to push"; exit 0
 # then PATH, then /tmp/gitleaks only if owned by us and not a symlink (PR41 r2 P3).
 GL="${GITLEAKS:-$(command -v gitleaks 2>/dev/null || true)}"
 if [ -z "$GL" ] && [ ! -L /tmp/gitleaks ] && [ -f /tmp/gitleaks ] && [ -x /tmp/gitleaks ] && [ -O /tmp/gitleaks ]; then GL=/tmp/gitleaks; fi
-GLOUT=$(mktemp) || exit 2; trap 'rm -f "$GLOUT"' EXIT
+GLOUT=$(mktemp) || exit 2
+PATCH_FILE=$(mktemp) || { rm -f "$GLOUT"; exit 2; }
+trap 'rm -f "$GLOUT" "$PATCH_FILE"' EXIT
 [ -n "$GL" ] && [ -x "$GL" ] || { echo "REFUSED: gitleaks missing at $GL"; exit 2; }
 # Known fake test fixtures are allowlisted by fingerprint in scripts/coord/gitleaks-baseline.json
 if ! "$GL" git --no-banner --redact --log-opts="$R" --baseline-path scripts/coord/gitleaks-baseline.json . > "$GLOUT" 2>&1; then
@@ -23,8 +25,8 @@ if ! "$GL" git --no-banner --redact --log-opts="$R" --baseline-path scripts/coor
 # Shared pattern (Sakana PR #4 P1-2: generic *_API_KEY=); fail closed if missing.
 . scripts/coord/secret-pattern.sh 2>/dev/null && [ -n "${P:-}" ] || { echo "REFUSED: scripts/coord/secret-pattern.sh missing"; exit 2; }
 # Full review P1: merge diffs too (-m), binary-as-text, and fail closed if git log fails.
-PATCH=$(git log -p -m --text "$R") || { echo "REFUSED: git log failed"; exit 2; }
-H=$(printf '%s\n' "$PATCH" | { grep -E '^\+' || [ $? -eq 1 ]; } | { grep -cE "$P" || [ $? -eq 1 ]; }) || { echo "REFUSED: pattern scan failed"; exit 2; }
+git log -p -m --text "$R" > "$PATCH_FILE" || { echo "REFUSED: git log failed"; exit 2; }
+H=$({ grep -aE '^\+' "$PATCH_FILE" || [ $? -eq 1 ]; } | { grep -caE "$P" || [ $? -eq 1 ]; }) || { echo "REFUSED: pattern scan failed"; exit 2; }
 [ "$H" = 0 ] || { echo "REFUSED: $H pattern hits in new commits"; exit 3; }
 git push github "$S:refs/heads/main"
 RS=$(git ls-remote github refs/heads/main | cut -f1)
