@@ -118,15 +118,22 @@ mesh task create --project "$PROJECT_ID" --title "Write hello.txt" --spec "Creat
   --assignee worker1 --token-file "$T"
 ```
 
-Set `PROJECT_ID` to the `project_id` in the intake response. Variables such as
+Set `PROJECT_ID` to the `id` in the intake response (`data.id`, a `prj_...` value). Variables such as
 `TASK_ID`, `RUN_ID`, `FENCE` and `CRITERION_ID` below stand for values returned by
 Mesh; do not paste angle-bracket placeholders into a shell. Agent and user commands
 have different authority: only the human runs the `--user` setup commands.
 
 The executor (here an inbox agent `worker1`, see
 [`docs/examples/inbox-agent.sh`](docs/examples/inbox-agent.sh)) then runs
-`mesh inbox wait`, `mesh task start <tsk>` (prints `run_id`, `fence` and a workspace
-directory), does the work there while sending a heartbeat well before the returned lease expires
+`mesh inbox wait`, `mesh task start <tsk>` (prints `run_id`, `fence`, `session` and a
+workspace directory), then exports the session before any other command for that run:
+
+```sh
+export MESH_SESSION="$SESSION"   # the `session` value from task start
+```
+
+Without it `heartbeat` and `submit` fail with `FENCE_MISMATCH` (`session_missing`). It then
+does the work there while sending a heartbeat well before the returned lease expires
 (for the default 120-second lease, every 40 seconds or less), and submits with
 `mesh task submit "$TASK_ID" --run "$RUN_ID" --fence "$FENCE" --summary "Created hello.txt"`. The lead finishes:
 
