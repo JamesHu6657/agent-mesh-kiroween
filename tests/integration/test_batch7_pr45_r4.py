@@ -13,8 +13,11 @@ import unittest
 
 import mesh.constants as c
 from tests.gitfixture import GitFixture, GitMeshHarness
+from tests.helpers import EXPECTED_CRASH_RETURNCODE, restore_accessible_for_test, set_inaccessible_for_test
 from tests.integration.test_execution_launch import create_agent as create_exec_agent
 from tests.stubs import create_test_stubs
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 MESH_PROC_LOCK = "shared"
 
@@ -210,7 +213,7 @@ class TestBatch7PR45R4Integration(unittest.TestCase):
         self.harness.restart_daemon(extra_env={"MESH_TEST_CRASH_AT": "after_merge_abort"})
         rc_c, _ = self.harness.cli("task", "merge", tsk_c, token=self.tok_lead1)
         self.assertNotEqual(rc_c, 0)
-        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), -signal.SIGKILL)
+        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), EXPECTED_CRASH_RETURNCODE)
 
         self.harness.restart_daemon()
         with open(os.path.join(integ, "calc.py"), encoding="utf-8") as f:
@@ -223,13 +226,15 @@ class TestBatch7PR45R4Integration(unittest.TestCase):
         script = os.path.join(self.stubs_dir, "r4_p23_test.py")
         with open(script, "w", encoding="utf-8") as f:
             f.write(
-                "import os\n"
+                "import os, sys\n"
+                f"sys.path.insert(0, {_REPO_ROOT!r})\n"
+                "from tests.helpers import set_inaccessible_for_test\n"
                 f"mode = open({mode_file!r}).read().strip()\n"
                 "if mode == 'sym_000':\n"
                 "    open('tests/test_calc.py', 'w').write('# dirt\\n')\n"
-                "    os.chmod('tests', 0o000)\n"
+                "    set_inaccessible_for_test('tests')\n"
                 "    os.rmdir('vendor_sub')\n"
-                "    os.symlink('.', 'vendor_sub')\n"
+                "    os.symlink('.', 'vendor_sub', target_is_directory=True)\n"
                 "elif mode == 'leak_gl':\n"
                 "    os.makedirs('vendor_sub/subcache', exist_ok=True)\n"
                 "    open('vendor_sub/leaked.txt', 'w').write('leftover\\n')\n"
@@ -239,7 +244,7 @@ class TestBatch7PR45R4Integration(unittest.TestCase):
         )
         integ = os.path.join(self.harness.home, "workspaces", prj, "integration")
         tests_dir = os.path.join(integ, "tests")
-        self.addCleanup(lambda: os.path.isdir(tests_dir) and os.chmod(tests_dir, 0o755))
+        self.addCleanup(lambda: os.path.isdir(tests_dir) and restore_accessible_for_test(tests_dir))
 
         # 1. Symlinked vendor_sub -> . + 0o000 tests -> INTEGRATION_DIRTY + restored!
         with open(mode_file, "w", encoding="utf-8") as f:
@@ -268,7 +273,7 @@ class TestBatch7PR45R4Integration(unittest.TestCase):
         self.harness.restart_daemon(extra_env={"MESH_TEST_CRASH_AT": "after_ws_prune_reserve"})
         rc_pr, _ = self.harness.cli("workspace", "prune", "--project", prj, "--idempotency-key", "k-r4-hist", token=self.tok_lead1)
         self.assertNotEqual(rc_pr, 0)
-        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), -signal.SIGKILL)
+        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), EXPECTED_CRASH_RETURNCODE)
         self.harness.restart_daemon()
         with contextlib.closing(self.harness.db()) as conn:
             self.assertEqual(

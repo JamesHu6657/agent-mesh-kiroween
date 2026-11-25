@@ -13,7 +13,8 @@ import unittest
 from typing import Any, Dict, List, Optional
 
 import mesh.constants as c
-from tests.helpers import MeshHarness, serial
+from mesh.platform import ipc as plat_ipc, perms as plat_perms
+from tests.helpers import MeshHarness, cli_popen_argv, serial
 from tests.stubs import create_test_stubs
 
 
@@ -64,7 +65,7 @@ def create_agent(
     tok_path = os.path.join(tok_dir, f"{name}.token")
     with open(tok_path, "w", encoding="utf-8") as f:
         f.write(token)
-    os.chmod(tok_path, 0o600)
+    plat_perms.set_private_file_acl(tok_path)
     return token
 
 
@@ -259,12 +260,10 @@ class TestInbox(unittest.TestCase):
         self.assertEqual(resp.get("error", {}).get("details", {}).get("param"), "user")
 
         # 2. Daemon trust boundary: agent credential sending args.user=True gets rc 4 CAPABILITY_MISSING
-        import socket
-        sock_path = os.path.join(self.harness.home, "run", "mesh.sock")
+        endpoint = plat_ipc.daemon_endpoint_path(self.harness.home)
 
         def send_agent_req(cmd: str, args: dict) -> dict:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.connect(sock_path)
+            s = plat_ipc.connect_endpoint(endpoint)
             req = json.dumps({
                 "v": 1,
                 "cmd": cmd,
@@ -361,14 +360,12 @@ class TestInbox(unittest.TestCase):
 
         tok_ibx = create_agent(self.harness, "ibx", delivery="inbox")
         tok_path = os.path.join(self.harness.home, "tokens", "ibx.token")
+        cmd_wait, env_wait = cli_popen_argv(
+            self.harness, "--token-file", tok_path, "inbox", "wait", "--timeout", "30s",
+        )
         proc = subprocess.Popen(
-            [
-                self.harness.bin_mesh,
-                "--home", self.harness.home,
-                "--token-file", tok_path,
-                "inbox", "wait",
-                "--timeout", "30s",
-            ],
+            cmd_wait,
+            env=env_wait,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )

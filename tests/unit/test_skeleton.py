@@ -11,7 +11,9 @@ import subprocess
 import sys
 import unittest
 
+from mesh.platform import paths as plat_paths, pipe_pump
 from tests.helpers import MeshHarness
+from tests.stubs import stub_path
 import mesh.constants as c
 
 
@@ -169,6 +171,7 @@ class TestSkeleton(unittest.TestCase):
                     f"Found forbidden vendor config open in {file_path}: {m.group(0) if m else ''}",
                 )
 
+    @unittest.skipIf(sys.platform == "win32", "scripts/test.sh is a POSIX shell runner")
     def test_test_runner_script(self):
         """Verify test runner script exists, is executable, and runs offline test tiers. ACC: A1"""
         script_path = os.path.join(self.repo_root, "scripts", "test.sh")
@@ -299,9 +302,15 @@ class TestSkeleton(unittest.TestCase):
 
         # Default output must itself be JSON (parsed directly, no harness fallback envelope).
         env = self.harness.get_env()
-        base = [self.harness.bin_mesh, "--home", self.harness.home, "task", "create", "--bogus"]
+        base = pipe_pump.prepare_win_cmd_args(
+            [self.harness.bin_mesh, "--home", self.harness.home, "task", "create", "--bogus"], env=env,
+        )
+        txt_cmd = pipe_pump.prepare_win_cmd_args(
+            [self.harness.bin_mesh, "--home", self.harness.home, "task", "create", "--bogus", "--format", "text"],
+            env=env,
+        )
         p_def = subprocess.run(base, env=env, capture_output=True, text=True, timeout=30)
-        p_txt = subprocess.run(base + ["--format", "text"], env=env, capture_output=True, text=True, timeout=30)
+        p_txt = subprocess.run(txt_cmd, env=env, capture_output=True, text=True, timeout=30)
         self.assertEqual(p_def.returncode, p_txt.returncode, "rc must be identical with --format text and default")
         self.assertEqual(p_def.returncode, 2)
         doc = json.loads(p_def.stdout)
@@ -372,7 +381,7 @@ class TestSkeleton(unittest.TestCase):
     def test_tripwire_shims(self):
         """Verify shims in tests/shims trigger tripwire and exit 99 when invoked. ACC: A3"""
         shims = ["droid", "agy", "kiro-cli", "vibe", "hermes", "openclaw"]
-        tripwire = f"/tmp/tripwire-test-{os.getpid()}.log"
+        tripwire = os.path.join(plat_paths.temp_root(), f"tripwire-test-{os.getpid()}.log")
         if os.path.exists(tripwire):
             os.remove(tripwire)
 
@@ -380,9 +389,11 @@ class TestSkeleton(unittest.TestCase):
             env = dict(os.environ)
             env["_TRIPWIRE_FILE"] = tripwire
             env["_SUITE_TRIPWIRE_FILE"] = tripwire
+            shims_dir = os.path.join(self.repo_root, "tests", "shims")
             for shim in shims:
-                shim_path = os.path.join(self.repo_root, "tests", "shims", shim)
-                proc = subprocess.run([shim_path, "--test-flag"], env=env, capture_output=True, text=True)
+                shim_path = stub_path(shims_dir, shim)
+                cmd = pipe_pump.prepare_win_cmd_args([shim_path, "--test-flag"], env=env)
+                proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
                 self.assertEqual(proc.returncode, 99)
 
             self.assertTrue(os.path.exists(tripwire))
@@ -396,8 +407,8 @@ class TestSkeleton(unittest.TestCase):
 
     def test_suite_tripwire_propagation(self):
         """Verify shim execution propagates to suite-level tripwire file when _SUITE_TRIPWIRE_FILE is set."""
-        shim_tripwire = f"/tmp/tripwire-per-harness-{os.getpid()}.log"
-        suite_tripwire = f"/tmp/tripwire-suite-test-{os.getpid()}.log"
+        shim_tripwire = os.path.join(plat_paths.temp_root(), f"tripwire-per-harness-{os.getpid()}.log")
+        suite_tripwire = os.path.join(plat_paths.temp_root(), f"tripwire-suite-test-{os.getpid()}.log")
         for p in (shim_tripwire, suite_tripwire):
             if os.path.exists(p):
                 os.remove(p)
@@ -407,15 +418,16 @@ class TestSkeleton(unittest.TestCase):
             env["_TRIPWIRE_FILE"] = shim_tripwire
             env["_SUITE_TRIPWIRE_FILE"] = suite_tripwire
 
-            droid_shim = os.path.join(self.repo_root, "tests", "shims", "droid")
-            proc = subprocess.run([droid_shim, "--version"], env=env, capture_output=True, text=True)
+            droid_shim = stub_path(os.path.join(self.repo_root, "tests", "shims"), "droid")
+            cmd = pipe_pump.prepare_win_cmd_args([droid_shim, "--version"], env=env)
+            proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
             self.assertEqual(proc.returncode, 99)
 
             self.assertTrue(os.path.exists(shim_tripwire))
             self.assertTrue(os.path.exists(suite_tripwire))
             with open(suite_tripwire, "r", encoding="utf-8") as f:
                 content = f.read()
-            self.assertIn("droid called with: --version", content)
+            self.assertIn(f"{os.path.basename(droid_shim)} called with: --version", content)
         finally:
             for p in (shim_tripwire, suite_tripwire):
                 if os.path.exists(p):
@@ -452,9 +464,10 @@ class TestSkeleton(unittest.TestCase):
         self.assertEqual(clean_env2.get("USER"), "box")
 
         # 3. Test running bin/mesh preserves _MESH_ORIG_PYTHONPATH in process
+        env3 = dict(os.environ, PYTHONPATH=f"{os.path.sep}some{os.path.sep}orig{os.path.sep}path")
         proc = subprocess.run(
-            [self.harness.bin_mesh, "version"],
-            env=dict(os.environ, PYTHONPATH="/some/orig/path"),
+            pipe_pump.prepare_win_cmd_args([self.harness.bin_mesh, "version"], env=env3),
+            env=env3,
             capture_output=True,
             text=True,
         )

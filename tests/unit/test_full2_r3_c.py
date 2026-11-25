@@ -8,6 +8,7 @@ import socket
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -29,7 +30,9 @@ from mesh.daemon.handlers.approval import handle_approval_approve
 from mesh.daemon.handlers.base import HandlerContext
 from mesh.daemon.server import DaemonServer, dispatch_internal_request
 from mesh.errors import MeshError
+from mesh.platform.paths import temp_root
 from tests.gitfixture import GitFixture
+from tests.helpers import fake_peer_creds
 
 
 def _setup_home_and_repo(tmp: str, fixture: GitFixture):
@@ -159,7 +162,7 @@ class TestP1_4DeliverIntentAndWorktreeSafety(unittest.TestCase, _GitEnvMixin):
 
     def setUp(self) -> None:
         self._init_git_env()
-        self._tmp = tempfile.TemporaryDirectory(prefix="mh-r3c-p14-", dir="/tmp")
+        self._tmp = tempfile.TemporaryDirectory(prefix="mh-r3c-p14-", dir=temp_root())
         self.addCleanup(self._tmp.cleanup)
         self.fixture.allow_root(self._tmp.name)
         self.home, self.conn, self.repo, self.base_sha, self.integ = _setup_home_and_repo(
@@ -473,7 +476,10 @@ class TestP1_4DeliverIntentAndWorktreeSafety(unittest.TestCase, _GitEnvMixin):
         pwn = self.fixture.path("pwned_marker")
         with open(os.path.join(fake_repo, ".git", "config"), "a", encoding="utf-8") as f:
             f.write(f"[core]\n\tfsmonitor = touch {pwn}\n")
-        with open(os.path.join(wt_main, ".git"), "w", encoding="utf-8") as f:
+        wt_git = os.path.join(wt_main, ".git")
+        if os.path.isfile(wt_git):
+            os.unlink(wt_git)
+        with open(wt_git, "w", encoding="utf-8") as f:
             f.write(f"gitdir: {os.path.join(fake_repo, '.git')}\n")
         with self.assertRaises(MeshError) as cm3:
             repos.deliver_to_base(self.repo, "main", self.integ["integration_branch"])
@@ -577,7 +583,7 @@ class TestP2_4ApprovalAndCommittedSideEffect(unittest.TestCase, _GitEnvMixin):
 
     def setUp(self) -> None:
         self._init_git_env()
-        self._tmp = tempfile.TemporaryDirectory(prefix="mh-r3c-p24-", dir="/tmp")
+        self._tmp = tempfile.TemporaryDirectory(prefix="mh-r3c-p24-", dir=temp_root())
         self.addCleanup(self._tmp.cleanup)
         self.fixture.allow_root(self._tmp.name)
         self.home, self.conn, self.repo, self.base_sha, self.integ = _setup_home_and_repo(
@@ -650,6 +656,42 @@ class TestP2_4ApprovalAndCommittedSideEffect(unittest.TestCase, _GitEnvMixin):
         self.assertEqual(
             self.conn.execute("SELECT status FROM approvals WHERE id = ?;", (apr["approval_id"],)).fetchone()["status"],
             "approved",
+        )
+
+    def test_set_lead_unchanged_preserves_evidence_warnings(self) -> None:
+        """PR63 P3-1: idempotent re-set of the same active warn-mode vendor lead keeps warnings."""
+        now = now_iso_utc()
+        missing_bin = os.path.join(self._tmp.name, "missing-codex")
+        with transaction(self.conn):
+            self.conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value_json, updated_at, updated_by) "
+                "VALUES ('lead.vendor_leads', 'true', ?, 'usr_1');",
+                (now,),
+            )
+            self.conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value_json, updated_at, updated_by) "
+                "VALUES ('adapter.evidence_mode', '\"warn\"', ?, 'usr_1');",
+                (now,),
+            )
+            self.conn.execute(
+                "UPDATE agents SET adapter = 'codex', delivery = 'launch', binary_path = ? WHERE id = 'agt_lead';",
+                (missing_bin,),
+            )
+        clean_env = {k: v for k, v in os.environ.items() if k != "MESH_TEST_SMOKE_RESULTS_DIR"}
+        with mock.patch.dict(os.environ, clean_env, clear=True):
+            res = project_handlers.handle_project_set_lead(
+                _ctx(
+                    self.conn,
+                    self.home,
+                    "project.set_lead",
+                    {"project_id": "prj_1", "agent": "lead1", "reason": "idempotent warn"},
+                )
+            )
+        self.assertTrue(res.data["unchanged"])
+        self.assertEqual(res.data["assignment_id"], "asg_1")
+        self.assertTrue(
+            any("no_smoke_evidence" in w and "codex" in w for w in res.warnings),
+            res.warnings,
         )
 
     def test_workspace_delete_tx2_revoked_with_deleted_false_keeps_approval_and_no_event(self) -> None:
@@ -781,7 +823,7 @@ class TestP2_6LogOffloadAndDeliverBudget(unittest.TestCase, _GitEnvMixin):
 
     def setUp(self) -> None:
         self._init_git_env()
-        self._tmp = tempfile.TemporaryDirectory(prefix="mh-r3c-p26-", dir="/tmp")
+        self._tmp = tempfile.TemporaryDirectory(prefix="mh-r3c-p26-", dir=temp_root())
         self.addCleanup(self._tmp.cleanup)
         self.fixture.allow_root(self._tmp.name)
         self.home, self.conn, self.repo, self.base_sha, self.integ = _setup_home_and_repo(
@@ -832,7 +874,7 @@ class TestP2_6LogOffloadAndDeliverBudget(unittest.TestCase, _GitEnvMixin):
             reader_s, writer_s = await asyncio.open_connection(sock=sock_b)
             reader_c, writer_c = await asyncio.open_connection(sock=sock_a)
             with mock.patch("mesh.daemon.server.get_peer_credentials",
-                            return_value=(os.getpid(), os.getuid(), os.getgid())), \
+                            return_value=fake_peer_creds()), \
                     mock.patch("mesh.daemon.server.classify_peer_run_session", return_value=None), \
                     mock.patch.object(srv, "refresh_run_caches"):
                 writer_c.write((json.dumps(payload) + "\n").encode("utf-8"))
@@ -944,7 +986,7 @@ class TestP2_11SetupIntegrationSymlinkAndProjectAuthzFirst(unittest.TestCase, _G
 
     def setUp(self) -> None:
         self._init_git_env()
-        self._tmp = tempfile.TemporaryDirectory(prefix="mh-r3c-p211-", dir="/tmp")
+        self._tmp = tempfile.TemporaryDirectory(prefix="mh-r3c-p211-", dir=temp_root())
         self.addCleanup(self._tmp.cleanup)
         self.fixture.allow_root(self._tmp.name)
         self.home, self.conn, self.repo, self.base_sha, self.integ = _setup_home_and_repo(
@@ -962,7 +1004,8 @@ class TestP2_11SetupIntegrationSymlinkAndProjectAuthzFirst(unittest.TestCase, _G
             repos.setup_integration(self.repo, "prj_sym", self.base_sha, ws_root)
         self.assertEqual(cm.exception.code, c.INVALID_ARGUMENT)
         self.assertEqual(cm.exception.details.get("reason"), "symlink_or_outside_root")
-        self.assertEqual(stat.S_IMODE(os.stat(outside).st_mode), 0o755)
+        if sys.platform != "win32":
+            self.assertEqual(stat.S_IMODE(os.stat(outside).st_mode), 0o755)
         self.assertFalse(os.path.exists(os.path.join(outside, "integration")))
 
     def test_project_handlers_authorize_before_nonexistent_project_not_found(self) -> None:

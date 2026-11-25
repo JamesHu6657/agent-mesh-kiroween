@@ -12,6 +12,9 @@ from unittest import mock
 
 from mesh.core.proc import get_proc_stat
 from mesh.daemon import recovery, supervisor
+from mesh.platform.paths import temp_root
+
+MESH_PROC_LOCK = "shared"
 
 
 class TestCrashHook(unittest.TestCase):
@@ -35,16 +38,16 @@ class TestIdentity(unittest.TestCase):
         self.assertFalse(recovery._identity_alive({"pid": "x"}))
 
     def test_identity_dead_pid(self) -> None:
-        proc = subprocess.Popen(["true"])
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
         proc.wait()
         self.assertFalse(recovery._identity_alive({"pid": proc.pid, "starttime": 0}))
 
 
 class TestRunwrapDelay(unittest.TestCase):
     def _run(self, spec_extra: dict) -> float:
-        run_dir = tempfile.mkdtemp(prefix="mh-rw-")
+        run_dir = tempfile.mkdtemp(prefix="mh-rw-", dir=temp_root())
         self.addCleanup(shutil.rmtree, run_dir, True)
-        spec = {"argv": ["true"], "cwd": run_dir, "stdin": "devnull", "redact_env_names": []}
+        spec = {"argv": [sys.executable, "-c", "pass"], "cwd": run_dir, "stdin": "devnull", "redact_env_names": []}
         spec.update(spec_extra)
         with open(os.path.join(run_dir, "spec.json"), "w", encoding="utf-8") as f:
             json.dump(spec, f)
@@ -72,7 +75,7 @@ class TestTestingModeDefaultHome(unittest.TestCase):
         from mesh.errors import MeshError
 
         with tempfile.TemporaryDirectory() as fake_home:
-            with mock.patch.dict(os.environ, {"HOME": fake_home}):
+            with mock.patch.dict(os.environ, {"HOME": fake_home, "USERPROFILE": fake_home}):
                 default = os.path.join(fake_home, ".agent-mesh")
                 os.makedirs(default, mode=0o700)
                 with self.assertRaises(MeshError) as cm:
@@ -97,6 +100,96 @@ class TestTestingModeDefaultHome(unittest.TestCase):
         from mesh.cli.commands import daemon as daemon_cmd
 
         self.assertGreaterEqual(daemon_cmd.DAEMON_START_WAIT_S, 30.0)
+
+
+class TestRecoveryLogLevels(unittest.TestCase):
+    """Issue 2: clean start logs INFO; WARNING/ERROR only for real recovery problems."""
+
+    def test_clean_start_logs_info_not_error(self) -> None:
+        from mesh.core.db import connect, init_db
+
+        with tempfile.TemporaryDirectory(prefix="mh-rec-log-") as home:
+            os.makedirs(os.path.join(home, "logs"), mode=0o700, exist_ok=True)
+            conn = init_db(os.path.join(home, "mesh.db"))
+            conn.close()
+            conn = connect(os.path.join(home, "mesh.db"))
+            try:
+                summary = recovery.recover(conn, home, "boot_clean_1", testing_mode=True)
+            finally:
+                conn.close()
+
+            self.assertEqual(summary["run_errors"], 0)
+            self.assertEqual(summary["merge_errors"], 0)
+            log_path = os.path.join(home, "logs", "meshd.log")
+            with open(log_path, encoding="utf-8") as f:
+                lines = [ln.strip() for ln in f if ln.strip()]
+            self.assertEqual(len(lines), 1, lines)
+            self.assertIn(" INFO recovery: ", lines[0])
+            self.assertNotIn(" ERROR recovery: ", lines[0])
+            self.assertNotIn(" WARNING recovery: ", lines[0])
+
+    def test_summary_level_classification(self) -> None:
+        zero_summary = {
+            "boot_id": "boot_1",
+            "runs_adopted": 0,
+            "runs_adopted_uncertain": 0,
+            "runs_adopted_past_deadline": 0,
+            "runs_exited": 0,
+            "runs_exit_deferred": 0,
+            "runs_lost": 0,
+            "runs_spawn_failed": 0,
+            "runs_terminating": 0,
+            "run_errors": 0,
+            "merge_runs_killed": 0,
+            "merge_runs_lost": 0,
+            "merge_runs_held": 0,
+            "merges_interrupted": 0,
+            "merges_reconciled": 0,
+            "merge_errors": 0,
+            "workspace_deletes_finalized": 0,
+            "workspace_deletes_rolled_back": 0,
+            "workspace_prunes_finalized": 0,
+            "workspace_prunes_rolled_back": 0,
+            "deliveries_recovered": 0,
+            "agent_leases_extended": 0,
+            "outbox_requeued": 0,
+            "tasks_cancelled": 0,
+            "approvals_expired": 0,
+        }
+        self.assertEqual(recovery._recovery_summary_level(zero_summary), "INFO")
+        self.assertEqual(
+            recovery._recovery_summary_level({**zero_summary, "approvals_expired": 2, "runs_adopted": 1}),
+            "INFO",
+        )
+        for warn_key in (
+            "runs_lost",
+            "runs_spawn_failed",
+            "runs_adopted_uncertain",
+            "runs_terminating",
+            "merges_interrupted",
+            "merge_runs_held",
+            "workspace_deletes_rolled_back",
+        ):
+            self.assertEqual(
+                recovery._recovery_summary_level({**zero_summary, warn_key: 1}),
+                "WARNING",
+                warn_key,
+            )
+        self.assertEqual(recovery._recovery_summary_level({**zero_summary, "run_errors": 1}), "ERROR")
+        self.assertEqual(recovery._recovery_summary_level({**zero_summary, "merge_errors": 1}), "ERROR")
+        self.assertEqual(
+            recovery._recovery_summary_level(zero_summary, {"deliver_intent_errors": 1}),
+            "ERROR",
+        )
+
+    def test_recovery_log_compat_with_two_arg_mock(self) -> None:
+        captured = []
+        with mock.patch.object(supervisor, "_log_meshd", lambda h, m: captured.append((h, m))):
+            recovery._log("/tmp/fake", "clean summary", level="INFO")
+            recovery._log("/tmp/fake", "problem", level="WARNING")
+            recovery._log("/tmp/fake", "failure", level="ERROR")
+        self.assertEqual(len(captured), 3)
+        self.assertTrue(all(msg.startswith("recovery: ") for _, msg in captured))
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ The chmod cases need a non-root uid (root ignores file modes) and are skipped as
 import argparse
 import os
 import stat
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -31,7 +32,7 @@ from mesh.errors import MeshError
 from tests.helpers import rmtree_deep
 from tests.unit.test_home_resolution_r3 import _CwdCase
 
-_IS_ROOT = os.getuid() == 0
+_IS_ROOT = os.getuid() == 0 if sys.platform != "win32" else False
 
 
 def _mode(path: str) -> int:
@@ -48,6 +49,7 @@ def _fd_count() -> int:
     return len(os.listdir("/proc/self/fd"))
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), 'Linux O_PATH/lstat/mode-bit fix-perms tests')
 class _Base(unittest.TestCase):
     def setUp(self) -> None:
         self.base = os.path.realpath(tempfile.mkdtemp(prefix="mesh-r6-"))
@@ -75,6 +77,7 @@ class _Base(unittest.TestCase):
         return doctor._fix_perms(self.home, doctor._home_identity(self.home))
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), 'Linux O_PATH/lstat/mode-bit fix-perms tests')
 class TestRmtreeDeep(unittest.TestCase):
     def test_removes_deep_unreadable_tree_iteratively(self) -> None:
         base = tempfile.mkdtemp(prefix="mesh-r6-deep-")
@@ -97,6 +100,7 @@ class TestRmtreeDeep(unittest.TestCase):
         self.assertTrue(os.path.isdir("/"))
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), 'Linux O_PATH/lstat/mode-bit fix-perms tests')
 @unittest.skipIf(_IS_ROOT, "root ignores file modes; needs a non-root uid")
 class TestHomeBoundToPrecheck(_Base):
     def _outside_twin(self) -> str:
@@ -157,6 +161,7 @@ class TestHomeBoundToPrecheck(_Base):
         self.assertEqual(report.skipped[0]["path"], ".")
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), 'Linux O_PATH/lstat/mode-bit fix-perms tests')
 @unittest.skipIf(_IS_ROOT, "root ignores file modes; needs a non-root uid")
 class TestHardlinks(_Base):
     def test_hardlinked_file_is_skipped(self) -> None:
@@ -177,6 +182,7 @@ class TestHardlinks(_Base):
                     os.unlink(out)
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), 'Linux O_PATH/lstat/mode-bit fix-perms tests')
 @unittest.skipIf(_IS_ROOT, "root ignores file modes; needs a non-root uid")
 class TestReverifyAfterWalk(_Base):
     def test_dir_swapped_mid_walk_is_unsafe(self) -> None:
@@ -209,6 +215,7 @@ class TestReverifyAfterWalk(_Base):
         self.assertEqual(set(report.repaired), {".", "runs", "runs/r1", "runs/r1/f"})
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), 'Linux O_PATH/lstat/mode-bit fix-perms tests')
 @unittest.skipIf(_IS_ROOT, "root ignores file modes; needs a non-root uid")
 class TestReverifyCli(_CwdCase):
     def test_swap_mid_walk_makes_doctor_fail(self) -> None:
@@ -240,6 +247,7 @@ class TestReverifyCli(_CwdCase):
         self.assertIn("runs", [u["path"] for u in cm.exception.details["unsafe"]])
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), 'Linux O_PATH/lstat/mode-bit fix-perms tests')
 @unittest.skipIf(_IS_ROOT, "root ignores file modes; needs a non-root uid")
 class TestNoNameFallback(_Base):
     def test_without_proc_chmod_entries_are_skipped(self) -> None:
@@ -278,6 +286,7 @@ class TestNoNameFallback(_Base):
         self.assertEqual(_mode(self.leaf), 0o644)
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), 'Linux O_PATH/lstat/mode-bit fix-perms tests')
 @unittest.skipIf(_IS_ROOT, "root ignores file modes; needs a non-root uid")
 class TestNoFdLeaks(_Base):
     """Make the Nth call of fstat / open / listdir raise, for every N, and check the
@@ -322,6 +331,7 @@ class TestNoFdLeaks(_Base):
                 self.assertEqual(_fd_count(), before, f"{fname} failing at call {k}")
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), 'Linux O_PATH/lstat/mode-bit fix-perms tests')
 @unittest.skipIf(_IS_ROOT, "root ignores file modes; needs a non-root uid")
 class TestPerEntryUidCheck(_Base):
     def test_entry_owned_by_other_uid_is_left_alone(self) -> None:
@@ -369,6 +379,7 @@ class TestInstallRootInsideHome(unittest.TestCase):
         check_install_path_secure(install_root=inst, home=os.path.join(base, "home2"))
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), 'Linux O_PATH/lstat/mode-bit fix-perms tests')
 @unittest.skipIf(_IS_ROOT, "root ignores file modes; needs a non-root uid")
 class TestInstallRootInHomeLogsCli(_CwdCase):
     def test_doctor_refuses_install_in_home_logs(self) -> None:

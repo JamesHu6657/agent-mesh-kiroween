@@ -3,9 +3,11 @@
 import json
 import os
 import subprocess
+import sys
 import unittest
 
 import mesh.constants as c
+from mesh.core.paths import mesh_cli_argv
 from tests.integration import test_merge as tm
 
 
@@ -23,16 +25,26 @@ class TestBatch7Pr46R4Integration(unittest.TestCase):
     q = tm.TestMerge.q
 
     def _run_with_pipe_passphrase(self, *cli_args: str) -> subprocess.CompletedProcess:
-        r_fd, w_fd = os.pipe()
-        try:
-            os.write(w_fd, (self.harness.passphrase + "\n").encode("utf-8"))
-        finally:
-            os.close(w_fd)
         env = {
             k: v
             for k, v in self.harness.get_env().items()
             if not k.startswith("MESH_PASSPHRASE")
         }
+        if sys.platform == "win32":
+            self.harness._with_direct_pythonpath(env)
+            return subprocess.run(
+                mesh_cli_argv("--home", self.harness.home, *cli_args, "--user", "--passphrase-fd", "0"),
+                input=self.harness.passphrase + "\n",
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        r_fd, w_fd = os.pipe()
+        try:
+            os.write(w_fd, (self.harness.passphrase + "\n").encode("utf-8"))
+        finally:
+            os.close(w_fd)
         try:
             return subprocess.run(
                 [
@@ -84,20 +96,21 @@ class TestBatch7Pr46R4Integration(unittest.TestCase):
             for k, v in self.harness.get_env().items()
             if not k.startswith("MESH_PASSPHRASE")
         }
+        stdin_cmd = (
+            mesh_cli_argv(
+                "--home", self.harness.home, "task", "merge", "--all-accepted",
+                "--project", self.prj, "--user", "--passphrase-fd", "0",
+            )
+            if sys.platform == "win32"
+            else [
+                self.harness.bin_mesh, "--home", self.harness.home, "task", "merge",
+                "--all-accepted", "--project", self.prj, "--user", "--passphrase-fd", "0",
+            ]
+        )
+        if sys.platform == "win32":
+            self.harness._with_direct_pythonpath(env)
         proc_stdin = subprocess.run(
-            [
-                self.harness.bin_mesh,
-                "--home",
-                self.harness.home,
-                "task",
-                "merge",
-                "--all-accepted",
-                "--project",
-                self.prj,
-                "--user",
-                "--passphrase-fd",
-                "0",
-            ],
+            stdin_cmd,
             input=self.harness.passphrase + "\n",
             env=env,
             capture_output=True,

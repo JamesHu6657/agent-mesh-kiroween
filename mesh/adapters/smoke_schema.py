@@ -3,13 +3,24 @@
 Pure: no subprocess, no network. ``validate`` and ``load_latest`` read files only.
 
 Decisions: Q2 (launch cases S-X-1, S-X-6), Q4 (file names), Q13 (smoke model).
+
+Per-adapter rules (smoke-codex-claude-devin), all checked by ``validate``:
+
+* profile: :func:`smoke_profile` (``readonly`` unless the adapter is in ``SMOKE_PROFILES``);
+* stdout capture name: :func:`stdout_capture_name` (``smoke-<case>-stdout.jsonl``, or
+  ``smoke-<case>-stdout.txt`` for an adapter in ``PLAIN_STDOUT_ADAPTERS``);
+* a case in ``UNSUPPORTED_CASES[adapter]`` is never ``pass``.
 """
 
 import hashlib
 import json
 import os
 import re
+import sys
+import tempfile
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from mesh.platform.paths import is_reparse_link, norm_cmp, strip_trailing_seps, temp_root
 
 SCHEMA = "mesh.smoke.v1"
 STATUSES = ("pass", "fail", "observed", "not_applicable", "not_run", "blocked")
@@ -29,6 +40,11 @@ CASE_CAPS: Dict[str, Tuple[str, ...]] = {
     "S-VIBE-9": (),
     "S-AGY-1": (),
     "S-AGY-8": (),
+    # smoke-codex-claude-devin: the shell case of each newer adapter (observation). S-DEVIN-8
+    # runs under devin's smoke profile (unrestricted), the other two under readonly.
+    "S-CODEX-8": (),
+    "S-CLAUDE-8": (),
+    "S-DEVIN-8": (),
 }
 LAUNCH_CASES = ("S-X-1", "S-X-6")
 CASE_IDS = tuple(CASE_CAPS)
@@ -47,7 +63,48 @@ _VERSION_RE = re.compile(r"\d+(?:\.\d+)*\Z")
 _ADAPTER_RE = re.compile(r"[a-z][a-z0-9_]*\Z")
 
 
+#: The profile every smoke run uses unless the adapter is listed in ``SMOKE_PROFILES``.
+DEFAULT_SMOKE_PROFILE = "readonly"
+#: Adapters that cannot run ``readonly`` -> the one profile their smoke runs use. devin: only
+#: ``unrestricted`` is mapped (readonly and edit raise PROFILE_UNSUPPORTED, measured 2026-11-19,
+#: docs/adapters-devin.md), so its results say ``unrestricted`` and never claim a readonly run.
+SMOKE_PROFILES: Dict[str, str] = {"devin": "unrestricted"}
+#: Adapters whose stdout is plain text, not a JSON stream (``stream_output`` is ``no``): their
+#: stdout capture is ``smoke-<case>-stdout.txt``.
+PLAIN_STDOUT_ADAPTERS = frozenset({"devin"})
+#: Cases that cannot apply to an adapter: every capability the case maps to (``CASE_CAPS``) is
+#: ``supported: "no"`` there. devin has no session id and no effort flag; vibe has no effort
+#: flag. Such a case is recorded ``not_applicable`` and ``validate`` refuses it as ``pass``.
+UNSUPPORTED_CASES: Dict[str, Tuple[str, ...]] = {
+    "devin": ("S-X-2", "S-X-3", "S-X-5"),
+    "vibe": ("S-X-5",),
+}
+
+_STDOUT_SUFFIXES = ("-stdout.jsonl", "-stdout.txt")
 _FIXTURE_NAME_RE = re.compile(r"smoke-S-[A-Z0-9-]+-stdout\.jsonl\Z")
+_PLAIN_FIXTURE_NAME_RE = re.compile(r"smoke-S-[A-Z0-9-]+-stdout\.txt\Z")
+
+
+def smoke_profile(adapter: str) -> str:
+    """The permission profile a smoke run of ``adapter`` uses and its results doc records."""
+    return SMOKE_PROFILES.get(adapter, DEFAULT_SMOKE_PROFILE)
+
+
+def stdout_capture_name(adapter: str, case_id: str) -> str:
+    """File name of a case's redacted stdout capture: ``.txt`` for plain-text stdout."""
+    return f"smoke-{case_id}-stdout.{'txt' if adapter in PLAIN_STDOUT_ADAPTERS else 'jsonl'}"
+
+
+def stderr_capture_name(case_id: str) -> str:
+    return f"smoke-{case_id}-stderr.txt"
+
+
+def capture_stem(stdout_name: str) -> str:
+    """``smoke-<case>`` of a stdout capture name (either suffix); other names unchanged."""
+    for suffix in _STDOUT_SUFFIXES:
+        if stdout_name.endswith(suffix):
+            return stdout_name[:-len(suffix)]
+    return stdout_name
 
 
 def version_ok(version: str) -> bool:
@@ -75,19 +132,35 @@ def _sha_file(path: str) -> str:
 
 
 def _has_symlink(path: str, root: Optional[str] = None) -> Optional[str]:
-    if os.path.islink(path):
+    if is_reparse_link(path):
         return f"symlink not allowed: {path}"
     cur = os.path.dirname(os.path.abspath(path))
-    stop = os.path.abspath(root).rstrip(os.sep) if root else None
+    if root:
+        stop_raw = strip_trailing_seps(root)
+        stop = norm_cmp(os.path.abspath(stop_raw))
+    else:
+        stop = None
+    stop_roots = {
+        norm_cmp(temp_root()),
+        "/tmp",
+        "/var",
+        "/private",
+        "/private/tmp",
+        "/private/var",
+        "/home",
+    }
+    if sys.platform == "win32":
+        stop_roots.add(norm_cmp(os.path.abspath(tempfile.gettempdir())))
     while cur and cur != os.path.dirname(cur):
-        if stop is not None and cur.rstrip(os.sep) == stop:
+        cur_cmp = norm_cmp(strip_trailing_seps(cur))
+        if stop is not None and cur_cmp == stop:
             break
-        if stop is None and cur in ("/tmp", "/var", "/private", "/private/tmp", "/private/var", "/home"):
+        if stop is None and cur_cmp in stop_roots:
             break
-        if os.path.islink(cur):
+        if is_reparse_link(cur):
             return f"symlinked directory not allowed: {cur}"
         cur = os.path.dirname(cur)
-    if root and os.path.islink(root.rstrip(os.sep) or root):
+    if root and is_reparse_link(root):
         return f"symlinked root directory not allowed: {root}"
     return None
 
@@ -158,8 +231,9 @@ def validate(doc: Any, repo_root: str, fixture_root: Optional[str] = None) -> Li
         errs.append("captured_at_utc must be YYYY-MM-DDTHH:MM:SSZ")
     if doc.get("effort") is not None and not (isinstance(doc["effort"], str) and doc["effort"]):
         errs.append("effort must be a string or null")
-    if doc.get("profile") != "readonly":
-        errs.append("profile must be 'readonly'")
+    expected_profile = smoke_profile(adapter) if adapter else DEFAULT_SMOKE_PROFILE
+    if doc.get("profile") != expected_profile:
+        errs.append(f"profile must be '{expected_profile}'")
     if not _is_num(doc.get("timeout_s")) or doc.get("timeout_s", 0) <= 0:
         errs.append("timeout_s must be a positive number")
     cases = doc.get("cases")
@@ -194,6 +268,8 @@ def validate(doc: Any, repo_root: str, fixture_root: Optional[str] = None) -> Li
             errs.append(f"{where}: status must be one of {list(STATUSES)}")
         if status != "pass" and status is not None and status in STATUSES and status != "observed" and not case.get("reason"):
             errs.append(f"{where}: status {status} needs a reason")
+        if status == "pass" and adapter is not None and cid in UNSUPPORTED_CASES.get(adapter, ()):
+            errs.append(f"{where}: {cid} cannot pass for {adapter} (unsupported capability)")
         for key in ("reason", "observation"):
             if case.get(key) is not None and not isinstance(case.get(key), (str, dict)):
                 errs.append(f"{where}: {key} must be a string, object or null")
@@ -226,8 +302,10 @@ def validate(doc: Any, repo_root: str, fixture_root: Optional[str] = None) -> Li
                 or adapter is None or version is None or parts[3] != adapter or parts[4] != version):
             errs.append(f"{where}: fixture outside {FIXTURE_PREFIX}{adapter}/{version}/: {fx}")
             continue
-        if not _FIXTURE_NAME_RE.match(parts[5]):
-            errs.append(f"{where}: fixture must be a smoke-S-*-stdout.jsonl capture: {fx}")
+        name_re = _PLAIN_FIXTURE_NAME_RE if adapter in PLAIN_STDOUT_ADAPTERS else _FIXTURE_NAME_RE
+        if not name_re.match(parts[5]):
+            kind = "txt" if adapter in PLAIN_STDOUT_ADAPTERS else "jsonl"
+            errs.append(f"{where}: fixture must be a smoke-S-*-stdout.{kind} capture: {fx}")
             continue
         check_root = root if fixture_root else os.path.abspath(repo_root)
         path = os.path.join(root, adapter, version, parts[5])

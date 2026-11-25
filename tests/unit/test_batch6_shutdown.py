@@ -7,6 +7,7 @@ import re
 import shutil
 import socket
 import sqlite3
+import sys
 import tempfile
 import time
 import unittest
@@ -77,8 +78,15 @@ class TestShutdownDrain(unittest.TestCase):
             srv._lead_merge_tasks.add(lm)
             lm.add_done_callback(srv._lead_merge_tasks.discard)
             # A connected client that never sends its request (a long poll stand-in).
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            await asyncio.get_running_loop().sock_connect(sock, os.path.join(self.home, "run", "mesh.sock"))
+            if sys.platform == "win32":
+                from mesh.platform import ipc
+
+                sock = await asyncio.to_thread(
+                    ipc.connect_endpoint, ipc.daemon_endpoint_path(self.home), 5.0
+                )
+            else:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                await asyncio.get_running_loop().sock_connect(sock, os.path.join(self.home, "run", "mesh.sock"))
             for _ in range(200):
                 if srv._client_tasks:
                     break
@@ -95,7 +103,12 @@ class TestShutdownDrain(unittest.TestCase):
         self.assertLess(order.index("record_stop"), order.index("release_lock"))
         self.assertIsNone(srv.db_conn)
         self.assertEqual(srv._client_tasks, set())
-        self.assertFalse(os.path.exists(os.path.join(self.home, "run", "mesh.sock")))
+        if sys.platform == "win32":
+            from mesh.platform import ipc
+
+            self.assertFalse(ipc.probe_daemon_endpoint(self.home, timeout=0.2))
+        else:
+            self.assertFalse(os.path.exists(os.path.join(self.home, "run", "mesh.sock")))
 
     def test_no_new_lead_merge_once_stopping(self):
         srv = DaemonServer(self.home, testing_mode=True)
@@ -283,17 +296,29 @@ class TestShutdownDrain(unittest.TestCase):
         self.assertTrue(got.get("aborted"))
 
     def test_cli_sees_lock_held(self):
-        import fcntl
         from mesh.cli.commands.daemon import _meshd_lock_held
         self.assertFalse(_meshd_lock_held(self.home))
         path = os.path.join(self.home, "run", "meshd.lock")
-        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-        self.addCleanup(os.close, fd)
-        self.assertFalse(_meshd_lock_held(self.home))
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        self.assertTrue(_meshd_lock_held(self.home))
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        self.assertFalse(_meshd_lock_held(self.home))
+        if sys.platform == "win32":
+            from mesh.platform import locks
+
+            fd = locks.open_lock_file(path)
+            self.addCleanup(os.close, fd)
+            self.assertFalse(_meshd_lock_held(self.home))
+            locks.acquire_lock(fd, exclusive=True, blocking=False)
+            self.assertTrue(_meshd_lock_held(self.home))
+            locks.release_lock(fd)
+            self.assertFalse(_meshd_lock_held(self.home))
+        else:
+            import fcntl
+
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+            self.addCleanup(os.close, fd)
+            self.assertFalse(_meshd_lock_held(self.home))
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertTrue(_meshd_lock_held(self.home))
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            self.assertFalse(_meshd_lock_held(self.home))
 
     def test_cli_stop_reports_stopping_while_lock_held(self):
         import argparse
@@ -443,6 +468,7 @@ class TestTmpGitleaksNotSymlink(unittest.TestCase):
             self.assertIn("[ -O /tmp/gitleaks ]", lines[0], rel)
             self.assertTrue(re.search(r'GL="\$\{GITLEAKS:-', src), rel)
 
+    @unittest.skipUnless(sys.platform != "win32", "POSIX bash/symlink test expression check")
     def test_condition_behaviour(self):
         # The same test expression, against a temp path standing in for /tmp/gitleaks.
         d = tempfile.mkdtemp(prefix="mb6gl-")

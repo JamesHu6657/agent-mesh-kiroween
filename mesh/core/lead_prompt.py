@@ -67,6 +67,9 @@ CRITERION_CUT = 500
 #: Steps 6–9: fixed cuts for fields that have no per-item bound of their own.
 TASK_TITLE_CUT = 200
 APPROVAL_SUMMARY_CUT = 500
+CHAT_BODY_CUT = 500
+CHAT_KEEP_MIN = 6
+PLAN_STEP_TITLE_CUT = 160
 
 #: Step 0: fixed cuts applied at entry, before anything is rendered.
 NAME_CUT = 200
@@ -152,6 +155,11 @@ class LeadPromptInput:
     messages: List[Dict[str, Any]] = field(default_factory=list)
     authority: Dict[str, Any] = field(default_factory=dict)
     limit_bytes: int = 100_000
+    workers: List[Dict[str, Any]] = field(default_factory=list)
+    active_plan: Optional[Dict[str, Any]] = None
+    chat_messages: List[Dict[str, Any]] = field(default_factory=list)
+    plan_gate_mode: str = "off"
+    permission_mode: str = "plan"
 
 
 @dataclass
@@ -201,10 +209,13 @@ def _cut_field(value: Any, limit: int) -> str:
 VARIABLE_SECTIONS = (
     "## Goal",
     "## Acceptance criteria",
+    "## Available workers",
+    "## Active plan & pending approvals",
     "## Tasks",
     "## Open approvals",
     "## Notes",
     "## Recent events",
+    "## Recent conversation",
     "## Pending messages",
 )
 
@@ -333,6 +344,73 @@ def _approval_line(approval: Dict[str, Any]) -> str:
     )
 
 
+def _worker_line(worker: Dict[str, Any]) -> str:
+    profs = ",".join(str(p) for p in (worker.get("supported_profiles") or [])) or "-"
+    models = ",".join(str(m) for m in (worker.get("allowed_models") or [])[:6]) or "(any)"
+    return "- %s (adapter=%s, delivery=%s, default_profile=%s, max_unapproved=%s, profiles=[%s], models=[%s])" % (
+        worker.get("name", ""),
+        worker.get("adapter", ""),
+        worker.get("delivery", ""),
+        worker.get("default_profile", ""),
+        worker.get("max_unapproved_profile", ""),
+        profs,
+        models,
+    )
+
+
+def _chat_line(msg: Dict[str, Any]) -> str:
+    def _one_line(val: Any) -> str:
+        return str(val).replace("\r", " ").replace("\n", " ").replace("\u2028", " ").replace("\u2029", " ")
+
+    role = _one_line(msg.get("role", ""))
+    via = _one_line(msg.get("via", ""))
+    if via == "relayed":
+        relayer = _one_line(msg.get("relayed_by_name") or msg.get("actor_name") or msg.get("actor_id") or "relay")
+        role_display = "%s [RELAYED via %s]" % (role, relayer)
+    else:
+        role_display = role
+    body = json.dumps(str(msg.get("body", "")), ensure_ascii=False).replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+    return "- [%s] %s (%s, via=%s, kind=%s): %s" % (
+        _one_line(msg.get("id", "")),
+        role_display,
+        _one_line(msg.get("created_at", "")),
+        via,
+        _one_line(msg.get("kind", "text")),
+        body,
+    )
+
+
+def _active_plan_lines(plan: Dict[str, Any], include_steps: bool = True) -> List[str]:
+    lines: List[str] = [
+        "- plan_id=%s v%s status=%s plan_hash=%s" % (
+            plan.get("id", ""),
+            plan.get("version", ""),
+            plan.get("status", ""),
+            plan.get("plan_hash", ""),
+        ),
+        "- title: %s" % (plan.get("title", ""),),
+    ]
+    if plan.get("approval_id"):
+        apr_status = plan.get("approval_status") or ""
+        lines.append("- approval_id=%s (status=%s)" % (
+            plan.get("approval_id", ""),
+            apr_status,
+        ))
+    if include_steps and plan.get("steps"):
+        for step in plan["steps"]:
+            deps = ",".join(step.get("depends_on") or []) or "-"
+            esc = " [REQUIRES_ESCALATION]" if step.get("requires_escalation") else ""
+            lines.append("  - %s: %s (assignee=%s, profile=%s, deps=%s)%s" % (
+                step.get("key", ""),
+                step.get("title", ""),
+                step.get("assignee", ""),
+                step.get("profile", ""),
+                deps,
+                esc,
+            ))
+    return lines
+
+
 def _authority_lines(authority: Dict[str, Any], omitted: Dict[str, int]) -> List[str]:
     """The authority rules, bounded in total to `AUTHORITY_BYTE_BUDGET` bytes.
 
@@ -430,8 +508,8 @@ def _authority_lines(authority: Dict[str, Any], omitted: Dict[str, int]) -> List
     return fixed + kept_models
 
 
-def _actions_schema_lines() -> List[str]:
-    return [
+def _actions_schema_lines(plan_gate_mode: str = "off", permission_mode: str = "plan") -> List[str]:
+    lines = [
         "## Actions",
         "",
         "End your final answer with at most one fenced block whose info string is exactly",
@@ -449,6 +527,26 @@ def _actions_schema_lines() -> List[str]:
         "```json",
         json.dumps({"cmd": ALLOWED_ACTION_CMDS[0], "args": {}}, ensure_ascii=False),
         "```",
+    ]
+    if plan_gate_mode == "require_approval":
+        mode_rule = {
+            "supervised": "- Permission mode is `supervised`: every dispatched step needs a card approval before running (`task.assign` requires `step_dispatch` or `permission_escalation` approval). Never bypass with raw `task.create` or rewrite dispatched plan tasks.",
+            "plan": "- Permission mode is `plan`: propose a plan (`plan.propose`), tell the user to click the inline approval card (允许 / 始终允许 / 拒绝), and once approved call `plan.dispatch`. Never call `task.create`/`task.assign` directly before plan approval or rewrite dispatched plan tasks.",
+            "auto": "- Permission mode is `auto`: plans and `retry_over_limit` run automatically without plan approval (`plan.propose` -> `plan.dispatch` or direct `task.create`). Note: `permission_escalation` STILL requires a card approval or an exact-scope standing grant.",
+        }.get(permission_mode, "- Permission mode is `plan`: propose a plan and wait for the user to approve the card.")
+        lines.extend([
+            "",
+            "### Chat & Plan Protocol",
+            "",
+            "- Plain text is private scratchpad; only `chat.reply` is shown to the user.",
+            "- Approvals happen ONLY via inline approval cards (buttons: 允许 / 始终允许 / 拒绝). Chat text NEVER approves anything — NEVER ask the user to type '可以'/'ok'/'approve' or any short code. Always tell the user to use the inline approval card.",
+            mode_rule,
+            "- You may ask clarifying questions in chat via `chat.reply(kind='clarification')`, and revise plans by calling `plan.propose` again.",
+            "- To propose/revise a plan: emit `chat.reply` + `plan.propose` with `{title, summary, steps:[{key,title,spec,kind,assignee,profile,model,depends_on}]}` using only listed workers (never assign yourself).",
+            "- When `active_plan.status == approved_pending_dispatch`: call `plan.dispatch` with `{plan_id}` (and top-level `approval` when `active_plan.approval_id` is present) and optionally a short `chat.reply(kind='dispatch_notice', plan_id=active_plan.id, text=...)`.",
+            "- When a `permission_escalation`, `step_dispatch`, or `retry_over_limit` card is pending: explain why briefly in `chat.reply` and ask the user to click 允许 / 始终允许 / 拒绝 on the card (for `config` cards, 允许 / 拒绝 — config writes are direct-user-only).",
+        ])
+    lines.extend([
         "",
         "## Completion report",
         "",
@@ -457,7 +555,8 @@ def _actions_schema_lines() -> List[str]:
         "```json",
         COMPLETE_REPORT_FORMAT,
         "```",
-    ]
+    ])
+    return lines
 
 
 def _render(
@@ -474,6 +573,10 @@ def _render(
     authority_lines: List[str],
     omitted: Dict[str, int],
     last_resort: bool,
+    workers: Optional[List[Dict[str, Any]]] = None,
+    active_plan: Optional[Dict[str, Any]] = None,
+    active_plan_steps: bool = True,
+    chat_messages: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     project = inp.project or {}
     lines: List[str] = []
@@ -510,6 +613,27 @@ def _render(
             "Criteria not listed: %d (see `mesh project show`)." % (omitted["criteria"],)
         )
     lines.append("")
+
+    # 3b. Available workers (Chat-First: emitted when provided or plan_gate_mode active)
+    if workers or inp.plan_gate_mode == "require_approval":
+        lines.append("## Available workers")
+        lines.append("")
+        if workers:
+            for w in workers:
+                lines.append(_worker_line(w))
+        else:
+            lines.append("- (none)")
+        lines.append("")
+
+    # 3c. Active plan & pending approvals (Chat-First)
+    if active_plan is not None or inp.plan_gate_mode == "require_approval":
+        lines.append("## Active plan & pending approvals")
+        lines.append("")
+        if active_plan is not None:
+            lines.extend(_active_plan_lines(active_plan, include_steps=active_plan_steps))
+        else:
+            lines.append("- (no active plan)")
+        lines.append("")
 
     # 4. Task table.
     lines.append("## Tasks")
@@ -570,6 +694,17 @@ def _render(
         lines.append("- (none)")
     lines.append("")
 
+    # 7b. Recent conversation (Chat-First)
+    if chat_messages or inp.plan_gate_mode == "require_approval":
+        lines.append("## Recent conversation")
+        lines.append("")
+        if chat_messages:
+            for cm in chat_messages:
+                lines.append(_chat_line(cm))
+        else:
+            lines.append("- (none)")
+        lines.append("")
+
     # 8. Pending messages as JSON.
     lines.append("## Pending messages")
     lines.append("")
@@ -585,7 +720,7 @@ def _render(
     lines.append("")
 
     # 10. The mesh-actions schema and the completion report format.
-    lines.extend(_actions_schema_lines())
+    lines.extend(_actions_schema_lines(inp.plan_gate_mode, inp.permission_mode))
     lines.append("")
 
     # 11. What was omitted.
@@ -633,6 +768,14 @@ def render_lead_prompt(inp: LeadPromptInput) -> RenderedLeadPrompt:
     bodies = [_message_body(m) for m in kept_messages]
     kept_approvals = [_copy_approval(approval) for approval in approvals]
     criteria = [_copy_criterion(criterion) for criterion in criteria]
+    kept_workers = [dict(w) for w in (inp.workers or [])]
+    kept_chat = [dict(cm) for cm in (inp.chat_messages or [])]
+    kept_plan: Optional[Dict[str, Any]] = None
+    if inp.active_plan is not None:
+        kept_plan = dict(inp.active_plan)
+        if isinstance(kept_plan.get("steps"), list):
+            kept_plan["steps"] = [dict(s) for s in kept_plan["steps"]]
+    active_plan_steps = True
     cut_message = False
 
     def cut_field(record: Dict[str, Any], key: str, limit: int, counter: str) -> None:
@@ -659,6 +802,15 @@ def render_lead_prompt(inp: LeadPromptInput) -> RenderedLeadPrompt:
     for message in kept_messages:
         for key in ("id", "type", "sender", "created_at"):
             cut_field(message, key, MESSAGE_FIELD_CUT, "message_fields_cut")
+    for cm in kept_chat:
+        cut_field(cm, "id", ID_CUT, "chat_fields_cut")
+        cut_field(cm, "body", CHAT_BODY_CUT, "chat_bodies_cut")
+    for w in kept_workers:
+        cut_field(w, "name", NAME_CUT, "worker_fields_cut")
+    if kept_plan is not None:
+        cut_field(kept_plan, "title", TASK_TITLE_CUT, "plan_fields_cut")
+        for step in (kept_plan.get("steps") or []):
+            cut_field(step, "title", PLAN_STEP_TITLE_CUT, "plan_step_titles_cut")
     if len(str(project.get("name", ""))) > NAME_CUT:
         omitted["project_name_cut"] = 1
     if len(str(project.get("id", ""))) > ID_CUT:
@@ -683,6 +835,10 @@ def render_lead_prompt(inp: LeadPromptInput) -> RenderedLeadPrompt:
             authority_lines,
             omitted,
             last_resort,
+            workers=kept_workers,
+            active_plan=kept_plan,
+            active_plan_steps=active_plan_steps,
+            chat_messages=kept_chat,
         )
 
     def build_without_messages() -> str:
@@ -701,6 +857,10 @@ def render_lead_prompt(inp: LeadPromptInput) -> RenderedLeadPrompt:
             authority_lines,
             omitted,
             last_resort,
+            workers=kept_workers,
+            active_plan=kept_plan,
+            active_plan_steps=active_plan_steps,
+            chat_messages=kept_chat,
         )
 
     text = build()
@@ -722,6 +882,14 @@ def render_lead_prompt(inp: LeadPromptInput) -> RenderedLeadPrompt:
         omitted["notes"] = omitted.get("notes", 0) + batch
         text = build()
 
+    # 2b. Drop oldest chat messages down to CHAT_KEEP_MIN (keep latest 6).
+    while _size(text) > limit and len(kept_chat) > CHAT_KEEP_MIN:
+        excess = len(kept_chat) - CHAT_KEEP_MIN
+        batch = min(max(1, excess // 2), excess)
+        del kept_chat[:batch]
+        omitted["chat_messages"] = omitted.get("chat_messages", 0) + batch
+        text = build()
+
     # 3. Drop terminal tasks, replaced by per-status counts.
     if _size(text) > limit:
         remaining = []
@@ -735,6 +903,20 @@ def render_lead_prompt(inp: LeadPromptInput) -> RenderedLeadPrompt:
             else:
                 remaining.append(task)
         kept_tasks = remaining
+        text = build()
+
+    # 3b. Under pressure, drop older chat messages down to latest 1, then excess workers, then plan step detail.
+    while _size(text) > limit and len(kept_chat) > 1:
+        del kept_chat[0]
+        omitted["chat_messages"] = omitted.get("chat_messages", 0) + 1
+        text = build()
+    while _size(text) > limit and len(kept_workers) > 1:
+        kept_workers.pop()
+        omitted["workers"] = omitted.get("workers", 0) + 1
+        text = build()
+    if _size(text) > limit and kept_plan is not None and active_plan_steps and kept_plan.get("steps"):
+        active_plan_steps = False
+        omitted["plan_steps"] = len(kept_plan.get("steps") or [])
         text = build()
 
     # 4. Take fewer pending messages, oldest first, at least one.
@@ -896,6 +1078,8 @@ def render_lead_prompt(inp: LeadPromptInput) -> RenderedLeadPrompt:
         for key, kept in (
             ("events", kept_events),
             ("notes", kept_notes),
+            ("chat_messages", kept_chat),
+            ("workers", kept_workers),
             ("tasks", kept_tasks),
             ("approvals", kept_approvals),
             ("criteria", criteria),
@@ -905,6 +1089,9 @@ def render_lead_prompt(inp: LeadPromptInput) -> RenderedLeadPrompt:
                 omitted[key] = omitted.get(key, 0) + len(kept)
                 del kept[:]
         bodies = []
+        if kept_plan is not None:
+            kept_plan = None
+            omitted["active_plan"] = 1
         if _size(goal) > GOAL_BYTE_BUDGET:
             goal = _cut_bytes(goal, GOAL_BYTE_BUDGET)
             omitted["goal_cut"] = 1

@@ -116,6 +116,7 @@ def _no_sleep(*_a, **_k):
     raise AssertionError("slept on the scheduler path")
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX real-process SIGTERM/SIGKILL/zombie /proc test base (Windows Job/process termination covered in test_win_close_gate_jobs)")
 class RealProcBase(unittest.TestCase):
     def setUp(self):
         self._procs = []
@@ -177,7 +178,7 @@ class TestClearCheck(unittest.TestCase):
         with mock.patch.object(terminate, "run_targets", return_value={}):
             self.assertEqual(terminate.step(t), "pending")
             self.assertEqual(terminate.step(t), "pending")  # same poll
-            t.empty_scan_at = time.monotonic() - terminate.POLL_S
+            t.empty_scan_at = time.monotonic() - terminate.POLL_S - 1e-3
             self.assertEqual(terminate.step(t), "done")
 
     def test_step_hit_between_empty_scans_resets(self):
@@ -196,6 +197,7 @@ class TestClearCheck(unittest.TestCase):
             self.assertEqual(terminate.step(t), "done")     # 0.3 s after that one
 
 
+@unittest.skipUnless(sys.platform != "win32", "Linux /proc closure codepath (_run_targets_inner) tested via FakeProc (Windows Toolhelp/Job scan tested in test_platform_win_jobs)")
 class TestClosureFakeProc(unittest.TestCase):
     """Descendant closure, confirmed identity and safety on a fake /proc table."""
 
@@ -312,6 +314,7 @@ class TestClosureFakeProc(unittest.TestCase):
             self.assertEqual(terminate.step(t), "pending")
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX SIGTERM SIG_IGN, /proc environ, and state=='Z' reaper loop (Windows Job/termination loop covered in test_win_close_gate_jobs)")
 class TestFullLoopRealProcesses(RealProcBase):
     """L-MINOR: UNKNOWN -> found -> parent exits / re-parented -> SIGKILL -> dead -> done."""
 
@@ -407,7 +410,7 @@ class TestFullLoopRealProcesses(RealProcBase):
 
 def _kill_quiet(pid):
     try:
-        os.kill(pid, signal.SIGKILL)
+        os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
     except (ProcessLookupError, PermissionError):
         pass
 
@@ -469,17 +472,18 @@ class TestWatchTickPath(unittest.TestCase):
             self.assertIsNone(self._tick())  # same poll: still open, lease renewed
         self.assertEqual(len(self.renewed), 2)
         self.assertEqual(self.reaped, [])  # wrapper unreaped until confirmed
-        time.sleep(terminate.POLL_S)
+        time.sleep(terminate.POLL_S + (0.05 if sys.platform == "win32" else 0.0))
         self.assertEqual(self._tick(), "closing")
 
     def test_changed_tick_invalidates_then_closes(self):
+        wait_s = terminate.POLL_S + (0.05 if sys.platform == "win32" else 0.0)
         self.assertIsNone(self._tick())
-        time.sleep(terminate.POLL_S)
+        time.sleep(wait_s)
         self.changed[0] = True
         self.assertIsNone(self._tick())  # a changed-seen tick never confirms
         self.changed[0] = False
         self.assertIsNone(self._tick())  # first empty scan again
-        time.sleep(terminate.POLL_S)
+        time.sleep(wait_s)
         self.assertEqual(self._tick(), "closing")
 
     def test_hit_between_scans_resets(self):
@@ -489,6 +493,17 @@ class TestWatchTickPath(unittest.TestCase):
             self.assertEqual(self._tick(), "closing")
         self.assertNotIn(f"run_w{_RUN_SFX}", supervisor._CLEAR)
 
+    @staticmethod
+    def _sleep_past_poll() -> None:
+        # Windows Sleep can wake slightly early relative to QueryPerformanceCounter; loop
+        # until monotonic time strictly crosses POLL_S so the next scan confirms closure.
+        deadline = time.monotonic() + terminate.POLL_S + (0.05 if sys.platform == "win32" else 0.0)
+        while True:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                break
+            time.sleep(rem)
+
     def test_run_eventually_closes(self):
         """Q1 regression: empty scans a poll apart close the run within a few ticks."""
         outcomes = []
@@ -496,7 +511,7 @@ class TestWatchTickPath(unittest.TestCase):
             outcomes.append(self._tick())
             if outcomes[-1] == "closing":
                 break
-            time.sleep(terminate.POLL_S)
+            self._sleep_past_poll()
         self.assertEqual(outcomes, [None, "closing"])
 
     def test_confirm_pending_exits_takes_the_second_scan(self):
@@ -506,7 +521,7 @@ class TestWatchTickPath(unittest.TestCase):
         with mock.patch.object(supervisor, "_watch_one", side_effect=lambda c, h, r: self._tick()) as w:
             self.assertEqual(supervisor.confirm_pending_exits(self.conn, "/tmp"), [])
             w.assert_not_called()  # not due yet
-            time.sleep(terminate.POLL_S)
+            self._sleep_past_poll()
             self.assertEqual(supervisor.confirm_pending_exits(self.conn, "/tmp"), [f"run_w{_RUN_SFX}"])
 
 
@@ -560,6 +575,7 @@ class _HandoffRace:
         return found
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX setsid/sh/killpg escapee handoff window (Windows Job Objects prevent breakaway; covered in test_win_close_gate_jobs)")
 class TestHandoffWindow(unittest.TestCase):
     """P (MESH_RUN_ID) has a setsid child C with an empty environ (UNKNOWN). The watch
     scan finds C through P; P exits before begin() scans; begin() must still get C."""
@@ -683,6 +699,7 @@ class TestLeadTurnTwoScanGate(unittest.TestCase):
         with mock.patch.object(supervisor, "wrapper_alive", return_value=False), \
                 mock.patch.object(supervisor, "_read_json_file", return_value={"exit_code": 0}), \
                 mock.patch.object(terminate, "run_targets", return_value={}), \
+                mock.patch.object(supervisor, "close_gate"), \
                 mock.patch.object(terminate, "time", types.SimpleNamespace(monotonic=lambda: clock[0], sleep=time.sleep)), \
                 mock.patch.object(supervisor, "_renew_lead_turn_lease") as renew, \
                 mock.patch.object(supervisor, "_reap_wrapper") as reap, \
@@ -735,6 +752,48 @@ class TestRecoveryConfirmingScan(unittest.TestCase):
         self.assertEqual(state["watches"], 2)
         self.assertEqual(state["status"], "succeeded")
 
+    def test_exit_json_run_closed_by_recovery_handles_early_sleep_wakeup(self):
+        tmp = tempfile.mkdtemp(prefix="mh-rce-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        with open(os.path.join(tmp, "exit.json"), "w", encoding="utf-8") as f:
+            f.write('{"exit_code": 0}')
+        supervisor._CLEAR.clear()
+        self.addCleanup(supervisor._CLEAR.clear)
+        state = {"status": "running", "watches": 0}
+        now_box = [100.0]
+        sleeps = []
+
+        def fake_monotonic():
+            return now_box[0]
+
+        def fake_sleep(dt):
+            sleeps.append(dt)
+            # First wakeup returns 1ms early (mimicking Win32 sleep timer jitter); second reaches deadline.
+            now_box[0] += dt - 0.001 if len(sleeps) == 1 else dt
+
+        def row(_conn, run_id):
+            return {"id": run_id, "status": state["status"], "run_dir": tmp, "wrapper_pid": 77,
+                    "pgid": 77, "kind": "task", "lease_holder": "old"}
+
+        def watch(_conn, _home, run):
+            state["watches"] += 1
+            if supervisor._clear_check(run["id"]).observe({}, now=now_box[0]):
+                supervisor._CLEAR.pop(run["id"], None)
+                state["status"] = "succeeded"
+
+        conn = mock.Mock()
+        with mock.patch.object(recovery, "_reload_run", side_effect=row), \
+                mock.patch.object(recovery, "transaction", lambda c: contextlib.nullcontext()), \
+                mock.patch.object(recovery, "_identity_alive", return_value=False), \
+                mock.patch.object(supervisor, "_watch_one", side_effect=watch), \
+                mock.patch.object(terminate, "POLL_S", 0.02), \
+                mock.patch.object(recovery.time, "monotonic", side_effect=fake_monotonic), \
+                mock.patch.object(recovery.time, "sleep", side_effect=fake_sleep):
+            out = recovery._recover_run(conn, "/tmp", {"id": f"run_rce{_RUN_SFX}", "lease_holder": "old"}, "boot")
+        self.assertEqual(out, "exited")
+        self.assertEqual(state["watches"], 2)
+        self.assertGreaterEqual(len(sleeps), 2)
+
 
 class TestTerminationLoopPendingExits(unittest.TestCase):
     """M17: meshd's 200 ms loop also runs while only an exit confirmation is pending."""
@@ -779,6 +838,7 @@ class TestTerminationLoopPendingExits(unittest.TestCase):
         self.assertAlmostEqual(supervisor.next_exit_check_in(now=10.5), 9.95 + terminate.POLL_S - 10.5)
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX sh/setsid escaped carrier recheck (Windows merge Job isolation covered in test_win_close_gate_jobs)")
 class TestMergeTestStepRecheck(unittest.TestCase):
     """M18: the merge test step does not conclude "no leftovers" from one empty scan."""
 
@@ -1023,6 +1083,7 @@ class _ExecRace:
         return found
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX os.execve(..., {}) carrier race (Windows PEB/Job carrier recovery covered in test_win_close_gate_jobs)")
 class TestRecoveryHandoffWindow(unittest.TestCase):
     """L1 handoff at the two recovery sites: recovery._lost -> _terminate_carriers and
     merge.recover_merge_runs. The carrier is found, then exec's to env={} before begin()."""
@@ -1081,6 +1142,7 @@ class TestRecoveryHandoffWindow(unittest.TestCase):
         self.assertTrue(_gone_or_zombie(p.pid))
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX setsid/sh/env-stripped carrier first-scan handoff (Windows Job carrier recovery covered in test_win_close_gate_jobs)")
 class TestRecoverRunFirstScanHandoff(unittest.TestCase):
     """Linear #20c MAJOR: _recover_run (no wrapper.json) finds P (MESH_RUN_ID) and its
     setsid env={} child C; P exits while recovery waits for the wrapper; _lost's own scan

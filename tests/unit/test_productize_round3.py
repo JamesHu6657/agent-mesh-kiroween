@@ -78,14 +78,21 @@ class TestShimPerInstall(_Tmp):
         from mesh.core import paths
 
         dirs = []
-        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": self.tmp}), \
+        env_key = "LOCALAPPDATA" if sys.platform == "win32" else "XDG_CACHE_HOME"
+        shim_name = "mesh.cmd" if sys.platform == "win32" else "mesh"
+        exes = (
+            (r"C:\venv-a\Scripts\python.exe", r"C:\venv-b\Scripts\python.exe")
+            if sys.platform == "win32"
+            else ("/opt/venv-a/bin/python3", "/opt/venv-b/bin/python3")
+        )
+        with mock.patch.dict(os.environ, {env_key: self.tmp}), \
                 mock.patch.object(paths, "get_install_root", return_value=self.tmp):
-            for exe in ("/opt/venv-a/bin/python3", "/opt/venv-b/bin/python3"):
+            for exe in exes:
                 with mock.patch.object(sys, "executable", exe):
                     dirs.append(paths.get_mesh_bin_dir())
         self.assertNotEqual(dirs[0], dirs[1])
         for d, exe in zip(dirs, ("venv-a", "venv-b")):
-            with open(os.path.join(d, "mesh"), encoding="utf-8") as f:
+            with open(os.path.join(d, shim_name), encoding="utf-8") as f:
                 self.assertIn(exe, f.read())
 
 
@@ -93,14 +100,20 @@ class TestLongPassphrase(_Tmp):
     def test_passphrase_longer_than_pipe_buffer(self):
         reader = os.path.join(self.tmp, "reader.py")
         with open(reader, "w", encoding="utf-8") as f:
-            f.write("import os,sys,json\n"
-                    "fd=int(sys.argv[sys.argv.index('--passphrase-fd')+1])\n"
-                    "data=b''\n"
-                    "while True:\n"
-                    "    b=os.read(fd,65536)\n"
-                    "    if not b: break\n"
-                    "    data+=b\n"
-                    "print(json.dumps({'ok': True, 'n': len(data)}))\n")
+            f.write(
+                "import os,sys,json\n"
+                "if '--passphrase-fd' in sys.argv:\n"
+                "    fd=int(sys.argv[sys.argv.index('--passphrase-fd')+1])\n"
+                "    data=b''\n"
+                "    while True:\n"
+                "        b=os.read(fd,65536)\n"
+                "        if not b: break\n"
+                "        data+=b\n"
+                "else:\n"
+                "    p=sys.argv[sys.argv.index('--passphrase-file')+1]\n"
+                "    data=open(p,'rb').read()\n"
+                "print(json.dumps({'ok': True, 'n': len(data)}))\n"
+            )
         secret = "x" * 200000
         with mock.patch.object(msetup, "_mesh_cmd", return_value=[sys.executable, reader]):
             rc, body = msetup._run(self.tmp, ["noop"], secret)
@@ -129,10 +142,15 @@ class TestDoctorBrokenGit(_Tmp):
     def test_git_that_fails_is_not_ok(self):
         from mesh.cli.commands import doctor_env
 
-        fake = os.path.join(self.tmp, "git")
-        with open(fake, "w", encoding="utf-8") as f:
-            f.write("#!/bin/sh\nexit 127\n")
-        os.chmod(fake, stat.S_IRWXU)
+        if sys.platform == "win32":
+            fake = os.path.join(self.tmp, "git.cmd")
+            with open(fake, "w", encoding="utf-8") as f:
+                f.write("@echo off\r\nexit /b 127\r\n")
+        else:
+            fake = os.path.join(self.tmp, "git")
+            with open(fake, "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\nexit 127\n")
+            os.chmod(fake, stat.S_IRWXU)
         with mock.patch.dict(os.environ, {"PATH": self.tmp + os.pathsep + os.environ.get("PATH", "")}):
             checks = doctor_env.environment_checks(self.tmp, False)
         git = [c for c in checks if c["name"] == "git"][0]
@@ -146,7 +164,7 @@ class TestRound4(_Tmp):
         TestTokenDestination._db(self, home, ws_root=ws_root, repo=repo)
 
     def test_home_with_uri_characters_still_protected(self):
-        home, ws = os.path.join(self.tmp, "h?mode=memory#x"), os.path.join(self.tmp, "ws")
+        home, ws = os.path.join(self.tmp, "h_mode=memory#x"), os.path.join(self.tmp, "ws")
         os.makedirs(ws)
         self._db(home, ws_root=ws)
         with self.assertRaises(MeshError):
@@ -175,7 +193,11 @@ class TestRound4(_Tmp):
             tok = os.path.join(d, "a.token")
             with open(tok, "w", encoding="utf-8") as f:
                 f.write("tok")
-            os.chmod(tok, 0o600)
+            if sys.platform == "win32":
+                from mesh.platform import perms as plat_perms
+                plat_perms.set_private_file_acl(tok, 0o600)
+            else:
+                os.chmod(tok, 0o600)
             client = MeshClient.__new__(MeshClient)
             client.home = home
             with self.assertRaises(MeshError) as cm:
@@ -186,12 +208,16 @@ class TestRound4(_Tmp):
         from mesh.core import paths
 
         dirs = []
-        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": self.tmp}), \
+        env_key = "LOCALAPPDATA" if sys.platform == "win32" else "XDG_CACHE_HOME"
+        shared_real = r"C:\Python312\python.exe" if sys.platform == "win32" else "/usr/bin/python3.11"
+        envs = (r"C:\opt\env-a", r"C:\opt\env-b") if sys.platform == "win32" else ("/opt/env-a", "/opt/env-b")
+        suffix = r"\Scripts\python.exe" if sys.platform == "win32" else "/bin/python3"
+        with mock.patch.dict(os.environ, {env_key: self.tmp}), \
                 mock.patch.object(paths, "get_install_root", return_value=self.tmp), \
-                mock.patch.object(os.path, "realpath", side_effect=lambda p: "/usr/bin/python3.11"
-                                  if "python" in str(p) else os.path.abspath(p)):
-            for venv in ("/opt/env-a", "/opt/env-b"):
-                with mock.patch.object(sys, "executable", venv + "/bin/python3"), \
+                mock.patch.object(os.path, "realpath", side_effect=lambda p: shared_real
+                                  if "python" in str(p).lower() else os.path.abspath(p)):
+            for venv in envs:
+                with mock.patch.object(sys, "executable", venv + suffix), \
                         mock.patch.object(sys, "prefix", venv):
                     dirs.append(paths.get_mesh_bin_dir())
         self.assertNotEqual(dirs[0], dirs[1])
@@ -206,10 +232,18 @@ class TestRound4(_Tmp):
     def test_doctor_non_utf8_git(self):
         from mesh.cli.commands import doctor_env
 
-        fake = os.path.join(self.tmp, "git")
-        with open(fake, "w", encoding="utf-8") as f:
-            f.write("#!/bin/sh\nprintf 'git version \\377\\n'\n")
-        os.chmod(fake, stat.S_IRWXU)
+        if sys.platform == "win32":
+            py_git = os.path.join(self.tmp, "fake_git.py")
+            with open(py_git, "w", encoding="utf-8") as f:
+                f.write("import sys\nsys.stdout.buffer.write(b'git version \\xff\\n')\n")
+            fake = os.path.join(self.tmp, "git.cmd")
+            with open(fake, "w", encoding="utf-8") as f:
+                f.write(f'@echo off\r\n"{sys.executable}" -P -s "{py_git}"\r\n')
+        else:
+            fake = os.path.join(self.tmp, "git")
+            with open(fake, "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\nprintf 'git version \\377\\n'\n")
+            os.chmod(fake, stat.S_IRWXU)
         with mock.patch.dict(os.environ, {"PATH": self.tmp + os.pathsep + os.environ.get("PATH", "")}):
             checks = doctor_env.environment_checks(self.tmp, False)
         self.assertTrue(any(c["name"] == "platform" for c in checks))
@@ -309,8 +343,12 @@ class TestRound6(TestRound5):
         ws = os.path.join(self.tmp, "ws")
         os.makedirs(os.path.join(ws, "prj_1", "tasks"))
         link = os.path.join(ws, "prj_1", "tasks", "tsk_1")
-        os.symlink(target, link)
-        self._db(home, ws_value=ws, task_paths=[link + "/"])
+        if sys.platform == "win32":
+            import _winapi
+            _winapi.CreateJunction(target, link)
+        else:
+            os.symlink(target, link)
+        self._db(home, ws_value=ws, task_paths=[link + os.sep])
         with self.assertRaises(MeshError):
             msetup._check_token_destination(home, os.path.join(target, "lead.token"))
 

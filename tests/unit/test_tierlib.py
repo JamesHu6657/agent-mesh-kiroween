@@ -13,6 +13,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 
+from mesh.platform.paths import temp_root
 from tests import tierlib
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -28,9 +29,9 @@ PRE_M3_FIXTURES = {
 
 class TierCase(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.mkdtemp(prefix="mh-tier-")
+        self.tmp = tempfile.mkdtemp(prefix="mh-tier-", dir=temp_root())
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        self.assertTrue(self.tmp.startswith("/tmp/mh-"))
+        self.assertTrue(self.tmp.startswith(os.path.join(temp_root(), "mh-")))
         self.staging = os.path.join(self.tmp, "staging")
         self.repo = os.path.join(self.tmp, "repo")
         os.makedirs(os.path.join(self.repo, "tests", "fixtures", "real", "droid", "1.3.0"))
@@ -198,18 +199,18 @@ class PromoteTest(TierCase):
         tierlib.write_capture(s, "droid/1.6.0/help.txt", b"a\n", ["droid", "--help"])
         elsewhere = os.path.join(self.tmp, "elsewhere", "1.7.0")
         tierlib.write_capture(os.path.join(self.tmp, "elsewhere-root"), "droid/1.7.0/help.txt", b"b\n", ["droid", "--help"])
-        os.symlink(os.path.join(self.tmp, "elsewhere-root", "droid", "1.7.0"), os.path.join(s, "droid", "1.7.0"))
+        os.symlink(os.path.join(self.tmp, "elsewhere-root", "droid", "1.7.0"), os.path.join(s, "droid", "1.7.0"), target_is_directory=True)
         with self.assertRaises(tierlib.TierError):
             tierlib.promote(s, self.repo)
         # (b) staging inside the repo, named through a symlinked alias outside it
         inside = os.path.join(self.repo, "stage")
         tierlib.write_capture(inside, "droid/1.6.0/help.txt", b"a\n", ["droid", "--help"])
         alias = os.path.join(self.tmp, "alias")
-        os.symlink(self.repo, alias)
+        os.symlink(self.repo, alias, target_is_directory=True)
         with self.assertRaises(tierlib.TierError):
             tierlib.promote(os.path.join(alias, "stage"), self.repo)
         link_stage = os.path.join(self.tmp, "link-stage")
-        os.symlink(inside, link_stage)
+        os.symlink(inside, link_stage, target_is_directory=True)
         with self.assertRaises(tierlib.TierError):
             tierlib.promote(link_stage, self.repo)
         self.assertEqual(os.listdir(os.path.join(self.repo, "tests", "fixtures", "real", "droid")), ["1.3.0"])
@@ -220,7 +221,7 @@ class PromoteTest(TierCase):
         """ACC: N21 - a destination parent that resolves outside the allowed trees (symlinked fixtures/real/<adapter>) is refused before writing."""
         outside = os.path.join(self.tmp, "outside")
         os.makedirs(outside)
-        os.symlink(outside, os.path.join(self.repo, "tests", "fixtures", "real", "agy"))
+        os.symlink(outside, os.path.join(self.repo, "tests", "fixtures", "real", "agy"), target_is_directory=True)
         tierlib.write_capture(self.staging, "agy/1.5.3/help.txt", b"a\n", ["agy", "--help"])
         with self.assertRaises(tierlib.TierError):
             tierlib.promote(self.staging, self.repo)

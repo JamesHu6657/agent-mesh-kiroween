@@ -7,8 +7,10 @@ import json
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import mesh.constants as c
 from mesh.adapters.base import (
@@ -34,6 +36,7 @@ from mesh.adapters.openclaw import OpenclawAdapter
 from mesh.adapters.none_adapter import NoneAdapter
 from mesh.adapters.fake import FakeAdapter
 from mesh.adapters.registry import get_adapter, list_adapters
+from mesh.platform.paths import temp_root
 from tests.stubs import (
     create_failing_stub,
     create_garbage_stub,
@@ -58,7 +61,7 @@ class TestAdapters(unittest.TestCase):
         cls.stubs_dir = tempfile.mkdtemp(prefix="unit-stubs-")
         create_test_stubs(cls.stubs_dir)
         cls.orig_path = os.environ.get("PATH", "")
-        os.environ["PATH"] = f"{cls.stubs_dir}:{cls.orig_path}"
+        os.environ["PATH"] = f"{cls.stubs_dir}{os.pathsep}{cls.orig_path}"
 
     @classmethod
     def tearDownClass(cls):
@@ -189,8 +192,8 @@ class TestAdapters(unittest.TestCase):
             )
             spec_ro = self.agy.build(req_ro)
             expected_ro = [
-                "agy", "--print", "--output-format", "stream-json", "--model", "claude-sonnet-4-6",
-                "--effort", "medium", "--mode", "plan", "--print-timeout", "300s", "Task content",
+                "agy", "--print", "Task content", "--output-format", "stream-json", "--model",
+                "claude-sonnet-4-6", "--effort", "medium", "--mode", "plan", "--print-timeout", "300s",
             ]
             self.assertEqual(spec_ro.argv, expected_ro)
 
@@ -571,7 +574,8 @@ class TestAdapters(unittest.TestCase):
             self.assertIn("--add-dir", spec_agy.argv)
             self.assertIn(tmpdir, spec_agy.argv)
             expected_sentence = f"Read the file {prompt_file} and follow the instructions in it exactly. It is your complete task."
-            self.assertEqual(spec_agy.argv[-1], expected_sentence)
+            self.assertEqual(spec_agy.argv[1:3], ["--print", expected_sentence])
+            self.assertEqual(spec_agy.argv[-2], "--print-timeout")
 
             # 4. Kiro edit: replaces argv with pointer sentence
             req_kiro_edit = RunRequest(prompt_path=prompt_file, workspace="/ws", model="claude-opus-5.5", effort=None, profile="edit")
@@ -596,7 +600,7 @@ class TestAdapters(unittest.TestCase):
             spec_and_rework = "Spec content\n" * 5000 + "Rework feedback\n" * 3000
             prompt_bytes = len(spec_and_rework.encode("utf-8"))
             self.assertGreater(prompt_bytes, 100_000)
-            with open(prompt_file, "w", encoding="utf-8") as f:
+            with open(prompt_file, "w", encoding="utf-8", newline="\n") as f:
                 f.write(spec_and_rework)
 
             req = RunRequest(
@@ -777,6 +781,13 @@ class TestAdapters(unittest.TestCase):
         norm2 = normalize_help_text(stdout="Usage of agy:\n", stderr="  --print   Print mode\n  --model   Model name\n")
         self.assertEqual(norm2, sample_help)
 
+        # 3. Windows CRLF line endings normalize to LF on win32 only
+        crlf_help = sample_help.replace("\n", "\r\n")
+        with mock.patch.object(sys, "platform", "win32"):
+            self.assertEqual(normalize_help_text(stdout=crlf_help, stderr=""), sample_help)
+        with mock.patch.object(sys, "platform", "linux"):
+            self.assertEqual(normalize_help_text(stdout=crlf_help, stderr=""), crlf_help)
+
     def test_find_missing_flags(self):
         """Verify flag presence checks distinguish prefixes and detect only genuinely missing flags."""
         text = "Usage of agy:\n  --print-timeout   Timeout in sec\n  --model   Model name\n"
@@ -880,14 +891,15 @@ def golden_argv(adapter, profile, resume, prompt, run_dir, options=None):
             argv += ["--session-id", resume]
         return argv + ["--log-group-id", "run_1", "--file", prompt]
     if adapter == "agy":
-        argv = ["agy", "--print", "--output-format", "stream-json", "--model", model, "--effort", effort, *pf]
+        argv = ["agy", "--print", PROMPT_TEXT, "--output-format", "stream-json", "--model", model,
+                "--effort", effort, *pf]
         if options.get("sandbox"):
             argv += ["--sandbox"]
         if options.get("agent"):
             argv += ["--agent", options["agent"]]
         if resume:
             argv += ["--conversation", resume]
-        return argv + ["--print-timeout", "300s", PROMPT_TEXT]
+        return argv + ["--print-timeout", "300s"]
     if adapter == "kiro":
         argv = ["kiro-cli", "chat", "--no-interactive", "--output-format", "stream-json", "--model", model,
                 "--effort", effort, *pf]
@@ -939,7 +951,7 @@ class TestAdapterGoldens(unittest.TestCase):
         cls.stubs_dir = tempfile.mkdtemp(prefix="unit-stubs-g-")
         create_test_stubs(cls.stubs_dir)
         cls.orig_path = os.environ.get("PATH", "")
-        os.environ["PATH"] = f"{cls.stubs_dir}:{cls.orig_path}"
+        os.environ["PATH"] = f"{cls.stubs_dir}{os.pathsep}{cls.orig_path}"
         cls.adapters = {"droid": DroidAdapter(), "agy": AgyAdapter(), "kiro": KiroAdapter(),
                         "vibe": VibeAdapter(), "fake": FakeAdapter()}
 
@@ -1004,15 +1016,16 @@ class TestAdapterGoldens(unittest.TestCase):
                 expected = [sys.executable, "-P", "-s", "-m", "mesh.testing.fake_agent",
                             "--fake-profile", "readonly", *flags, self.prompt]
                 self.assertEqual(FakeAdapter().build(req).argv, expected)
-                req.options["binary"] = "/tmp/mh-options/python3"
+                req.options["binary"] = os.path.join(temp_root(), "mh-options", "python3")
                 self.assertEqual(FakeAdapter().build(req).argv, [req.options["binary"], *expected[1:]])
 
     def test_droid_real_run_id_and_binary_options(self):
         """RunRequest options select droid's binary and the actual log group, offline."""
+        droid_bin = os.path.join(temp_root(), "mh-options", "droid")
         req = self._req("droid", "readonly", options={
-            "binary": "/tmp/mh-options/droid", "run_id": "run_actual"})
+            "binary": droid_bin, "run_id": "run_actual"})
         self.assertEqual(DroidAdapter().build(req).argv, [
-            "/tmp/mh-options/droid", "exec", "--output-format", "stream-json",
+            droid_bin, "exec", "--output-format", "stream-json",
             "--cwd", "/ws/t", "--model", "claude-opus-5-5", "--reasoning-effort", "high",
             "--log-group-id", "run_actual", "--file", self.prompt])
 
@@ -1021,7 +1034,7 @@ class TestAdapterGoldens(unittest.TestCase):
         from mesh.adapters.base import Capability
         from mesh.daemon.supervisor import build_run_options, verified_resume_session
 
-        agent = {"binary_path": "/tmp/mh-options/agent",
+        agent = {"binary_path": os.path.join(temp_root(), "mh-options", "agent"),
                  "adapter_options_json": '{"resume_verified":true}'}
         options = build_run_options(agent, "run_from_daemon")
         self.assertEqual(options, {"binary": agent["binary_path"], "run_id": "run_from_daemon",
@@ -1276,10 +1289,11 @@ class TestAdapterGoldens(unittest.TestCase):
         self.assertTrue(calls, "kiro list_models must run the vendor list command")
         for argv in calls:
             self.assertEqual(argv[1:], ["chat", "--list-models", "-f", "json"])
-            self.assertEqual(os.path.basename(argv[0]), "kiro-cli")
+            self.assertEqual(os.path.splitext(os.path.basename(argv[0]))[0], "kiro-cli")
+        home_norm = home.replace(os.sep, "/")
         for path in opened:
             norm = path.replace(os.sep, "/")
-            self.assertFalse(norm.startswith(home), f"vendor home path touched: {path}")
+            self.assertFalse(norm.startswith(home_norm), f"vendor home path touched: {path}")
             for d in (".factory", ".gemini", ".kiro", ".vibe"):
                 self.assertNotIn(f"/{d}/", norm + "/", f"vendor config path touched: {path}")
 
@@ -1288,9 +1302,9 @@ class TestDaemonRunOptionGuards(unittest.TestCase):
     def test_adapter_options_cannot_override_run_id_or_configured_binary(self):
         from mesh.daemon.supervisor import build_run_options
 
-        stored = {"run_id": "wrong_run", "binary": "/tmp/mh-options/wrong",
+        stored = {"run_id": "wrong_run", "binary": os.path.join(temp_root(), "mh-options", "wrong"),
                   "resume_verified": True}
-        for binary in ("/tmp/mh-options/configured", None):
+        for binary in (os.path.join(temp_root(), "mh-options", "configured"), None):
             with self.subTest(binary=binary):
                 agent = {"binary_path": binary, "adapter_options_json": json.dumps(stored)}
                 self.assertEqual(build_run_options(agent, "actual_run"), {

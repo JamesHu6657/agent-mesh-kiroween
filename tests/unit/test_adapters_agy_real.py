@@ -12,6 +12,7 @@ import tempfile
 import unittest
 
 from mesh.adapters.agy import AgyAdapter, _scan_stream
+from mesh.platform.paths import temp_root
 from tests import tierlib
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -56,8 +57,8 @@ class AgyParseBase(unittest.TestCase):
         self.agy = AgyAdapter()
 
     def run_dir(self) -> str:
-        d = tempfile.mkdtemp(prefix="mh-agyparse-", dir="/tmp")
-        self.assertTrue(d.startswith("/tmp/mh-"), d)
+        d = tempfile.mkdtemp(prefix="mh-agyparse-", dir=temp_root())
+        self.assertTrue(d.startswith(os.path.join(temp_root(), "mh-")), d)
         self.addCleanup(shutil.rmtree, d, True)
         return d
 
@@ -190,7 +191,10 @@ class TestAgyParseRobust(AgyParseBase):
 
     def test_missing_file(self):
         self.assert_no_result(self.agy.parse(self.run_dir()), "missing stdout")
-        self.assert_no_result(self.agy.parse("/tmp/mh-agyparse-does-not-exist"), "missing stdout")
+        self.assert_no_result(
+            self.agy.parse(os.path.join(temp_root(), "mh-agyparse-does-not-exist")),
+            "missing stdout",
+        )
 
     def test_empty_and_garbage(self):
         for data in (b"", b"\n\n"):

@@ -15,6 +15,7 @@ import unittest
 
 from mesh.adapters import kiro as kiro_mod
 from mesh.adapters.kiro import KiroAdapter
+from mesh.platform.paths import temp_root
 from tests import tierlib
 from tests.unit.test_fixture_hashes import FIXTURE_HASHES
 
@@ -41,8 +42,8 @@ def read_text(path: str) -> str:
 
 class KiroParseBase(unittest.TestCase):
     def stage(self, src: str, name: str = "stdout.log") -> str:
-        d = tempfile.mkdtemp(prefix="mh-kiroparse-", dir="/tmp")
-        self.assertTrue(d.startswith("/tmp/mh-"), d)
+        d = tempfile.mkdtemp(prefix="mh-kiroparse-", dir=temp_root())
+        self.assertTrue(d.startswith(os.path.join(temp_root(), "mh-")), d)
         self.addCleanup(shutil.rmtree, d, True)
         if src:
             shutil.copyfile(src, os.path.join(d, name))

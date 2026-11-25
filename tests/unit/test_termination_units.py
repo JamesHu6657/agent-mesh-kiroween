@@ -52,12 +52,13 @@ class TestProcIdentity(unittest.TestCase):
         self.assertEqual(info["starttime"], 123456)
 
     def test_proc_identity(self) -> None:
+        sig = terminate.SIGKILL if sys.platform == "win32" else signal.SIGTERM
         proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
         try:
             start = get_proc_stat(proc.pid)["starttime"]
-            self.assertFalse(terminate.signal_if_same(proc.pid, start + 1, signal.SIGTERM))
+            self.assertFalse(terminate.signal_if_same(proc.pid, start + 1, sig))
             self.assertIsNone(proc.poll())
-            self.assertTrue(terminate.signal_if_same(proc.pid, start, signal.SIGTERM))
+            self.assertTrue(terminate.signal_if_same(proc.pid, start, sig))
             proc.wait(timeout=WAIT_S)
         finally:
             if proc.poll() is None:
@@ -65,6 +66,7 @@ class TestProcIdentity(unittest.TestCase):
                 proc.wait()
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX SIGTERM->SIGKILL escalation and wait status -SIGKILL (Windows Job/process termination covered in test_platform_win_jobs and test_win_close_gate_jobs)")
 class TestTerminationStateMachine(unittest.TestCase):
     def tearDown(self) -> None:
         for run_id in list(terminate.active()):
@@ -100,6 +102,7 @@ class TestTerminationStateMachine(unittest.TestCase):
 
 
 class TestChildRegistry(unittest.TestCase):
+    @unittest.skipUnless(sys.platform != "win32", "POSIX zombie state ('Z') and waitpid orphan reaping (Windows has no zombie process states)")
     def test_reaper_reaps_only_unregistered_zombies(self) -> None:
         mine = children.popen_registered("wrapper", [sys.executable, "-c", "pass"])
         stray = subprocess.Popen([sys.executable, "-c", "pass"])
@@ -116,6 +119,7 @@ class TestChildRegistry(unittest.TestCase):
         finally:
             children.unregister(mine.pid)
 
+    @unittest.skipUnless(sys.platform != "win32", "POSIX zombie state ('Z') and waitpid orphan reaping (Windows has no zombie process states)")
     def test_reaper_skips_while_spawn_in_flight(self) -> None:
         stray = subprocess.Popen([sys.executable, "-c", "pass"])
         self.assertTrue(_wait(lambda: (get_proc_stat(stray.pid) or {}).get("state") == "Z"))
@@ -140,8 +144,9 @@ class TestChildRegistry(unittest.TestCase):
             reaper_task = asyncio.create_task(reaper())
             codes = []
             try:
+                probe_cmd = ("cmd", "/c", "exit", "0") if sys.platform == "win32" else ("true",)
                 for _ in range(200):
-                    proc = await children.create_subprocess_exec_registered("probe", "true")
+                    proc = await children.create_subprocess_exec_registered("probe", *probe_cmd)
                     try:
                         codes.append(await proc.wait())
                     finally:
@@ -187,6 +192,7 @@ class TestPidReuseSafety(unittest.TestCase):
         proc.wait()
         proc.stdout.close()
 
+    @unittest.skipUnless(sys.platform != "win32", "POSIX PGID session/os.killpg isolation (Windows PID-reuse safety covered in test_platform_win_jobs)")
     def test_registered_wrapper_pid_with_other_starttime_excluded(self) -> None:
         """A registered meshd child whose pid equals the run's (stale) wrapper_pid but whose
         starttime differs (another run's wrapper reusing the number) is never a target."""
@@ -201,6 +207,7 @@ class TestPidReuseSafety(unittest.TestCase):
         # Control: with the registered starttime it is this run's own wrapper again.
         self.assertIn(other.pid, terminate.run_targets(run_id, other.pid, other.pid, int(st)))
 
+    @unittest.skipUnless(sys.platform != "win32", "Linux/POSIX /proc pgrp scan for stale PGID (Windows Job Object isolation covered in test_win_close_gate_jobs)")
     def test_stale_pgid_member_without_run_id_after_wrapper_gone(self) -> None:
         """Once the wrapper identity is gone, a process whose only link is the pgid/sid number
         (no MESH_RUN_ID, not seen, not a descendant of a seen process) is left alone."""
@@ -226,7 +233,7 @@ class TestPidReuseSafety(unittest.TestCase):
         """_reap_wrapper polls the run's own Popen; a run without one waits on nothing."""
         from mesh.daemon import supervisor
 
-        proc = subprocess.Popen(["true"])
+        proc = subprocess.Popen([sys.executable, "-c", "pass"] if sys.platform == "win32" else ["true"])
         children.register(proc.pid, "wrapper")
         supervisor._WRAPPERS[f"run_reap{_RUN_SFX}"] = proc
         deadline = time.monotonic() + WAIT_S
@@ -302,6 +309,7 @@ class TestTerminationReason(unittest.TestCase):
             self.assertIsNone(supervisor.termination_reason(self.conn, self._run(), task))
 
 
+@unittest.skipUnless(sys.platform != "win32", "Linux/POSIX unreaped zombie wrapper ('Z') and pgrp scan (Windows uses Job Objects in test_win_close_gate_jobs)")
 class TestZombieWrapperGroup(unittest.TestCase):
     """Review m1c-run4 §2: while meshd's own wrapper is an unreaped zombie, the pgid is still
     this run's, so a group member that dropped MESH_RUN_ID is a target."""

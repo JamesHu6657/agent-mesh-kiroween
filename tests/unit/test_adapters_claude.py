@@ -140,10 +140,11 @@ class TestClaudeBuild(_Tmp):
 
     def test_binary_option_resolved(self):
         d = self.tmpdir()
-        path = os.path.join(d, "claude")
-        with open(path, "w") as f:
-            f.write("#!/bin/sh\n")
-        os.chmod(path, 0o755)
+        path = os.path.join(d, "claude.cmd" if sys.platform == "win32" else "claude")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("@echo off\r\nexit /b 0\r\n" if sys.platform == "win32" else "#!/bin/sh\n")
+        if sys.platform != "win32":
+            os.chmod(path, 0o755)
         self.assertEqual(ClaudeAdapter().build(self.req(options={"binary": path})).argv[0], path)
 
     def test_helpdiff_emitted_flags(self):
@@ -405,10 +406,19 @@ class TestClaudeProbe(_Tmp):
             auth = json.dumps({"loggedIn": True, "authMethod": "claude.ai", "email": "someone@example.com",
                                "orgName": "Org"})
         d = self.tmpdir()
+        body = STUB.format(python=sys.executable, version=version, version_rc=version_rc, drop=drop,
+                           auth=auth, auth_rc=auth_rc)
+        if sys.platform == "win32":
+            py_path = os.path.join(d, "claude_stub.py")
+            with open(py_path, "w", encoding="utf-8") as f:
+                f.write(body)
+            path = os.path.join(d, "claude.cmd")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f'@echo off\r\n"{sys.executable}" -P -s "{py_path}" %*\r\n')
+            return path
         path = os.path.join(d, "claude")
         with open(path, "w", encoding="utf-8") as f:
-            f.write(STUB.format(python=sys.executable, version=version, version_rc=version_rc, drop=drop,
-                                auth=auth, auth_rc=auth_rc))
+            f.write(body)
         os.chmod(path, 0o755)
         return path
 
@@ -467,19 +477,23 @@ class TestClaudeProbe(_Tmp):
         other = os.path.join(root, "bin")
         os.makedirs(shims)
         os.makedirs(other)
+        fname = "claude.cmd" if sys.platform == "win32" else "claude"
+        content = "@echo off\r\nexit /b 99\r\n" if sys.platform == "win32" else "#!/bin/sh\nexit 99\n"
         for d in (shims, other):
-            with open(os.path.join(d, "claude"), "w") as f:
-                f.write("#!/bin/sh\nexit 99\n")
-            os.chmod(os.path.join(d, "claude"), 0o755)
+            with open(os.path.join(d, fname), "w", encoding="utf-8") as f:
+                f.write(content)
+            if sys.platform != "win32":
+                os.chmod(os.path.join(d, fname), 0o755)
         with mock.patch.dict(os.environ, {"PATH": shims + os.pathsep + other}):
             self.assertIsNone(ClaudeAdapter().resolve_binary())
             self.assertEqual(ClaudeAdapter().probe().status, "not_installed")
         with mock.patch.dict(os.environ, {"PATH": other}):
-            self.assertEqual(ClaudeAdapter().resolve_binary(), os.path.join(other, "claude"))
-        # A shim checked out without its exec bit still hides the real binary.
-        os.chmod(os.path.join(shims, "claude"), 0o644)
-        with mock.patch.dict(os.environ, {"PATH": shims + os.pathsep + other}):
-            self.assertIsNone(ClaudeAdapter().resolve_binary())
+            self.assertEqual(ClaudeAdapter().resolve_binary(), os.path.join(other, fname))
+        if sys.platform != "win32":
+            # A shim checked out without its exec bit still hides the real binary.
+            os.chmod(os.path.join(shims, fname), 0o644)
+            with mock.patch.dict(os.environ, {"PATH": shims + os.pathsep + other}):
+                self.assertIsNone(ClaudeAdapter().resolve_binary())
 
     def test_list_models_is_user_supplied(self):
         self.assertIsNone(ClaudeAdapter().list_models(self.stub()))

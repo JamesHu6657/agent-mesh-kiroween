@@ -153,7 +153,7 @@ class TestFinding1RunTierTopLevelAndImportError(unittest.TestCase):
                 "    def test_pkg(self): self.assertEqual(shared_mod.X, 'lifted')\n",
             )
             res = subprocess.run(
-                [sys.executable, os.path.join(ROOT, "tests", "run_tier.py"), "ext_pkg/sub"],
+                [sys.executable, os.path.join(ROOT, "tests", "run_tier.py"), os.path.join("ext_pkg", "sub")],
                 cwd=work, env=env, capture_output=True, text=True, timeout=20,
             )
             self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
@@ -200,6 +200,7 @@ class TestFinding1RunTierTopLevelAndImportError(unittest.TestCase):
             self.assertIn("prior_loader_error_pr47r2", res_mid.stderr)
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash + scripts/coord/secret-pattern.sh + grep -E test")
 class TestFinding2SecretPatternFalsePositivesAndGaps(unittest.TestCase):
     """P2: secret-pattern.sh must avoid empty-literal/Python false positives and catch f-strings + double-escaped JSON."""
 
@@ -326,6 +327,7 @@ class TestFinding2SecretPatternFalsePositivesAndGaps(unittest.TestCase):
                 self.assertEqual(_grep_secret_pattern(fh.read().splitlines()), [], rel)
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash + scripts/coord/inbox-worker.sh + /proc PID-reuse test")
 class TestFinding3InboxWorkerNoPostReapSignaling(unittest.TestCase):
     """P3: inbox-worker-example.sh must not signal reaped PID or empty/gone PGID."""
 

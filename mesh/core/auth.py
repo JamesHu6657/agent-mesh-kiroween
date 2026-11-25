@@ -17,11 +17,13 @@ import os
 import secrets
 import socket
 import struct
-from typing import Any, Dict, Optional, Set, Tuple
+import sys
+from typing import Any, Dict, Mapping, Optional, Set, Tuple
 
 import mesh.constants as c
 from mesh.errors import MeshError
 from mesh.core.proc import get_proc_ancestry, get_proc_environ, get_proc_stat
+from mesh.platform import ipc as _plat_ipc, proc as _plat_proc
 
 # Scrypt parameters per plan §7.1
 SCRYPT_N = 2**15  # 32768
@@ -317,11 +319,24 @@ def verify_token_hash(token: str, stored_hash: bytes) -> bool:
     return hmac.compare_digest(token_hash, stored_hash)
 
 
-def get_peer_credentials(sock: socket.socket) -> Tuple[int, int, int]:
-    """Get (pid, uid, gid) from Unix socket using SO_PEERCRED."""
+def get_peer_credentials(sock: Any) -> Tuple[int, int, int]:
+    """Get ``(pid, uid, gid)`` from Unix socket (``SO_PEERCRED``) or Windows Named Pipe."""
+    if sys.platform == "win32":
+        return _plat_ipc.get_peer_credentials(sock)
     ucred = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
     pid, uid, gid = struct.unpack("3i", ucred)
     return pid, uid, gid
+
+
+def _env_get_run_id(env: Mapping[str, str]) -> Optional[str]:
+    if sys.platform != "win32":
+        return env.get("MESH_RUN_ID")
+    if "MESH_RUN_ID" in env:
+        return env["MESH_RUN_ID"]
+    for k, v in env.items():
+        if k.upper() == "MESH_RUN_ID":
+            return v
+    return None
 
 
 def classify_peer_run_session(
@@ -329,19 +344,28 @@ def classify_peer_run_session(
     active_runs: Dict[str, int],
     known_run_ids: Set[str],
     meshd_pid: int,
+    *,
+    active_job_handles: Optional[Dict[str, Any]] = None,
+    home: Optional[str] = None,
 ) -> Optional[str]:
     """Classify whether peer_pid is inside a run session per plan §7.1.
 
     A peer is inside run R if any of:
-    (a) its session id equals the sid of an active run R (the wrapper pid)
+    (a) on POSIX: its session id equals the sid of an active run R (the wrapper pid);
+        on Windows: it belongs to an active run R's Job Object (``IsProcessInJob``) or
+        matches an active wrapper pid
     (b) walking PPid upward reaches R's wrapper pid before pid 1 or meshd
-    (c) /proc/<pid>/environ contains MESH_RUN_ID=<R> for any known run R (active or ended)
+    (c) process environ contains MESH_RUN_ID=<R> for any known run R (active or ended)
 
-    If /proc cannot be read: raise MeshError(CREDENTIAL_NOT_ALLOWED_IN_RUN).
+    If process inspection fails: raise MeshError(CREDENTIAL_NOT_ALLOWED_IN_RUN).
     Returns run_id if inside run R, else None.
     """
     # Invert active_runs mapping: wrapper_pid -> run_id
     wrapper_to_run = {wpid: rid for rid, wpid in active_runs.items() if wpid}
+    is_win = sys.platform == "win32"
+    stat_src = f"process stat for peer {peer_pid}" if is_win else f"/proc/{peer_pid}/stat"
+    anc_src = f"process ancestry for peer {peer_pid}" if is_win else f"/proc ancestry for peer {peer_pid}"
+    env_src = f"process environ for peer {peer_pid}" if is_win else f"/proc/{peer_pid}/environ"
 
     try:
         stat_info = get_proc_stat(peer_pid)
@@ -349,18 +373,38 @@ def classify_peer_run_session(
         raise MeshError(
             code=c.CREDENTIAL_NOT_ALLOWED_IN_RUN,
             exit_code=c.EXIT_FORBIDDEN,
-            message=f"Unable to read /proc/{peer_pid}/stat for run-session classification: {exc}",
+            message=f"Unable to read {stat_src} for run-session classification: {exc}",
             details={"peer_pid": peer_pid},
         ) from exc
     if stat_info is None:
         raise MeshError(
             code=c.CREDENTIAL_NOT_ALLOWED_IN_RUN,
             exit_code=c.EXIT_FORBIDDEN,
-            message=f"Unable to read /proc/{peer_pid}/stat for run-session classification",
+            message=f"Unable to read {stat_src} for run-session classification",
             details={"peer_pid": peer_pid},
         )
 
-    # (a) Check session id
+    # (a) Active run Job Object membership (Windows) or session id (POSIX)
+    if is_win:
+        try:
+            job_run_id = _plat_proc.find_active_job_for_pid(
+                peer_pid,
+                active_runs,
+                active_job_handles=active_job_handles,
+                home=home,
+            )
+        except (OSError, ValueError) as exc:
+            raise MeshError(
+                code=c.CREDENTIAL_NOT_ALLOWED_IN_RUN,
+                exit_code=c.EXIT_FORBIDDEN,
+                message=f"Unable to check Job Object membership for peer {peer_pid} for run-session classification: {exc}",
+                details={"peer_pid": peer_pid},
+            ) from exc
+        if job_run_id is not None:
+            return job_run_id
+        if peer_pid in wrapper_to_run:
+            return wrapper_to_run[peer_pid]
+
     sid = stat_info["session"]
     if sid in wrapper_to_run:
         return wrapper_to_run[sid]
@@ -372,7 +416,7 @@ def classify_peer_run_session(
         raise MeshError(
             code=c.CREDENTIAL_NOT_ALLOWED_IN_RUN,
             exit_code=c.EXIT_FORBIDDEN,
-            message=f"Unable to read /proc ancestry for peer {peer_pid}: {exc}",
+            message=f"Unable to read {anc_src}: {exc}",
             details={"peer_pid": peer_pid},
         ) from exc
     for ppid in ancestry:
@@ -386,18 +430,18 @@ def classify_peer_run_session(
         raise MeshError(
             code=c.CREDENTIAL_NOT_ALLOWED_IN_RUN,
             exit_code=c.EXIT_FORBIDDEN,
-            message=f"Unable to read /proc/{peer_pid}/environ for run-session classification: {exc}",
+            message=f"Unable to read {env_src} for run-session classification: {exc}",
             details={"peer_pid": peer_pid},
         ) from exc
     if env is None:
         raise MeshError(
             code=c.CREDENTIAL_NOT_ALLOWED_IN_RUN,
             exit_code=c.EXIT_FORBIDDEN,
-            message=f"Unable to read /proc/{peer_pid}/environ for run-session classification",
+            message=f"Unable to read {env_src} for run-session classification",
             details={"peer_pid": peer_pid},
         )
 
-    run_id_in_env = env.get("MESH_RUN_ID")
+    run_id_in_env = _env_get_run_id(env)
     if run_id_in_env and run_id_in_env in known_run_ids:
         return run_id_in_env
 

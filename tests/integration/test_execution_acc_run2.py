@@ -13,6 +13,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -21,7 +22,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import mesh.constants as c
 from mesh.core.clock import parse_utc
 from mesh.core.proc import find_run_processes, get_proc_environ
-from tests.helpers import MeshHarness, assert_h5, idle_bound, serial
+from mesh.platform.paths import strip_trailing_seps
+from mesh.platform.proc import get_proc_cmdline
+from tests.helpers import MeshHarness, assert_h5, cli_popen_argv, idle_bound, serial
 from tests.integration.test_execution_launch import create_agent
 from tests.stubs import create_test_stubs
 
@@ -90,7 +93,7 @@ class Run2AccBase(unittest.TestCase):
         open(path, "w").close()
 
     def held_spec(self, name: str) -> str:
-        return 'FAKE {"wait_release": {"path": "%s"}}' % self.gate(name)
+        return 'FAKE ' + json.dumps({"wait_release": {"path": self.gate(name)}})
 
     def q(self, sql: str, args: tuple = ()) -> List[Any]:
         conn = self.harness.db()
@@ -245,7 +248,7 @@ class TestRun2Execution(Run2AccBase):
         # 2 s runs (was 3 s, m3-a1-speed): five runs at max 2 keep tasks queued for about
         # 4 s. The queue is watched from before the first create (fix round, Linear MINOR),
         # so the whole queued span is observed, not only what is left after five creates.
-        spec = 'FAKE {"steps": [{"record_pid": {"path": "%s"}}, {"sleep": {"seconds": 2}}]}' % pid_file
+        spec = 'FAKE ' + json.dumps({"steps": [{"record_pid": {"path": pid_file}}, {"sleep": {"seconds": 2}}]})
         watch_errors: List[str] = []
 
         def watch_queue() -> bool:
@@ -381,7 +384,10 @@ class TestRun2Execution(Run2AccBase):
             rc, resp = self.harness.cli("task", "show", t, token=self.tok_lead1)
             self.assertEqual(rc, 0, resp)
             path = resp["data"]["workspace_path"]
-            self.assertEqual(path.rstrip("/"), os.path.join(self.harness.home, "workspaces", self.project_id, "tasks", t))
+            self.assertEqual(
+                strip_trailing_seps(path),
+                os.path.join(self.harness.home, "workspaces", self.project_id, "tasks", t),
+            )
             with open(os.path.join(path, "out.txt"), "r", encoding="utf-8") as f:
                 self.assertEqual(f.read(), content)
             paths[t] = path
@@ -389,8 +395,8 @@ class TestRun2Execution(Run2AccBase):
         found = []
         for dirpath, _dirs, files in os.walk(os.path.join(self.harness.home, "workspaces")):
             if "out.txt" in files:
-                found.append(dirpath.rstrip("/"))
-        self.assertEqual(sorted(found), sorted(p.rstrip("/") for p in paths.values()))
+                found.append(strip_trailing_seps(dirpath))
+        self.assertEqual(sorted(found), sorted(strip_trailing_seps(p) for p in paths.values()))
         rc, resp = self.harness.cli("workspace", "list", "--project", self.project_id, token=self.tok_lead1)
         self.assertEqual(rc, 0, resp)
         entries = resp["data"]["workspaces"]
@@ -399,7 +405,7 @@ class TestRun2Execution(Run2AccBase):
         self.assertEqual(task_entries, paths)
         self.assertEqual(len(lead_entries), 1)
         lead_id = self.q1("SELECT id FROM principals WHERE name = 'lead1';")["id"]
-        self.assertEqual(lead_entries[0]["path"].rstrip("/"),
+        self.assertEqual(strip_trailing_seps(lead_entries[0]["path"]),
                          os.path.join(self.harness.home, "workspaces", self.project_id, "lead", lead_id))
         self.assertTrue(lead_entries[0]["exists"])
         self.assertNotIn(lead_entries[0]["path"], paths.values())
@@ -415,7 +421,7 @@ class TestRun2Execution(Run2AccBase):
         apr = resp["data"].get("approval_id") or resp["data"].get("id")
         self.assertTrue(apr, resp)
         op_hash = resp["data"]["op_hash"]
-        spec = 'FAKE {"try_approve": {"approval": "%s", "op_hash": "%s"}}' % (apr, op_hash)
+        spec = 'FAKE ' + json.dumps({"try_approve": {"approval": apr, "op_hash": op_hash}})
         task_id = self.create_task(spec)
         self.wait_status(task_id, "submitted")
         run_id = self.runs_of(task_id)[0]["id"]
@@ -441,8 +447,7 @@ class TestRun2Execution(Run2AccBase):
         self.assertEqual((rc, resp["error"]["code"]), (3, c.TOKEN_REVOKED))
 
         pid_file = os.path.join(self.harness.fixtures_dir, "g18-pids")
-        spec = 'FAKE {"steps": [{"record_pid": {"path": "%s"}}, {"wait_release": {"path": "%s"}}]}' % (
-            pid_file, self.gate("g18"))
+        spec = 'FAKE ' + json.dumps({"steps": [{"record_pid": {"path": pid_file}}, {"wait_release": {"path": self.gate("g18")}}]})
         task_id = self.create_task(spec)
         run = self.wait_running_run(task_id)
         self.assertTrue(self.harness.wait_for(lambda: os.path.exists(pid_file), timeout=10.0))
@@ -473,8 +478,8 @@ class TestRun2Execution(Run2AccBase):
 
         self.assertTrue(self.harness.wait_for(lambda: bool(kids()), timeout=5.0))
         for pid in [run["wrapper_pid"], *kids()]:
-            with open(f"/proc/{pid}/cmdline", "rb") as f:
-                self.assertNotIn(token.encode(), f.read())
+            cmdline = " ".join(get_proc_cmdline(pid) or [])
+            self.assertNotIn(token, cmdline)
         with open(os.path.join(run["run_dir"], "spec.json"), "r", encoding="utf-8") as f:
             self.assertNotIn(token, f.read())
         self.assertNotIn(token, run["argv_redacted_json"])
@@ -490,8 +495,7 @@ class TestRun2Secrets(Run2AccBase):
 
     def test_c7_no_secret_in_home_or_outputs(self) -> None:
         """ACC: C7 - print_secrets with FAKE_SECRET_API_KEY in meshd env: run token, agent tokens, key, passphrase -> 0 hits in $H and log/event output; logs have [REDACTED."""
-        task_id = self.create_task('FAKE {"steps": [{"print_secrets": {}}, {"wait_release": {"path": "%s"}}]}'
-                                   % self.gate("c7"))
+        task_id = self.create_task('FAKE ' + json.dumps({"steps": [{"print_secrets": {}}, {"wait_release": {"path": self.gate("c7")}}]}))
         run = self.wait_running_run(task_id)
         env = get_proc_environ(run["wrapper_pid"])
         self.assertIsNotNone(env)
@@ -523,8 +527,18 @@ class TestRun2Secrets(Run2AccBase):
         self.assertNotEqual(replay["data"]["token"], resp["data"]["token"])
         for label, secret in secrets_to_find.items():
             self.assertTrue(secret)
-            proc = subprocess.run(["grep", "-rlF", "--", secret, self.harness.home], capture_output=True, text=True)
-            self.assertEqual(proc.stdout.strip(), "", f"{label} found in $H: {proc.stdout.strip()}")
+            secret_bytes = secret.encode("utf-8")
+            hits: List[str] = []
+            for root_dir, _, files in os.walk(self.harness.home):
+                for fname in files:
+                    fpath = os.path.join(root_dir, fname)
+                    try:
+                        with open(fpath, "rb") as fh:
+                            if secret_bytes in fh.read():
+                                hits.append(fpath)
+                    except OSError:
+                        pass
+            self.assertEqual(hits, [], f"{label} found in $H: {hits}")
             for out in outputs:
                 self.assertNotIn(secret, out, label)
         self.doctor_ok()
@@ -597,16 +611,25 @@ class TestRun2SerialTiming(Run2AccBase):
     def test_j9_event_tail_live_ndjson(self) -> None:
         """ACC: J9 - event tail --project [U] while a task runs: NDJSON, one event per line, live, in seq order."""
         since = self.q1("SELECT MAX(seq) AS s FROM events;")["s"]
-        pass_fd = os.open(self.harness.passphrase_file, os.O_RDONLY)
-        try:
-            proc = subprocess.Popen(
-                [self.harness.bin_mesh, "--home", self.harness.home, "--user", "--passphrase-fd", str(pass_fd),
-                 "event", "tail", "--project", self.project_id, "--since", str(since), "--timeout", "15s"],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=self.harness.get_env(),
-                pass_fds=(pass_fd,),
+        if sys.platform == "win32":
+            cmd, env = cli_popen_argv(
+                self.harness, "--user", "--passphrase-file", self.harness.passphrase_file,
+                "event", "tail", "--project", self.project_id, "--since", str(since), "--timeout", "15s",
             )
-        finally:
-            os.close(pass_fd)
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+            )
+        else:
+            pass_fd = os.open(self.harness.passphrase_file, os.O_RDONLY)
+            try:
+                proc = subprocess.Popen(
+                    [self.harness.bin_mesh, "--home", self.harness.home, "--user", "--passphrase-fd", str(pass_fd),
+                     "event", "tail", "--project", self.project_id, "--since", str(since), "--timeout", "15s"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=self.harness.get_env(),
+                    pass_fds=(pass_fd,),
+                )
+            finally:
+                os.close(pass_fd)
         try:
             time.sleep(0.5)  # event tail has no wait counter; --since covers any start-up gap
             task_id = self.create_task('FAKE {"steps": [{"sleep": {"seconds": 1}}, {"succeed": {}}]}')

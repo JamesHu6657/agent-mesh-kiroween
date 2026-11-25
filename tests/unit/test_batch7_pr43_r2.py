@@ -1,5 +1,6 @@
 """Unit/DB/daemon regression tests for batch7 PR #43 round-2 review findings."""
 
+import sys
 import asyncio
 import json
 import os

@@ -20,9 +20,9 @@ STATUS_WORDS = {"verified", "partially_verified", "not_installed", "unsupported"
 # results file, launch_milestone. "—" = null, "not run" = no results file.
 EXPECTED_ROWS = {
     "droid": ("1.6.0", "verified", "true", "—", "tests/smoke/results/droid-1.6.0-2026-11-09-3.json", "—"),
-    "agy": ("1.5.4", "partially_verified", "false", "no_smoke_evidence", "not run", "M3"),
+    "agy": ("1.5.12", "partially_verified", "false", "launch_cases_failed", "tests/smoke/results/agy-1.5.12-2026-11-19.json", "M3"),
     "kiro": ("3.1.0", "partially_verified", "true", "—", "tests/smoke/results/kiro-3.1.0-2026-11-10-2.json", "—"),
-    "vibe": ("3.1.0", "partially_verified", "false", "no_smoke_evidence", "not run", "M3"),
+    "vibe": ("3.1.0", "partially_verified", "false", "launch_cases_failed", "tests/smoke/results/vibe-3.1.0-2026-11-19.json", "M3"),
     "hermes": ("—", "not_installed", "false", "no_smoke_evidence", "not run", "M4"),
     "openclaw": ("—", "not_installed", "false", "no_smoke_evidence", "not run", "M4"),
 }
@@ -114,12 +114,14 @@ class TestDocsM3(unittest.TestCase):
                 doc = json.load(handle)
             self.assertEqual(doc["adapter"], adapter)
             self.assertEqual(doc["version"], row[2])
-        self.assertEqual(named, 2)
+        self.assertEqual(named, 4)
 
     def test_n27_droid_case_rows_cite_results_and_real_fixtures(self):
         """ACC: N27, N12 - every droid case row has its status from the results file and names an existing real fixture with a sidecar; every smoke row names an existing results file."""
         doc = read("docs/adapters.md")
-        droid = section(doc, "## Factory droid (`droid`)")
+        # The droid text ends at the next "###" heading: the Kiro and Antigravity subsections
+        # follow under the same "##" heading, and the agy 1.5.12 case table has its own rows.
+        droid = section(doc, "## Factory droid (`droid`)").split("\n### ")[0]
         results_rel = "tests/smoke/results/droid-1.6.0-2026-11-09-3.json"
         self.assertIn(results_rel, droid)
         with open(os.path.join(ROOT, results_rel), encoding="utf-8") as handle:
@@ -151,11 +153,11 @@ class TestDocsM3(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(ROOT, rel)), rel)
 
     def test_n27_capability_rows_and_e2e_results(self):
-        """ACC: N27 - capability rows copy live verification words; N13 and N26 results are cited and passed."""
+        """ACC: N27 - capability rows copy live verification words (the agy 1.5.12 row is the probe and evidence code's output for the committed 1.5.12 captures and results, re-derived in test_agy_1_5_12_evidence); N13 and N26 results are cited and passed."""
         doc = read("docs/adapters.md")
         expected = {
             "droid 1.6.0": ["yes / smoke"] * 4 + ["unknown / smoke"],
-            "agy 1.5.4": ["yes / stale"] * 4 + ["unknown / stale"],
+            "agy 1.5.12": ["yes / smoke"] * 3 + ["yes / stale", "unknown / smoke"],
             "kiro 3.1.0": ["yes / smoke", "yes / smoke", "yes / help", "yes / help", "unknown / smoke"],
             "vibe 3.1.0": ["yes / help", "yes / help", "yes / unverified", "no / help", "unknown / help"],
             "hermes": ["unknown / none"] * 5,
@@ -174,7 +176,7 @@ class TestDocsM3(unittest.TestCase):
                 self.assertEqual(json.load(handle)["status"], "pass")
 
     def test_n27_deferred_list(self):
-        """ACC: N27 - the deferred list names kiro/agy/vibe smoke, kiro/agy dev, idle timeout, vendor lead turns, resume, hermes/openclaw and N11 scoped."""
+        """ACC: N27 - the deferred list names kiro/agy/vibe smoke (agy and vibe pass S-X-1 and fail S-X-6), kiro/agy dev, idle timeout, vendor lead turns, resume, hermes/openclaw and N11 scoped."""
         deferred = normalize(section(read("docs/adapters.md"), "## Deferred"))
         for phrase in (
             "kiro, agy and vibe smoke",
@@ -184,7 +186,8 @@ class TestDocsM3(unittest.TestCase):
             "Resume.",
             "hermes and openclaw",
             "coverage is incomplete",
-            "agy/vibe have no promoted results",
+            "the agy 1.5.12 and vibe 3.1.0 results (2026-11-19) fail a launch case",
+            "S-X-6: both pass S-X-1, and each CLI exits non-zero on SIGTERM (agy 1, vibe 3)",
             "S-X-3, S-X-5, S-X-7 and S-KIRO-8 were not run",
         ):
             self.assertIn(phrase, deferred)
@@ -217,6 +220,7 @@ class TestDocsM3(unittest.TestCase):
             "`tests/smoke/results/`",
             "vendor_lead_m3_lite",
             "every vendor launch lead is refused, even with launch evidence",
+            "lead.vendor_leads",
             "`run.idle_timeout_s` defaults to `0`",
             "droid `dev` is the profile that commits locally",
             "Mesh never auto-commits",

@@ -1,0 +1,146 @@
+{
+  "adapter": "agy",
+  "binary": "/home/user/.local/bin/agy",
+  "captured_at_utc": "2026-11-19T14:08:47Z",
+  "cases": [
+    {
+      "carried_from": null,
+      "duration_s": 7.855,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/agy/1.5.12/smoke-S-X-1-stdout.jsonl",
+      "fixture_sha256": "51c024df9b16cebc83a3f25203d2bc759946cabe8902ad4cc0bdd4f7bc3a43b1",
+      "id": "S-X-1",
+      "observation": {
+        "raw_token_seen": true
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 7.855,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/agy/1.5.12/smoke-S-X-1-stdout.jsonl",
+      "fixture_sha256": "51c024df9b16cebc83a3f25203d2bc759946cabe8902ad4cc0bdd4f7bc3a43b1",
+      "id": "S-X-2",
+      "observation": {
+        "init_cwd": "/tmp/mh-smoke-80xanhyb",
+        "session_id": "a4b9aab8-e897-4cf2-8ec3-911a85a5d155",
+        "workspace": "/tmp/mh-smoke-80xanhyb"
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 10.89,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/agy/1.5.12/smoke-S-X-3-stdout.jsonl",
+      "fixture_sha256": "c8bede5ef3b154f5c049c094f437ec3486d0b8d400b9e2deec52458ff62aa1aa",
+      "id": "S-X-3",
+      "observation": {
+        "cwd": "/tmp/mh-smoke-80xanhyb",
+        "parsed_token_seen": true,
+        "raw_token_seen": true,
+        "resumed_session_id": "a4b9aab8-e897-4cf2-8ec3-911a85a5d155"
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 7.855,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/agy/1.5.12/smoke-S-X-1-stdout.jsonl",
+      "fixture_sha256": "51c024df9b16cebc83a3f25203d2bc759946cabe8902ad4cc0bdd4f7bc3a43b1",
+      "id": "S-X-4",
+      "observation": {
+        "init_model": "gemini-3.8-flash-low"
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 0.0,
+      "evaluated_from": null,
+      "fixture": null,
+      "fixture_sha256": null,
+      "id": "S-X-5",
+      "observation": null,
+      "rc": null,
+      "reason": "effort_not_listed",
+      "status": "not_applicable"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 5.222,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/agy/1.5.12/smoke-S-X-6-stdout.jsonl",
+      "fixture_sha256": "53ebbdf3403de44dbc4ac1c7279c05bab43f20d51211e90cddd800cc61b25dbf",
+      "id": "S-X-6",
+      "observation": {
+        "alive_at_term": true,
+        "first_byte": true,
+        "group_gone_after_term": true,
+        "lines_at_term": 2,
+        "rc": 1,
+        "seconds_to_gone": 0.208,
+        "stderr_excerpt": "error: interrupted",
+        "term_after_s": 5.012,
+        "vendor_exit_meaning": "run_error"
+      },
+      "rc": 1,
+      "reason": "exited_with_error",
+      "status": "fail"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 10.235,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/agy/1.5.12/smoke-S-X-7-stdout.jsonl",
+      "fixture_sha256": "f3a04789701ba49caaa90ac067d55c071424bed52319313b467d36ddd6a7bf4d",
+      "id": "S-X-7",
+      "observation": {
+        "file_created": false,
+        "rc": 0,
+        "stderr_excerpt": "",
+        "timed_out": false
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "observed"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 11.044,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/agy/1.5.12/smoke-S-AGY-8-stdout.jsonl",
+      "fixture_sha256": "781fbb0ffd0d42b49ef4c6506e8f00b744dbffeacc973fa64ac88ce18d33564a",
+      "id": "S-AGY-8",
+      "observation": {
+        "denied_actions": null,
+        "outcome": "deny",
+        "rc": 0,
+        "stderr_excerpt": "",
+        "tool_errors": 0,
+        "y_txt_exists": false
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "observed"
+    }
+  ],
+  "consent_ref": "james-2026-11-19-2036",
+  "effort": null,
+  "mesh_commit": "d7467e2b7c6e2c4a0642edeaccd8244c689ffa81",
+  "model": "gemini-3.8-flash-low",
+  "profile": "readonly",
+  "schema": "mesh.smoke.v1",
+  "timeout_s": 180.0,
+  "version": "1.5.12"
+}

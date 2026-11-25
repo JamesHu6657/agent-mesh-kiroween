@@ -1112,6 +1112,7 @@ The `Usage of agy:` header (L1) suggests Go's `flag` package, where flags must p
   - (B) `--print` takes the prompt as its value;
   - (C) stdin.
   Smoke S-AGY-1 tries A, then B, then C, and stores the working mode as adapter option `prompt_mode`. The default is A until verified.
+  **Update 2026-11-19 (agy 1.5.12):** mode A as built above failed on 1.5.12 (`--print took "--output-format" as its prompt`): there `--print` takes the next argv item as the prompt. The adapter now builds `agy --print <prompt> --output-format stream-json --model <m> … --print-timeout <timeout_s>s` (mode B with the prompt as a separate item directly after `--print`), which is also the shape of the real 1.5.3 captures (`agy -p <prompt> --model <m> --output-format stream-json`). A rerun with that argv on real agy 1.5.12 the same day (Mesh commit `d7467e2`) passed S-X-1 to S-X-4, so mode B is the verified mode on 1.5.12; S-X-6 is recorded as a failure because agy exits 1 on SIGTERM (`tests/smoke/results/agy-1.5.12-2026-11-19.json`). Reasoning and limits: `docs/adapters.md`, "Antigravity prompt argument (agy 1.5.12)".
 - **Version note:** the requirements recorded 1.4.8; 1.5.2 was observed on 2026-11-06.
 - **UNVERIFIED:**
   - the json and stream-json schemas;

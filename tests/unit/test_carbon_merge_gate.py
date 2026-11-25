@@ -48,7 +48,8 @@ class TestCommitReadyDurable(_MergeFixtureBase):
         with mock.patch("mesh.daemon.merge.os.fsync", side_effect=spy):
             merge._save_commit_ready(run_dir, task_id="tsk_1", pre_head=self.PRE, tip=self.TIP,
                                      symref="refs/heads/main", message="m")
-        self.assertEqual([stat.S_ISREG(m) for m in fsynced], [True, False])  # the file, then its directory
+        expected_fsyncs = [True] if sys.platform == "win32" else [True, False]
+        self.assertEqual([stat.S_ISREG(m) for m in fsynced], expected_fsyncs)  # the file (and dir on POSIX)
         self.assertEqual([n for n in os.listdir(run_dir) if n != merge.COMMIT_READY_NAME], [])
         cr = merge._load_commit_ready(run_dir)
         self.assertEqual((cr["task_id"], cr["pre_head"], cr["tip"]), ("tsk_1", self.PRE, self.TIP))

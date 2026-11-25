@@ -17,7 +17,8 @@ from typing import Any, Dict, List, Optional
 
 import mesh.constants as c
 from mesh.core.proc import get_proc_environ
-from tests.helpers import MeshHarness
+from mesh.platform import ipc as plat_ipc, pipe_pump
+from tests.helpers import MeshHarness, assert_private_mode
 from tests.stubs import create_test_stubs
 
 
@@ -154,7 +155,7 @@ class TestExecutionLaunch(unittest.TestCase):
 
         run_dir = run["run_dir"]
         self.assertTrue(os.path.isdir(run_dir))
-        self.assertEqual(os.stat(run_dir).st_mode & 0o777, 0o700)
+        assert_private_mode(self, run_dir, is_dir=True, posix_mode=0o700)
 
         prompt_path = os.path.join(run_dir, "prompt.md")
         self.assertTrue(os.path.isfile(prompt_path))
@@ -169,7 +170,7 @@ class TestExecutionLaunch(unittest.TestCase):
 
         spec_path = os.path.join(run_dir, "spec.json")
         self.assertTrue(os.path.isfile(spec_path))
-        self.assertEqual(os.stat(spec_path).st_mode & 0o777, 0o600)
+        assert_private_mode(self, spec_path, is_dir=False, posix_mode=0o600)
         with open(spec_path, "r", encoding="utf-8") as f:
             spec = json.load(f)
         self.assertIn("argv", spec)
@@ -215,7 +216,7 @@ class TestExecutionLaunch(unittest.TestCase):
         self.assertEqual(wrapper_env.get("MESH_PROJECT_ID"), self.project_id)
         self.assertEqual(wrapper_env.get("MESH_FENCE"), str(run["fence"]))
         self.assertTrue(wrapper_env.get("MESH_TOKEN", "").startswith("mesh_rt_"))
-        self.assertEqual(wrapper_env.get("MESH_SOCKET"), os.path.join(self.harness.home, "run", "mesh.sock"))
+        self.assertEqual(wrapper_env.get("MESH_SOCKET"), plat_ipc.daemon_endpoint_path(self.harness.home))
         self.assertNotIn("MESH_HOME", wrapper_env)
 
     def test_h12_executor_run_token_authority(self) -> None:
@@ -241,7 +242,10 @@ class TestExecutionLaunch(unittest.TestCase):
         self.assertIsNotNone(wrapper_env)
 
         def as_run(*args: str) -> tuple:
-            res = subprocess.run(["mesh", *args], capture_output=True, text=True, env=dict(wrapper_env), timeout=60)
+            env = dict(wrapper_env)
+            resolved = shutil.which("mesh", path=env.get("PATH")) or "mesh"
+            cmd = pipe_pump.prepare_win_cmd_args([resolved, *args], env=env)
+            res = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=60)
             try:
                 env = json.loads(res.stdout)
             except ValueError:
@@ -309,9 +313,10 @@ class TestExecutionLaunch(unittest.TestCase):
             "task", "create",
             "--project", self.project_id,
             "--title", "Huge",
-            "--spec", big_spec,
+            "--spec", "-",
             "--assignee", "fx",
             token=self.tok_lead1,
+            stdin=big_spec,
         )
         self.assertEqual(rc_t, 0, resp_t)
         task_id = resp_t["data"]["id"]

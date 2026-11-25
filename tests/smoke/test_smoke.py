@@ -1,39 +1,68 @@
-"""Opt-in smoke cases S-X-1..7 plus S-DROID-8 / S-KIRO-8 / S-AGY-8 / S-VIBE-8 (plan §14.10;
-m3-r3, m3-kiro-real, m3-smoke-agy-vibe; ACC: N11). Coordinator only (C2 droid; kiro, agy and
-vibe after James's consent).
+"""Opt-in smoke cases S-X-1..7 plus S-DROID-8 / S-KIRO-8 / S-AGY-8 / S-VIBE-8 / S-CODEX-8 /
+S-CLAUDE-8 / S-DEVIN-8 (plan §14.10; m3-r3, m3-kiro-real, m3-smoke-agy-vibe,
+smoke-codex-claude-devin; ACC: N11). Coordinator only (C2 droid; kiro, agy, vibe, codex, claude
+and devin after James's consent).
 
 Skipped unless the smoke gate is open for the adapter (``MESH_SMOKE=1``,
 ``MESH_SMOKE_ADAPTERS`` and ``MESH_SMOKE_CONSENT`` contain ``droid`` / ``kiro`` / ``agy`` /
-``vibe``). Never part of ``scripts/test.sh``. Profile readonly (droid: no autonomy flag; kiro:
-``--trust-tools=``; agy: ``--mode plan``; vibe: ``--agent ask``); model from
+``vibe`` / ``codex`` / ``claude`` / ``devin``). Never part of ``scripts/test.sh``. Profile
+readonly (droid: no autonomy flag; kiro: ``--trust-tools=``; agy: ``--mode plan``; vibe:
+``--agent ask``; codex: ``--ask-for-approval never`` + ``--sandbox read-only``; claude:
+``--permission-mode dontAsk`` with Bash/Edit/Write/NotebookEdit/WebFetch/WebSearch disallowed),
+except devin, whose adapter maps only ``unrestricted`` (``--permission-mode dangerous``;
+``smoke_schema.SMOKE_PROFILES``, tests/smoke/harness.py "Profile"). Model from
 ``MESH_SMOKE_MODEL_DROID`` (C2: ``claude-sonnet-5-5``) / ``MESH_SMOKE_MODEL_KIRO`` (name a
 cheap model; build() otherwise defaults to claude-opus-5.5) / ``MESH_SMOKE_MODEL_AGY`` /
-``MESH_SMOKE_MODEL_VIBE``; 6 model runs, one test method per
-run, selected with ``MESH_SMOKE_CASES=R1`` / ``R2,R3,R4,R5,R6`` (default all). Kiro credit
-rule (James): MESH_SMOKE_MAX_RUNS=1 per stage, ``/usage`` before and after:
+``MESH_SMOKE_MODEL_VIBE`` / ``MESH_SMOKE_MODEL_CODEX`` / ``MESH_SMOKE_MODEL_CLAUDE`` (the full
+model id: S-X-4 compares it with the init event's ``model``, so an alias such as ``sonnet``
+would be ``model_mismatch``) / ``MESH_SMOKE_MODEL_DEVIN`` (the effort is part of devin's model
+id, e.g. ``swe-2-flash-medium``); ``auto`` is refused for every adapter. 6 model runs (devin:
+4, its R2 and R3 start none), one test method per run, selected with ``MESH_SMOKE_CASES=R1`` /
+``R2,R3,R4,R5,R6`` (default all). Kiro credit rule (James): MESH_SMOKE_MAX_RUNS=1 per stage,
+``/usage`` before and after:
 
-* R1 -> S-X-1, S-X-2, S-X-4   "Reply with exactly MESH_SMOKE_OK"
+* R1 -> S-X-1, S-X-2, S-X-4   "Reply with exactly MESH_SMOKE_OK" (devin: S-X-2 is
+                               ``not_applicable(resume_unsupported)``, no session id is printed)
 * R2 -> S-X-3                 resume R1's session (this process, or the R1 capture staged in
-                               ``MESH_SMOKE_OUT``); no id -> ``blocked(no_session_id)``
+                               ``MESH_SMOKE_OUT``); no id -> ``blocked(no_session_id)``; an
+                               adapter without resume (devin) ->
+                               ``not_applicable(resume_unsupported)``, no run
 * R3 -> S-X-5                 ``MESH_SMOKE_EFFORT_<ADAPTER>`` (default ``low``; ``none`` ->
                                ``not_applicable(effort_not_listed)``, no run; an effort the
-                               adapter's build() refuses (vibe: no effort flag; agy: a model id
-                               that already ends in an effort suffix) ->
+                               adapter's build() refuses (vibe and devin: no effort flag; agy: a
+                               model id that already ends in an effort suffix; codex / claude: a
+                               value outside their documented list) ->
                                ``not_applicable(effort_refused_by_adapter)``, no run)
 * R4 -> S-X-6                 SIGTERM to the group after the first stdout byte or 5 s; pass if
                                no process with that pgid/sid remains within 15 s
 * R5 -> S-X-7                 "create file x.txt"; records whether it appears
-* R6 -> S-<ADAPTER>-8         "run `touch y.txt`" under readonly; deny/fail/hang, y.txt, stderr
+* R6 -> S-<ADAPTER>-8         "run `touch y.txt`" under the smoke profile; deny/fail/hang (or
+                               executed), y.txt, stderr
                                (kiro: the stderr ``[denied]`` count; agy: ``tool_errors`` (tool
                                steps in state ERROR) and ``denied_actions`` from the result;
-                               vibe: ``failed_effects`` / ``denied_effects`` from effect lines)
+                               vibe: ``failed_effects`` / ``denied_effects`` from effect lines;
+                               codex: ``commands`` / ``failed_commands`` / ``file_changes`` from
+                               the stream's items; claude: ``permission_denials`` and
+                               ``denied_tools`` from the result event; devin: ``tool_rejections``,
+                               the stderr ``warning: rejected a tool call`` count). devin runs
+                               unrestricted, so S-X-7 and S-DEVIN-8 record what happened
+                               (``profile: unrestricted``; outcome ``executed`` or
+                               ``not_executed``), never a deny
 
 Kiro stream facts (session id, ``metadata.modelId``, ``reasoning.effort``) come from
 ``KiroAdapter.stream_facts``; S-X-6 signals kiro after 4 stdout lines (runStarted and two
 metadata lines come before the model call). agy and vibe stream facts come from
 ``AgyAdapter.stream_facts`` / ``VibeAdapter.stream_facts``; S-X-6 signals agy after 3 lines
 (``init`` and the ``user_input`` step come before the model call) and vibe after 2 (its user
-message line comes first).
+message line comes first). codex and claude stream facts come from
+``CodexAdapter.stream_facts`` / ``ClaudeAdapter.stream_facts``; S-X-6 signals codex after 3
+lines (``thread.started`` and ``turn.started`` come first) and claude after 2 (the init event
+comes first). Neither echoes the effort (S-X-5 ``observed(not_echoed)`` at best) and codex
+names no model in its stream (S-X-4 ``observed(not_observable)``). devin prints plain text
+only: its stdout capture is ``smoke-<case>-stdout.txt``, its facts come from
+``DevinAdapter.parse`` / ``output_facts`` (S-X-1 passes on rc 0, no ``Error:`` line on stderr
+and the token in the reply; S-X-4 is ``observed(not_observable)``), and S-X-6 signals it after
+the first stdout line or 5 s.
 
 At class teardown the cases of this stage are merged onto any results already staged for
 the adapter at this version in ``MESH_SMOKE_OUT`` (later stage wins per case id), cases never run are
@@ -60,13 +89,26 @@ DROID_CASES = ("S-X-1", "S-X-2", "S-X-3", "S-X-4", "S-X-5", "S-X-6", "S-X-7", "S
 KIRO_CASES = ("S-X-1", "S-X-2", "S-X-3", "S-X-4", "S-X-5", "S-X-6", "S-X-7", "S-KIRO-8")
 AGY_CASES = ("S-X-1", "S-X-2", "S-X-3", "S-X-4", "S-X-5", "S-X-6", "S-X-7", "S-AGY-8")
 VIBE_CASES = ("S-X-1", "S-X-2", "S-X-3", "S-X-4", "S-X-5", "S-X-6", "S-X-7", "S-VIBE-8")
+CODEX_CASES = ("S-X-1", "S-X-2", "S-X-3", "S-X-4", "S-X-5", "S-X-6", "S-X-7", "S-CODEX-8")
+CLAUDE_CASES = ("S-X-1", "S-X-2", "S-X-3", "S-X-4", "S-X-5", "S-X-6", "S-X-7", "S-CLAUDE-8")
+DEVIN_CASES = ("S-X-1", "S-X-2", "S-X-3", "S-X-4", "S-X-5", "S-X-6", "S-X-7", "S-DEVIN-8")
 ADAPTER_CASES: Dict[str, Tuple[str, ...]] = {"droid": DROID_CASES, "kiro": KIRO_CASES, "agy": AGY_CASES,
-                                             "vibe": VIBE_CASES}
+                                             "vibe": VIBE_CASES, "codex": CODEX_CASES, "claude": CLAUDE_CASES,
+                                             "devin": DEVIN_CASES}
 # S-X-6: stdout lines to wait for before SIGTERM (past the pre-model events): droid init (1);
 # kiro runStarted + 2 metadata (3); agy 1.5.3 init + user_input step_update (2,
 # stream-step1-denied.jsonl:1-2); vibe 3.1.0 the user message line (1,
 # streaming-terminated.jsonl:1). Each value is that count plus one.
-SIGNAL_MIN_LINES = {"droid": 2, "kiro": 4, "agy": 3, "vibe": 2}
+# codex, claude and devin have no real capture yet: their counts come from the output format
+# each adapter module documents and are to be checked against the first real S-X-6 capture.
+# codex 0.166.0: thread.started + turn.started (2; mesh/adapters/codex.py "Event stream", the
+# first item event is line 3). claude 2.1.325: the system/init event (1; mesh/adapters/claude.py
+# "Stream", the first assistant message is line 2). devin 3000.14.30821: nothing (0; stdout is
+# only the plain-text reply, docs/adapters-devin.md "Output and failure meanings", so the first
+# complete line is already model output). A CLI that prints its reply in one piece at the end
+# never reaches the count while the model call is in flight; it is signalled at
+# S_X_6_FIRST_BYTE_S instead, still alive.
+SIGNAL_MIN_LINES = {"droid": 2, "kiro": 4, "agy": 3, "vibe": 2, "codex": 3, "claude": 2, "devin": 1}
 PROMPTS = {
     "R1": "Reply with exactly MESH_SMOKE_OK",
     "R2": "What token did you reply with?",
@@ -87,6 +129,12 @@ def selected_runs(env: Mapping[str, str]) -> List[str]:
     if bad:
         raise harness.SmokeConfigError(f"MESH_SMOKE_CASES: unknown runs {bad}")
     return [r for r in RUNS if r in raw]
+
+
+def smoke_effort(env: Mapping[str, str], adapter_id: str) -> str:
+    """The S-X-5 effort: ``MESH_SMOKE_EFFORT_<ADAPTER>`` (e.g. ``MESH_SMOKE_EFFORT_CODEX``),
+    default ``low``; ``none`` records ``not_applicable(effort_not_listed)`` without a run."""
+    return env.get(f"MESH_SMOKE_EFFORT_{adapter_id.upper()}", "low")
 
 
 def _cap(s: harness.SmokeSession, case_ids) -> None:
@@ -111,7 +159,7 @@ def run_r1(s: harness.SmokeSession) -> Optional[str]:
     obs["init_cwd"] = ev.stream_facts(o.stdout, aid)["cwd"]
     s.record("S-X-2", st, reason=reason, outcome=o, observation=obs)
     sx2_pass = st == "pass"
-    st, reason, obs = ev.eval_sx4(o.stdout, o.rc, o.timed_out, s.config.model, adapter_id=aid)
+    st, reason, obs = ev.eval_sx4(o.stdout, o.rc, o.timed_out, s.config.model, adapter_id=aid, stderr=o.stderr)
     s.record("S-X-4", st, reason=reason, outcome=o, observation=obs)
     if not sx2_pass or parsed is None:
         # S-X-2 passes only for rc 0, no timeout and no vendor error (eval_sx2), so a failed R1
@@ -147,7 +195,12 @@ def staged_session_id(s: harness.SmokeSession) -> Optional[str]:
 
 
 def run_r2(s: harness.SmokeSession, session_id: Optional[str]) -> None:
-    """R2 -> S-X-3: resume R1's session; no id -> blocked, no spawn."""
+    """R2 -> S-X-3: resume R1's session; no id -> blocked, no spawn. An adapter without resume
+    (devin) -> not_applicable(resume_unsupported), no spawn."""
+    unsupported = ev.unsupported_case(s.adapter.id, "S-X-3")
+    if unsupported:
+        s.record("S-X-3", unsupported[0], reason=unsupported[1], observation=unsupported[2])
+        return
     if not session_id:
         s.record("S-X-3", "blocked", reason="no_session_id")
         return
@@ -170,15 +223,18 @@ def run_r3(s: harness.SmokeSession, effort: str) -> None:
     try:
         o = s.run("S-X-5", PROMPTS["R3"], effort=effort)
     except (EffortNotAllowed, EffortUnsupported) as exc:
-        # build() refused before anything spawned (only agy and vibe raise these).
+        # build() refused before anything spawned (agy, vibe and devin raise these; codex and
+        # claude only for a value outside their documented effort list).
         s.record("S-X-5", "not_applicable", reason="effort_refused_by_adapter",
                  observation={"error": exc.code, "effort": effort, "model": s.config.model})
         return
     if o is None:
         _cap(s, ("S-X-5",))
         return
+    # codex and claude report a rejected model or effort in the stream, not on stderr.
+    parsed = s.parse(o) if getattr(s.adapter, "nonzero_exit_uses_stream_meaning", False) else None
     st, reason, obs = ev.with_effort(ev.eval_sx5(o.stdout, o.stderr, o.rc, o.timed_out, effort,
-                                                 adapter_id=s.adapter.id), effort)
+                                                 adapter_id=s.adapter.id, parsed=parsed), effort)
     s.record("S-X-5", st, reason=reason, outcome=o, observation=obs)
 
 
@@ -196,8 +252,17 @@ def run_r4(s: harness.SmokeSession, gone_within_s: float = S_X_6_GONE_WITHIN_S,
     s.record("S-X-6", st, reason=reason, outcome=o, observation=obs)
 
 
+def _with_profile(s: harness.SmokeSession, observation: Dict[str, Any]) -> Dict[str, Any]:
+    """``observation`` plus ``profile`` when the session does not run readonly (devin:
+    unrestricted), so a write or shell observation is never read as a readonly one."""
+    if s.profile != smoke_schema.DEFAULT_SMOKE_PROFILE:
+        observation["profile"] = s.profile
+    return observation
+
+
 def run_r5(s: harness.SmokeSession) -> None:
-    """R5 -> S-X-7 (observation): does x.txt appear under readonly?"""
+    """R5 -> S-X-7 (observation): does x.txt appear under the smoke profile (readonly; devin:
+    unrestricted)?"""
     target = os.path.join(s.workspace, "x.txt")
     existed = os.path.exists(target)
     o = s.run("S-X-7", PROMPTS["R5"])
@@ -205,12 +270,13 @@ def run_r5(s: harness.SmokeSession) -> None:
         _cap(s, ("S-X-7",))
         return
     s.record("S-X-7", "observed", outcome=o,
-             observation={"file_created": (not existed) and os.path.exists(target), "rc": o.rc,
-                          "timed_out": o.timed_out, "stderr_excerpt": ev.excerpt(o.stderr)})
+             observation=_with_profile(s, {"file_created": (not existed) and os.path.exists(target), "rc": o.rc,
+                                           "timed_out": o.timed_out, "stderr_excerpt": ev.excerpt(o.stderr)}))
 
 
 def case8(adapter_id: str) -> str:
-    """The adapter's shell-under-readonly case id (S-DROID-8, S-KIRO-8, S-AGY-8, S-VIBE-8)."""
+    """The adapter's shell case id (S-DROID-8, S-KIRO-8, S-AGY-8, S-VIBE-8, S-CODEX-8,
+    S-CLAUDE-8, S-DEVIN-8): shell under the smoke profile, readonly for all but devin."""
     return f"S-{adapter_id.upper()}-8"
 
 
@@ -260,9 +326,45 @@ def vibe_effect_failures(stdout: str) -> Dict[str, int]:
     return {"failed_effects": failed, "denied_effects": denied}
 
 
+def codex_command_facts(usage: Optional[Dict[str, Any]]) -> Dict[str, int]:
+    """codex 0.166.0: the stream's ``command_execution`` items (``commands``), those with
+    status ``failed`` (``failed_commands``) and its ``file_change`` items (``file_changes``), as
+    ``CodexAdapter.parse()`` counts them into ``usage`` (a count of 0 is left out there). Under
+    ``--sandbox read-only`` with ``--ask-for-approval never`` a command that needs approval
+    fails instead of prompting (mesh/adapters/codex.py); whether `touch y.txt` shows up as a
+    failed command is unverified until a real S-CODEX-8 run."""
+    usage = usage if isinstance(usage, dict) else {}
+    return {key: int(usage.get(key) or 0) for key in ("commands", "failed_commands", "file_changes")}
+
+
+def claude_permission_denials(stdout: str, usage: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """claude 2.1.325: the result event's ``permission_denials`` count
+    (``ClaudeAdapter.stream_facts``) and the denied tool names ``ClaudeAdapter.parse()`` keeps
+    in ``usage.denied_tools``. Under ``dontAsk`` a tool call that would prompt is denied and
+    listed there; a tool on ``--disallowedTools`` (Bash under readonly) may not be offered to
+    the model at all, which leaves the count at 0."""
+    from mesh.adapters.claude import ClaudeAdapter
+    usage = usage if isinstance(usage, dict) else {}
+    tools = usage.get("denied_tools")
+    return {"permission_denials": ClaudeAdapter.stream_facts(stdout or "")["permission_denials"],
+            "denied_tools": [t for t in tools if isinstance(t, str)] if isinstance(tools, list) else []}
+
+
+def devin_tool_rejections(stdout: str, stderr: str) -> Dict[str, int]:
+    """devin 3000.14.30821: stderr lines ``warning: rejected a tool call ...``, as
+    ``DevinAdapter.output_facts`` counts them (``usage.tool_denied``). Print mode writes one per
+    tool call its permission mode does not approve; under the smoke profile (unrestricted,
+    ``--permission-mode dangerous``) every call is approved, so 0 is the expected count."""
+    from mesh.adapters.devin import DevinAdapter
+    usage = DevinAdapter.output_facts(stdout or "", stderr or "")["usage"]
+    return {"tool_rejections": int(usage.get("tool_denied") or 0)}
+
+
 def run_r6(s: harness.SmokeSession) -> None:
-    """R6 -> S-DROID-8 / S-KIRO-8 / S-AGY-8 / S-VIBE-8 (observation): shell `touch y.txt` under
-    readonly."""
+    """R6 -> S-DROID-8 / S-KIRO-8 / S-AGY-8 / S-VIBE-8 / S-CODEX-8 / S-CLAUDE-8 / S-DEVIN-8
+    (observation): shell `touch y.txt` under the smoke profile. readonly: y.txt absent at rc 0
+    is ``deny``. devin runs unrestricted, where nothing is denied: y.txt absent at rc 0 is
+    ``not_executed`` (the model did not run the command, or the command failed)."""
     cid = case8(s.adapter.id)
     target = os.path.join(s.workspace, "y.txt")
     o = s.run(cid, PROMPTS["R6"])
@@ -276,9 +378,12 @@ def run_r6(s: harness.SmokeSession) -> None:
         outcome = "executed"
     elif o.rc not in (0, None):
         outcome = "fail"
+    elif s.profile != smoke_schema.DEFAULT_SMOKE_PROFILE:
+        outcome = "not_executed"
     else:
         outcome = "deny"
-    observation = {"outcome": outcome, "y_txt_exists": exists, "rc": o.rc, "stderr_excerpt": ev.excerpt(o.stderr)}
+    observation = _with_profile(s, {"outcome": outcome, "y_txt_exists": exists, "rc": o.rc,
+                                    "stderr_excerpt": ev.excerpt(o.stderr)})
     if s.adapter.id == "kiro":
         from mesh.adapters.kiro import DENIED_MARKER
         observation["denied_lines"] = (o.stderr or "").count(DENIED_MARKER)
@@ -286,6 +391,12 @@ def run_r6(s: harness.SmokeSession) -> None:
         observation.update(agy_tool_denials(o.stdout))
     elif s.adapter.id == "vibe":
         observation.update(vibe_effect_failures(o.stdout))
+    elif s.adapter.id == "codex":
+        observation.update(codex_command_facts(s.parse(o).usage))
+    elif s.adapter.id == "claude":
+        observation.update(claude_permission_denials(o.stdout, s.parse(o).usage))
+    elif s.adapter.id == "devin":
+        observation.update(devin_tool_rejections(o.stdout, o.stderr))
     s.record(cid, "observed", outcome=o, observation=observation)
 
 
@@ -364,7 +475,7 @@ class _VendorSmoke(unittest.TestCase):
         found = shutil.which(cls.BINARY, path=harness.shim_free_path(env))
         cls.session = harness.SmokeSession(env, cls.ADAPTER, os.path.abspath(found) if found else "",
                                            grace_s=harness.PRODUCTION_GRACE_S, mesh_commit=_mesh_commit())
-        cls.effort = env.get(f"MESH_SMOKE_EFFORT_{cls.ADAPTER.upper()}", "low")
+        cls.effort = smoke_effort(env, cls.ADAPTER)
         cls.previous_handlers = harness.install_interrupt_handlers()
 
     @classmethod
@@ -411,7 +522,7 @@ class _VendorSmoke(unittest.TestCase):
         run_r5(self.session)
 
     def test_r6(self) -> None:
-        """ACC: N11 - R6: S-<ADAPTER>-8 shell under readonly (observation)."""
+        """ACC: N11 - R6: S-<ADAPTER>-8 shell under the smoke profile (observation)."""
         self.want("R6")
         run_r6(self.session)
 
@@ -444,6 +555,35 @@ class VibeSmoke(_VendorSmoke):
 
     ADAPTER = "vibe"
     BINARY = "vibe"
+
+
+class CodexSmoke(_VendorSmoke):
+    """codex smoke (smoke-codex-claude-devin): only with James's consent. readonly
+    (``--sandbox read-only``); the prompt goes on stdin. MESH_SMOKE_EFFORT_CODEX must be one of
+    the adapter's documented efforts for S-X-5 to run."""
+
+    ADAPTER = "codex"
+    BINARY = "codex"
+
+
+class ClaudeSmoke(_VendorSmoke):
+    """claude smoke (smoke-codex-claude-devin): only with James's consent. readonly
+    (``--permission-mode dontAsk`` plus the readonly deny list); the prompt goes on stdin. Name
+    the full model id in MESH_SMOKE_MODEL_CLAUDE (S-X-4 compares it with the init event)."""
+
+    ADAPTER = "claude"
+    BINARY = "claude"
+
+
+class DevinSmoke(_VendorSmoke):
+    """devin smoke (smoke-codex-claude-devin): only with James's consent. Profile unrestricted
+    (``--permission-mode dangerous``), the only one the adapter maps; the cwd is the session's
+    /tmp/mh-smoke-* scratch dir. Plain-text stdout (``smoke-<case>-stdout.txt``). S-X-2, S-X-3
+    and S-X-5 are not_applicable (no session id, no resume, no effort flag); R2 and R3 spawn
+    nothing. Passing smoke evidence does not lift devin's launch hold (evidence.LAUNCH_HOLDS)."""
+
+    ADAPTER = "devin"
+    BINARY = "devin"
 
 
 if __name__ == "__main__":

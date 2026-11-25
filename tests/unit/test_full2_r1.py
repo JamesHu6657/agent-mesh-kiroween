@@ -13,6 +13,9 @@
    support.)
 """
 
+import contextlib
+import sys
+import subprocess
 import asyncio
 import json
 import os
@@ -37,6 +40,7 @@ from mesh.daemon.handlers.project import handle_project_deliver
 from mesh.daemon.server import DaemonServer, idempotency_partition
 from mesh.errors import MeshError
 from tests.gitfixture import GitFixture
+from tests.helpers import fake_peer_creds
 
 
 def _make_ctx(conn: sqlite3.Connection, home: str, cmd: str, args: dict) -> HandlerContext:
@@ -128,7 +132,7 @@ class TestP1RelayedIdempotencyPartition(unittest.TestCase):
         reader_s, writer_s = await asyncio.open_connection(sock=sock_b)
         reader_c, writer_c = await asyncio.open_connection(sock=sock_a)
         with mock.patch("mesh.daemon.server.get_peer_credentials",
-                        return_value=(os.getpid(), os.getuid(), os.getgid())), \
+                        return_value=fake_peer_creds()), \
                 mock.patch("mesh.daemon.server.classify_peer_run_session", return_value=None), \
                 mock.patch.object(self.srv, "refresh_run_caches"):
             writer_c.write((json.dumps(payload) + "\n").encode("utf-8"))
@@ -379,7 +383,7 @@ class TestP2ReverseI9JointExclusion(unittest.TestCase):
         return self.fixture.git(self.repo, *args).stdout.strip()
 
     def _insert_task(self, task_id: str, status: str, branch: str, base_commit: str,
-                     merge_commit: str | None = None) -> None:
+                     merge_commit: str | None = None, *, commit: bool = True) -> None:
         ts = "2026-01-01T00:00:00Z"
         mj = json.dumps({"merge_commit": merge_commit, "noop": False}) if merge_commit else None
         self.conn.execute(
@@ -388,7 +392,8 @@ class TestP2ReverseI9JointExclusion(unittest.TestCase):
             "VALUES (?, 'proj_1', 't', 's', 'code', ?, 'edit', 60, 1, ?, ?, ?, 'user', ?, ?);",
             (task_id, status, branch, base_commit, mj, ts, ts),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def test_run_git_supports_stdin_input(self) -> None:
         cp_excl = run_git(
@@ -408,39 +413,97 @@ class TestP2ReverseI9JointExclusion(unittest.TestCase):
         self.assertEqual(cp_keep.stdout.strip(), self.base_sha)
 
     def test_reverse_i9_over_200_excused_commits_and_pre_base_upstream(self) -> None:
-        # Build 210 merged tasks on integration: task 0 starts from old_base (before base_sha),
-        # tasks 1..209 start from base_sha.
+        # Build 210 merged tasks on integration (task 0 from old_base, tasks 1..209 from
+        # base_sha) and the 206-parent cancelled branch in one batched `git fast-import` so
+        # Windows does not spawn ~630 `git commit-tree` processes during setup.
         tree = self._git_out("rev-parse", f"{self.base_sha}^{{tree}}")
-        old_tree = self._git_out("rev-parse", f"{self.old_base}^{{tree}}")
-        cur = self.base_sha
-        tips: list[str] = []
+        fi_lines: list[str] = []
+        ident = "t <t@example.invalid>"
+        ts_sec = int(self._git_out("show", "-s", "--format=%ct", self.base_sha))
+        next_mark = 1
+        tip_marks: list[int] = []
+        merge_marks: list[int] = []
+
+        def _fi_commit(ref: str, msg: str, parents: list[str]) -> int:
+            nonlocal next_mark, ts_sec
+            mark = next_mark
+            next_mark += 1
+            ts_sec += 1
+            msg_bytes = msg.encode("utf-8")
+            fi_lines.extend([
+                f"commit {ref}",
+                f"mark :{mark}",
+                f"author {ident} {ts_sec} +0000",
+                f"committer {ident} {ts_sec} +0000",
+                f"data {len(msg_bytes)}",
+                msg,
+                f"from {parents[0]}",
+            ])
+            for par in parents[1:]:
+                fi_lines.append(f"merge {par}")
+            return mark
+
+        cur_ref = self.base_sha
         for i in range(210):
             if i == 0:
-                tip = self._git_out("commit-tree", old_tree, "-p", self.old_base, "-m", "pre_base_task")
-                task_base = self.old_base
+                t_mark = _fi_commit("refs/tmp/tip", "pre_base_task", [self.old_base])
             else:
-                tip = self._git_out("commit-tree", tree, "-p", self.base_sha, "-m", f"task_{i}")
-                task_base = self.base_sha
-            cur = self._git_out("commit-tree", tree, "-p", cur, "-p", tip, "-m", f"merge_{i}")
-            tips.append(tip)
-            self._insert_task(f"tsk_m{i}", "merged", f"mesh/proj_1/m{i}", task_base, merge_commit=cur)
-        self._git_out("update-ref", f"refs/heads/{self.integ}", cur)
+                t_mark = _fi_commit("refs/tmp/tip", f"task_{i}", [self.base_sha])
+            m_mark = _fi_commit(f"refs/heads/{self.integ}", f"merge_{i}", [cur_ref, f":{t_mark}"])
+            cur_ref = f":{m_mark}"
+            tip_marks.append(t_mark)
+            merge_marks.append(m_mark)
 
-        # Cancelled task branched from base_sha that pulled 206 merged upstream tips (including
-        # task 0 from pre-base history), plus its own unmerged work.
-        cancel_tip = self.base_sha
+        cancel_ref = "refs/heads/mesh/proj_1/cancel_ok"
+        c_prev = self.base_sha
         for i in range(206):
-            cancel_tip = self._git_out(
-                "commit-tree", tree, "-p", cancel_tip, "-p", tips[i], "-m", f"pull_up_{i}"
+            c_mark = _fi_commit(cancel_ref, f"pull_up_{i}", [c_prev, f":{tip_marks[i]}"])
+            c_prev = f":{c_mark}"
+        _fi_commit(cancel_ref, "own_unmerged", [c_prev])
+
+        marks_file = self.fixture.path("full2-marks.txt")
+        # Feed fast-import raw bytes: text-mode stdin would turn "\n" into "\r\n" on Windows
+        # and break the byte-counted `data` blocks (git exits 128).
+        subprocess.run(
+            ["git", "fast-import", "--force", "--quiet", f"--export-marks={marks_file}"],
+            cwd=self.repo,
+            env=self.fixture.env(),
+            check=True,
+            capture_output=True,
+            input=("\n".join(fi_lines) + "\n").encode("utf-8"),
+        )
+        self.fixture.git(self.repo, "update-ref", "-d", "refs/tmp/tip")
+        marks: dict[int, str] = {}
+        with open(marks_file, "r", encoding="utf-8") as mf:
+            for ln in mf:
+                mk_s, sha = ln.split()
+                marks[int(mk_s[1:])] = sha
+        for i in range(210):
+            task_base = self.old_base if i == 0 else self.base_sha
+            self._insert_task(
+                f"tsk_m{i}",
+                "merged",
+                f"mesh/proj_1/m{i}",
+                task_base,
+                merge_commit=marks[merge_marks[i]],
+                commit=False,
             )
-        cancel_tip = self._git_out("commit-tree", tree, "-p", cancel_tip, "-m", "own_unmerged")
-        self._git_out("branch", "mesh/proj_1/cancel_ok", cancel_tip)
+        self.conn.commit()
+        cur = marks[merge_marks[-1]]
         self._insert_task("tsk_cancel_ok", "cancelled", "mesh/proj_1/cancel_ok", self.base_sha)
 
         # Detach HEAD from main so deliver can update refs/heads/main
         self._git_out("checkout", "-q", "--detach", self.base_sha)
         self.assertEqual(invariants.check_i9_integrated_unmerged_tasks(self.conn, "proj_1"), [])
-        res = handle_project_deliver(_make_ctx(self.conn, self.tmp.name, "project.deliver", {"project_id": "proj_1"}))
+        # The reverse-I9 check spawns one `git merge-base --is-ancestor` per recorded merge (~220
+        # here). Process creation on Windows CI runners is slow enough that this exceeds the
+        # 30 s deliver git budget; the invariant logic is unchanged, so give it more wall time.
+        budget_patch = (
+            mock.patch("mesh.core.repos.SETUP_INTEGRATION_BUDGET_S", 300.0)
+            if sys.platform == "win32" else contextlib.nullcontext()
+        )
+        with budget_patch:
+            res = handle_project_deliver(_make_ctx(self.conn, self.tmp.name, "project.deliver", {"project_id": "proj_1"}))
         self.assertEqual(res.data["new"], cur)
 
         # Now test >200 excused commits reaching `git log --stdin` (non-excused commit fast-forwarded
@@ -453,8 +516,11 @@ class TestP2ReverseI9JointExclusion(unittest.TestCase):
 
         real_run_git = run_git
         stdin_seen: list[str] = []
+        git_call_count = 0
 
         def spy_run_git(args, cwd=None, **kw):
+            nonlocal git_call_count
+            git_call_count += 1
             if args and args[0] == "log" and "--stdin" in args and "input" in kw:
                 stdin_seen.append(kw["input"])
             return real_run_git(args, cwd=cwd, **kw)

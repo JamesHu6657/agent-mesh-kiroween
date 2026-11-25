@@ -6,9 +6,13 @@ caller-supplied newline can forge an extra log line), and the file rotates at
 
 import os
 import stat
+import sys
 import threading
 
 from mesh.core.redact import redact
+from mesh.platform import perms
+from mesh.platform.fs import atomic_replace, open_regular_nofollow
+from mesh.platform.paths import is_reparse_stat
 
 ROTATE_BYTES = 10 * 1024 * 1024
 KEEP = 4
@@ -41,10 +45,10 @@ def _rotate(path: str) -> None:
             st = os.lstat(src)
         except OSError:
             continue
-        if stat.S_ISLNK(st.st_mode):
+        if is_reparse_stat(st):
             continue
         try:
-            os.replace(src, dst)
+            atomic_replace(src, dst)
         except OSError:
             pass
 
@@ -64,25 +68,30 @@ def append_line(home: str, text: str, name: str = "meshd.log") -> None:
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
         with _lock:
             st_home = os.lstat(home)
-            if stat.S_ISLNK(st_home.st_mode) or not stat.S_ISDIR(st_home.st_mode):
+            if is_reparse_stat(st_home) or not stat.S_ISDIR(st_home.st_mode):
                 return
             logs_dir = os.path.join(home, "logs")
             if os.path.lexists(logs_dir):
                 st_logs = os.lstat(logs_dir)
-                if stat.S_ISLNK(st_logs.st_mode) or not stat.S_ISDIR(st_logs.st_mode):
+                if is_reparse_stat(st_logs) or not stat.S_ISDIR(st_logs.st_mode):
                     return
             else:
                 os.makedirs(logs_dir, mode=0o700, exist_ok=True)
+                if sys.platform == "win32":
+                    perms.set_private_dir_acl(logs_dir, 0o700)
             path = os.path.join(logs_dir, name)
             try:
                 st = os.lstat(path)
-                if not stat.S_ISLNK(st.st_mode) and st.st_size >= ROTATE_BYTES:
+                if not is_reparse_stat(st) and st.st_size >= ROTATE_BYTES:
                     _rotate(path)
             except OSError:
                 pass
-            fd = os.open(path, flags, 0o600)
+            if sys.platform == "win32":
+                fd = open_regular_nofollow(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600, label="log file")
+            else:
+                fd = os.open(path, flags, 0o600)
             try:
-                os.fchmod(fd, 0o600)
+                perms.fchmod_private(fd, 0o600)
                 os.write(fd, line.encode("utf-8", errors="replace"))
             finally:
                 os.close(fd)

@@ -24,6 +24,7 @@ class HermesAdapter(Adapter):
 
     id = "hermes"
     kind = "vendor"
+    supported_profiles = ()
     #: Productize: stub adapter (no command builder yet); warn mode never waives evidence for it.
     implemented = False
     binary_names = ["hermes"]

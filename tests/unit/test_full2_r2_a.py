@@ -31,6 +31,7 @@ from mesh.daemon.handlers.task import (
 from mesh.daemon.server import DaemonServer
 from mesh.errors import MeshError
 from tests.gitfixture import GitFixture
+from tests.helpers import fake_peer_creds
 
 
 def _make_ctx(
@@ -683,7 +684,7 @@ class TestP2_2TaskStartPrechecksIdempotencyAndNotify(unittest.TestCase):
         reader_s, writer_s = await asyncio.open_connection(sock=sock_b)
         reader_c, writer_c = await asyncio.open_connection(sock=sock_a)
         with mock.patch("mesh.daemon.server.get_peer_credentials",
-                        return_value=(os.getpid(), os.getuid(), os.getgid())), \
+                        return_value=fake_peer_creds()), \
                 mock.patch("mesh.daemon.server.classify_peer_run_session", return_value=None), \
                 mock.patch.object(self.srv, "refresh_run_caches"):
             writer_c.write((json.dumps(payload) + "\n").encode("utf-8"))

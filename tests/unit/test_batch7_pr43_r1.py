@@ -28,6 +28,7 @@ from mesh.daemon.handlers.run import handle_run_release
 from mesh.daemon.handlers.task import handle_task_reject
 from mesh.daemon.server import DaemonServer
 from mesh.errors import MeshError
+from mesh.platform.paths import temp_root
 
 # Tests spawn real child processes and scan real /proc: hold host-wide /proc lock shared.
 MESH_PROC_LOCK = "shared"
@@ -115,7 +116,7 @@ class TestBatch7PR43R1Unit(unittest.TestCase):
     """Focused unit tests for PR #43 review findings (P1-1, P1-3, P2-1, P2-2)."""
 
     def setUp(self) -> None:
-        self.home = tempfile.mkdtemp(prefix="mh-pr43r1-u-", dir="/tmp")
+        self.home = tempfile.mkdtemp(prefix="mh-pr43r1-u-", dir=temp_root())
         self.addCleanup(shutil.rmtree, self.home, True)
         for sub in ("logs", "run", "runs", "workspaces"):
             os.makedirs(os.path.join(self.home, sub), mode=0o700, exist_ok=True)
@@ -324,6 +325,7 @@ class TestBatch7PR43R1Unit(unittest.TestCase):
     # seen.json has reason='spawn_abort_pending', while still refusing when
     # run_id is in supervisor._SPAWN_ABORTS.
     # ------------------------------------------------------------------
+    @unittest.skipUnless(sys.platform != "win32", "POSIX os.fork/PGID detached carrier and select() pipe helper (Windows carrier termination covered in test_win_close_gate_jobs)")
     def test_p1_3_seen_held_allows_release_after_spawn_abort_recovery(self) -> None:
         run_id = "run_p13"
         run_dir = os.path.join(self.home, "runs", run_id)
@@ -397,7 +399,8 @@ class TestBatch7PR43R1Unit(unittest.TestCase):
     # P1-1: handle_task_reject checks spec+rework prompt length for launch agents
     # ------------------------------------------------------------------
     def test_p1_1_reject_checks_spec_prompt_length_for_launch(self) -> None:
-        kiro_bin = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "shims", "kiro-cli"))
+        kiro_name = "kiro-cli.cmd" if sys.platform == "win32" else "kiro-cli"
+        kiro_bin = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "shims", kiro_name))
         now = now_iso_utc()
         with transaction(self.conn):
             self.conn.execute(
@@ -513,6 +516,7 @@ class TestBatch7PR43R1Unit(unittest.TestCase):
     # ------------------------------------------------------------------
     # P2-2: lead_turn termination during leftovers, gone, and starting windows
     # ------------------------------------------------------------------
+    @unittest.skipUnless(sys.platform != "win32", "POSIX os.fork/PGID detached carrier and select() pipe helper (Windows carrier termination covered in test_win_close_gate_jobs)")
     def test_p2_2_lead_turn_cancel_during_leftovers_window(self) -> None:
         run_id = "run_lt_left"
         grp = self._spawn_detached_group(run_id, keep_env=True)
@@ -577,6 +581,7 @@ class TestBatch7PR43R1Unit(unittest.TestCase):
             0,
         )
 
+    @unittest.skipUnless(sys.platform != "win32", "POSIX os.fork/PGID detached carrier and select() pipe helper (Windows carrier termination covered in test_win_close_gate_jobs)")
     def test_p2_2_lead_turn_set_lead_finalize_fallback_and_gone_no_leftovers(self) -> None:
         # Case A: _finalize_termination fallback when lead was superseded while t.end_reason was still 'leftovers'.
         run_id = "run_lt_sup"
@@ -674,6 +679,7 @@ class TestBatch7PR43R1Unit(unittest.TestCase):
             0,
         )
 
+    @unittest.skipUnless(sys.platform != "win32", "POSIX os.fork/PGID detached carrier and select() pipe helper (Windows carrier termination covered in test_win_close_gate_jobs)")
     def test_p2_2_terminate_lead_turn_starting_window_and_expired_leftovers_control(self) -> None:
         # Subcase A: starting window (wrapper_pid IS NULL in DB, wrapper.json on disk)
         run_start = "run_lt_start"

@@ -233,6 +233,14 @@ def fan_out_event(conn: sqlite3.Connection, event: Dict[str, Any]) -> None:
             dedup = f"{etype}:{project_id}:{event_id}:{lead['assignment_id']}"
             _insert_outbox_msg(conn, event_seq, lead["agent_id"], channel, dedup, project_id, etype, payload_raw, now)
 
+    # 1b. chat.message (user messages ONLY) -> lead (never loop on lead/system cards)
+    elif etype == "chat.message" and project_id and payload.get("role") == "user":
+        lead = _get_project_lead_info(conn, project_id)
+        if lead:
+            channel = "lead_wake" if lead["delivery"] == "launch" else "inbox"
+            dedup = f"chat.message:{project_id}:{event_id}:{lead['assignment_id']}"
+            _insert_outbox_msg(conn, event_seq, lead["agent_id"], channel, dedup, project_id, etype, payload_raw, now)
+
     # 2. project.handover -> new lead
     elif etype == "project.handover" and project_id:
         asg_id = payload.get("new_assignment_id") or payload.get("assignment_id")
@@ -415,6 +423,9 @@ def verify_event_chain(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         "agent.token_revoked",
         "run.seen_release_forced",
         "run.merge_release_forced",
+        "project.permission_mode_changed",
+        "grant.created",
+        "grant.revoked",
     }
     has_init_markers = conn.execute(
         "SELECT 1 FROM principals WHERE id = 'principal_system' "

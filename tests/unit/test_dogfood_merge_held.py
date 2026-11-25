@@ -12,13 +12,14 @@ steps instead of INTERNAL_ERROR.
 """
 
 import os
+import sys
 import unittest
 from unittest import mock
 
 import mesh.constants as c
 from mesh.daemon import merge, terminate
 
-ME = os.geteuid()
+ME = os.geteuid() if sys.platform != "win32" else 0
 WRAP_ST = 1000
 
 
@@ -44,6 +45,7 @@ def _fake(procs):
     return stat, ostat
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), 'Linux /proc bystander UID inspection tests')
 class TestForeignSpawnedBystander(unittest.TestCase):
     def _check(self, procs, pid):
         stat, ostat = _fake(procs)

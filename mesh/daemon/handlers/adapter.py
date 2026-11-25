@@ -81,6 +81,39 @@ def _extract_binary_arg(ctx: HandlerContext, allow_on_probe: bool) -> Optional[s
     return os.path.abspath(os.path.expanduser(raw_bin.strip()))
 
 
+def _adapter_supported_profiles(adapter: Any) -> List[str]:
+    raw = getattr(adapter, "supported_profiles", ())
+    if isinstance(raw, (list, tuple)):
+        return list(raw)
+    return []
+
+
+def _adapter_model_presets(adapter: Any) -> Optional[Dict[str, Any]]:
+    raw = getattr(adapter, "model_presets", None)
+    if not isinstance(raw, dict):
+        return None
+    chips = raw.get("chips")
+    default_allowed = raw.get("default_allowed")
+    note = raw.get("note")
+    return {
+        "chips": list(chips) if isinstance(chips, (list, tuple)) else [],
+        "default_allowed": list(default_allowed) if isinstance(default_allowed, (list, tuple)) else [],
+        "note": str(note) if note is not None else "",
+    }
+
+
+def _adapter_profile_flags(adapter: Any) -> Dict[str, List[str]]:
+    out: Dict[str, List[str]] = {}
+    for prof in _adapter_supported_profiles(adapter):
+        try:
+            flags = adapter.profile_flags(prof)
+            if isinstance(flags, (list, tuple)):
+                out[prof] = [str(f) for f in flags]
+        except Exception:
+            pass
+    return out
+
+
 def _authorize_adapter_cmd(ctx: HandlerContext) -> None:
     check_authz(
         ctx.conn,
@@ -194,6 +227,9 @@ def handle_adapter_list(ctx: HandlerContext, testing_mode: bool) -> HandlerResul
             "launch_milestone": pdata["launch_milestone"],
             "launch_reason": pdata["launch_reason"],
             "results_file": pdata["results_file"],
+            "supported_profiles": _adapter_supported_profiles(a),
+            "profile_flags": _adapter_profile_flags(a),
+            "model_presets": _adapter_model_presets(a),
             "note": note,
         })
     return HandlerResult(data=redact_value({"adapters": items, "items": items}, jsonl=True))
@@ -219,6 +255,9 @@ def handle_adapter_show(ctx: HandlerContext, testing_mode: bool) -> HandlerResul
     data = apply_to_probe(probe.to_dict(), adapter, effective_launch(ctx.conn, adapter, testing_mode))
     data["kind"] = adapter.kind
     data["vendor"] = None if adapter.kind in ("test_double", "none") else adapter.id
+    data["supported_profiles"] = _adapter_supported_profiles(adapter)
+    data["profile_flags"] = _adapter_profile_flags(adapter)
+    data["model_presets"] = _adapter_model_presets(adapter)
     if adapter.kind == "test_double":
         data["note"] = "not a vendor integration"
     return HandlerResult(data=redact_value(data, jsonl=True))  # r5 P1-4: vendor stderr/output
@@ -249,6 +288,9 @@ def handle_adapter_probe(ctx: HandlerContext, testing_mode: bool) -> HandlerResu
         )
         data["kind"] = adapter.kind
         data["vendor"] = None if adapter.kind in ("test_double", "none") else adapter.id
+        data["supported_profiles"] = _adapter_supported_profiles(adapter)
+        data["profile_flags"] = _adapter_profile_flags(adapter)
+        data["model_presets"] = _adapter_model_presets(adapter)
         if adapter.kind == "test_double":
             data["note"] = "not a vendor integration"
         return HandlerResult(data=redact_value(data, jsonl=True))  # r5 P1-4: vendor stderr/output
@@ -271,6 +313,9 @@ def handle_adapter_probe(ctx: HandlerContext, testing_mode: bool) -> HandlerResu
         pdict = apply_to_probe(probe.to_dict(), a, effective_launch(ctx.conn, a, testing_mode, binary_path))
         pdict["kind"] = a.kind
         pdict["vendor"] = None if a.kind in ("test_double", "none") else a.id
+        pdict["supported_profiles"] = _adapter_supported_profiles(a)
+        pdict["profile_flags"] = _adapter_profile_flags(a)
+        pdict["model_presets"] = _adapter_model_presets(a)
         if a.kind == "test_double":
             pdict["note"] = "not a vendor integration"
         items.append(pdict)

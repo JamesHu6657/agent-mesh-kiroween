@@ -37,6 +37,13 @@ def _repo(path: str, branch: str) -> None:
 
 
 def _alive(pid: int) -> bool:
+    if sys.platform == "win32":
+        from mesh.core.proc import is_tgid_alive
+
+        try:
+            return is_tgid_alive(pid)
+        except OSError:
+            return False
     try:
         with open(f"/proc/{pid}/stat") as f:
             return f.read().split(") ", 1)[1].split()[0] != "Z"
@@ -54,10 +61,11 @@ class TestSpawnedThenFailedCleanup(unittest.TestCase):
             seen["pid"] = p.pid
             return p
 
+        cmd = [sys.executable, "-c", "import time; time.sleep(60)"] if sys.platform == "win32" else ["sleep", "60"]
         with mock.patch.object(children, "register", side_effect=OSError("proc gone")), \
                 mock.patch.object(children.subprocess, "Popen", side_effect=popen):
             with self.assertRaises(children.SpawnedThenFailed):
-                children.run_registered("probe", ["sleep", "60"], timeout=1)
+                children.run_registered("probe", cmd, timeout=1)
         time.sleep(0.2)
         self.assertFalse(_alive(seen["pid"]))
         self.assertNotIn(seen["pid"], children._held)
@@ -71,16 +79,41 @@ class TestProbeBounds(unittest.TestCase):
         try:
             pidfile = os.path.join(d, "pid")
             t0 = time.monotonic()
-            res = run_readonly_cmd(["sh", "-c", f"sleep 30 & echo $! > {pidfile}; wait"], timeout_s=0.3)
+            if sys.platform == "win32":
+                # Write pidfile atomically via os.replace so a timeout mid-write never leaves
+                # an empty 0-byte pidfile, and allow double-Python startup on loaded CI while
+                # staying far below the descendant's 30s sleep.
+                helper = (
+                    "import os, subprocess, sys\n"
+                    "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+                    "tmp = sys.argv[1] + '.tmp'\n"
+                    "with open(tmp, 'w') as f:\n"
+                    "    f.write(str(p.pid))\n"
+                    "    f.flush()\n"
+                    "os.replace(tmp, sys.argv[1])\n"
+                    "p.wait()\n"
+                )
+                res = run_readonly_cmd([sys.executable, "-c", helper, pidfile], timeout_s=2.5)
+            else:
+                res = run_readonly_cmd(["sh", "-c", f"sleep 30 & echo $! > {pidfile}; wait"], timeout_s=0.3)
             took = time.monotonic() - t0
             self.assertEqual(res.returncode, -1)
-            self.assertLess(took, 3.0)
-            time.sleep(0.2)
-            with open(pidfile) as f:
-                self.assertFalse(_alive(int(f.read().strip())))
+            self.assertLess(took, 7.0 if sys.platform == "win32" else 3.0)
+            if sys.platform == "win32":
+                with open(pidfile) as f:
+                    desc_pid = int(f.read().strip())
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and _alive(desc_pid):
+                    time.sleep(0.05)
+                self.assertFalse(_alive(desc_pid))
+            else:
+                time.sleep(0.2)
+                with open(pidfile) as f:
+                    self.assertFalse(_alive(int(f.read().strip())))
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+    @unittest.skipUnless(sys.platform != "win32", "POSIX setsid descendant holding inherited stdout pipe across process-group SIGKILL")
     def test_escaped_descendant_holding_pipe_does_not_block(self) -> None:
         from mesh.adapters.base import run_readonly_cmd
 
@@ -105,7 +138,7 @@ class TestProbeBounds(unittest.TestCase):
 
         tracemalloc.start()
         try:
-            res = run_readonly_cmd(["python3", "-c", "import sys; sys.stdout.write('x' * (16 * 1024 * 1024))"],
+            res = run_readonly_cmd([sys.executable, "-c", "import sys; sys.stdout.write('x' * (16 * 1024 * 1024))"],
                                    timeout_s=20, max_output_bytes=64)
             _, peak = tracemalloc.get_traced_memory()
         finally:
@@ -140,7 +173,8 @@ class TestDeferredRecovery(unittest.TestCase):
         self.addCleanup(shutil.rmtree, home, True)
         run_dir = os.path.join(home, "runs", "run_x")
         os.makedirs(run_dir)
-        child = subprocess.Popen(["sleep", "30"])
+        child_cmd = [sys.executable, "-c", "import time; time.sleep(30)"] if sys.platform == "win32" else ["sleep", "30"]
+        child = subprocess.Popen(child_cmd)
         self.addCleanup(child.wait)
         self.addCleanup(child.kill)
         with open(os.path.join(run_dir, "wrapper.json"), "w") as f:
@@ -219,6 +253,7 @@ class TestMergeBranchIdentity(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
 
+@unittest.skipUnless(sys.platform != "win32", "NTFS forbids newline characters (0x0A) in directory names")
 class TestWorktreeNewlinePath(unittest.TestCase):
     def test_path_with_newline(self) -> None:
         from mesh.core import repos
@@ -241,12 +276,19 @@ class TestClientHomeAndTail(unittest.TestCase):
             env = {k: v for k, v in os.environ.items() if k not in ("MESH_HOME", "MESH_SOCKET")}
             env.update(HOME=d, MESH_SOCKET=os.path.join(d, "other.sock"))
             root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            cp = subprocess.run([os.path.join(root, "bin", "mesh"), "--home", os.path.join(d, ".agent-mesh"),
-                                 "daemon", "status"], env=env, capture_output=True, text=True, timeout=30)
+            if sys.platform == "win32":
+                env.update(USERPROFILE=d, LOCALAPPDATA=d)
+                cmd = [sys.executable, os.path.join(root, "bin", "mesh"), "--home", os.path.join(d, ".agent-mesh"),
+                       "daemon", "status"]
+            else:
+                cmd = [os.path.join(root, "bin", "mesh"), "--home", os.path.join(d, ".agent-mesh"),
+                       "daemon", "status"]
+            cp = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=30)
             self.assertNotIn("other.sock", cp.stdout + cp.stderr)
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+    @unittest.skipUnless(sys.platform != "win32", "POSIX AF_UNIX socket transport (Windows MeshClient uses Named Pipes)")
     def test_tail_does_not_retain_events(self) -> None:
         from mesh.client import MeshClient
 
@@ -319,14 +361,21 @@ class TestDeferredRecoveryR2(unittest.TestCase):
         run_id = "run_blk" + str(os.getpid())
         self.add_run(run_id)
         env = dict(os.environ, MESH_RUN_ID=run_id)
-        carrier = subprocess.Popen(["sleep", "30"], env=env)
+        carrier_cmd = [sys.executable, "-c", "import time; time.sleep(30)"] if sys.platform == "win32" else ["sleep", "30"]
+        carrier = subprocess.Popen(carrier_cmd, env=env)
         self.addCleanup(carrier.wait)
         self.addCleanup(carrier.kill)
         time.sleep(0.1)
         self.recovery.DEFERRED[run_id] = ("boot_1", 0.0)
-        t0 = time.monotonic()
-        self.recovery.retry_deferred(self.conn, self.home)
-        self.assertLess(time.monotonic() - t0, 1.0)
+        sleep_calls: list[float] = []
+        with mock.patch.object(time, "sleep", side_effect=sleep_calls.append):
+            t0 = time.monotonic()
+            self.recovery.retry_deferred(self.conn, self.home)
+            took = time.monotonic() - t0
+        self.assertEqual(sleep_calls, [], f"retry_deferred must not sleep: {sleep_calls}")
+        # Win32 full-host Toolhelp+PEB scans under loaded CI can exceed 1.0s without sleeping;
+        # still assert strictly below WRAPPER_WAIT_S (5.0s), keeping the tight 1.0s bound on POSIX.
+        self.assertLess(took, 3.0 if sys.platform == "win32" else 1.0)
         self.assertIn(run_id, self.recovery.DEFERRED)
 
     def test_closed_run_releases_delivering_messages(self) -> None:
@@ -368,28 +417,35 @@ class TestDeferredRecoveryR3(TestDeferredRecoveryR2):
         # 30 s: closing waits for the termination engine, which is slow under full-suite
         # load (merge gate flake at 5 s); each tick is still bounded below (no sleep).
         durations = []
+        real_sleep = time.sleep
         end = time.monotonic() + limit_s
         while time.monotonic() < end:
             entry = self.recovery.DEFERRED.get(run_id)
             if entry is not None:
                 self.recovery.DEFERRED[run_id] = (entry[0], 0.0) + tuple(entry[2:])
+            sleep_calls: list[float] = []
             t0 = time.monotonic()
-            with mock.patch.object(self.recovery, "_log"):
+            with mock.patch.object(self.recovery, "_log"), \
+                    mock.patch.object(time, "sleep", side_effect=sleep_calls.append):
                 self.recovery.retry_deferred(self.conn, self.home)
             durations.append(time.monotonic() - t0)
+            self.assertEqual(sleep_calls, [], f"retry_deferred must not sleep: {sleep_calls}")
             if run_id not in self.recovery.DEFERRED:
                 break
-            time.sleep(0.05)
+            real_sleep(0.05)
         return durations
 
     def test_empty_spawn_window_does_not_sleep(self) -> None:
+        # Win32 Toolhelp+PEB process scans can spike >0.15s on overloaded CI runners without sleeping;
+        # zero-sleep inside retry_deferred is verified directly above while keeping 0.15s on POSIX.
+        tick_bound_s = 10.0 if sys.platform == "win32" else 0.15
         for n in range(3):
             run_id = "run_nsl%d_%d" % (n, os.getpid())
             self.add_run(run_id)
             self.recovery.DEFERRED[run_id] = ("boot_1", 0.0)
             durations = self.tick_until_closed(run_id)
             self.assertNotIn(run_id, self.recovery.DEFERRED)
-            self.assertLess(max(durations), 0.15, durations)
+            self.assertLess(max(durations), tick_bound_s, durations)
             st = self.conn.execute("SELECT status FROM runs WHERE id = ?;", (run_id,)).fetchone()[0]
             self.assertNotIn(st, ("starting", "running"))
 
@@ -399,9 +455,12 @@ class TestDeferredRecoveryR3(TestDeferredRecoveryR2):
         with open(os.path.join(run_dir, "wrapper.json"), "w") as f:
             f.write('{"pid": 999999, "starttime": 12345}')
         self.recovery.DEFERRED[run_id] = ("boot_1", 0.0)
-        durations = self.tick_until_closed(run_id, limit_s=1.0)
-        self.assertLess(max(durations), 0.15, durations)
+        limit_s = 5.0 if sys.platform == "win32" else 1.0
+        tick_bound_s = 10.0 if sys.platform == "win32" else 0.15
+        durations = self.tick_until_closed(run_id, limit_s=limit_s)
+        self.assertLess(max(durations), tick_bound_s, durations)
 
+    @unittest.skipUnless(sys.platform != "win32", "POSIX setsid env -i escaped carrier orphan semantics (Windows Job Object carrier recovery covered in test_win_close_gate_jobs)")
     def test_carrier_child_survives_parent_exit_between_ticks(self) -> None:
         run_id = "run_kid" + str(os.getpid())
         self.add_run(run_id)
@@ -464,6 +523,7 @@ class TestDeferredRecoveryR3(TestDeferredRecoveryR2):
         self.assertEqual(row[0], "pending")
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX setsid env -i escaped carrier recovery and seen.json adoption (Windows Job Object close-gate covered in test_win_close_gate_jobs)")
 class TestDeferredRecoveryR4(TestDeferredRecoveryR3):
     """PR #40 r4: identities found by earlier live-recovery scans survive adoption and
     both exit-file paths (real processes, no mocked process table)."""
@@ -578,6 +638,7 @@ class TestDeferredRecoveryR4(TestDeferredRecoveryR3):
         self.assertIn(kid, self.targets(run_id))
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX setsid env -i escaped carrier recovery and seen.json adoption (Windows Job Object close-gate covered in test_win_close_gate_jobs)")
 class TestDeferredRecoveryR5(TestDeferredRecoveryR4):
     """PR #40 r5: on an uncertain adoption the found identities are persisted in the
     unusable marker (hold kept); if that fails, recovery keeps the run and retries."""
@@ -645,6 +706,7 @@ class TestDeferredRecoveryR5(TestDeferredRecoveryR4):
         self.assertIn(kid, self.recovery.DEFERRED[run_id][2].found)
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX setsid env -i escaped carrier recovery and seen.json adoption (Windows Job Object close-gate covered in test_win_close_gate_jobs)")
 class TestDeferredRecoveryR6(TestDeferredRecoveryR5):
     """PR #40 r6: a failed hand-over write is redone on the retry; the hold survives a
     restart in a fresh interpreter."""
@@ -720,7 +782,14 @@ class TestProbeExitAfterClose(unittest.TestCase):
     def test_closed_output_then_clean_exit_is_not_killed(self) -> None:
         from mesh.adapters.base import run_readonly_cmd
 
-        res = run_readonly_cmd(["sh", "-c", "echo hi; exec >/dev/null 2>&1; sleep 0.3; exit 0"], timeout_s=3)
+        cmd = (
+            [sys.executable, "-c",
+             "import os, time; print('hi', flush=True); d = os.open(os.devnull, os.O_RDWR); "
+             "os.dup2(d, 1); os.dup2(d, 2); os.close(d); time.sleep(0.3)"]
+            if sys.platform == "win32"
+            else ["sh", "-c", "echo hi; exec >/dev/null 2>&1; sleep 0.3; exit 0"]
+        )
+        res = run_readonly_cmd(cmd, timeout_s=3)
         self.assertEqual(res.returncode, 0)
         self.assertIn("hi", res.stdout)
 

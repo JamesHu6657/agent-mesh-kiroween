@@ -1,6 +1,8 @@
 """Unit regression tests for PR #45 round-2 review findings (P1-1, P1-2, P2, P3)."""
 
 import asyncio
+import contextlib
+import gc
 import json
 import os
 import shutil
@@ -28,10 +30,38 @@ from mesh.daemon.handlers.config import handle_config_set
 from mesh.daemon.handlers.run import handle_run_release, handle_workspace_delete
 from mesh.daemon.server import DaemonServer
 from mesh.errors import MeshError
+from mesh.platform import paths as plat_paths
 from tests.gitfixture import GitFixture
+from tests.helpers import fake_peer_creds, restore_accessible_for_test, set_inaccessible_for_test
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Calls recovery.recover and merge.run_merge_pipeline scanning real /proc.
 MESH_PROC_LOCK = "shared"
+
+
+@contextlib.contextmanager
+def _win_safe_tempdir(prefix: str):
+    """TemporaryDirectory with brief WinError 32 retry (AV/WAL close race) on Windows."""
+    if sys.platform != "win32":
+        with tempfile.TemporaryDirectory(prefix=prefix) as tmp:
+            yield tmp
+        return
+    tmp = os.path.realpath(tempfile.mkdtemp(prefix=prefix, dir=plat_paths.temp_root()))
+    try:
+        yield tmp
+    finally:
+        gc.collect()
+        delays = (0.02, 0.05, 0.1, 0.2)
+        for idx in range(len(delays) + 1):
+            try:
+                shutil.rmtree(tmp)
+                break
+            except OSError as exc:
+                if idx >= len(delays) or getattr(exc, "winerror", None) != 32:
+                    raise
+                gc.collect()
+                time.sleep(delays[idx])
 
 
 def _setup_home_and_db(tmp: str):
@@ -151,7 +181,7 @@ async def _drive_server(
         async def wait_closed(self) -> None:
             pass
 
-    with mock.patch("mesh.daemon.server.get_peer_credentials", return_value=(os.getpid(), os.getuid(), os.getgid())), \
+    with mock.patch("mesh.daemon.server.get_peer_credentials", return_value=fake_peer_creds()), \
          mock.patch.object(srv, "authenticate_and_authorize", return_value=(principal, actor_kind, via, k_user)):
         await srv.handle_client(reader, _W())
     return json.loads(buf.decode("utf-8").splitlines()[0])
@@ -499,11 +529,11 @@ class TestP1_1WorkspaceDeletePruneReservation(unittest.TestCase):
         fixture = GitFixture()
         self.addCleanup(fixture.cleanup)
         repo = fixture.make_k0("PrnUnit")
-        with tempfile.TemporaryDirectory(prefix="mh-r2-p11prn-") as tmp:
+        with _win_safe_tempdir(prefix="mh-r2-p11prn-") as tmp:
             home, conn = _setup_home_and_db(tmp)
-            fixture.allow_root(tmp)
-            fixture.allow_root(home)
             try:
+                fixture.allow_root(tmp)
+                fixture.allow_root(home)
                 now = now_iso_utc()
                 fixture.git(repo, "branch", "mesh/prj_1/integration", "main")
                 integ = os.path.join(home, "workspaces", "prj_1", "integration")
@@ -601,7 +631,10 @@ class TestP1_1WorkspaceDeletePruneReservation(unittest.TestCase):
                 self.assertEqual(ev_sys, 1)
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'ws_res:%';").fetchone()[0], 0)
             finally:
+                if "srv" in locals():
+                    srv.db_conn = None
                 conn.close()
+                gc.collect()
 
     def test_recovery_handles_leftover_ws_delete_and_prune_reservations(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mh-r2-p11rec-") as tmp:
@@ -834,17 +867,22 @@ class TestP1_2MergeTrackedAndUnreadableCleanup(unittest.TestCase):
         run_dir = os.path.join(self.fixture.base, "run_000")
         os.makedirs(run_dir, mode=0o700, exist_ok=True)
         script = (
-            "import os\n"
+            "import os, sys\n"
+            f"sys.path.insert(0, {_REPO_ROOT!r})\n"
+            "from tests.helpers import set_inaccessible_for_test\n"
             "os.makedirs('top000', mode=0o700)\n"
             "open('top000/f', 'w').write('1')\n"
-            "os.chmod('top000', 0o000)\n"
+            "set_inaccessible_for_test('top000')\n"
             "os.makedirs('cache/sub000', mode=0o700)\n"
             "open('cache/norm.txt', 'w').write('2')\n"
             "open('cache/sub000/g', 'w').write('3')\n"
-            "os.chmod('cache/sub000', 0o000)\n"
+            "set_inaccessible_for_test('cache/sub000')\n"
             "os.makedirs('dir100', mode=0o700)\n"
             "open('dir100/h', 'w').write('4')\n"
-            "os.chmod('dir100', 0o100)\n"
+            "if sys.platform == 'win32':\n"
+            "    set_inaccessible_for_test('dir100')\n"
+            "else:\n"
+            "    os.chmod('dir100', 0o100)\n"
             "os.makedirs('empty_dir', mode=0o700)\n"
         )
         try:
@@ -870,7 +908,7 @@ class TestP1_2MergeTrackedAndUnreadableCleanup(unittest.TestCase):
             for d in ("top000", "cache", "cache/sub000", "dir100"):
                 p = os.path.join(self.repo, d)
                 if os.path.exists(p):
-                    os.chmod(p, 0o700)
+                    restore_accessible_for_test(p)
 
         # Also verify decide_recovery cleans tracked edits + 0o000/empty dirs when pre-merge snapshots exist,
         # and preserves pre-existing empty dirs when pre_empty_dirs.json is absent (run_dir=None).
@@ -886,7 +924,7 @@ class TestP1_2MergeTrackedAndUnreadableCleanup(unittest.TestCase):
         os.makedirs(os.path.join(self.repo, "crash000"), mode=0o700)
         with open(os.path.join(self.repo, "crash000", "x"), "w", encoding="utf-8") as f:
             f.write("x\n")
-        os.chmod(os.path.join(self.repo, "crash000"), 0o000)
+        set_inaccessible_for_test(os.path.join(self.repo, "crash000"))
         os.makedirs(os.path.join(self.repo, "crash_empty"), mode=0o700)
         try:
             rec = merge.decide_recovery(
@@ -901,7 +939,7 @@ class TestP1_2MergeTrackedAndUnreadableCleanup(unittest.TestCase):
         finally:
             p = os.path.join(self.repo, "crash000")
             if os.path.exists(p):
-                os.chmod(p, 0o700)
+                restore_accessible_for_test(p)
 
         preexisting_empty = os.path.join(self.repo, "preexisting_empty")
         os.makedirs(preexisting_empty, mode=0o700)
@@ -1191,7 +1229,8 @@ class TestP3TestingModePropagation(unittest.TestCase):
                     )
                 next_at = conn.execute("SELECT next_attempt_at FROM outbox WHERE id = 'msg_lt1';").fetchone()["next_attempt_at"]
                 delta = parse_utc(next_at).timestamp() - before_ts
-                self.assertLess(delta, 5.0, f"expected ~1s testing backoff, got {delta:.2f}s")
+                # Windows CI: slow spawn-failure path; 15s still far below the 30s production backoff.
+                self.assertLess(delta, 15.0 if sys.platform == "win32" else 5.0, f"expected ~1s testing backoff, got {delta:.2f}s")
 
                 # Recovery lost_before_spawn path also forwards testing_mode=True even without MESH_TESTING in env!
                 run_dir2 = os.path.join(home, "runs", "run_lt2")
@@ -1229,7 +1268,8 @@ class TestP3TestingModePropagation(unittest.TestCase):
                     recovery.recover(conn, home, "boot_new", testing_mode=True)
                 next_at2 = conn.execute("SELECT next_attempt_at FROM outbox WHERE id = 'msg_lt2';").fetchone()["next_attempt_at"]
                 delta2 = parse_utc(next_at2).timestamp() - before_rec
-                self.assertLess(delta2, 5.0, f"expected ~1s testing backoff on recovery, got {delta2:.2f}s")
+                # Windows CI: same slow path as above (5.08s seen on windows-latest); 15s still far below the 30s production backoff.
+                self.assertLess(delta2, 15.0 if sys.platform == "win32" else 5.0, f"expected ~1s testing backoff on recovery, got {delta2:.2f}s")
             finally:
                 conn.close()
 

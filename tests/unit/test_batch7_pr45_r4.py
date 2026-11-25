@@ -29,6 +29,9 @@ from mesh.daemon.handlers.run import (
 )
 from mesh.errors import MeshError
 from tests.gitfixture import GitFixture
+from tests.helpers import fake_peer_creds, restore_accessible_for_test, set_inaccessible_for_test
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 MESH_PROC_LOCK = "shared"
 
@@ -512,13 +515,15 @@ class TestP2_3GitlinkSymlinkAndEmptyCleanup(_MergeFixtureBase):
             with self.subTest(exit_code=exit_code):
                 script = (
                     "import os, sys\n"
+                    f"sys.path.insert(0, {_REPO_ROOT!r})\n"
+                    "from tests.helpers import set_inaccessible_for_test\n"
                     "open('tests/test_calc.py', 'w').write('# dirtied\\n')\n"
-                    "os.chmod('tests', 0o000)\n"
+                    "set_inaccessible_for_test('tests')\n"
                     "os.rmdir('vendor_sub')\n"
-                    "os.symlink('.', 'vendor_sub')\n"
+                    "os.symlink('.', 'vendor_sub', target_is_directory=True)\n"
                     "os.rmdir('deps/nested_sub')\n"
                     "os.rmdir('deps')\n"
-                    "os.symlink('.', 'deps')\n"
+                    "os.symlink('.', 'deps', target_is_directory=True)\n"
                     f"sys.exit({exit_code})\n"
                 )
                 out = merge.run_merge_pipeline(self._plan(f"run_gl_{exit_code}", "tsk_gl", b, self.base, script))
@@ -545,11 +550,13 @@ class TestP2_3GitlinkSymlinkAndEmptyCleanup(_MergeFixtureBase):
         b = "mesh/prj_1/tsk_gl_leak"
         self._make_branch(b, {"clean_gl.txt": "ok\n"})
         script = (
-            "import os\n"
+            "import os, sys\n"
+            f"sys.path.insert(0, {_REPO_ROOT!r})\n"
+            "from tests.helpers import set_inaccessible_for_test\n"
             "os.makedirs('vendor_sub/subcache/d000', exist_ok=True)\n"
             "open('vendor_sub/leaked.txt', 'w').write('leftover\\n')\n"
             "open('vendor_sub/subcache/d000/inner.txt', 'w').write('x')\n"
-            "os.chmod('vendor_sub/subcache/d000', 0o000)\n"
+            "set_inaccessible_for_test('vendor_sub/subcache/d000')\n"
             "os.makedirs('vendor_sub/.git', exist_ok=True)\n"
             "open('vendor_sub/.git/HEAD', 'w').write('ref: refs/heads/main\\n')\n"
         )
@@ -557,7 +564,8 @@ class TestP2_3GitlinkSymlinkAndEmptyCleanup(_MergeFixtureBase):
         self.assertEqual(out["outcome"], "merged", out)
         self.assertEqual(os.listdir(os.path.join(self.repo, "vendor_sub")), [])
         self.assertTrue(os.path.isfile(keep_file))
-        self.assertEqual(os.stat(nested_dir).st_mode & 0o777, 0o555)
+        if sys.platform != "win32":
+            self.assertEqual(os.stat(nested_dir).st_mode & 0o777, 0o555)
         self.assertTrue(self.fixture.is_clean(self.repo))
 
         # Direct _post_test_dirty_paths guard flags non-empty empty-snapshot gitlink if uncleaned.
@@ -575,15 +583,17 @@ class TestP2_4PruneOffLoopNoTxGitAndBranchCheck(unittest.TestCase):
     """P2-4: plan_workspace_prune / dry-run / except BaseException never run git in TX or on event loop; missing integ_wt fails branch delete."""
 
     def test_plan_dry_run_live_and_except_never_call_git_on_loop_or_in_transaction(self) -> None:
+        from tests.unit.test_batch7_pr45_r2 import _win_safe_tempdir
+
         fixture = GitFixture()
         self.addCleanup(fixture.cleanup)
         repo = fixture.make_k0("P24Prn")
         base_sha = fixture.head(repo, "main")
 
-        with tempfile.TemporaryDirectory(prefix="mh-r4-p24-") as tmp:
+        with _win_safe_tempdir(prefix="mh-r4-p24-") as tmp:
             home, conn = _setup_home_and_db(tmp)
-            fixture.allow_root(home)
             try:
+                fixture.allow_root(home)
                 now = "2026-01-01T00:00:00.000Z"
                 integ_wt = os.path.join(home, "workspaces", "prj_1", "integration")
                 os.makedirs(os.path.dirname(integ_wt), mode=0o700, exist_ok=True)
@@ -666,7 +676,7 @@ class TestP2_4PruneOffLoopNoTxGitAndBranchCheck(unittest.TestCase):
                         async def wait_closed(self) -> None:
                             pass
 
-                    with mock.patch("mesh.daemon.server.get_peer_credentials", return_value=(os.getpid(), os.getuid(), os.getgid())), \
+                    with mock.patch("mesh.daemon.server.get_peer_credentials", return_value=fake_peer_creds()), \
                          mock.patch.object(srv, "authenticate_and_authorize", return_value=({"id": "usr_1", "kind": "user", "name": "user"}, "user", "direct", None)):
                         await srv.handle_client(reader, _W())
                     return json.loads(buf.decode("utf-8").splitlines()[0])
@@ -733,7 +743,12 @@ class TestP2_4PruneOffLoopNoTxGitAndBranchCheck(unittest.TestCase):
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM events WHERE type = 'workspace.pruned' AND task_id = 'tsk_old';").fetchone()[0], 0)
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM events WHERE type = 'workspace.pruned' AND task_id = 'tsk_act2';").fetchone()[0], 1)
             finally:
+                import gc
+
+                if "srv" in locals():
+                    srv.db_conn = None
                 conn.close()
+                gc.collect()
 
     def test_remove_worktree_missing_integ_wt_with_nonempty_branch_returns_branch_delete_failed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mh-r4-p24miss-") as tmp:

@@ -9,7 +9,6 @@ P3: `_pgid_has_live_ps` must pass separate `-o` column arguments per POSIX/BSD `
 """
 
 import ctypes
-import fcntl
 import json
 import os
 import re
@@ -19,6 +18,11 @@ import sys
 import tempfile
 import time
 import unittest
+
+if sys.platform != "win32":
+    import fcntl
+else:
+    fcntl = None  # type: ignore[assignment]
 
 from tests.unit.test_inbox_worker_kit import SCRIPT as WORKER_SCRIPT, STUB as WORKER_STUB
 
@@ -188,6 +192,7 @@ def _run_in_subreaper(cmd, env, timeout=15.0):
     return json.loads(res.stdout)
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash + scripts/coord/* + os.fork/killpg test")
 class TestPR47R5(unittest.TestCase):
     def _cleanup_fake_proc(self, fake_proc, pidf):
         for root, dirs, files in os.walk(fake_proc):

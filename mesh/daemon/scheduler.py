@@ -36,13 +36,13 @@ def get_inbox_ack_timeout_s(conn: sqlite3.Connection, testing_mode: Optional[boo
     return 600
 
 
-def _log_to_meshd(home: str, msg: str) -> None:
-    """Log an error message to meshd.log if home is provided."""
+def _log_to_meshd(home: str, msg: str, level: str = "ERROR") -> None:
+    """Log a message to meshd.log at *level* (default ERROR) if home is provided."""
     if not home:
         return
     from mesh.core.logfile import append_line
 
-    append_line(home, f"{now_iso_utc()} ERROR {msg}")
+    append_line(home, f"{now_iso_utc()} {level} {msg}")
 
 
 #: Scheduler errors since this meshd started (batch 5): count and the latest one. Also
@@ -701,6 +701,15 @@ def sweep_expired_approvals(conn: sqlite3.Connection, home: str = "") -> List[st
                         "expires_at": row["expires_at"],
                         "status": "expired",
                     },
+                )
+                from mesh.core.approvals import sync_plan_on_approval_terminal
+                sync_plan_on_approval_terminal(
+                    conn,
+                    apr_id,
+                    "approval_expired",
+                    actor_id="system",
+                    actor_kind="system",
+                    via="system",
                 )
                 expired_ids.append(apr_id)
         except Exception as e:

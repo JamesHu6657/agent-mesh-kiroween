@@ -11,11 +11,15 @@ import shutil
 import sqlite3
 import stat
 import subprocess
+import sys
 from typing import Any, Dict, List, Optional, TextIO, Tuple
 
 import mesh.constants as c
 from mesh.constants import build_external_env
 from mesh.errors import MeshError
+from mesh.platform.fs import open_regular_nofollow
+from mesh.platform.paths import norm_cmp
+from mesh.platform.pipe_pump import run_bounded_group
 
 # Expected help sha256 hashes per plan §14.11
 # Committed fixtures evidence captured read-only by coordinator.
@@ -62,6 +66,8 @@ def normalize_help_text(stdout: str, stderr: str) -> str:
     combined = (stdout or "") + (stderr or "")
     if not combined:
         return ""
+    if sys.platform == "win32":
+        combined = combined.replace("\r\n", "\n")
     stripped = ANSI_ESCAPE_RE.sub("", combined)
     lines = [
         line
@@ -116,104 +122,16 @@ PROBE_KILL_DRAIN_S = 1.0
 
 def _run_probe_bounded(argv: List[str], timeout_s: float, max_output_bytes: int,
                        env: Dict[str, str]) -> Tuple[bytes, bytes, int]:
-    """Blind review P2: run a probe in its own process group, keep at most
+    """Blind review P2: run a probe in its own process group/job, keep at most
     ``max_output_bytes`` of each stream while draining the rest, and on timeout kill the
-    whole group (descendants too). Raises ``subprocess.TimeoutExpired`` on timeout."""
-    import signal
-    import time
-
-    from mesh.daemon import children
-
-    try:
-        proc = children.popen_registered(
-            "probe", argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, env=env, shell=False, start_new_session=True,
-        )
-    except children.SpawnedThenFailed as exc:
-        try:
-            os.killpg(exc.proc.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        try:
-            exc.proc.wait(timeout=PROBE_KILL_DRAIN_S)
-        except Exception:
-            pass
-        children.unhold(exc.proc.pid)
-        raise
-    # PR #40 r1: no reader threads. A descendant that left the group (setsid) may keep
-    # the pipes open forever; reads are non-blocking with an overall deadline, and the
-    # pipe fds are closed directly (closing a file object another thread reads blocks).
-    import selectors
-
-    bufs = {proc.stdout.fileno(): bytearray(), proc.stderr.fileno(): bytearray()}
-    sel = selectors.DefaultSelector()
-    for fd in bufs:
-        os.set_blocking(fd, False)
-        sel.register(fd, selectors.EVENT_READ)
-    timed_out = False
-    deadline = time.monotonic() + timeout_s
-    drain_until: Optional[float] = None
-    try:
-        while True:
-            now = time.monotonic()
-            # PR #40 r2: process exit is tracked apart from pipe EOF; a probe that closes
-            # its output and keeps running is waited for, and killed only at the deadline.
-            exited = proc.poll() is not None
-            if exited and drain_until is None:
-                drain_until = now + PROBE_KILL_DRAIN_S
-            if exited and not sel.get_map():
-                break
-            if drain_until is not None and now >= drain_until:
-                break
-            if drain_until is None and now >= deadline:
-                timed_out = True
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except OSError:
-                    pass
-                drain_until = now + PROBE_KILL_DRAIN_S
-                continue
-            limit = drain_until if drain_until is not None else deadline
-            wait = max(0.0, min(0.05, limit - now))
-            if not sel.get_map():
-                time.sleep(wait)
-                continue
-            for key, _ in sel.select(timeout=wait):
-                fd = key.fd
-                try:
-                    chunk = os.read(fd, 65536)
-                except BlockingIOError:
-                    continue
-                except OSError:
-                    chunk = b""
-                if not chunk:
-                    sel.unregister(fd)
-                    continue
-                room = max_output_bytes - len(bufs[fd])
-                if room > 0:
-                    bufs[fd].extend(chunk[:room])
-        # The group is killed either way: a probe never leaves descendants behind.
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        try:
-            proc.wait(timeout=PROBE_KILL_DRAIN_S)
-        except subprocess.TimeoutExpired:
-            pass
-    finally:
-        sel.close()
-        out_b = bytes(bufs[proc.stdout.fileno()])
-        err_b = bytes(bufs[proc.stderr.fileno()])
-        for f in (proc.stdout, proc.stderr):
-            try:
-                f.close()
-            except OSError:
-                pass
-        children.unregister(proc.pid)
-    if timed_out:
-        raise subprocess.TimeoutExpired(argv, timeout_s)
-    return out_b, err_b, proc.returncode if proc.returncode is not None else -1
+    whole group/job (descendants too). Raises ``subprocess.TimeoutExpired`` on timeout."""
+    return run_bounded_group(
+        argv,
+        timeout_s,
+        max_output_bytes,
+        env,
+        kill_drain_s=PROBE_KILL_DRAIN_S,
+    )
 
 
 def run_readonly_cmd(
@@ -307,8 +225,9 @@ class ProfileUnsupported(MeshError):
 
 
 def positional_prompt(text: str) -> str:
-    """Make ``text`` safe as the last positional argv item of a vendor CLI: a prompt that
-    starts with "-" (and so could be parsed as an option) gets a leading newline. Mesh's own
+    """Make ``text`` safe as the prompt argv item of a vendor CLI (kiro: the last positional
+    item; agy: the item directly after ``--print``): a prompt that starts with "-" (and so
+    could be parsed as an option) gets a leading newline. Mesh's own
     prompts start with "# Agent Mesh task" or "Read the file", so this only matters for a
     caller-supplied prompt file (m4-p3-cleanup)."""
     return "\n" + text if text.startswith("-") else text
@@ -590,6 +509,117 @@ class Probe:
         return d
 
 
+def _win_pathext(env: Optional[Dict[str, str]] = None) -> Tuple[str, ...]:
+    raw = (env.get("PATHEXT") if env else None) or os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD"
+    exts = tuple(e.strip().lower() for e in raw.split(";") if e.strip())
+    return exts or (".com", ".exe", ".bat", ".cmd")
+
+
+def is_tripwire_shim_path(candidate: str, name: Optional[str] = None) -> bool:
+    """Return True if *candidate* (or its realpath) lives under ``tests/shims/``."""
+    real = norm_cmp(os.path.realpath(candidate)).replace("\\", "/")
+    cand_abs = norm_cmp(os.path.abspath(candidate)).replace("\\", "/")
+    for p in (real, cand_abs):
+        if "/tests/shims/" in p:
+            return True
+        if name and p.endswith("/tests/shims/" + norm_cmp(name)):
+            return True
+    return False
+
+
+def _resolve_win_explicit_binary(path: str, pathext: Tuple[str, ...]) -> Optional[str]:
+    """Validate an explicit Windows binary path against ``PATHEXT`` (not ``os.X_OK``)."""
+    lower = path.lower()
+    if lower.endswith(pathext):
+        return os.path.abspath(path) if os.path.isfile(path) else None
+    for ext in pathext:
+        cand = path + ext
+        if os.path.isfile(cand):
+            return os.path.abspath(cand)
+    return None
+
+
+#: Canonical permission profiles from least to most permissive.
+ALL_PROFILES: Tuple[str, ...] = ("readonly", "edit", "dev", "elevated", "unrestricted")
+
+#: Preference order when picking an adapter's default safe profile.
+#: Never includes ``elevated`` or ``unrestricted`` (Mesh never defaults to or broadens to those).
+SAFE_DEFAULT_PROFILE_PREFERENCE: Tuple[str, ...] = ("edit", "dev", "readonly")
+
+
+def resolve_executable_on_path(
+    binary_names: List[str],
+    *,
+    stop_on_tripwire: bool = False,
+    skip_tripwire: bool = False,
+) -> Optional[str]:
+    """Resolve the first matching binary from absolute entries on external PATH.
+
+    Unlike ``shutil.which``, never searches the current working directory on Windows
+    and strictly skips empty or relative PATH entries (e.g. ``""``, ``"."``, ``"./bin"``).
+    """
+    ext_env = build_external_env()
+    env_path = ext_env.get("PATH") or ""
+    raw_entries = env_path.split(os.pathsep)
+    abs_entries: List[str] = []
+    for raw_entry in raw_entries:
+        entry = raw_entry.strip()
+        if sys.platform == "win32":
+            entry = entry.strip('"')
+        if not entry or not os.path.isabs(entry):
+            continue
+        abs_entries.append(entry)
+
+    if sys.platform == "win32":
+        pathext = _win_pathext(ext_env)
+        for name in binary_names:
+            name_lower = name.lower()
+            has_pathext = name_lower.endswith(pathext)
+            wanted_lower = [name_lower]
+            if not has_pathext:
+                wanted_lower.extend(name_lower + ext for ext in pathext)
+            for entry in abs_entries:
+                if not os.path.isdir(entry):
+                    continue
+                # On native win32, direct os.path.join is case-insensitive; on POSIX
+                # hosts running mocked win32 tests, fall back to a case-insensitive dir map.
+                dir_map: Optional[Dict[str, str]] = None
+                if os.name != "nt":
+                    try:
+                        dir_map = {fn.lower(): fn for fn in os.listdir(entry)}
+                    except OSError:
+                        continue
+                for target_l in wanted_lower:
+                    actual_name = dir_map.get(target_l) if dir_map is not None else target_l
+                    if not actual_name:
+                        continue
+                    candidate = os.path.join(entry, actual_name)
+                    if not os.path.isfile(candidate):
+                        continue
+                    if (stop_on_tripwire or skip_tripwire) and is_tripwire_shim_path(candidate, name):
+                        if stop_on_tripwire:
+                            return None
+                        continue
+                    if candidate.lower().endswith(pathext):
+                        return os.path.abspath(candidate)
+        return None
+
+    for name in binary_names:
+        for entry in abs_entries:
+            candidate = os.path.join(entry, name)
+            if not os.path.isfile(candidate):
+                continue
+            if stop_on_tripwire or skip_tripwire:
+                real = os.path.realpath(candidate)
+                if "/tests/shims/" in real or "/tests/shims/" in os.path.abspath(candidate):
+                    if stop_on_tripwire:
+                        return None
+                    continue
+            if os.access(candidate, os.X_OK):
+                return os.path.abspath(candidate)
+    return None
+
+
 class Adapter:
     """Base class for model/agent execution adapters."""
 
@@ -598,32 +628,45 @@ class Adapter:
     binary_names: List[str] = []
     planned_version: Optional[str] = None
     verified_version: Optional[str] = None
+    #: Optional UI model presets for adapters whose list_models() returns None:
+    #: {"chips": [...], "default_allowed": [...], "note": "..."}.
+    model_presets: Optional[Dict[str, Any]] = None
     capabilities: Dict[str, Capability] = {}
     liveness: str = "none"  # 'stream' | 'none'
     max_argv_prompt_bytes: int = 100_000
+    #: The exact permission profiles this adapter supports (in canonical order).
+    supported_profiles: Tuple[str, ...] = ()
     #: The exact effort values the vendor CLI accepts; None = no fixed list (checked elsewhere).
     supported_efforts: Optional[Tuple[str, ...]] = None
     launch_enabled: bool = False
     launch_milestone: Optional[str] = "M3"
 
+    def default_safe_profile(self) -> Optional[str]:
+        """Return the first supported safe profile for this adapter, or None.
+
+        Checks ``('edit', 'dev', 'readonly')`` in order and never returns
+        ``elevated`` or ``unrestricted``.
+        """
+        supported = set(self.supported_profiles)
+        for prof in SAFE_DEFAULT_PROFILE_PREFERENCE:
+            if prof in supported:
+                return prof
+        return None
+
     def resolve_binary(self, binary_path: Optional[str] = None) -> Optional[str]:
-        """Resolve executable binary from explicit path or PATH."""
+        """Resolve executable binary from explicit path or absolute PATH entries."""
+        ext_env = build_external_env()
         if binary_path:
             p = os.path.expanduser(binary_path)
+            if sys.platform == "win32":
+                return _resolve_win_explicit_binary(p, _win_pathext(ext_env))
             if os.path.isfile(p) and os.access(p, os.X_OK):
                 return os.path.abspath(p)
             return None
-        env_path = build_external_env().get("PATH")
-        for name in self.binary_names:
-            resolved = shutil.which(name, path=env_path)
-            if resolved:
-                if self.id in ("hermes", "openclaw"):
-                    # Hermes and OpenClaw are not installed in M1; shims in tests/shims are tripwires
-                    real = os.path.realpath(resolved)
-                    if "/tests/shims/" in real or real.endswith("/tests/shims/" + name):
-                        continue
-                return os.path.abspath(resolved)
-        return None
+        return resolve_executable_on_path(
+            self.binary_names,
+            stop_on_tripwire=self.id in ("hermes", "openclaw"),
+        )
 
     def is_installed(self, binary_path: Optional[str] = None) -> bool:
         """Check if adapter is installed without starting full probe."""
@@ -686,27 +729,15 @@ def open_run_file_nofollow(
     errors: str = "replace",
     max_bytes: Optional[int] = DEFAULT_MAX_RUN_FILE_BYTES,
 ) -> TextIO:
-    """Open a regular file inside a run dir safely without following symlinks or blocking on FIFOs."""
-    if not isinstance(path, str) or not path.strip() or "\x00" in path or path.endswith(os.sep):
+    """Open a regular file inside a run dir safely without following symlinks/junctions or blocking on FIFOs."""
+    trailing = (os.sep, "/") if sys.platform == "win32" else (os.sep,)
+    if not isinstance(path, str) or not path.strip() or "\x00" in path or path.endswith(trailing):
         raise OSError(errno.EINVAL, "Invalid run file path", path)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    fd = os.open(path, flags)
+    fd = open_regular_nofollow(path, os.O_RDONLY, label="run file")
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise OSError(errno.EINVAL, "Refusing non-regular run file", path)
         if max_bytes is not None and st.st_size > max_bytes:
             raise OSError(errno.EFBIG, f"Run file exceeds {max_bytes} bytes", path)
-        nonblock = getattr(os, "O_NONBLOCK", 0)
-        if nonblock:
-            try:
-                import fcntl
-
-                fl = fcntl.fcntl(fd, fcntl.F_GETFL)
-                if fl & nonblock:
-                    fcntl.fcntl(fd, fcntl.F_SETFL, fl & ~nonblock)
-            except OSError:
-                pass
         return os.fdopen(fd, "r", encoding=encoding, errors=errors)
     except BaseException:
         os.close(fd)

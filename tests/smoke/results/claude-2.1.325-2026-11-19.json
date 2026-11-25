@@ -1,0 +1,144 @@
+{
+  "adapter": "claude",
+  "binary": "/data/home/mesh-cli/node_modules/.bin/claude",
+  "captured_at_utc": "2026-11-19T13:36:08Z",
+  "cases": [
+    {
+      "carried_from": null,
+      "duration_s": 3.431,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/claude/2.1.325/smoke-S-X-1-stdout.jsonl",
+      "fixture_sha256": "6e7a7d8326cdfe661268c70a4746550595f87ac6065e96b6678ed8cc5f9d8a7c",
+      "id": "S-X-1",
+      "observation": {
+        "raw_token_seen": true
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 3.431,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/claude/2.1.325/smoke-S-X-1-stdout.jsonl",
+      "fixture_sha256": "6e7a7d8326cdfe661268c70a4746550595f87ac6065e96b6678ed8cc5f9d8a7c",
+      "id": "S-X-2",
+      "observation": {
+        "init_cwd": "/tmp/mh-smoke-4mzlm99r",
+        "session_id": "0d9a16a2-3f76-4509-b15e-4a35ba0d953e",
+        "workspace": "/tmp/mh-smoke-4mzlm99r"
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 1.623,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/claude/2.1.325/smoke-S-X-3-stdout.jsonl",
+      "fixture_sha256": "080b52668803554a5657248b9674717cc5bf5576bc6ab5fb292049846ecc0cdb",
+      "id": "S-X-3",
+      "observation": {
+        "cwd": "/tmp/mh-smoke-4mzlm99r",
+        "parsed_token_seen": true,
+        "raw_token_seen": true,
+        "resumed_session_id": "0d9a16a2-3f76-4509-b15e-4a35ba0d953e"
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 3.431,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/claude/2.1.325/smoke-S-X-1-stdout.jsonl",
+      "fixture_sha256": "6e7a7d8326cdfe661268c70a4746550595f87ac6065e96b6678ed8cc5f9d8a7c",
+      "id": "S-X-4",
+      "observation": {
+        "init_model": "ds-flash"
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 0.0,
+      "evaluated_from": null,
+      "fixture": null,
+      "fixture_sha256": null,
+      "id": "S-X-5",
+      "observation": null,
+      "rc": null,
+      "reason": "effort_not_listed",
+      "status": "not_applicable"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 1.303,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/claude/2.1.325/smoke-S-X-6-stdout.jsonl",
+      "fixture_sha256": "207453b8b93363eaf9fcb0e99e55eab196464308a1ad6cc0197e4debf474a03a",
+      "id": "S-X-6",
+      "observation": {
+        "alive_at_term": true,
+        "first_byte": true,
+        "group_gone_after_term": true,
+        "lines_at_term": 7,
+        "rc": 143,
+        "seconds_to_gone": 0.093,
+        "term_after_s": 1.206
+      },
+      "rc": 143,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 28.477,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/claude/2.1.325/smoke-S-X-7-stdout.jsonl",
+      "fixture_sha256": "706170f6afc05e30f38a217d29f620091894b964b4b93eb6701d26a90489b362",
+      "id": "S-X-7",
+      "observation": {
+        "file_created": false,
+        "rc": 0,
+        "stderr_excerpt": "[claude-code:unrecognized_model] {\"model\":\"ds-flash\",\"query_source\":\"sdk\"}",
+        "timed_out": false
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "observed"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 26.222,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/claude/2.1.325/smoke-S-CLAUDE-8-stdout.jsonl",
+      "fixture_sha256": "0e2fa322ddb02cedf23c2bec53d7fb9c677f312713e954bfc80b173ffe1deb1a",
+      "id": "S-CLAUDE-8",
+      "observation": {
+        "denied_tools": [],
+        "outcome": "deny",
+        "permission_denials": 0,
+        "rc": 0,
+        "stderr_excerpt": "[claude-code:unrecognized_model] {\"model\":\"ds-flash\",\"query_source\":\"sdk\"}",
+        "y_txt_exists": false
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "observed"
+    }
+  ],
+  "consent_ref": "james-2026-11-19-1909",
+  "effort": null,
+  "mesh_commit": "unknown",
+  "model": "ds-flash",
+  "profile": "readonly",
+  "schema": "mesh.smoke.v1",
+  "timeout_s": 180.0,
+  "version": "2.1.325"
+}

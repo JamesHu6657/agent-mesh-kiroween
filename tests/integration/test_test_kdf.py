@@ -16,7 +16,7 @@ import unittest
 
 import mesh.constants as c
 from mesh.core.auth import SCRYPT_N, SCRYPT_N_TESTING
-from tests.helpers import MeshHarness
+from tests.helpers import MeshHarness, cli_popen_argv
 from tests.stubs import create_test_stubs
 
 
@@ -40,7 +40,8 @@ class TestKdfProductionPath(unittest.TestCase):
     def _start_non_testing_daemon(self, h: MeshHarness) -> None:
         env = h.get_env()
         env.pop("MESH_TESTING", None)
-        h.daemon_proc = subprocess.Popen([h.bin_mesh, "--home", h.home, "daemon", "run"], env=env,
+        cmd, popen_env = cli_popen_argv(h, "daemon", "run", env=env)
+        h.daemon_proc = subprocess.Popen(cmd, env=popen_env,
                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         h.wait_for(lambda: h.cli("status")[0] == 0, timeout=10.0)
 

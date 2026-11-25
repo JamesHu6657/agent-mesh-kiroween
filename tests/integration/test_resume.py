@@ -16,10 +16,25 @@ def fake_steps(session_id, finish):
 
 class TestResume(unittest.TestCase):
     def setUp(self):
-        self.h = MeshHarness(init_db=True, start_daemon=True)
+        if sys.platform == "win32":
+            base_py = getattr(sys, "_base_executable", None) or sys.executable
+            if not os.path.isfile(base_py):
+                base_py = sys.executable
+            dll_dirs = os.pathsep.join(
+                dict.fromkeys([
+                    os.path.dirname(os.path.abspath(base_py)),
+                    os.path.dirname(os.path.abspath(os.path.realpath(base_py))),
+                    os.path.abspath(sys.base_prefix),
+                    os.path.dirname(os.path.abspath(sys.executable)),
+                ])
+            )
+            self.h = MeshHarness(init_db=True, start_daemon=True, extra_path=dll_dirs)
+        else:
+            base_py = sys.executable
+            self.h = MeshHarness(init_db=True, start_daemon=True)
         self.addCleanup(self.h.teardown)
-        self.binary = os.path.join(self.h.home, "fake-python")
-        os.symlink(sys.executable, self.binary)
+        self.binary = os.path.join(self.h.home, "fake-python" + (".exe" if sys.platform == "win32" else ""))
+        os.symlink(base_py, self.binary)
         for name, adapter, delivery in (("lead", "none", "inbox"),
                                          ("verified", "fake", "launch"),
                                          ("fresh", "fake", "launch")):

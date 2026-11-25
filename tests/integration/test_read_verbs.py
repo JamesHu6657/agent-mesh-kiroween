@@ -14,13 +14,18 @@ from typing import Any, Dict, Tuple
 
 import mesh.constants as c
 from mesh.core.proc import get_proc_environ
-from tests.helpers import MeshHarness
+from mesh.platform import pipe_pump
+from mesh.platform.paths import strip_trailing_seps
+from tests.helpers import MeshHarness, assert_private_mode
 from tests.integration.test_execution_launch import create_agent
 from tests.stubs import create_test_stubs
 
 
 def run_cli_as(env: Dict[str, str], *args: str) -> Tuple[int, Dict[str, Any]]:
-    res = subprocess.run(["mesh", *args], capture_output=True, text=True, env=dict(env), timeout=60)
+    e = dict(env)
+    resolved = shutil.which("mesh", path=e.get("PATH")) or "mesh"
+    cmd = pipe_pump.prepare_win_cmd_args([resolved, *args], env=e)
+    res = subprocess.run(cmd, capture_output=True, text=True, env=e, timeout=60)
     try:
         return res.returncode, json.loads(res.stdout)
     except ValueError:
@@ -193,7 +198,7 @@ class TestReadVerbs(unittest.TestCase):
             conn.close()
         lead1_dir = os.path.join(self.harness.home, "workspaces", self.project_id, "lead", lead1_id)
         self.assertTrue(os.path.isdir(lead1_dir))
-        self.assertEqual(os.stat(lead1_dir).st_mode & 0o777, 0o700)
+        assert_private_mode(self, lead1_dir, is_dir=True, posix_mode=0o700)
 
         task_id = self._create('FAKE {"write_file": {"path": "out.txt", "content": "hello"}}')
         self._wait_status(task_id, "submitted")
@@ -216,7 +221,7 @@ class TestReadVerbs(unittest.TestCase):
         self.assertTrue(task_path.startswith(os.path.join(self.harness.home, "workspaces", self.project_id, "tasks", task_id)))
         self.assertTrue(tasks[0]["exists"])
         for lead in leads.values():
-            self.assertNotEqual(lead["path"].rstrip("/"), task_path.rstrip("/"))
+            self.assertNotEqual(strip_trailing_seps(lead["path"]), strip_trailing_seps(task_path))
 
         rc, resp = self.harness.cli("workspace", "show", task_id, token=self.tok_lead1)
         self.assertEqual(rc, 0, resp)

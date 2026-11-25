@@ -17,7 +17,7 @@ import unittest
 import mesh.constants as c
 from mesh.adapters import evidence, smoke_schema
 from tests import tierlib
-from tests.helpers import MeshHarness
+from tests.helpers import MeshHarness, cli_popen_argv
 from tests.integration import test_tasks as tt
 from tests.stubs import create_test_stubs
 
@@ -191,7 +191,8 @@ class TestAdapterEvidence(unittest.TestCase):
             env = h.get_env()
             env.pop("MESH_TESTING", None)
             env[evidence.OVERRIDE_ENV] = self.results
-            h.daemon_proc = subprocess.Popen([h.bin_mesh, "--home", h.home, "daemon", "run"], env=env,
+            cmd, popen_env = cli_popen_argv(h, "daemon", "run", env=env)
+            h.daemon_proc = subprocess.Popen(cmd, env=popen_env,
                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             h.wait_for(lambda: h.cli("status")[0] == 0, timeout=5.0)
             rc, resp = h.cli("adapter", "show", "droid", user=True)

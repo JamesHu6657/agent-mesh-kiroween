@@ -2,7 +2,6 @@
 
 import asyncio
 import ctypes
-import fcntl
 import hashlib
 import json
 import logging
@@ -10,12 +9,21 @@ import os
 import shutil
 import signal
 import socket
+import sqlite3
 import sys
+import threading
 import time
 from collections import deque
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Set, Tuple
 
+if sys.platform != "win32":
+    import fcntl
+else:
+    fcntl = None  # type: ignore[assignment]
+
 import mesh.constants as c
+from mesh.platform import ipc, locks, perms
+from mesh.platform.fs import open_regular_nofollow
 from mesh.core.logfile import append_line, escape_field
 from mesh.errors import DbIntegrityError, MeshError, SchemaTooNewError
 from mesh.core.auth import (
@@ -30,7 +38,7 @@ from mesh.core.auth import (
 from mesh.core.authz import ADAPTER_CMDS, ROSTER_READ_CMDS, UNAUTH_CMDS, check_authz
 from mesh.core.canonical import canonical_json
 from mesh.core.clock import now_iso_utc, now_monotonic
-from mesh.core.db import connect_db, parse_schema_version
+from mesh.core.db import backup_db, connect_db, migrate_db, parse_schema_version
 from mesh.core.events import insert_event
 from mesh.core.ids import new_id
 from mesh.core.lead_actions import IDEMPOTENCY_KEY_RE
@@ -39,10 +47,12 @@ from mesh.core.paths import (
     check_home_permissions,
     check_install_path_secure,
     check_socket_path_length,
+    clear_autostart_hold,
     get_install_root,
     refuse_testing_on_default_home,
     resolve_home,
     rmtree_allow_readonly,
+    write_autostart_hold,
 )
 from mesh.core.schema import CURRENT_SCHEMA_VERSION
 from mesh.daemon.handlers.base import Effect, HandlerContext, HandlerResult
@@ -81,6 +91,7 @@ from mesh.daemon.handlers.project import (
     handle_project_set_lead,
     handle_project_show,
     handle_project_update,
+    handle_project_set_permission_mode,
     handle_project_wait,
 )
 from mesh.daemon.handlers.inbox import (
@@ -96,10 +107,15 @@ from mesh.daemon.handlers.approval import (
     handle_approval_cancel,
     handle_approval_check,
     handle_approval_consume,
+    handle_approval_decide,
     handle_approval_list,
     handle_approval_reject,
     handle_approval_request,
     handle_approval_show,
+)
+from mesh.daemon.handlers.grant import (
+    handle_grant_list,
+    handle_grant_revoke,
 )
 from mesh.daemon.handlers.task import (
     handle_task_accept,
@@ -129,12 +145,30 @@ from mesh.daemon.handlers.dep import (
     handle_dep_remove,
 )
 from mesh.daemon.handlers.audit import handle_audit_verify
+from mesh.daemon.handlers.chat import (
+    handle_chat_list,
+    handle_chat_queue_cancel,
+    handle_chat_queue_edit,
+    handle_chat_reply,
+    handle_chat_send,
+    handle_lead_interrupt,
+)
+from mesh.daemon.handlers.plan import (
+    handle_plan_cancel,
+    handle_plan_dispatch,
+    handle_plan_list,
+    handle_plan_propose,
+    handle_plan_show,
+)
 from mesh.daemon.handlers import run as run_handlers
 from mesh.daemon.handlers.run import (
+    handle_project_diff,
+    handle_run_activity,
     handle_run_list,
     handle_run_log,
     handle_run_release,
     handle_run_show,
+    handle_task_diff,
     handle_task_log,
     handle_workspace_list,
     handle_workspace_prune,
@@ -247,13 +281,14 @@ _NON_MUTATING_CMDS = frozenset({
     "config.get", "config.list",
     "agent.list", "agent.show", "agent.token.list",
     "adapter.list", "adapter.show", "adapter.models",
-    "project.list", "project.show", "project.leads", "project.wait",
-    "task.list", "task.show", "task.log", "task.wait", "dep.list",
+    "project.list", "project.show", "project.diff", "project.leads", "project.wait",
+    "task.list", "task.show", "task.log", "task.diff", "task.wait", "dep.list",
     "inbox.list", "inbox.wait",
-    "run.list", "run.show", "run.log", "run.attach_info",
+    "run.list", "run.show", "run.log", "run.activity", "run.attach_info",
     "workspace.list", "workspace.show",
     "approval.list", "approval.show", "approval.check",
     "event.list", "event.tail", "audit.verify", "doctor",
+    "chat.list", "plan.list", "plan.show", "grant.list",
 })
 
 
@@ -303,6 +338,10 @@ def _resolve_idempotency_scope(
             rrow = conn.execute("SELECT project_id, task_id FROM runs WHERE id = ?;", (args["run_id"],)).fetchone()
             if rrow is not None:
                 proj_id, tsk_id = rrow["project_id"], rrow["task_id"]
+        elif isinstance(args.get("plan_id"), str) and args["plan_id"]:
+            plrow = conn.execute("SELECT project_id FROM plans WHERE id = ?;", (args["plan_id"],)).fetchone()
+            if plrow is not None:
+                proj_id = plrow["project_id"]
     if cmd in ("intake.submit", "project.create") and not (
         isinstance(args, dict) and (args.get("project") or args.get("project_id"))
     ):
@@ -401,6 +440,10 @@ INTERNAL_REQUEST_HANDLERS: Dict[str, Callable[[HandlerContext], HandlerResult]] 
     "project.complete": handle_project_complete,
     "project.deliver": handle_project_deliver,
     "approval.request": handle_approval_request,
+    "chat.reply": handle_chat_reply,
+    "plan.propose": handle_plan_propose,
+    "plan.dispatch": handle_plan_dispatch,
+    "plan.cancel": handle_plan_cancel,
 }
 
 
@@ -882,6 +925,72 @@ class DaemonServer:
         """Write error log to meshd.log per plan §15.2 and checklist C11 without secrets."""
         append_line(self.home, f"{now_iso_utc()} ERROR {message}")
 
+    def _read_and_validate_schema_version(self, conn: sqlite3.Connection) -> int:
+        cur = conn.execute("SELECT value FROM meta WHERE key = 'schema_version';")
+        row = cur.fetchone()
+        if not row:
+            raise MeshError(
+                code=c.INTERNAL_ERROR,
+                exit_code=c.EXIT_INTERNAL,
+                message="Missing schema_version in database meta table",
+            )
+        raw = row["value"]
+        schema_version = parse_schema_version(raw)
+        if schema_version is None:
+            raise DbIntegrityError([f"schema_version is not an integer: {raw!r}"])
+        if schema_version > CURRENT_SCHEMA_VERSION:
+            raise SchemaTooNewError(schema_version, CURRENT_SCHEMA_VERSION)
+        if schema_version < 1:
+            raise DbIntegrityError([f"schema_version out of range: {schema_version}"])
+        return schema_version
+
+    def _check_db_integrity(self, conn: sqlite3.Connection) -> None:
+        """Run PRAGMA quick_check and raise DbIntegrityError if the DB is not healthy."""
+        cur = conn.execute("PRAGMA quick_check;")
+        rows = [r[0] for r in cur.fetchall()]
+        if rows != ["ok"]:
+            raise DbIntegrityError(rows)
+
+    def _migrate_with_backup(self, conn: sqlite3.Connection, schema_version: int) -> None:
+        """Back up mesh.db to mesh.db.v<N>.bak, verify the backup, migrate, and re-verify (caller holds lock)."""
+        if schema_version >= CURRENT_SCHEMA_VERSION:
+            return
+        bak_path = os.path.join(self.home, f"mesh.db.v{schema_version}.bak")
+        if os.path.exists(bak_path):
+            ts_tag = now_iso_utc().replace(":", "").replace("-", "").replace(".", "")
+            bak_path = os.path.join(self.home, f"mesh.db.v{schema_version}.{ts_tag}.bak")
+        saved = backup_db(conn, bak_path)
+        bak_conn = connect_db(saved, read_only=True)
+        try:
+            self._check_db_integrity(bak_conn)
+        finally:
+            bak_conn.close()
+        append_line(
+            self.home,
+            f"{now_iso_utc()} INFO Migrating database schema v{schema_version} -> v{CURRENT_SCHEMA_VERSION}; "
+            f"pre-migration backup saved at {saved} (to downgrade: stop meshd and restore this backup)",
+        )
+        migrate_db(conn)
+        self._check_db_integrity(conn)
+
+    def _complete_storage_after_lock(self) -> None:
+        """Open read-write DB, run quick_check BEFORE backup/migration, and migrate if needed (P2-2, P3-3)."""
+        if not getattr(self, "_pending_storage_open", False):
+            return
+        self._pending_storage_open = False
+        db_path = os.path.join(self.home, "mesh.db")
+        self.db_conn = connect_db(db_path)
+        try:
+            # P3-3: Always verify DB integrity BEFORE backing up or altering schema!
+            self._check_db_integrity(self.db_conn)
+            schema_version = self._read_and_validate_schema_version(self.db_conn)
+            if schema_version < CURRENT_SCHEMA_VERSION:
+                self._migrate_with_backup(self.db_conn, schema_version)
+        except BaseException:
+            self.db_conn.close()
+            self.db_conn = None
+            raise
+
     def setup_storage(self) -> None:
         """Check filesystem permissions, paths, and SQLite integrity."""
         # 0. Plan §17.1: testing mode (fake adapter, crash hooks, lowered minimums) is
@@ -895,9 +1004,10 @@ class DaemonServer:
         # 2. Bidirectional install-path security check (§7.6 mitigation 7)
         check_install_path_secure(install_root=get_install_root(), home=self.home)
 
-        # 3. Check socket path length
-        sock_path = os.path.join(self.home, "run", "mesh.sock")
-        check_socket_path_length(sock_path)
+        # 3. Check socket/IPC path length
+        if sys.platform != "win32":
+            endpoint_path = ipc.daemon_endpoint_path(self.home)
+            check_socket_path_length(endpoint_path)
 
         # 4. Open and verify database
         db_path = os.path.join(self.home, "mesh.db")
@@ -908,12 +1018,15 @@ class DaemonServer:
                 message=f"Database does not exist at '{db_path}'. Run 'mesh init' first.",
             )
 
-        self.db_conn = connect_db(db_path)
+        defer_migration = bool(getattr(self, "_defer_migration", False))
+        conn = connect_db(db_path, read_only=defer_migration)
+        if not defer_migration:
+            self.db_conn = conn
         try:
             # Check configured workspaces.root if set in DB
             configured_ws = None
             try:
-                cur = self.db_conn.execute("SELECT value_json FROM settings WHERE key = 'workspaces.root';")
+                cur = conn.execute("SELECT value_json FROM settings WHERE key = 'workspaces.root';")
                 row = cur.fetchone()
                 if row and row["value_json"]:
                     configured_ws = json.loads(row["value_json"])
@@ -926,47 +1039,43 @@ class DaemonServer:
                 )
 
             # Registered project repos must not overlap the install root either (§7.6 mitigation 7).
-            repo_paths = project_repo_paths(self.db_conn)
+            repo_paths = project_repo_paths(conn)
             if repo_paths:
                 check_install_path_secure(install_root=get_install_root(), repo_paths=repo_paths)
 
-            # Check schema version
-            cur = self.db_conn.execute("SELECT value FROM meta WHERE key = 'schema_version';")
-            row = cur.fetchone()
-            if not row:
-                raise MeshError(
-                    code=c.INTERNAL_ERROR,
-                    exit_code=c.EXIT_INTERNAL,
-                    message="Missing schema_version in database meta table",
-                )
-            raw = row["value"]
-            schema_version = parse_schema_version(raw)
-            if schema_version is None:
-                raise DbIntegrityError([f"schema_version is not an integer: {raw!r}"])
-            if schema_version > CURRENT_SCHEMA_VERSION:
-                raise SchemaTooNewError(schema_version, CURRENT_SCHEMA_VERSION)
-            if schema_version < 1:
-                raise DbIntegrityError([f"schema_version out of range: {schema_version}"])
+            # P3-3: Integrity quick check BEFORE reading/migrating schema (never mutate a corrupt DB!)
+            self._check_db_integrity(conn)
 
-            # Integrity quick check
-            cur = self.db_conn.execute("PRAGMA quick_check;")
-            rows = [r[0] for r in cur.fetchall()]
-            if rows != ["ok"]:
-                raise DbIntegrityError(rows)
+            # Check schema version (never mutate DB before single-instance lock is held!)
+            schema_version = self._read_and_validate_schema_version(conn)
+            if defer_migration:
+                conn.close()
+                self._pending_storage_open = True
+                return
+
+            if schema_version < CURRENT_SCHEMA_VERSION:
+                self._migrate_with_backup(conn, schema_version)
         except BaseException:
-            self.db_conn.close()
-            self.db_conn = None
+            try:
+                conn.close()
+            except Exception:
+                pass
+            if not defer_migration:
+                self.db_conn = None
             raise
 
     def acquire_lock(self) -> None:
-        """Acquire single-instance flock on $MESH_HOME/run/meshd.lock."""
+        """Acquire single-instance lock on $MESH_HOME/run/meshd.lock."""
         run_dir = os.path.join(self.home, "run")
+        run_existed = os.path.isdir(run_dir)
         os.makedirs(run_dir, mode=0o700, exist_ok=True)
+        if sys.platform == "win32" and not run_existed:
+            perms.set_private_dir_acl(run_dir, 0o700)
         lock_path = os.path.join(run_dir, "meshd.lock")
 
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        fd = locks.open_lock_file(lock_path, mode=0o600)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locks.acquire_lock(fd, exclusive=True, blocking=False)
         except (BlockingIOError, OSError) as exc:
             try:
                 os.close(fd)
@@ -981,12 +1090,25 @@ class DaemonServer:
         # Write pid file
         pid_path = os.path.join(run_dir, "meshd.pid")
         try:
-            with open(pid_path, "w", encoding="utf-8") as f:
-                f.write(str(os.getpid()))
-            os.chmod(pid_path, 0o600)
+            if sys.platform == "win32":
+                pfd = open_regular_nofollow(
+                    pid_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                    0o600,
+                    label="pid file",
+                )
+                try:
+                    perms.fchmod_private(pfd, 0o600)
+                    os.write(pfd, str(os.getpid()).encode("utf-8"))
+                finally:
+                    os.close(pfd)
+            else:
+                with open(pid_path, "w", encoding="utf-8") as f:
+                    f.write(str(os.getpid()))
+                os.chmod(pid_path, 0o600)
         except BaseException:
             try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                locks.release_lock(fd)
             except OSError:
                 pass
             try:
@@ -997,7 +1119,7 @@ class DaemonServer:
         self.lock_fd = fd
 
     def release_lock(self) -> None:
-        """Release flock and remove pid file."""
+        """Release lock and remove pid file."""
         if self.lock_fd is None:
             return
         run_dir = os.path.join(self.home, "run")
@@ -1009,7 +1131,7 @@ class DaemonServer:
                 pass
 
         try:
-            fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+            locks.release_lock(self.lock_fd)
         except OSError:
             pass
         try:
@@ -1069,6 +1191,9 @@ class DaemonServer:
 
     def setup_subreaper(self) -> None:
         """Set PR_SET_CHILD_SUBREAPER so orphaned descendants reparent to meshd (§11.4)."""
+        if sys.platform == "win32":
+            # Windows has no zombie reparenting; child containment uses Job Objects.
+            return
         try:
             libc = ctypes.CDLL(None, use_errno=True)
             libc.prctl.argtypes = [
@@ -1140,12 +1265,24 @@ class DaemonServer:
         self.refresh_run_caches()
 
         # Run-session classification (§7.1, G25–G27)
-        bound_run_id = classify_peer_run_session(
-            peer_pid=peer_pid,
-            active_runs=self.active_runs,
-            known_run_ids=self.known_run_ids,
-            meshd_pid=os.getpid(),
-        )
+        if sys.platform == "win32":
+            from mesh.daemon import supervisor as _sup
+
+            bound_run_id = classify_peer_run_session(
+                peer_pid=peer_pid,
+                active_runs=self.active_runs,
+                known_run_ids=self.known_run_ids,
+                meshd_pid=os.getpid(),
+                active_job_handles=_sup.active_run_jobs(),
+                home=self.home,
+            )
+        else:
+            bound_run_id = classify_peer_run_session(
+                peer_pid=peer_pid,
+                active_runs=self.active_runs,
+                known_run_ids=self.known_run_ids,
+                meshd_pid=os.getpid(),
+            )
 
         if not isinstance(auth_info, dict):
             raise MeshError(
@@ -1202,6 +1339,16 @@ class DaemonServer:
                         pass
 
             if not is_valid_run_token:
+                if sys.platform == "win32" and cmd == "daemon.status" and auth_type == "none":
+                    # On Windows, MeshClient probes daemon.status with auth=none to map
+                    # MESH_SOCKET named pipe -> home; refuse it without emitting a bogus
+                    # auth.credential_in_run security event.
+                    raise MeshError(
+                        code=c.CREDENTIAL_NOT_ALLOWED_IN_RUN,
+                        exit_code=c.EXIT_FORBIDDEN,
+                        message=f"Process inside run '{bound_run_id}' cannot use {auth_type} credential",
+                        details={"run_id": bound_run_id, "peer_pid": peer_pid},
+                    )
                 # Reject before verification; write auth.credential_in_run event
                 bound_run = self.db_conn.execute(
                     "SELECT project_id, task_id FROM runs WHERE id = ?;", (bound_run_id,)
@@ -1441,6 +1588,14 @@ class DaemonServer:
         pending_reconciles: List[asyncio.Future] = []
         for eff in effects:
             if eff.kind == "stop_daemon":
+                # N1: persist user-requested stop intent BEFORE closing the socket so
+                # any open desktop window sees the hold marker and does not auto-restart.
+                write_autostart_hold(
+                    self.home,
+                    pid=os.getpid(),
+                    boot_id=self.boot_id,
+                    source="daemon.stop",
+                )
                 if self.stop_event:
                     self.stop_event.set()
             elif eff.kind == "create_run_and_workspace_dirs":
@@ -1865,12 +2020,29 @@ class DaemonServer:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        sock = writer.get_extra_info("socket")
+        if sys.platform == "win32":
+            sock = writer.get_extra_info("pipe")
+            if sock is None:
+                sock = writer.get_extra_info("socket")
+            expected_uid = 0
+        else:
+            sock = writer.get_extra_info("socket")
+            expected_uid = os.getuid()
         start_mono = now_monotonic()
 
-        # SO_PEERCRED check (C6)
-        peer_pid, peer_uid, peer_gid = get_peer_credentials(sock)
-        if peer_uid != os.getuid():
+        # SO_PEERCRED / Named Pipe peer SID+PID check (C6)
+        try:
+            peer_pid, peer_uid, peer_gid = get_peer_credentials(sock)
+        except OSError:
+            if sys.platform != "win32":
+                raise
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return
+        if peer_uid != expected_uid:
             # Reject immediately
             writer.close()
             try:
@@ -2419,14 +2591,16 @@ class DaemonServer:
                 await prepare_task_close(ctx)
             elif cmd in ADAPTER_CMDS:
                 await prepare_adapter_command(ctx, self.testing_mode)
-            elif cmd in ("run.log", "task.log"):
+            elif cmd in ("run.log", "task.log", "run.activity"):
                 await run_handlers.prepare_log_command(ctx)
+            elif cmd in ("task.diff", "project.diff"):
+                await run_handlers.prepare_diff_command(ctx)
 
             # Transaction execution
             if True:
                 self.db_conn.execute("BEGIN IMMEDIATE;")
                 if (
-                    cmd in ("task.start", "task.submit", "task.close", "run.log", "task.log")
+                    cmd in ("task.start", "task.submit", "task.close", "run.log", "task.log", "run.activity", "task.diff", "project.diff")
                     or (cmd == "workspace.prune" and dry_run)
                     or cmd in ADAPTER_CMDS
                 ):
@@ -2516,6 +2690,8 @@ class DaemonServer:
                         "kill_failed_runs": _kill_failed_runs(),
                         "scheduler": scheduler_errors_view(),
                     }
+                    if sys.platform == "win32":
+                        daemon_info["home"] = self.home
                     res = handle_daemon_status(ctx, daemon_info)
                 elif cmd == "daemon.stop":
                     res = handle_daemon_stop(ctx)
@@ -2575,12 +2751,16 @@ class DaemonServer:
                     res = handle_project_cancel(ctx)
                 elif cmd == "project.update":
                     res = handle_project_update(ctx)
+                elif cmd == "project.set_permission_mode":
+                    res = handle_project_set_permission_mode(ctx)
                 elif cmd == "project.complete":
                     res = handle_project_complete(ctx)
                 elif cmd == "project.note":
                     res = handle_project_note(ctx)
                 elif cmd == "project.deliver":
                     res = handle_project_deliver(ctx)
+                elif cmd == "project.diff":
+                    res = handle_project_diff(ctx)
                 elif cmd == "inbox.list":
                     res = handle_inbox_list(ctx)
                 elif cmd == "inbox.ack":
@@ -2593,6 +2773,8 @@ class DaemonServer:
                     res = handle_approval_approve(ctx)
                 elif cmd == "approval.reject":
                     res = handle_approval_reject(ctx)
+                elif cmd == "approval.decide":
+                    res = handle_approval_decide(ctx)
                 elif cmd == "approval.cancel":
                     res = handle_approval_cancel(ctx)
                 elif cmd == "approval.check":
@@ -2617,12 +2799,16 @@ class DaemonServer:
                     res = handle_task_show(ctx)
                 elif cmd == "task.log":
                     res = handle_task_log(ctx)
+                elif cmd == "task.diff":
+                    res = handle_task_diff(ctx)
                 elif cmd == "run.list":
                     res = handle_run_list(ctx)
                 elif cmd == "run.show":
                     res = handle_run_show(ctx)
                 elif cmd == "run.log":
                     res = handle_run_log(ctx)
+                elif cmd == "run.activity":
+                    res = handle_run_activity(ctx)
                 elif cmd == "run.release":
                     res = handle_run_release(ctx)
                 elif cmd == "workspace.list":
@@ -2661,6 +2847,32 @@ class DaemonServer:
                     res = handle_dep_list(ctx)
                 elif cmd == "audit.verify":
                     res = handle_audit_verify(ctx)
+                elif cmd == "chat.send":
+                    res = handle_chat_send(ctx)
+                elif cmd == "chat.list":
+                    res = handle_chat_list(ctx)
+                elif cmd == "chat.reply":
+                    res = handle_chat_reply(ctx)
+                elif cmd == "chat.queue_cancel":
+                    res = handle_chat_queue_cancel(ctx)
+                elif cmd == "chat.queue_edit":
+                    res = handle_chat_queue_edit(ctx)
+                elif cmd == "lead.interrupt":
+                    res = handle_lead_interrupt(ctx)
+                elif cmd == "plan.propose":
+                    res = handle_plan_propose(ctx)
+                elif cmd == "plan.dispatch":
+                    res = handle_plan_dispatch(ctx)
+                elif cmd == "plan.cancel":
+                    res = handle_plan_cancel(ctx)
+                elif cmd == "plan.list":
+                    res = handle_plan_list(ctx)
+                elif cmd == "plan.show":
+                    res = handle_plan_show(ctx)
+                elif cmd == "grant.list":
+                    res = handle_grant_list(ctx)
+                elif cmd == "grant.revoke":
+                    res = handle_grant_revoke(ctx)
                 elif cmd in PLANNED_COMMAND_MILESTONES:
                     ms = PLANNED_COMMAND_MILESTONES[cmd]
                     details = {"cmd": cmd}
@@ -2770,10 +2982,13 @@ class DaemonServer:
 
         except MeshError as exc:
             exit_code = exc.exit_code
+            committed_on_error = False
             if self.db_conn and self.db_conn.in_transaction:
                 try:
-                    if exit_code == c.EXIT_APPROVAL_REQUIRED and not dry_run:
+                    if (exit_code == c.EXIT_APPROVAL_REQUIRED or getattr(exc, "commit_tx", False)) and not dry_run:
                         self.db_conn.execute("COMMIT;")
+                        if getattr(exc, "commit_tx", False):
+                            committed_on_error = True
                     else:
                         self.db_conn.execute("ROLLBACK;")
                 except Exception:
@@ -2781,6 +2996,8 @@ class DaemonServer:
             if getattr(locals().get("ctx"), "_committed_side_effect", False):
                 await self.notify_waiters()
                 self.wake_scheduler()
+            elif committed_on_error:
+                await self.notify_waiters()
             err_envelope = exc.to_envelope(request_id=request_id)
             if dry_run:
                 err_envelope["dry_run"] = True
@@ -2930,32 +3147,48 @@ class DaemonServer:
         """Run the daemon server loop."""
         self.start_time = time.time()
         self.stop_event = asyncio.Event()
-        sock_path = os.path.join(self.home, "run", "mesh.sock")
+        endpoint_path: Optional[str] = ipc.daemon_endpoint_path(self.home) if sys.platform != "win32" else None
         sock_bound = False
-        old_umask = os.umask(0o077)
+        pipe_file_written = False
+        old_umask = os.umask(0o077) if sys.platform != "win32" else None
+        old_win_signals: Dict[int, Any] = {}
 
         try:
-            # Check setup and lock
-            self.setup_storage()
-            self.acquire_lock()
+            # Check read-only storage preflight, acquire single-instance lock FIRST, then open/backup/migrate DB (P2-2).
+            self._defer_migration = True
+            self._pending_storage_open = False
+            try:
+                self.setup_storage()
+                self.acquire_lock()
+                self._complete_storage_after_lock()
+            finally:
+                self._defer_migration = False
+            clear_autostart_hold(self.home)
+            if sys.platform == "win32":
+                ipc.remove_pipe_endpoint_win(self.home)
             self.record_boot()
             self.setup_subreaper()
             self.run_recovery()
 
-            if os.path.exists(sock_path):
+            if sys.platform == "win32":
+                endpoint_path = ipc.generate_pipe_endpoint_win(self.home)
+            elif endpoint_path and os.path.exists(endpoint_path):
                 try:
-                    os.remove(sock_path)
+                    os.remove(endpoint_path)
                 except OSError:
                     pass
 
             sock_bound = True
-            self.server = await asyncio.start_unix_server(
+            assert endpoint_path is not None
+            self.server = await ipc.start_daemon_server(
                 self.handle_client,
-                path=sock_path,
+                endpoint_path,
                 backlog=64,
                 limit=MAX_REQUEST_BYTES + 4096,
             )
-            os.chmod(sock_path, 0o600)
+            if sys.platform == "win32":
+                ipc.write_pipe_endpoint_win(self.home, endpoint_path)
+                pipe_file_written = True
 
             loop = asyncio.get_running_loop()
             self._scheduler_wake = asyncio.Event()
@@ -2972,15 +3205,40 @@ class DaemonServer:
                 if self.stop_event:
                     self.stop_event.set()
 
-            for sig in (signal.SIGTERM, signal.SIGINT):
-                try:
-                    loop.add_signal_handler(sig, on_signal)
-                except NotImplementedError:
-                    pass
+            if sys.platform == "win32":
+                if threading.current_thread() is threading.main_thread():
+                    win_sigs = [signal.SIGINT, signal.SIGTERM]
+                    sig_break = getattr(signal, "SIGBREAK", None)
+                    if sig_break is not None:
+                        win_sigs.append(sig_break)
+
+                    def _win_on_signal(_signum: int, _frame: Any) -> None:
+                        try:
+                            loop.call_soon_threadsafe(on_signal)
+                        except RuntimeError:
+                            pass
+
+                    for sig in win_sigs:
+                        try:
+                            old_win_signals[sig] = signal.signal(sig, _win_on_signal)
+                        except (ValueError, OSError):
+                            pass
+            else:
+                for sig in (signal.SIGTERM, signal.SIGINT):
+                    try:
+                        loop.add_signal_handler(sig, on_signal)
+                    except NotImplementedError:
+                        pass
 
             await self.stop_event.wait()
         finally:
             try:
+                for sig, prev_handler in old_win_signals.items():
+                    try:
+                        signal.signal(sig, prev_handler)
+                    except (ValueError, OSError):
+                        pass
+
                 # Graceful shutdown
                 for bg_task in (self._scheduler_task, self._termination_task, self._stub_task):
                     if bg_task:
@@ -3002,9 +3260,12 @@ class DaemonServer:
                     except (asyncio.TimeoutError, Exception):
                         pass
 
-                if sock_bound and os.path.exists(sock_path):
+                if sys.platform == "win32":
+                    if pipe_file_written:
+                        ipc.remove_pipe_endpoint_win(self.home)
+                elif sock_bound and endpoint_path and os.path.exists(endpoint_path):
                     try:
-                        os.remove(sock_path)
+                        os.remove(endpoint_path)
                     except OSError:
                         pass
 
@@ -3014,4 +3275,5 @@ class DaemonServer:
                     self.db_conn.close()
                     self.db_conn = None
             finally:
-                os.umask(old_umask)
+                if old_umask is not None:
+                    os.umask(old_umask)

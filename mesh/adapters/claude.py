@@ -99,11 +99,17 @@ class ClaudeAdapter(Adapter):
     """Adapter for Anthropic Claude Code (``claude``)."""
 
     id = "claude"
+    supported_profiles = ("readonly", "edit", "unrestricted")
     supported_efforts = CLAUDE_EFFORTS
     kind = "vendor"
     binary_names = ["claude"]
     planned_version = CLAUDE_VERSION
     verified_version = None  # no committed help fixture; probe() checks flags live
+    model_presets = {
+        "chips": ["sonnet", "opus", "haiku"],
+        "default_allowed": ["sonnet", "opus"],
+        "note": "Claude Code 支持短别名（sonnet/opus/haiku）或完整模型 ID，可点击快捷标签或自由输入",
+    }
     liveness = "stream"
     max_argv_prompt_bytes = 100_000  # the prompt goes on stdin; kept for the shared limit
     launch_enabled = False

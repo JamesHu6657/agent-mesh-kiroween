@@ -7,13 +7,16 @@ import concurrent.futures
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
 from typing import Any, Dict, List, Optional
 
 import mesh.constants as c
-from tests.helpers import MeshHarness, serial
+from mesh.platform import perms as plat_perms
+from tests.helpers import MeshHarness, cli_popen_argv, serial
 from tests.stubs import create_test_stubs
 
 
@@ -64,7 +67,7 @@ def create_agent(
     tok_path = os.path.join(tok_dir, f"{name}.tok")
     with open(tok_path, "w", encoding="utf-8") as f:
         f.write(token)
-    os.chmod(tok_path, 0o600)
+    plat_perms.set_private_file_acl(tok_path)
 
     return token
 
@@ -326,9 +329,6 @@ class TestEventsIntegration(unittest.TestCase):
     @serial
     def test_event_tail_disconnect_releases_stream(self) -> None:
         """Verify daemon terminates tail coroutine and active_streams returns to 0 when client disconnects without --timeout."""
-        import subprocess
-        import sys
-
         rc_p, resp_p = self.harness.cli(
             "intake", "submit",
             "--title", "Proj Disconnect Tail",
@@ -340,14 +340,12 @@ class TestEventsIntegration(unittest.TestCase):
         prj_id = resp_p["data"]["id"]
 
         tok_path = os.path.join(self.harness.home, "tokens", "lead1.tok")
+        cmd_tail, env_tail = cli_popen_argv(
+            self.harness, "--token-file", tok_path, "event", "tail", "--project", prj_id,
+        )
         proc = subprocess.Popen(
-            [
-                self.harness.bin_mesh,
-                "--home", self.harness.home,
-                "--token-file", tok_path,
-                "event", "tail",
-                "--project", prj_id,
-            ],
+            cmd_tail,
+            env=env_tail,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )

@@ -3,6 +3,7 @@
 B2 an unexpected error after `merge --no-commit` aborts the merge (integration clean).
 B4 run_registered's timeout holds even when a descendant keeps the output pipes open."""
 
+import sys
 import errno
 import os
 import subprocess
@@ -43,19 +44,30 @@ class TestUnexpectedMergeErrorCleansUp(RepoFixtureCase):
 class TestRunRegisteredTimeoutBounded(unittest.TestCase):
     def test_descendant_holding_pipes_does_not_block(self) -> None:
         t0 = time.monotonic()
+        script = (
+            "import subprocess, sys, time; "
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], close_fds=False); "
+            "print('started', flush=True); time.sleep(30)"
+        )
         with self.assertRaises(subprocess.TimeoutExpired):
-            run_registered("probe", ["sh", "-c", "sleep 30 & echo started; sleep 30"],
+            run_registered("probe", [sys.executable, "-c", script],
                            timeout=0.2, capture_output=True, text=True)
         self.assertLess(time.monotonic() - t0, 15.0)
 
     def test_own_group_is_killed(self) -> None:
+        script = (
+            "import subprocess, sys, time; "
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], close_fds=False); "
+            "time.sleep(30)"
+        )
+        kw = {"start_new_session": True} if sys.platform != "win32" else {}
         with self.assertRaises(subprocess.TimeoutExpired):
-            run_registered("probe", ["sh", "-c", "sleep 30 & echo $! > /dev/null; sleep 30"],
-                           timeout=0.2, capture_output=True, text=True, start_new_session=True)
+            run_registered("probe", [sys.executable, "-c", script],
+                           timeout=0.2, capture_output=True, text=True, **kw)
 
     def test_normal_run_unchanged(self) -> None:
-        cp = run_registered("probe", ["sh", "-c", "echo hi"], timeout=5, capture_output=True, text=True)
-        self.assertEqual((cp.returncode, cp.stdout), (0, "hi\n"))
+        cp = run_registered("probe", [sys.executable, "-c", "print('hi')"], timeout=5, capture_output=True, text=True)
+        self.assertEqual((cp.returncode, cp.stdout.replace("\r\n", "\n")), (0, "hi\n"))
 
 
 if __name__ == "__main__":

@@ -20,9 +20,26 @@ Output layout under ``MESH_SMOKE_OUT`` is the promotion layout of ``tests/tierli
 ``<adapter>/<version>/smoke-<case>-stdout.jsonl`` / ``smoke-<case>-stderr.txt`` and
 ``results/<adapter>-<version>-<date>.json``, each with a sidecar. Raw output only exists in
 a private run dir under ``MESH_SMOKE_OUT/.runs`` and is replaced by its redacted form.
+An adapter with plain-text stdout (``smoke_schema.PLAIN_STDOUT_ADAPTERS``: devin, which has no
+JSON output format) is captured the same way as ``smoke-<case>-stdout.txt``: the redacted
+stdout text as printed (terminal escapes included), with sidecar and sha256.
+
+Profile (smoke-codex-claude-devin): every run of a session uses
+``smoke_schema.smoke_profile(adapter)`` and the results doc records it. That is ``readonly``
+for droid, kiro, agy, vibe, codex and claude. devin maps only ``unrestricted``
+(``--permission-mode dangerous``; readonly and edit raise PROFILE_UNSUPPORTED), so its smoke
+runs are unrestricted: the CLI approves every tool call and nothing on the vendor side limits
+what a run may touch. The harness keeps what it enforces for every adapter (the cwd is this
+session's ``/tmp/mh-smoke-*`` scratch dir, never the repository; the prompts are the fixed
+ones in tests/smoke/test_smoke.py), which is a working directory, not a sandbox.
+
+Prompt: an adapter that reads its prompt from stdin (codex ``exec -``, claude ``-p``;
+``CommandSpec.stdin`` is the prompt path) gets the run's ``prompt.md`` on stdin; every other
+adapter gets ``/dev/null``.
 """
 
 import argparse
+import contextlib
 import json
 import os
 import shutil
@@ -131,6 +148,17 @@ def load_config(env: Mapping[str, str], adapter_id: str, binary: str) -> SmokeCo
 def child_env(env: Mapping[str, str]) -> Dict[str, str]:
     """The vendor child's env: ``env`` minus every ``MESH_*`` name."""
     return {k: v for k, v in env.items() if not k.startswith("MESH_")}
+
+
+@contextlib.contextmanager
+def child_stdin(spec):
+    """The vendor child's stdin: the open prompt file when ``spec.stdin`` is a path (codex and
+    claude read the prompt from stdin, as under mesh/runwrap.py), else ``/dev/null``."""
+    if spec.stdin in (None, "", "devnull"):
+        yield subprocess.DEVNULL
+        return
+    with open(spec.stdin, "rb") as f:
+        yield f
 
 
 @dataclass
@@ -242,13 +270,16 @@ class SmokeSession:
     """One adapter's smoke capture: run cases, record results, write the results doc.
 
     ``grace_s`` is the SIGTERM->SIGKILL wait on timeout (production 15 s; tests 1 s).
-    ``version`` defaults to ``adapter.probe(binary_path=binary).version``."""
+    ``version`` defaults to ``adapter.probe(binary_path=binary).version``.
+    ``profile`` is ``smoke_schema.smoke_profile(adapter_id)`` for every run of the session
+    (readonly; devin: unrestricted, see the module docstring)."""
 
     def __init__(self, env: Mapping[str, str], adapter_id: str, binary: str, *, grace_s: float = PRODUCTION_GRACE_S,
                  version: Optional[str] = None, mesh_commit: str = "unknown", effort: Optional[str] = None):
         self.config = load_config(env, adapter_id, binary)
         self.env = dict(env)
         self.adapter = ADAPTER_CLASSES[adapter_id]()
+        self.profile = smoke_schema.smoke_profile(adapter_id)
         self.grace_s = float(grace_s)
         self.effort = effort
         self.mesh_commit = mesh_commit or "unknown"
@@ -278,6 +309,34 @@ class SmokeSession:
     def redact(self, text: str) -> str:
         return redact_mod.redact(text, self.exact_values)
 
+    def prepare(self, case_id: str, prompt: str, *, effort: Optional[str] = None,
+                resume_session_id: Optional[str] = None, timeout_s: Optional[float] = None):
+        """``(run_dir, run_id, spec)`` for one run: a private run dir with ``prompt.md`` and the
+        command ``adapter.build()`` makes for the session's profile. Nothing is spawned.
+        Refused (SmokeConfigError): a command that does not start with the absolute binary, a
+        cwd that is inside the repository or is not this session's ``/tmp/mh-smoke-*``
+        workspace, and a stdin file other than the run's ``prompt.md``."""
+        run_dir = tempfile.mkdtemp(prefix=f"{case_id}-", dir=self.runs_root)
+        prompt_path = os.path.join(run_dir, "prompt.md")
+        with open(prompt_path, "w", encoding="utf-8") as f:
+            f.write(prompt)
+        run_id = f"smoke-{case_id}-{os.path.basename(run_dir)}"
+        req = RunRequest(prompt_path=prompt_path, workspace=self.workspace, model=self.config.model,
+                         effort=effort if effort is not None else self.effort, profile=self.profile,
+                         resume_session_id=resume_session_id, timeout_s=int(timeout_s or self.config.timeout_s),
+                         options={"binary": self.config.binary, "run_id": run_id})
+        spec = self.adapter.build(req)
+        if spec.argv[0] != self.config.binary:
+            raise SmokeConfigError(f"build() did not use the absolute binary: {spec.argv[0]!r}")
+        if _inside(spec.cwd, REPO_ROOT):
+            raise SmokeConfigError(f"cwd inside the repository: {spec.cwd}")
+        if os.path.realpath(spec.cwd) != os.path.realpath(self.workspace) \
+                or not os.path.realpath(self.workspace).startswith(os.path.realpath("/tmp") + os.sep + "mh-smoke-"):
+            raise SmokeConfigError(f"cwd is not the smoke workspace: {spec.cwd}")
+        if spec.stdin not in (None, "", "devnull") and os.path.realpath(spec.stdin) != os.path.realpath(prompt_path):
+            raise SmokeConfigError(f"stdin is not the run's prompt file: {spec.stdin}")
+        return run_dir, run_id, spec
+
     def run(self, case_id: str, prompt: str, *, effort: Optional[str] = None,
             resume_session_id: Optional[str] = None, timeout_s: Optional[float] = None) -> Optional[RunOutcome]:
         """One model run. Returns None (nothing spawned) at the run cap."""
@@ -286,20 +345,8 @@ class SmokeSession:
         if self.cap_reached:
             return None
         self.refuse_existing_capture(case_id)
-        run_dir = tempfile.mkdtemp(prefix=f"{case_id}-", dir=self.runs_root)
-        prompt_path = os.path.join(run_dir, "prompt.md")
-        with open(prompt_path, "w", encoding="utf-8") as f:
-            f.write(prompt)
-        run_id = f"smoke-{case_id}-{os.path.basename(run_dir)}"
-        req = RunRequest(prompt_path=prompt_path, workspace=self.workspace, model=self.config.model,
-                         effort=effort if effort is not None else self.effort, profile="readonly",
-                         resume_session_id=resume_session_id, timeout_s=int(timeout_s or self.config.timeout_s),
-                         options={"binary": self.config.binary, "run_id": run_id})
-        spec = self.adapter.build(req)
-        if spec.argv[0] != self.config.binary:
-            raise SmokeConfigError(f"build() did not use the absolute binary: {spec.argv[0]!r}")
-        if _inside(spec.cwd, REPO_ROOT):
-            raise SmokeConfigError(f"cwd inside the repository: {spec.cwd}")
+        run_dir, run_id, spec = self.prepare(case_id, prompt, effort=effort, resume_session_id=resume_session_id,
+                                             timeout_s=timeout_s)
         limit = float(timeout_s or self.config.timeout_s)
         raw_out, raw_err = os.path.join(run_dir, "raw-stdout"), os.path.join(run_dir, "raw-stderr")
         self.runs_used += 1
@@ -307,8 +354,8 @@ class SmokeSession:
         timed_out = False
         proc: Optional["subprocess.Popen[bytes]"] = None
         try:
-            with open(raw_out, "wb") as fo, open(raw_err, "wb") as fe:
-                proc = subprocess.Popen(spec.argv, cwd=spec.cwd, stdin=subprocess.DEVNULL, stdout=fo, stderr=fe,
+            with open(raw_out, "wb") as fo, open(raw_err, "wb") as fe, child_stdin(spec) as fi:
+                proc = subprocess.Popen(spec.argv, cwd=spec.cwd, stdin=fi, stdout=fo, stderr=fe,
                                         env=child_env(self.env), start_new_session=True)
                 try:
                     proc.wait(timeout=limit)
@@ -346,7 +393,8 @@ class SmokeSession:
         with open(os.path.join(run_dir, "stderr.log"), "w", encoding="utf-8") as f:
             f.write(stderr)
         cmd = [self.redact(a) for a in [os.path.basename(spec.argv[0])] + spec.argv[1:]]
-        out_name, err_name = f"smoke-{case_id}-stdout.jsonl", f"smoke-{case_id}-stderr.txt"
+        out_name = smoke_schema.stdout_capture_name(self.adapter.id, case_id)
+        err_name = smoke_schema.stderr_capture_name(case_id)
         base = f"{self.adapter.id}/{self.version}"
         out_path = tierlib.write_capture(self.config.out, f"{base}/{out_name}", stdout.encode("utf-8"), cmd)
         tierlib.write_capture(self.config.out, f"{base}/{err_name}", stderr.encode("utf-8"), cmd)
@@ -367,7 +415,7 @@ class SmokeSession:
 
     def capture_names(self, case_id: str) -> List[str]:
         base = os.path.join(self.config.out, self.adapter.id, self.version)
-        names = [f"smoke-{case_id}-stdout.jsonl", f"smoke-{case_id}-stderr.txt"]
+        names = [smoke_schema.stdout_capture_name(self.adapter.id, case_id), smoke_schema.stderr_capture_name(case_id)]
         if self.adapter.id == "vibe":
             names.append(f"smoke-{case_id}-vibe-export.json")
         return [os.path.join(base, n + suffix) for n in names for suffix in ("", tierlib.SIDECAR_SUFFIX)]
@@ -392,7 +440,8 @@ class SmokeSession:
         ``outcome.signal_info`` = ``{first_byte, term_after_s, alive_at_term, rc, lines_at_term,
         group_gone_after_term, seconds_to_gone}``. The SIGTERM goes out once stdout has a second
         line (past droid's init event; ``min_lines``, default 2, kiro passes 4 to get past
-        runStarted and its two pre-model metadata lines), or at ``wait_first_byte_s``, or when the leader exits;
+        runStarted and its two pre-model metadata lines; the per-adapter values are
+        ``SIGNAL_MIN_LINES`` in tests/smoke/test_smoke.py), or at ``wait_first_byte_s``, or when the leader exits;
         ``alive_at_term`` is False when the leader had already exited before the SIGTERM.
         Returns None (nothing spawned) at the run cap.
         """
@@ -403,26 +452,14 @@ class SmokeSession:
         if self.cap_reached:
             return None
         self.refuse_existing_capture(case_id)
-        run_dir = tempfile.mkdtemp(prefix=f"{case_id}-", dir=self.runs_root)
-        prompt_path = os.path.join(run_dir, "prompt.md")
-        with open(prompt_path, "w", encoding="utf-8") as f:
-            f.write(prompt)
-        run_id = f"smoke-{case_id}-{os.path.basename(run_dir)}"
-        req = RunRequest(prompt_path=prompt_path, workspace=self.workspace, model=self.config.model,
-                         effort=self.effort, profile="readonly", timeout_s=int(self.config.timeout_s),
-                         options={"binary": self.config.binary, "run_id": run_id})
-        spec = self.adapter.build(req)
-        if spec.argv[0] != self.config.binary:
-            raise SmokeConfigError(f"build() did not use the absolute binary: {spec.argv[0]!r}")
-        if _inside(spec.cwd, REPO_ROOT):
-            raise SmokeConfigError(f"cwd inside the repository: {spec.cwd}")
+        run_dir, run_id, spec = self.prepare(case_id, prompt)
         raw_out, raw_err = os.path.join(run_dir, "raw-stdout"), os.path.join(run_dir, "raw-stderr")
         self.runs_used += 1
         started = time.monotonic()
         proc: Optional["subprocess.Popen[bytes]"] = None
         try:
-            with open(raw_out, "wb") as fo, open(raw_err, "wb") as fe:
-                proc = subprocess.Popen(spec.argv, cwd=spec.cwd, stdin=subprocess.DEVNULL, stdout=fo, stderr=fe,
+            with open(raw_out, "wb") as fo, open(raw_err, "wb") as fe, child_stdin(spec) as fi:
+                proc = subprocess.Popen(spec.argv, cwd=spec.cwd, stdin=fi, stdout=fo, stderr=fe,
                                         env=child_env(self.env), start_new_session=True)
                 pgid = proc.pid
                 deadline = started + wait_first_byte_s
@@ -535,7 +572,7 @@ class SmokeSession:
     def document(self) -> Dict[str, Any]:
         return {"schema": smoke_schema.SCHEMA, "adapter": self.adapter.id, "binary": self.config.binary,
                 "version": self.version, "captured_at_utc": self.captured_at_utc, "mesh_commit": self.mesh_commit,
-                "model": self.config.model, "effort": self.effort, "profile": "readonly",
+                "model": self.config.model, "effort": self.effort, "profile": self.profile,
                 "timeout_s": self.config.timeout_s, "consent_ref": self.config.consent_ref, "cases": list(self.cases)}
 
     def carry_staged(self) -> List[str]:

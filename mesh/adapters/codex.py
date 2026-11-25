@@ -130,11 +130,17 @@ class CodexAdapter(Adapter):
     """Adapter for the OpenAI Codex CLI (``codex``)."""
 
     id = "codex"
+    supported_profiles = ("readonly", "dev", "unrestricted")
     supported_efforts = CODEX_EFFORTS
     kind = "vendor"
     binary_names = ["codex"]
     planned_version = CODEX_VERSION
     verified_version = None  # no committed help fixture; probe() checks flags live
+    model_presets = {
+        "chips": ["gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-luna", "gpt-5.6-luna"],
+        "default_allowed": [],
+        "note": "Mesh 不自动拉取 Codex 模型列表，可用模型取决于账号套餐（其中 gpt-5.6-luna 为已做冒烟测试的 ID，未必对所有套餐开放）；请点击预设芯片选择或自由输入模型 ID",
+    }
     liveness = "stream"
     max_argv_prompt_bytes = 100_000  # the prompt goes on stdin; kept for the shared limit
     launch_enabled = False

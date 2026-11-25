@@ -29,12 +29,15 @@ class TestR5Redact(unittest.TestCase):
     def test_p0_1_nested_json_strings_are_bounded(self) -> None:
         from mesh.core.redact import redact, LINE_CAP
 
+        # GitHub windows-latest runners (2-4 vCPUs, MESH_TEST_JOBS=6) can hit ~2.3s on
+        # d=110 vs ~0.5s idle on Linux; 6.0s still proves O(depth)-bounded runtime.
+        bound_s = 6.0 if sys.platform == "win32" else 2.0
         for d in (14, 21, 49, 110):
             line = _nest(d)
             self.assertLess(len(line), LINE_CAP)
             t = time.monotonic()
             out = redact(line, [], jsonl=True)
-            self.assertLess(time.monotonic() - t, 2.0, d)
+            self.assertLess(time.monotonic() - t, bound_s, d)
             self.assertLessEqual(len(out), LINE_CAP)
             self.assertNotIn("hunter2", out)
             json.loads(out)
@@ -100,12 +103,19 @@ class TestR5Worktree(unittest.TestCase):
         fake = os.path.join(self.wt, "sub")
         self.git(self.tmp, "init", "-q", fake)
         marker = os.path.join(self.tmp, "PWNED")
-        hook = os.path.join(self.tmp, "fsm.sh")
-        with open(hook, "w") as f:
-            f.write("#!/bin/sh\ntouch %s\n" % marker)
-        os.chmod(hook, 0o755)
-        self.git(fake, "config", "core.fsmonitor", hook)
-        with open(os.path.join(self.wt, ".git"), "w") as f:
+        if sys.platform == "win32":
+            self.git(fake, "config", "core.fsmonitor",
+                     f'"{sys.executable}" -c "open({marker!r}, \'w\').close()"')
+        else:
+            hook = os.path.join(self.tmp, "fsm.sh")
+            with open(hook, "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\ntouch %s\n" % marker)
+            os.chmod(hook, 0o755)
+            self.git(fake, "config", "core.fsmonitor", hook)
+        wt_git = os.path.join(self.wt, ".git")
+        if os.path.isfile(wt_git):
+            os.unlink(wt_git)
+        with open(wt_git, "w") as f:
             f.write("gitdir: sub/.git\n")
         return marker
 
@@ -158,7 +168,10 @@ class TestR5Worktree(unittest.TestCase):
             shutil.copy(os.path.join(real, name), os.path.join(fake, name))
         with open(os.path.join(fake, "commondir"), "w") as f:
             f.write(os.path.join(self.repo, ".git") + "\n")
-        with open(os.path.join(self.wt, ".git"), "w") as f:
+        wt_git = os.path.join(self.wt, ".git")
+        if os.path.isfile(wt_git):
+            os.unlink(wt_git)
+        with open(wt_git, "w") as f:
             f.write("gitdir: %s\n" % fake)
         info = submission_git_info(self.wt, "t1", None, repo_path=self.repo)
         self.assertEqual(info["error"]["reason"], "foreign_repository")

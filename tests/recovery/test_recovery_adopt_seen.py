@@ -19,9 +19,12 @@ import unittest
 from typing import Any, Dict, List, Optional
 from unittest import mock
 
-from mesh.core.proc import get_proc_stat
+from mesh.core.proc import get_proc_environ, get_proc_stat
 from mesh.daemon import supervisor
+from mesh.platform import proc as plat_proc
+from mesh.platform.paths import temp_root
 from mesh.testing import fake_agent
+from tests.helpers import _win_terminate_and_wait_pid, restore_accessible_for_test, set_inaccessible_for_test
 from tests.recovery.test_recovery import RecoveryBase, _alive
 
 
@@ -40,7 +43,7 @@ class TestRecoveryAdoptSeen(RecoveryBase):
             if cur is not None and starttime is not None and cur["starttime"] == starttime \
                     and cur["state"] != "Z":
                 try:
-                    os.kill(pid, signal.SIGKILL)
+                    self._kill_pid(pid)
                 except ProcessLookupError:
                     pass
         self.addCleanup(_cleanup)
@@ -78,8 +81,9 @@ class TestRecoveryAdoptSeen(RecoveryBase):
         SIGTERM); then SIGKILL, member gone, lease released, seen.json listed it."""
         pidfile = os.path.join(self.harness.fixtures_dir, "member-pid")
         trigger = os.path.join(self.harness.fixtures_dir, "member-trigger")
-        spec = ('FAKE {"steps":[{"spawn_envless_member":{"path":"%s","trigger":"%s"}},'
-                '{"succeed":{}}]}' % (pidfile, trigger))
+        spec = "FAKE " + json.dumps(
+            {"steps": [{"spawn_envless_member": {"path": pidfile, "trigger": trigger}}, {"succeed": {}}]}
+        )
         self.set_setting("kill.grace_s", "2")
         task_id = self.create_task(spec)
         run = self.wait_running_run(task_id)
@@ -89,8 +93,16 @@ class TestRecoveryAdoptSeen(RecoveryBase):
         self._guard_member(member)
         member_st = get_proc_stat(member)["starttime"]
         info = get_proc_stat(member)
-        self.assertEqual(info["pgrp"], run["pgid"])
-        self.assertEqual(info["session"], run["pgid"])
+        if sys.platform == "win32":
+            job = plat_proc.open_run_job(self.harness.home, run["id"], terminate=False)
+            self.assertIsNotNone(job)
+            try:
+                self.assertIn(member, plat_proc.query_job_pids(job))
+            finally:
+                job.close()
+        else:
+            self.assertEqual(info["pgrp"], run["pgid"])
+            self.assertEqual(info["session"], run["pgid"])
 
         self.harness.kill9_daemon()
         self.assertTrue(_alive(run["wrapper_pid"]), "the run must survive meshd's death")
@@ -139,7 +151,7 @@ class TestRecoveryAdoptSeen(RecoveryBase):
     def test_adopted_wrapper_exit_without_member_closes_normally(self) -> None:
         """ACC: N18 (control) - the same adopted flow without a member closes normally."""
         trigger = os.path.join(self.harness.fixtures_dir, "ctl-trigger")
-        spec = 'FAKE {"steps":[{"wait_release":{"path":"%s"}},{"succeed":{}}]}' % trigger
+        spec = "FAKE " + json.dumps({"steps": [{"wait_release": {"path": trigger}}, {"succeed": {}}]})
         task_id, run = self._adopt(spec)
         self.assertTrue(self.harness.wait_for(lambda: os.path.exists(
             os.path.join(run["run_dir"], "seen.json")), timeout=15), "no seen.json for the adopted run")
@@ -163,8 +175,9 @@ class TestRecoveryAdoptSeen(RecoveryBase):
         grace window; then the lease is released, the run closes lost, doctor ok."""
         pidfile = os.path.join(self.harness.fixtures_dir, "member2-pid")
         trigger = os.path.join(self.harness.fixtures_dir, "member2-trigger")
-        spec = ('FAKE {"steps":[{"spawn_envless_member":{"path":"%s","trigger":"%s"}},'
-                '{"succeed":{}}]}' % (pidfile, trigger))
+        spec = "FAKE " + json.dumps(
+            {"steps": [{"spawn_envless_member": {"path": pidfile, "trigger": trigger}}, {"succeed": {}}]}
+        )
         self.set_setting("kill.grace_s", "2")
         task_id = self.create_task(spec)
         run = self.wait_running_run(task_id)
@@ -188,9 +201,9 @@ class TestRecoveryAdoptSeen(RecoveryBase):
 
         # Second restart with the wrapper (and the fake agent) gone without exit.json.
         self.harness.kill9_daemon()
-        os.kill(run["wrapper_pid"], signal.SIGKILL)
+        self._kill_pid(run["wrapper_pid"])
         self.assertTrue(self.harness.wait_for(lambda: not _alive(run["wrapper_pid"]), timeout=10))
-        os.kill(fake_pid, signal.SIGKILL)
+        self._kill_pid(fake_pid)
         self.assertTrue(self.harness.wait_for(lambda: not _alive(fake_pid), timeout=10))
         self.assertFalse(os.path.exists(os.path.join(run["run_dir"], "exit.json")))
         self.assertTrue(_alive(member))
@@ -238,8 +251,9 @@ class TestRecoveryAdoptSeen(RecoveryBase):
         run and `task:<id>` until it is gone."""
         pidfile = os.path.join(self.harness.fixtures_dir, "member3-pid")
         trigger = os.path.join(self.harness.fixtures_dir, "member3-trigger")
-        spec = ('FAKE {"steps":[{"spawn_envless_member":{"path":"%s","trigger":"%s"}},'
-                '{"succeed":{}}]}' % (pidfile, trigger))
+        spec = "FAKE " + json.dumps(
+            {"steps": [{"spawn_envless_member": {"path": pidfile, "trigger": trigger}}, {"succeed": {}}]}
+        )
         self.set_setting("kill.grace_s", "120")
         task_id = self.create_task(spec)
         run = self.wait_running_run(task_id)
@@ -344,9 +358,16 @@ class TestRecoveryAdoptSeen(RecoveryBase):
 
 def _spawn_session_leader() -> subprocess.Popen:
     """A child in its own session (pgid == sid == pid) blocking on a pipe read."""
-    return subprocess.Popen([sys.executable, "-c", "import os; r, w = os.pipe(); os.read(r, 1)"],
-                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, start_new_session=True)
+    kw: Dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if sys.platform == "win32":
+        kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kw["start_new_session"] = True
+    return subprocess.Popen([sys.executable, "-c", "import os; r, w = os.pipe(); os.read(r, 1)"], **kw)
 
 
 def _dead_pid() -> int:
@@ -359,7 +380,7 @@ class TestSeenState(unittest.TestCase):
     """r4b items 2 and 3: seen.json persistence retry and load validation (in-process)."""
 
     def setUp(self) -> None:
-        self.dir = tempfile.mkdtemp(prefix="mh-seen-", dir="/tmp")
+        self.dir = tempfile.mkdtemp(prefix="mh-seen-", dir=temp_root())
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.leader = _spawn_session_leader()
         self.addCleanup(self._kill, self.leader)
@@ -514,7 +535,17 @@ class TestSeenState(unittest.TestCase):
         os.symlink("seen.json", path)
         self.assertEqual(supervisor.load_seen_state(self.run_row), (supervisor.SEEN_UNUSABLE, {}))
         os.unlink(path)
-        if os.geteuid() != 0:
+        if sys.platform == "win32":
+            # A run_dir without read/list/traverse access: exists() says False, open() raises EACCES.
+            self._write(self._good())
+            set_inaccessible_for_test(self.dir)
+            try:
+                self.assertEqual(supervisor.load_seen_state(self.run_row), (supervisor.SEEN_UNUSABLE, {}))
+                self.assertEqual(supervisor._load_seen(self.run_row)[2], "unreadable")
+            finally:
+                restore_accessible_for_test(self.dir)
+            os.unlink(path)
+        elif os.geteuid() != 0:
             # A run_dir that cannot be searched: exists() says False, open() raises EACCES.
             self._write(self._good())
             os.chmod(self.dir, 0o600)
@@ -527,13 +558,23 @@ class TestSeenState(unittest.TestCase):
         self.assertEqual(supervisor.load_seen_state(self.run_row), (supervisor.SEEN_UNUSABLE, {}))
         self.assertEqual(self._reason_of(), "unreadable")
         os.rmdir(path)
-        if os.geteuid() != 0:
+        if sys.platform == "win32":
+            self._write(self._good())
+            set_inaccessible_for_test(path)
+            self.addCleanup(restore_accessible_for_test, path)
+            self.assertEqual(supervisor.load_seen_state(self.run_row), (supervisor.SEEN_UNUSABLE, {}))
+            self.assertEqual(self._reason_of(), "unreadable")
+        elif os.geteuid() != 0:
             self._write(self._good())
             os.chmod(path, 0)
             self.addCleanup(os.chmod, path, 0o600)
             self.assertEqual(supervisor.load_seen_state(self.run_row), (supervisor.SEEN_UNUSABLE, {}))
             self.assertEqual(self._reason_of(), "unreadable")
 
+    @unittest.skipUnless(
+        sys.platform != "win32",
+        "POSIX r4 legacy seen.json without sid verifies members via pgrp == pgid; Windows has no process-group ID",
+    )
     def test_legacy_file_without_sid_is_usable(self) -> None:
         """ACC: N18 (r4c item 3.1) - an r4-format seen.json (no `sid`) stays usable; its
         members count only while alive with their starttime and pgrp == pgid."""
@@ -587,7 +628,7 @@ class TestEnvlessMemberReady(unittest.TestCase):
         """ACC: N18 (r4b item 5) - the pid file is written only after the member has
         installed SIG_IGN for SIGTERM (readiness handshake): it reads `<pid>`, `ready`,
         and an immediate SIGTERM does not end the member."""
-        d = tempfile.mkdtemp(prefix="mh-ready-", dir="/tmp")
+        d = tempfile.mkdtemp(prefix="mh-ready-", dir=temp_root())
         self.addCleanup(shutil.rmtree, d, True)
         path = os.path.join(d, "pid")
         fake_agent.execute_behavior("spawn_envless_member", {"path": path})
@@ -599,6 +640,9 @@ class TestEnvlessMemberReady(unittest.TestCase):
 
         def _cleanup() -> None:
             if pid is None:
+                return
+            if sys.platform == "win32":
+                _win_terminate_and_wait_pid(pid)
                 return
             try:
                 os.kill(pid, signal.SIGKILL)
@@ -612,12 +656,16 @@ class TestEnvlessMemberReady(unittest.TestCase):
         self.assertIsNotNone(pid, lines)
         self.assertEqual(len(lines), 2, lines)
         self.assertEqual(lines[1], "ready")
-        with open(f"/proc/{pid}/status", "r", encoding="utf-8") as f:
-            sigign = [ln for ln in f if ln.startswith("SigIgn:")][0].split()[1]
-        self.assertTrue(int(sigign, 16) & (1 << (signal.SIGTERM - 1)), "SIGTERM not ignored yet")
-        os.kill(pid, signal.SIGTERM)
-        self.assertEqual(os.waitpid(pid, os.WNOHANG), (0, 0))
-        self.assertEqual(get_proc_stat(pid)["state"] != "Z", True)
+        if sys.platform == "win32":
+            self.assertTrue(_alive(pid))
+            self.assertNotIn("MESH_RUN_ID", get_proc_environ(pid) or {})
+        else:
+            with open(f"/proc/{pid}/status", "r", encoding="utf-8") as f:
+                sigign = [ln for ln in f if ln.startswith("SigIgn:")][0].split()[1]
+            self.assertTrue(int(sigign, 16) & (1 << (signal.SIGTERM - 1)), "SIGTERM not ignored yet")
+            os.kill(pid, signal.SIGTERM)
+            self.assertEqual(os.waitpid(pid, os.WNOHANG), (0, 0))
+            self.assertEqual(get_proc_stat(pid)["state"] != "Z", True)
 
 if __name__ == "__main__":
     unittest.main()

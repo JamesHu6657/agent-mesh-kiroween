@@ -96,7 +96,7 @@ def refuse_project_layer(adapter_id: str, req: RunRequest, config_dir: str, name
     if not paths:
         return
     ws = os.path.realpath(req.workspace)
-    shown = [os.path.relpath(p, ws) for p in paths]
+    shown = [os.path.relpath(p, ws).replace(os.sep, "/") for p in paths]
     reason = f"{adapter_id}_project_layer_present"
     raise AdapterUnsupported(
         f"{reason}: {adapter_id} refuses profile '{req.profile}': the workspace has a project config "

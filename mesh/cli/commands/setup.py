@@ -14,12 +14,17 @@ import re
 import os
 import subprocess
 import sys
+import tempfile
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import mesh
 import mesh.constants as c
 from mesh.core.paths import get_install_root, is_site_packages_dir
 from mesh.errors import MeshError
+from mesh.platform import perms
+from mesh.platform.fs import atomic_replace, open_regular_nofollow
+from mesh.platform.paths import is_reparse_link, same_path, temp_root
 
 
 def register_setup_command(subparsers: argparse._SubParsersAction, parent_parser: argparse.ArgumentParser) -> None:
@@ -76,36 +81,95 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[n:]
 
 
+_WIN_CLEANUP_BACKOFF_S = (0.005, 0.015, 0.030)
+_TRANSIENT_CLEANUP_WINERRORS = (5, 32)  # ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION
+
+
+def _remove_retry_win(
+    path: str,
+    remove_fn: Any,
+    *,
+    sleep_fn: Any = time.sleep,
+) -> None:
+    for delay in _WIN_CLEANUP_BACKOFF_S:
+        try:
+            remove_fn(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            if getattr(exc, "winerror", None) not in _TRANSIENT_CLEANUP_WINERRORS:
+                return
+            sleep_fn(delay)
+    try:
+        remove_fn(path)
+    except OSError:
+        pass
+
+
 def _run(home: str, argv: List[str], passphrase: Optional[str] = None) -> Tuple[int, Dict[str, Any]]:
     cmd = _mesh_cmd() + ["--home", home, "--format", "json"] + argv
     pass_fds: Tuple[int, ...] = ()
     r = w = None
-    if passphrase is not None:
-        r, w = os.pipe()
-        data = passphrase.encode("utf-8")
-
-        def _feed() -> None:
-            # A writer thread, so a passphrase longer than the pipe buffer cannot
-            # block setup before the child starts reading (Linear round 3 P3).
-            try:
-                _write_all(w, data)
-            except OSError:
-                pass
-            finally:
-                os.close(w)
-
-        import threading
-        feeder = threading.Thread(target=_feed, daemon=True)
-        feeder.start()
-        cmd += ["--passphrase-fd", str(r)]
-        pass_fds = (r,)
+    feeder = None
+    pp_dir: Optional[str] = None
+    pp_file: Optional[str] = None
     try:
-        proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                              env=_mesh_env(), pass_fds=pass_fds, timeout=300)
+        if passphrase is not None:
+            if sys.platform == "win32":
+                pp_dir = tempfile.mkdtemp(prefix="mesh-pp-", dir=temp_root())
+                perms.set_private_dir_acl(pp_dir, 0o700)
+                pp_file = os.path.join(pp_dir, "passphrase")
+                fd = open_regular_nofollow(
+                    pp_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, label="passphrase file"
+                )
+                try:
+                    perms.fchmod_private(fd, 0o600)
+                    _write_all(fd, passphrase.encode("utf-8"))
+                finally:
+                    os.close(fd)
+                cmd += ["--passphrase-file", pp_file]
+            else:
+                r, w = os.pipe()
+                data = passphrase.encode("utf-8")
+
+                def _feed() -> None:
+                    # A writer thread, so a passphrase longer than the pipe buffer cannot
+                    # block setup before the child starts reading (Linear round 3 P3).
+                    try:
+                        _write_all(w, data)
+                    except OSError:
+                        pass
+                    finally:
+                        os.close(w)
+
+                import threading
+                t = threading.Thread(target=_feed, daemon=True)
+                t.start()
+                feeder = t
+                cmd += ["--passphrase-fd", str(r)]
+                pass_fds = (r,)
+        run_kwargs: Dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "capture_output": True,
+            "text": True,
+            "env": _mesh_env(),
+            "timeout": 300,
+        }
+        if pass_fds:
+            run_kwargs["pass_fds"] = pass_fds
+        proc = subprocess.run(cmd, **run_kwargs)
     finally:
         if r is not None:
             os.close(r)
-            feeder.join(timeout=5)
+            if feeder is not None:
+                feeder.join(timeout=5)
+            elif w is not None:
+                os.close(w)
+        if pp_dir is not None:
+            if pp_file is not None:
+                _remove_retry_win(pp_file, os.unlink)
+            _remove_retry_win(pp_dir, os.rmdir)
     try:
         body = json.loads(proc.stdout) if proc.stdout.strip() else {}
     except ValueError:
@@ -130,7 +194,7 @@ def token_path_for(home: str, lead: str, token_dir: Optional[str]) -> str:
     one credential file (Linear PR30 P2-1)."""
     tdir = os.path.abspath(os.path.expanduser(token_dir or DEFAULT_TOKEN_DIR))
     default_home = os.path.realpath(os.path.expanduser("~/.agent-mesh"))
-    if os.path.realpath(home) == default_home:
+    if same_path(home, default_home):
         name = f"{lead}.token"
     else:
         name = f"{lead}-{hashlib.sha256(os.path.realpath(home).encode()).hexdigest()[:8]}.token"
@@ -180,17 +244,34 @@ def _check_token_destination(home: str, path: str, prefix: str = "mesh setup") -
         )
         raise _usage(_prefix=prefix, msg=msg, token_dir=check_dir)
     if os.path.isdir(check_dir):
-        import stat as _stat
-        st = os.stat(check_dir)
-        if hasattr(os, "geteuid") and st.st_uid not in (os.geteuid(), 0):
-            raise _usage(_prefix=prefix, msg=f"directory {check_dir} is owned by another user", token_dir=check_dir)
-        if st.st_mode & 0o022 and not (st.st_mode & _stat.S_ISVTX):
-            raise _usage(
-                _prefix=prefix,
-                msg=f"directory {check_dir} is writable by other users (mode {oct(_stat.S_IMODE(st.st_mode))}); "
-                    "choose a private directory such as ~/.config/agent-mesh",
-                token_dir=check_dir,
-            )
+        if sys.platform == "win32":
+            try:
+                perms.verify_dir_not_other_writable(
+                    check_dir,
+                    label=check_dir,
+                    error_code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                )
+            except MeshError as exc:
+                raise _usage(_prefix=prefix, msg=exc.message, token_dir=check_dir) from exc
+            except OSError as exc:
+                raise _usage(
+                    _prefix=prefix,
+                    msg=f"directory {check_dir} cannot be verified safely: {exc.strerror or exc}",
+                    token_dir=check_dir,
+                ) from exc
+        else:
+            import stat as _stat
+            st = os.stat(check_dir)
+            if hasattr(os, "geteuid") and st.st_uid not in (os.geteuid(), 0):
+                raise _usage(_prefix=prefix, msg=f"directory {check_dir} is owned by another user", token_dir=check_dir)
+            if st.st_mode & 0o022 and not (st.st_mode & _stat.S_ISVTX):
+                raise _usage(
+                    _prefix=prefix,
+                    msg=f"directory {check_dir} is writable by other users (mode {oct(_stat.S_IMODE(st.st_mode))}); "
+                        "choose a private directory such as ~/.config/agent-mesh",
+                    token_dir=check_dir,
+                )
     real = os.path.realpath(path)
     for name in ("runs", "workspaces"):
         bad = os.path.realpath(os.path.join(home, name))
@@ -208,7 +289,7 @@ def _check_token_destination(home: str, path: str, prefix: str = "mesh setup") -
         raise _usage(_prefix=prefix, msg=f"token file {path} would be inside the git work tree {git_top}; a credential there can be "
                      "committed or read by agents. Choose a token directory outside any repository",
                      token_file=path, conflict=git_top)
-    if os.path.islink(path):
+    if is_reparse_link(path):
         raise _usage(_prefix=prefix, msg=f"token file {path} is a symlink; refusing to write through it", token_file=path)
     if os.path.lexists(path) and not os.path.isfile(path):
         raise _usage(_prefix=prefix, msg=f"token file {path} exists and is not a regular file", token_file=path)
@@ -217,7 +298,7 @@ def _check_token_destination(home: str, path: str, prefix: str = "mesh setup") -
 def _token_works(home: str, path: str, lead: str) -> bool:
     """True only for a working, unscoped agent token of ``lead`` itself: a valid token of
     another agent in the lead's file is replaced (Linear PR30 re-review P2)."""
-    if not os.path.isfile(path) or os.path.islink(path):
+    if not os.path.isfile(path) or is_reparse_link(path):
         return False
     rc, body = _run(home, ["whoami", "--token-file", path])
     d = body.get("data") or {}
@@ -228,15 +309,28 @@ def _write_token(path: str, token: str) -> None:
     """Atomic 0600 write: a private temp file in the same directory, then rename over the
     old file. rename replaces the directory entry, so it never follows a symlink."""
     tdir = os.path.dirname(path)
-    os.makedirs(tdir, mode=0o700, exist_ok=True)
+    existed = os.path.isdir(tdir) if tdir else True
+    if tdir:
+        os.makedirs(tdir, mode=0o700, exist_ok=True)
+        if sys.platform == "win32" and not existed:
+            perms.set_private_dir_acl(tdir, 0o700)
     tmp = os.path.join(tdir, f".{os.path.basename(path)}.{os.getpid()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    if sys.platform == "win32":
+        fd = open_regular_nofollow(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, label="token temp file")
+    else:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
+        try:
+            if sys.platform == "win32":
+                perms.fchmod_private(fd, 0o600)
+        except BaseException:
+            os.close(fd)
+            raise
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(token + "\n")
             f.flush()
             os.fsync(f.fileno())
-        os.rename(tmp, path)
+        atomic_replace(tmp, path)
     except BaseException:
         try:
             os.unlink(tmp)

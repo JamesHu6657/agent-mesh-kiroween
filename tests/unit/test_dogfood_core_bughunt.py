@@ -108,12 +108,14 @@ class TestRedactedRootStaysProtected(unittest.TestCase):
         self.assertNotIn("secret=abc", pj)
 
     def test_remember_is_idempotent_and_normalised(self):
-        remember_protected_path(self.conn, " /a/b/../c ")
-        remember_protected_path(self.conn, "/a/c")
+        p = os.path.join(self.tmp, "a", "b", "..", "c")
+        norm_c = os.path.abspath(os.path.join(self.tmp, "a", "c"))
+        remember_protected_path(self.conn, f" {p} ")
+        remember_protected_path(self.conn, norm_c)
         remember_protected_path(self.conn, "")
         remember_protected_path(self.conn, None)
         rows = self.conn.execute("SELECT value FROM meta;").fetchall()
-        self.assertEqual(rows, [("/a/c",)])
+        self.assertEqual(rows, [(norm_c,)])
 
 
 if __name__ == "__main__":

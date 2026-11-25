@@ -4,12 +4,14 @@ from contextlib import contextmanager
 import os
 import pathlib
 import sqlite3
+import sys
 from typing import Generator, List, Optional
 
 import mesh.constants as c
 from mesh.errors import DbIntegrityError, SchemaTooNewError
 from mesh.core.paths import resolve_path
 from mesh.core.schema import CURRENT_SCHEMA_VERSION, MIGRATIONS
+from mesh.platform import perms
 
 
 def sqlite_uri(path: str, mode: str) -> str:
@@ -128,8 +130,71 @@ def get_schema_version(conn: sqlite3.Connection) -> int:
         return 0
 
 
+def backup_db(conn: sqlite3.Connection, backup_path: str) -> str:
+    """Write a consistent, private (0600) SQLite backup before schema migration (P2-2).
+
+    Downgrade procedure: stop meshd, replace `mesh.db` with `mesh.db.v<N>.bak`,
+    remove any stale `mesh.db-wal` / `mesh.db-shm` sidecars, and restart the
+    older meshd binary.
+    """
+    backup_path = resolve_path(backup_path)
+    parent = os.path.dirname(backup_path)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    tmp_path = f"{backup_path}.tmp.{os.getpid()}"
+    old_umask = os.umask(0o077)
+    dst_conn: Optional[sqlite3.Connection] = None
+    try:
+        # Ensure WAL checkpoint so backup captures all committed pages cleanly.
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        except sqlite3.Error:
+            pass
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        dst_conn = sqlite3.connect(sqlite_uri(tmp_path, "rwc"), uri=True, isolation_level=None)
+        conn.backup(dst_conn)
+        dst_conn.close()
+        dst_conn = None
+        try:
+            perms.set_private_file_acl(tmp_path, 0o600)
+        except OSError:
+            pass
+        try:
+            fd = os.open(tmp_path, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+        os.replace(tmp_path, backup_path)
+        try:
+            perms.set_private_file_acl(backup_path, 0o600)
+        except OSError:
+            pass
+        return backup_path
+    except BaseException:
+        if dst_conn is not None:
+            try:
+                dst_conn.close()
+            except Exception:
+                pass
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
+    finally:
+        os.umask(old_umask)
+
+
 def migrate_db(conn: sqlite3.Connection) -> int:
     """Apply pending migrations or verify schema version compatibility.
+
+    Callers running on an existing live home MUST hold the daemon single-instance
+    lock and save a backup (`backup_db`) before calling `migrate_db`.
+    Downgrade is performed by stopping meshd and restoring `mesh.db.v<N>.bak`.
 
     Raises:
         SchemaTooNewError (exit 1, SCHEMA_TOO_NEW) if DB version > CURRENT_SCHEMA_VERSION.
@@ -169,6 +234,8 @@ def init_db(path: str) -> sqlite3.Connection:
         old_umask = os.umask(0o077)
         try:
             os.makedirs(db_dir, mode=0o700, exist_ok=True)
+            if sys.platform == "win32":
+                perms.set_private_dir_acl(db_dir, 0o700)
         finally:
             os.umask(old_umask)
 
@@ -179,7 +246,7 @@ def init_db(path: str) -> sqlite3.Connection:
         check_quick(conn)
         # Ensure file mode is 0600
         try:
-            os.chmod(path, 0o600)
+            perms.set_private_file_acl(path, 0o600)
         except OSError:
             pass
         return conn

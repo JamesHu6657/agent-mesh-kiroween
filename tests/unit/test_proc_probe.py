@@ -90,6 +90,7 @@ def _read_line_or_fail(proc: subprocess.Popen, timeout_s: float = WAIT_S) -> str
     )
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), 'Linux /proc and PR_SET_CHILD_SUBREAPER tests')
 class TestProcProbe(unittest.TestCase):
     """Probe /proc fidelity and prctl support on real child processes."""
 

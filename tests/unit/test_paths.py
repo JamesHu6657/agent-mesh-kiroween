@@ -16,6 +16,7 @@ from mesh.core.paths import (
     get_install_root,
 )
 from mesh.errors import MeshError
+from mesh.platform import perms
 
 
 class TestPaths(unittest.TestCase):
@@ -130,15 +131,21 @@ class TestPaths(unittest.TestCase):
             valid_tok = os.path.join(cfg_dir, "agent.tok")
             with open(valid_tok, "w") as f:
                 f.write("mesh_at_1234567890_secret")
-            os.chmod(valid_tok, 0o600)
+            if sys.platform == "win32":
+                perms.set_private_file_acl(valid_tok, 0o600)
+            else:
+                os.chmod(valid_tok, 0o600)
 
             check_token_file_secure(valid_tok, home=home, workspaces_root=ws)
 
-            # Insecure mode 0644
+            # Insecure mode 0644 (or Everyone-readable ACL on Windows)
             insecure_mode_tok = os.path.join(cfg_dir, "insecure.tok")
             with open(insecure_mode_tok, "w") as f:
                 f.write("mesh_at_1234567890_secret")
-            os.chmod(insecure_mode_tok, 0o644)
+            if sys.platform == "win32":
+                perms.grant_everyone_read_for_test(insecure_mode_tok)
+            else:
+                os.chmod(insecure_mode_tok, 0o644)
             with self.assertRaises(MeshError) as ctx:
                 check_token_file_secure(insecure_mode_tok, home=home, workspaces_root=ws)
             self.assertEqual(ctx.exception.code, c.TOKEN_FILE_INSECURE)
@@ -148,7 +155,10 @@ class TestPaths(unittest.TestCase):
             tok_in_ws = os.path.join(ws, "g.tok")
             with open(tok_in_ws, "w") as f:
                 f.write("mesh_at_1234567890_secret")
-            os.chmod(tok_in_ws, 0o600)
+            if sys.platform == "win32":
+                perms.set_private_file_acl(tok_in_ws, 0o600)
+            else:
+                os.chmod(tok_in_ws, 0o600)
             with self.assertRaises(MeshError) as ctx:
                 check_token_file_secure(tok_in_ws, home=home, workspaces_root=ws)
             self.assertEqual(ctx.exception.code, c.TOKEN_FILE_INSECURE)
@@ -158,7 +168,10 @@ class TestPaths(unittest.TestCase):
             tok_in_runs = os.path.join(runs, "r.tok")
             with open(tok_in_runs, "w") as f:
                 f.write("mesh_at_1234567890_secret")
-            os.chmod(tok_in_runs, 0o600)
+            if sys.platform == "win32":
+                perms.set_private_file_acl(tok_in_runs, 0o600)
+            else:
+                os.chmod(tok_in_runs, 0o600)
             with self.assertRaises(MeshError) as ctx:
                 check_token_file_secure(tok_in_runs, home=home, workspaces_root=ws)
             self.assertEqual(ctx.exception.code, c.TOKEN_FILE_INSECURE)
@@ -168,9 +181,14 @@ class TestPaths(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             home = os.path.join(tmpdir, "home")
             os.makedirs(home, mode=0o700)
+            if sys.platform == "win32":
+                perms.set_private_dir_acl(home, 0o700)
             check_home_permissions(home)
 
-            os.chmod(home, 0o755)
+            if sys.platform == "win32":
+                perms.grant_everyone_read_for_test(home)
+            else:
+                os.chmod(home, 0o755)
             with self.assertRaises(MeshError) as ctx:
                 check_home_permissions(home)
             self.assertEqual(ctx.exception.code, c.INSECURE_PERMISSIONS)

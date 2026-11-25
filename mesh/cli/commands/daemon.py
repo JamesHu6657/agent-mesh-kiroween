@@ -10,7 +10,7 @@ from typing import Any, Dict
 import mesh.constants as c
 from mesh.errors import MeshError
 from mesh.client import MeshClient
-from mesh.core.paths import get_install_root
+from mesh.core.paths import clear_autostart_hold, get_install_root, write_autostart_hold
 
 
 DAEMON_START_WAIT_S = 30.0
@@ -70,19 +70,10 @@ def register_daemon_commands(subparsers: argparse._SubParsersAction, parent_pars
 def _meshd_lock_held(home: str) -> bool:
     """PR42 r1: True while some meshd still holds $MESH_HOME/run/meshd.lock (e.g. one
     that stopped answering but is still draining in-flight merges)."""
-    import fcntl
+    from mesh.platform import locks
+
     path = os.path.join(home, "run", "meshd.lock")
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return False
-    try:
-        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-    except (BlockingIOError, OSError):
-        return True
-    finally:
-        os.close(fd)  # closing the fd also drops a probe lock we got
-    return False
+    return locks.is_exclusive_lock_held(path)
 
 
 def _refuse_dry_run(args: argparse.Namespace, what: str) -> None:
@@ -107,6 +98,7 @@ def handle_daemon_start(args: argparse.Namespace) -> Dict[str, Any]:
     # Check if already running using unauthenticated status
     try:
         resp = client.execute_cmd(args, "daemon.status", auth_override={"type": "none"})
+        clear_autostart_hold(client.home)
         return {
             "status": "already_running",
             "message": "Daemon is already running",
@@ -126,19 +118,50 @@ def handle_daemon_start(args: argparse.Namespace) -> Dict[str, Any]:
             details={"status": "stopping"},
         )
 
-    install_root = get_install_root()
-    from mesh.core.paths import get_mesh_bin_dir
-    bin_mesh = os.path.join(get_mesh_bin_dir(), "mesh")
+    clear_autostart_hold(client.home)
 
-    env = {k: v for k, v in os.environ.items() if k not in DAEMON_SECRET_ENV}
+    install_root = get_install_root()
+    from mesh.core.gitops import augment_env_with_bundled_git
+
+    env = {k: v for k, v in os.environ.items() if not _is_daemon_secret_env(k)}
+    env = augment_env_with_bundled_git(env)
+    no_window_spawn = env.pop("_MESH_DAEMON_NO_WINDOW", None) == "1"
+    if sys.platform == "win32":
+        from mesh.core.paths import is_site_packages_dir, mesh_cli_argv
+        from mesh.platform import proc as plat_proc
+
+        has_pythonpath = (
+            any(k.upper() == "PYTHONPATH" for k in env)
+            if sys.platform == "win32"
+            else "PYTHONPATH" in env
+        )
+        if not is_site_packages_dir(install_root) and not has_pythonpath:
+            env["PYTHONPATH"] = install_root
+        spawn_argv = mesh_cli_argv("--home", args.home, "daemon", "run")
+        if no_window_spawn:
+            spawn_kw = {
+                "creationflags": (
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+                ),
+                "close_fds": True,
+            }
+        else:
+            spawn_kw = plat_proc.detached_popen_kwargs()
+    else:
+        from mesh.core.paths import get_mesh_bin_dir
+        bin_mesh = os.path.join(get_mesh_bin_dir(), "mesh")
+        spawn_argv = [bin_mesh, "--home", args.home, "daemon", "run"]
+        spawn_kw = {"start_new_session": True}
+
     # Detached spawn
     proc = subprocess.Popen(
-        [bin_mesh, "--home", args.home, "daemon", "run"],
+        spawn_argv,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        start_new_session=True,
         env=env,
+        **spawn_kw,
     )
 
     # Wait up to 30 s for the socket: boot recovery (§11.7) runs before the socket opens and
@@ -149,6 +172,45 @@ def handle_daemon_start(args: argparse.Namespace) -> Dict[str, Any]:
     status_resp = None
     while time.monotonic() < deadline:
         if proc.poll() is not None:
+            # N2: If another caller (e.g. desktop auto-start vs `mesh setup`) started meshd
+            # concurrently, our child exited on meshd.lock while the winner is starting or up.
+            # Probe daemon.status immediately and briefly while meshd.lock is held.
+            race_deadline = min(deadline, time.monotonic() + 10.0)
+            while True:
+                try:
+                    resp = client.execute_cmd(args, "daemon.status", auth_override={"type": "none"})
+                    if resp.get("ok"):
+                        clear_autostart_hold(client.home)
+                        return {
+                            "status": "already_running",
+                            "message": "Daemon is already running",
+                            "pid": resp.get("data", {}).get("pid"),
+                        }
+                except Exception:
+                    pass
+                if not _meshd_lock_held(client.home) or time.monotonic() >= race_deadline:
+                    break
+                time.sleep(0.1)
+            # Final status check in case the winner opened its socket right as the loop ended
+            try:
+                resp = client.execute_cmd(args, "daemon.status", auth_override={"type": "none"})
+                if resp.get("ok"):
+                    clear_autostart_hold(client.home)
+                    return {
+                        "status": "already_running",
+                        "message": "Daemon is already running",
+                        "pid": resp.get("data", {}).get("pid"),
+                    }
+            except Exception:
+                pass
+            if _meshd_lock_held(client.home):
+                raise MeshError(
+                    code=c.DAEMON_ALREADY_RUNNING,
+                    exit_code=c.EXIT_INTERNAL,
+                    message="A previous meshd is still stopping (finishing in-flight merges) and holds "
+                            "meshd.lock; retry `mesh daemon start` when it has exited",
+                    details={"status": "stopping"},
+                )
             raise MeshError(
                 code=c.INTERNAL_ERROR,
                 exit_code=c.EXIT_INTERNAL,
@@ -184,19 +246,37 @@ def handle_daemon_start(args: argparse.Namespace) -> Dict[str, Any]:
 DAEMON_SECRET_ENV = ("MESH_PASSPHRASE", "MESH_PASSPHRASE_FILE", "MESH_TOKEN")
 
 
+def _is_daemon_secret_env(name: str) -> bool:
+    """Return True if *name* matches a caller secret env var (case-insensitive on Win32)."""
+    return (name.upper() if sys.platform == "win32" else name) in DAEMON_SECRET_ENV
+
+
 def _exec_without_secret_env() -> None:
     """Re-exec this `daemon run` with the caller's credentials removed from the
     environment (the kernel keeps the exec-time block; only a new exec drops it)."""
-    if not any(k in os.environ for k in DAEMON_SECRET_ENV):
+    if not any(_is_daemon_secret_env(k) for k in os.environ):
         return
-    env = {k: v for k, v in os.environ.items() if k not in DAEMON_SECRET_ENV}
-    os.execve(sys.executable, [sys.executable, "-P", "-s", "-m", "mesh", *sys.argv[1:]], env)
+    env = {k: v for k, v in os.environ.items() if not _is_daemon_secret_env(k)}
+    argv = [sys.executable, "-P", "-s", "-m", "mesh", *sys.argv[1:]]
+    if sys.platform == "win32":
+        from mesh.platform import proc as plat_proc
+
+        plat_proc.reexec_clean_env(argv, env)
+        return
+    os.execve(sys.executable, argv, env)
 
 
 def handle_daemon_run(args: argparse.Namespace) -> Dict[str, Any]:
     """Run meshd in the foreground."""
     _refuse_dry_run(args, "mesh daemon run")
     _exec_without_secret_env()
+    # S10: prefer shipped checksum-pinned MinGit on meshd's PATH when present.
+    from mesh.core.gitops import augment_env_with_bundled_git
+
+    aug_env = augment_env_with_bundled_git(dict(os.environ))
+    for path_key in ("PATH", "Path"):
+        if path_key in aug_env and aug_env[path_key] != os.environ.get(path_key):
+            os.environ[path_key] = aug_env[path_key]
     # Imported here: every other CLI verb skips asyncio and the daemon (startup cost, A1).
     import asyncio
 
@@ -214,6 +294,9 @@ def handle_daemon_stop(args: argparse.Namespace) -> Dict[str, Any]:
     if getattr(args, "dry_run", False):
         # Full review: a dry run stops nothing; report what would happen.
         return resp.get("data", {})
+
+    # N1: persist autostart hold so any open desktop window does not undo the CLI stop.
+    write_autostart_hold(client.home, source="cli")
 
     # Wait (up to 5s) for the socket to stop answering AND for meshd.lock to be free:
     # PR42 r1, meshd closes its socket first and then drains in-flight merges.

@@ -12,7 +12,7 @@ import unittest
 
 import mesh.constants as c
 from mesh.adapters.base import EXPECTED_HELP_HASHES
-from tests.helpers import MeshHarness
+from tests.helpers import MeshHarness, cli_popen_argv
 from tests.stubs import (
     create_failing_stub,
     create_garbage_stub,
@@ -46,8 +46,8 @@ class TestAdaptersIntegration(unittest.TestCase):
             # Start daemon with MESH_TESTING unset
             env_no_test = harness_no_test.get_env()
             env_no_test.pop("MESH_TESTING", None)
-            cmd = [harness_no_test.bin_mesh, "--home", harness_no_test.home, "daemon", "run"]
-            proc = subprocess.Popen(cmd, env=env_no_test, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            cmd, popen_env = cli_popen_argv(harness_no_test, "daemon", "run", env=env_no_test)
+            proc = subprocess.Popen(cmd, env=popen_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             harness_no_test.daemon_proc = proc
 
             harness_no_test.wait_for(lambda: harness_no_test.cli("status")[0] == 0, timeout=5.0)

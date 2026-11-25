@@ -57,6 +57,82 @@ def can_principal_read_project(conn: sqlite3.Connection, principal_id: str, proj
     return False
 
 
+def check_relayed_chat_send_scope(
+    conn: sqlite3.Connection,
+    principal: Dict[str, Any],
+    project_id: str,
+) -> None:
+    """Enforce origin + current-relationship scope for relayed `chat.send`.
+
+    Relayed `chat.send` standing right:
+    - A relay-capable agent (e.g. an external DM bot with `relay` + `intake`) may relay
+      visibly-marked user chat messages (`relayed: true`, `[RELAYED via ...]`, zero
+      approval authority) ONLY to projects that satisfy ALL of:
+      1. Originated by the relayer (`projects.origin_principal_id == relayer`).
+      2. Currently readable by the relayer (`can_principal_read_project`).
+      3. Currently has an active, enabled project lead (`get_project_active_lead` with
+         `disabled_at IS NULL`, and not the relayer itself — checked separately as `SELF_APPROVAL`).
+      4. Relayer was NOT previously removed as lead of the project (no ended
+         `lead_assignments` row for `(project_id, relayer)`), so a former lead cannot
+         retain posting rights after losing lead ownership.
+    """
+    prow = conn.execute(
+        "SELECT origin_principal_id FROM projects WHERE id = ?;",
+        (project_id,),
+    ).fetchone()
+    if prow is None:
+        return
+
+    relayer_id = principal["id"]
+    relayer_name = principal.get("name")
+    if prow["origin_principal_id"] != relayer_id:
+        raise MeshError(
+            code=c.SCOPE_MISMATCH,
+            exit_code=c.EXIT_FORBIDDEN,
+            message=(
+                f"Relayer '{relayer_name}' can only send relayed chat messages "
+                f"to projects it originated"
+            ),
+            details={
+                "project_id": project_id,
+                "principal": relayer_name,
+                "origin_principal_id": prow["origin_principal_id"],
+            },
+        )
+    if not can_principal_read_project(conn, relayer_id, project_id):
+        raise MeshError(
+            code=c.SCOPE_MISMATCH,
+            exit_code=c.EXIT_FORBIDDEN,
+            message=f"Relayer '{relayer_name}' does not have read access to project '{project_id}'",
+            details={"project_id": project_id, "principal": relayer_name, "reason": "project_not_readable"},
+        )
+    removed_lead = conn.execute(
+        "SELECT 1 FROM lead_assignments WHERE project_id = ? AND agent_id = ? AND ended_at IS NOT NULL LIMIT 1;",
+        (project_id, relayer_id),
+    ).fetchone()
+    if removed_lead is not None:
+        raise MeshError(
+            code=c.SCOPE_MISMATCH,
+            exit_code=c.EXIT_FORBIDDEN,
+            message=(
+                f"Relayer '{relayer_name}' was removed as lead of project '{project_id}' "
+                f"and no longer holds a current relationship for relayed chat"
+            ),
+            details={"project_id": project_id, "principal": relayer_name, "reason": "former_lead_removed"},
+        )
+    active_lead = get_project_active_lead(conn, project_id)
+    if active_lead is None or active_lead.get("disabled_at") is not None:
+        raise MeshError(
+            code=c.SCOPE_MISMATCH,
+            exit_code=c.EXIT_FORBIDDEN,
+            message=(
+                f"Project '{project_id}' has no active enabled lead; "
+                f"relayer '{relayer_name}' cannot send relayed chat messages"
+            ),
+            details={"project_id": project_id, "principal": relayer_name, "reason": "no_active_lead"},
+        )
+
+
 def can_principal_read_task(conn: sqlite3.Connection, principal_id: str, task_id: str) -> bool:
     """Check if agent has read access to task (assignee, or project read access)."""
     cur = conn.execute("SELECT project_id, assignee_agent_id FROM tasks WHERE id = ? LIMIT 1;", (task_id,))
@@ -109,6 +185,13 @@ ADAPTER_CMDS = frozenset({
 USER_DIRECT_CMDS = frozenset({
     "daemon.stop",
     "run.release",
+    "project.set_permission_mode",
+    "approval.decide",
+    "grant.list",
+    "grant.revoke",
+    "lead.interrupt",
+    "chat.queue_cancel",
+    "chat.queue_edit",
 })
 
 #: Read-only agent roster commands. They stay user-only except for leads (an enabled
@@ -132,6 +215,14 @@ LEAD_RUN_TOKEN_CMDS = frozenset({
     "project.complete",
     "project.note",
     "project.deliver",
+    # chat & plan (Chat-First Batch 1)
+    "chat.list",
+    "chat.reply",
+    "plan.propose",
+    "plan.dispatch",
+    "plan.cancel",
+    "plan.list",
+    "plan.show",
     # task create/assign/reassign/accept/reject/retry/escalate/cancel/merge, dep *
     "task.create",
     "task.assign",
@@ -151,10 +242,12 @@ LEAD_RUN_TOKEN_CMDS = frozenset({
     "approval.consume",
     # read commands: own project only
     "project.show",
+    "project.diff",
     "project.leads",
     "project.list",
     "project.wait",
     "task.show",
+    "task.diff",
     "task.list",
     "task.wait",
     "task.log",
@@ -162,6 +255,7 @@ LEAD_RUN_TOKEN_CMDS = frozenset({
     "event.list",
     "event.tail",
     "run.log",
+    "run.activity",
     "run.list",
     "run.show",
     "workspace.list",
@@ -179,6 +273,7 @@ LEAD_RUN_TOKEN_CMDS = frozenset({
 LEAD_RUN_TOKEN_TASK_CMDS = frozenset({
     "workspace.delete",
     "task.show",
+    "task.diff",
     "task.list",
     "task.wait",
     "task.log",
@@ -201,6 +296,7 @@ LEAD_RUN_TOKEN_TASK_CMDS = frozenset({
     "run.list",
     "run.show",
     "run.log",
+    "run.activity",
 })
 
 #: Documentation of the lead run-token list/read commands that name no project. Each
@@ -218,6 +314,8 @@ LEAD_RUN_TOKEN_SCOPED_READS = frozenset({
     "inbox.ack",
     "approval.list",
     "workspace.list",
+    "chat.list",
+    "plan.list",
 })
 
 
@@ -231,6 +329,10 @@ LEAD_RUN_TOKEN_MUTATING_CMDS = frozenset({
     "project.complete",
     "project.note",
     "project.deliver",
+    "chat.reply",
+    "plan.propose",
+    "plan.dispatch",
+    "plan.cancel",
     "task.create",
     "task.assign",
     "task.reassign",
@@ -434,7 +536,7 @@ def check_authz(
             if not current["can_lead"]:  # r2 P2-C
                 raise _lead_superseded(scope.get("project_id"), scope.get("lead_assignment_id"), None)
             return
-    if cmd.startswith("config.") or cmd.startswith("agent.") or cmd.startswith("audit."):
+    if cmd.startswith("config.") or cmd.startswith("agent.") or cmd.startswith("audit.") or cmd.startswith("grant."):
         raise MeshError(
             code=c.CAPABILITY_MISSING,
             exit_code=c.EXIT_FORBIDDEN,
@@ -460,8 +562,10 @@ def check_authz(
             "project.show",
             # §7.3: "own task" reads
             "task.log",
+            "task.diff",
             "run.show",
             "run.log",
+            "run.activity",
             "workspace.show",
         }
         if cmd not in allowed_run_cmds and cmd not in ANY_AUTH_INFO_CMDS:
@@ -484,7 +588,7 @@ def check_authz(
                     message="Run token cannot write to a task outside its run scope",
                     details={"scope_task_id": scope.get("task_id"), "task_id": task_id},
                 )
-        if cmd in ("task.show", "task.log", "run.show", "run.log", "workspace.show"):
+        if cmd in ("task.show", "task.log", "task.diff", "run.show", "run.log", "run.activity", "workspace.show"):
             if not task_id or scope.get("task_id") != task_id:
                 raise MeshError(
                     code=c.SCOPE_MISMATCH,
@@ -528,16 +632,23 @@ def check_authz(
             "approval.reject",
             "intake.submit",
             "project.create",
+            "chat.send",
             # Read commands
             "project.show",
+            "project.diff",
             "project.list",
             "project.leads",
+            "chat.list",
+            "plan.list",
+            "plan.show",
             "task.show",
+            "task.diff",
             "task.list",
             "dep.list",
             "event.list",
             "event.tail",
             "run.log",
+            "run.activity",
             "run.list",
             "run.show",
             "task.log",
@@ -567,6 +678,11 @@ def check_authz(
                 message="Project lead cannot act as relayer for its own project",
                 details={"project_id": project_id, "principal": principal.get("name")},
             )
+
+        # Relayed chat.send requires origin + a current relationship (readable project,
+        # active enabled lead, and relayer not removed as lead).
+        if cmd == "chat.send" and project_id:
+            check_relayed_chat_send_scope(conn, principal, project_id)
 
         if cmd in ("intake.submit", "project.create"):
             if "intake" not in caps:
@@ -606,7 +722,22 @@ def check_authz(
         return
 
     # 6. Project operations by lead or user
-    if cmd in ("project.complete", "project.note"):
+    if cmd == "chat.send":
+        raise MeshError(
+            code=c.CAPABILITY_MISSING,
+            exit_code=c.EXIT_FORBIDDEN,
+            message="Command 'chat.send' requires direct user authentication",
+            details={"cmd": cmd, "required": "user_direct"},
+        )
+
+    if cmd in (
+        "project.complete",
+        "project.note",
+        "chat.reply",
+        "plan.propose",
+        "plan.dispatch",
+        "plan.cancel",
+    ):
         if project_id:
             if not is_acting_project_lead(conn, project_id, principal["id"]):
                 raise MeshError(
@@ -725,14 +856,17 @@ def check_authz(
     # 9. Read commands (project.leads, project.show, project.list, task.show, task.list, dep.list, etc.)
     read_cmds = {
         "project.show",
+        "project.diff",
         "project.leads",
         "project.list",
         "task.show",
+        "task.diff",
         "task.list",
         "dep.list",
         "event.list",
         "event.tail",
         "run.log",
+        "run.activity",
         "run.list",
         "run.show",
         "task.log",
@@ -745,6 +879,9 @@ def check_authz(
         "inbox.ack",
         "approval.show",
         "approval.list",
+        "chat.list",
+        "plan.list",
+        "plan.show",
     }
     if cmd in read_cmds:
         caps = principal.get("capabilities", [])
@@ -758,8 +895,8 @@ def check_authz(
         if not agent_id:
             return
 
-        if cmd in ("task.show", "dep.list", "task.wait", "task.log", "workspace.show") or (
-            cmd in ("run.show", "run.log", "run.list") and task_id
+        if cmd in ("task.show", "task.diff", "dep.list", "task.wait", "task.log", "workspace.show") or (
+            cmd in ("run.show", "run.log", "run.activity", "run.list") and task_id
         ):
             if task_id and not can_principal_read_task(conn, agent_id, task_id):
                 raise MeshError(
@@ -774,8 +911,8 @@ def check_authz(
         ).fetchone() is not None:
             # Full review: an assignee lists its own task workspaces (the handler filters rows).
             pass
-        elif cmd in ("project.show", "project.leads", "project.wait", "workspace.list", "approval.list") or (
-            cmd in ("run.show", "run.log") and not task_id
+        elif cmd in ("project.show", "project.diff", "project.leads", "project.wait", "workspace.list", "approval.list", "chat.list", "plan.list", "plan.show") or (
+            cmd in ("run.show", "run.log", "run.activity") and not task_id
         ):
             if project_id and not can_principal_read_project(conn, agent_id, project_id):
                 raise MeshError(

@@ -27,7 +27,7 @@ from mesh.daemon.handlers.approval import (
     handle_approval_show,
 )
 from mesh.daemon.handlers.event import handle_event_list
-from mesh.daemon.handlers.run import handle_workspace_list
+from mesh.daemon.handlers.run import _resolve_run_activity_target, handle_run_list, handle_workspace_list
 from mesh.daemon.handlers.task import handle_task_list
 from mesh.errors import MeshError
 
@@ -849,3 +849,117 @@ class TestAuthzMatrix(unittest.TestCase):
         evt_ids = [e["id"] for e in res_events.data["items"]]
         self.assertIn("evt_worker", evt_ids)
         self.assertNotIn("evt_plain", evt_ids)
+
+    def test_run_list_task_and_mismatched_project_authz_before_empty_return(self):
+        """PR #70 R4 P2: handle_run_list must check task/project authz before returning empty on mismatch (no ownership oracle)."""
+        self.conn.execute(
+            """INSERT INTO principals (id, name, kind, created_at)
+               VALUES ('lead2', 'lead2', 'agent', 'now');"""
+        )
+        self.conn.execute(
+            """INSERT INTO agents (id, adapter, delivery, can_lead, capabilities_json, max_concurrency, created_at, updated_at)
+               VALUES ('lead2', 'fake', 'inbox', 1, '["intake"]', 1, 'now', 'now');"""
+        )
+        self.conn.execute(
+            """INSERT INTO projects (id, name, goal, status, created_by, created_via, version, created_at, updated_at)
+               VALUES ('prj_2', 'Project B', 'Goal B', 'active', 'usr_1', 'direct', 1, 'now', 'now');"""
+        )
+        self.conn.execute(
+            """INSERT INTO lead_assignments (id, project_id, agent_id, assigned_by, via, started_at)
+               VALUES ('asg_2', 'prj_2', 'lead2', 'usr_1', 'direct', 'now');"""
+        )
+        for pid, tid, rid, ag in (
+            ("prj_1", "tsk_A", "run_A", "lead1"),
+            ("prj_2", "tsk_B", "run_B", "lead2"),
+        ):
+            self.conn.execute(
+                """INSERT INTO tasks (id, project_id, title, spec, kind, status, priority, profile, timeout_s, idle_timeout_s, max_attempts, attempt, fence_seq, workspace_path, created_by, version, created_at, updated_at)
+                   VALUES (?, ?, 'T', 'Spec', 'general', 'assigned', 0, 'dev', 3600, 0, 1, 1, 1, ?, 'usr_1', 1, 'now', 'now');""",
+                (tid, pid, os.path.join(self.temp_dir.name, "ws", tid)),
+            )
+            self.conn.execute(
+                """INSERT INTO runs (id, project_id, task_id, agent_id, kind, attempt, fence, adapter, status, boot_id, run_dir, started_at, deadline_at)
+                   VALUES (?, ?, ?, ?, 'task', 1, 1, 'fake', 'running', 'boot_1', ?, '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z');""",
+                (rid, pid, tid, ag, os.path.join(self.temp_dir.name, "runs", rid)),
+            )
+
+        # 1. Foreign-project agent token (lead2) calling run.list(task=tsk_A, project=prj_2) -> SCOPE_MISMATCH (rc 4)
+        for guessed_prj in ("prj_2", "prj_1", "prj_nonexistent"):
+            ctx_agent = HandlerContext(
+                conn=self.conn,
+                principal={"id": "lead2", "name": "lead2", "capabilities": []},
+                actor_kind="agent",
+                via="token",
+                request_id=f"req-agent-{guessed_prj}",
+                home=self.temp_dir.name,
+                cmd="run.list",
+                args={"task": "tsk_A", "project": guessed_prj},
+            )
+            with self.assertRaises(MeshError) as cm:
+                handle_run_list(ctx_agent)
+            self.assertEqual(cm.exception.code, c.SCOPE_MISMATCH, guessed_prj)
+            self.assertEqual(cm.exception.exit_code, c.EXIT_FORBIDDEN, guessed_prj)
+
+        # 2. Lead run token scoped to prj_2 calling run.list(task=tsk_A, project=prj_2) -> SCOPE_MISMATCH (rc 4)
+        lead2_scope = {"role": "lead", "run_id": "run_lt2", "project_id": "prj_2", "lead_assignment_id": "asg_2"}
+        for args in (
+            {"task": "tsk_A", "project": "prj_2"},
+            {"task": "tsk_A", "project": "prj_1"},
+            {"task": "tsk_B", "project": "prj_1"},
+        ):
+            ctx_lead_rt = HandlerContext(
+                conn=self.conn,
+                principal={"id": "lead2", "name": "lead2", "capabilities": ["intake"], "scope": lead2_scope},
+                actor_kind="agent",
+                via="run_token",
+                request_id="req-lead-rt",
+                home=self.temp_dir.name,
+                cmd="run.list",
+                args=args,
+            )
+            with self.assertRaises(MeshError) as cm:
+                handle_run_list(ctx_lead_rt)
+            self.assertEqual(cm.exception.code, c.SCOPE_MISMATCH, args)
+            self.assertEqual(cm.exception.exit_code, c.EXIT_FORBIDDEN, args)
+
+        # 3. Direct user still gets empty list on legitimate task/project mismatch and matching run when aligned
+        ctx_user_mismatch = HandlerContext(
+            conn=self.conn,
+            principal={"id": "usr_1", "name": "user", "kind": "user"},
+            actor_kind="user",
+            via="direct",
+            request_id="req-user-mismatch",
+            home=self.temp_dir.name,
+            cmd="run.list",
+            args={"task": "tsk_A", "project": "prj_2"},
+        )
+        self.assertEqual(handle_run_list(ctx_user_mismatch).data["runs"], [])
+
+        ctx_user_match = HandlerContext(
+            conn=self.conn,
+            principal={"id": "usr_1", "name": "user", "kind": "user"},
+            actor_kind="user",
+            via="direct",
+            request_id="req-user-match",
+            home=self.temp_dir.name,
+            cmd="run.list",
+            args={"task": "tsk_A", "project": "prj_1"},
+        )
+        self.assertEqual([r["id"] for r in handle_run_list(ctx_user_match).data["runs"]], ["run_A"])
+
+        # 4. run.activity checks _authz_run BEFORE run.task_id != task_id (no run->task ownership oracle)
+        for guessed_tid in ("tsk_A", "tsk_B", "tsk_nonexistent"):
+            ctx_act_foreign = HandlerContext(
+                conn=self.conn,
+                principal={"id": "lead2", "name": "lead2", "capabilities": []},
+                actor_kind="agent",
+                via="token",
+                request_id=f"req-act-{guessed_tid}",
+                home=self.temp_dir.name,
+                cmd="run.activity",
+                args={"run_id": "run_A", "task_id": guessed_tid},
+            )
+            with self.assertRaises(MeshError) as cm:
+                _resolve_run_activity_target(ctx_act_foreign)
+            self.assertEqual(cm.exception.code, c.SCOPE_MISMATCH, guessed_tid)
+            self.assertEqual(cm.exception.exit_code, c.EXIT_FORBIDDEN, guessed_tid)

@@ -1,11 +1,14 @@
 """Regression tests for full-high-gemini.md (P1-1..P1-4, P2-1, P2-2)."""
 
+import sys
 import asyncio
 import json
 import os
 import shutil
 import socket
 import sqlite3
+
+from tests.helpers import fake_peer_creds
 import subprocess
 import tempfile
 import unittest
@@ -282,7 +285,10 @@ class TestP12IdempotencyReplayAndPartition(unittest.TestCase):
             sock_a, sock_b = socket.socketpair()
             reader_s, writer_s = await asyncio.open_connection(sock=sock_b)
             reader_c, writer_c = await asyncio.open_connection(sock=sock_a)
-            with mock.patch.object(srv, "authenticate_and_authorize", new=mock.AsyncMock(return_value=(principal, actor_kind, via, None))):
+            with (
+                mock.patch("mesh.daemon.server.get_peer_credentials", return_value=fake_peer_creds()),
+                mock.patch.object(srv, "authenticate_and_authorize", new=mock.AsyncMock(return_value=(principal, actor_kind, via, None))),
+            ):
                 writer_c.write((json.dumps(req) + "\n").encode("utf-8"))
                 await writer_c.drain()
                 await srv.handle_client(reader_s, writer_s)
@@ -425,15 +431,17 @@ class TestP14VibeOutRedactionPermissionsAndSize(unittest.TestCase):
         os.makedirs(self.vibe_out)
 
     def tearDown(self) -> None:
-        for root, dirs, _ in os.walk(self.tmpdir, topdown=True):
-            os.chmod(root, 0o700)
-            for d in dirs:
-                try:
-                    os.chmod(os.path.join(root, d), 0o700)
-                except OSError:
-                    pass
+        if sys.platform != "win32":
+            for root, dirs, _ in os.walk(self.tmpdir, topdown=True):
+                os.chmod(root, 0o700)
+                for d in dirs:
+                    try:
+                        os.chmod(os.path.join(root, d), 0o700)
+                    except OSError:
+                        pass
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
+    @unittest.skipUnless(sys.platform != "win32", "POSIX 0o000/0o500 directory chmod redaction test")
     def test_redact_output_dir_handles_0500_and_0000_dirs(self) -> None:
         secret = "sk-ant-api03-" + "A" * 80
         export_path = os.path.join(self.vibe_out, "export.json")

@@ -39,6 +39,7 @@ class DroidAdapter(Adapter):
 
     id = "droid"
     kind = "vendor"
+    supported_profiles = ("readonly", "edit", "dev", "elevated", "unrestricted")
     binary_names = ["droid"]
     planned_version = "1.3.0"
     verified_version = "1.3.0"

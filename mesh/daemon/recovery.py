@@ -51,6 +51,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import time
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
@@ -60,6 +61,7 @@ from mesh.core.events import record_event
 from mesh.core.leases import get_lease_ttl_s
 from mesh.core.proc import ScanResult, get_proc_stat, is_tgid_alive
 from mesh.daemon import supervisor, terminate
+from mesh.platform import paths as _plat_paths, proc as plat_proc
 
 WRAPPER_WAIT_S = 5.0
 WRAPPER_POLL_S = 0.1
@@ -67,8 +69,44 @@ WRAPPER_POLL_S = 0.1
 RECOVERY_END_STATUS = supervisor.RECOVERY_END_STATUS
 
 
-def _log(home: str, msg: str) -> None:
-    supervisor._log_meshd(home, f"recovery: {msg}")
+_RECOVERY_ERROR_KEYS = (
+    "run_errors",
+    "merge_errors",
+)
+_RECOVERY_WARNING_KEYS = (
+    "runs_adopted_uncertain",
+    "runs_adopted_past_deadline",
+    "runs_lost",
+    "runs_spawn_failed",
+    "runs_terminating",
+    "merge_runs_killed",
+    "merge_runs_lost",
+    "merge_runs_held",
+    "merges_interrupted",
+    "workspace_deletes_rolled_back",
+    "workspace_prunes_rolled_back",
+)
+
+
+def _recovery_summary_level(summary: Mapping[str, Any], counts: Optional[Mapping[str, int]] = None) -> str:
+    """Classify boot recovery summary severity: ERROR for failures, WARNING for crash problems, INFO otherwise."""
+    if any(int(summary.get(k) or 0) > 0 for k in _RECOVERY_ERROR_KEYS):
+        return "ERROR"
+    if counts and int(counts.get("deliver_intent_errors") or 0) > 0:
+        return "ERROR"
+    if any(int(summary.get(k) or 0) > 0 for k in _RECOVERY_WARNING_KEYS):
+        return "WARNING"
+    return "INFO"
+
+
+def _log(home: str, msg: str, *, level: str = "ERROR") -> None:
+    if level == "ERROR":
+        supervisor._log_meshd(home, f"recovery: {msg}")
+        return
+    try:
+        supervisor._log_meshd(home, f"recovery: {msg}", level=level)
+    except TypeError:
+        supervisor._log_meshd(home, f"recovery: {msg}")
 
 
 def _read_json(path: str) -> Optional[Dict[str, Any]]:
@@ -173,7 +211,7 @@ def _hand_over(home: str, run: Optional[Mapping[str, Any]], found: Optional[Mapp
         return  # r6: skipped only once a write holding them has committed
     merged.update(alive)
     supervisor._SEEN[run["id"]] = merged
-    _log(home, f"run {run['id']}: recovery-found identities {sorted(alive)} handed to the supervisor")
+    _log(home, f"run {run['id']}: recovery-found identities {sorted(alive)} handed to the supervisor", level="INFO")
     if run["id"] in supervisor._SEEN_UNUSABLE:
         # PR #40 r5: a held run keeps its hold; the identities go into the unusable
         # marker's prior_members (durable across a restart), never a valid seen.json.
@@ -186,10 +224,61 @@ def _hand_over(home: str, run: Optional[Mapping[str, Any]], found: Optional[Mapp
     durable.update(alive.items())
 
 
+def _win_adopt_run_job(
+    home: str,
+    run_id: str,
+    *,
+    pgid: Optional[int] = None,
+    wrapper_starttime: Optional[int] = None,
+) -> None:
+    """Re-open and retain the Win32 Named Run Job Object across daemon restarts."""
+    if sys.platform != "win32":
+        return
+    supervisor.record_run_home(run_id, home)
+    supervisor.register_pgid_run(run_id, pgid, wrapper_starttime, home)
+    try:
+        job = plat_proc.open_run_job(home, run_id, terminate=True)
+    except (OSError, ValueError) as exc:
+        _log(home, f"run {run_id}: failed to re-open Win32 Named Job Object: {exc}", level="WARNING")
+        return
+    if job is not None:
+        supervisor.register_run_job(
+            run_id,
+            job,
+            pgid=pgid,
+            wrapper_starttime=wrapper_starttime,
+            home=home,
+        )
+
+
+def _win_exit_job_members(home: str, run: Mapping[str, Any]) -> Dict[int, int]:
+    """Return live ``{pid: starttime}`` members from ``exit.json`` ``job_members_at_exit``."""
+    if sys.platform != "win32":
+        return {}
+    pairs = supervisor._win_exit_job_member_pairs(run)
+    if not pairs:
+        return {}
+    return _live_members({pid: st for pid, st in pairs})
+
+
+def _merge_found(
+    base: Optional[Mapping[int, int]],
+    extra: Optional[Mapping[int, int]],
+) -> Optional[Dict[int, int]]:
+    if not base and not extra:
+        return dict(base) if base is not None else None
+    merged: Dict[int, int] = dict(base or {})
+    if extra:
+        merged.update(extra)
+    return merged
+
+
 def _adopt(conn: sqlite3.Connection, home: str, run: Mapping[str, Any], old_holder: Optional[str],
            boot_id: str, wrapper: Mapping[str, Any], found: Optional[Mapping[int, int]] = None) -> str:
     pid = int(wrapper["pid"])
     starttime = int(wrapper["starttime"])
+    if sys.platform == "win32":
+        _win_adopt_run_job(home, run["id"], pgid=pid, wrapper_starttime=starttime)
     from_spawn_window = run["status"] == "starting" or not run["wrapper_pid"]
     # M3 gate fix round 4: durable adopt_pending marker before anything is committed.
     supervisor.prepare_adopt_seen(run, home)
@@ -223,7 +312,7 @@ def _adopt(conn: sqlite3.Connection, home: str, run: Mapping[str, Any], old_hold
                 "from_spawn_window": from_spawn_window,
             },
         )
-    _log(home, f"adopted run {run['id']} (wrapper {pid}; boot {old_holder} -> {boot_id})")
+    _log(home, f"adopted run {run['id']} (wrapper {pid}; boot {old_holder} -> {boot_id})", level="INFO")
     fresh = _reload_run(conn, run["id"])
     if fresh is not None:
         # M3 gate P1-1: record the group members now, while the wrapper identity is
@@ -237,7 +326,7 @@ def _adopt(conn: sqlite3.Connection, home: str, run: Mapping[str, Any], old_hold
             # run.seen_unusable event are persisted now, not on a later tick.
             supervisor.report_seen_unusable(conn, fresh, home)
             _hand_over(home, fresh, found)
-            _log(home, f"adopted run {run['id']} uncertain: adoption scan not trusted; held")
+            _log(home, f"adopted run {run['id']} uncertain: adoption scan not trusted; held", level="WARNING")
             return "adopted_uncertain"
         _hand_over(home, fresh, found)
     if run["deadline_at"] and time.time() > parse_utc(run["deadline_at"]).timestamp():
@@ -290,7 +379,7 @@ def _terminate_carriers(conn: sqlite3.Connection, home: str, run: Mapping[str, A
     grace = supervisor._setting_int(conn, "kill.grace_s", supervisor.DEFAULT_KILL_GRACE_S)
     t = terminate.begin(run["id"], None, None, end_reason, grace,
                         wrapper_starttime=wrapper_starttime, seen=carriers)
-    _log(home, f"terminating run {run['id']} ({end_reason}); MESH_RUN_ID carriers {t.initial_pids}")
+    _log(home, f"terminating run {run['id']} ({end_reason}); MESH_RUN_ID carriers {t.initial_pids}", level="WARNING")
 
 
 def _live_members(seen: Mapping[int, int]) -> Dict[int, int]:
@@ -312,7 +401,7 @@ def _terminate_group(conn: sqlite3.Connection, home: str, run: Mapping[str, Any]
     t = terminate.begin(run["id"], int(run["pgid"]), run["wrapper_pid"], end_reason, grace,
                         wrapper_starttime=supervisor.close_identity(run)[1], seen=seen)  # Carbon RO p1c P2-1
     _log(home, f"terminating run {run['id']} ({end_reason}); seen members {sorted(seen)}, "
-               f"targets {t.initial_pids}")
+               f"targets {t.initial_pids}", level="WARNING")
 
 
 def _is_spawn_aborted(conn: sqlite3.Connection, run: Mapping[str, Any]) -> bool:
@@ -384,7 +473,17 @@ def _recover_run(conn: sqlite3.Connection, home: str, row: Mapping[str, Any], bo
             # exit.json without any wrapper identity cannot come from runwrap; treat as lost.
             return _lost(conn, home, fresh, "lost_on_restart", boot_id, found=found_so_far(), live_ctx=live,
                          testing_mode=testing_mode)
-        _hand_over(home, fresh, found_so_far())
+        if sys.platform == "win32":
+            _win_adopt_run_job(
+                home,
+                run_id,
+                pgid=None,
+                wrapper_starttime=supervisor.close_identity(fresh)[1],
+            )
+            exit_members = _win_exit_job_members(home, fresh)
+            _hand_over(home, fresh, _merge_found(found_so_far(), exit_members))
+        else:
+            _hand_over(home, fresh, found_so_far())
         if testing_mode is None:
             supervisor._watch_one(conn, home, fresh)
         else:
@@ -396,7 +495,12 @@ def _recover_run(conn: sqlite3.Connection, home: str, row: Mapping[str, Any], bo
             # Startup recovery (not the scheduler loop) has no next tick of its own:
             # take the confirming second empty scan one poll later in this call
             # (m3-runtargets-race), so a clean exit is still closed from exit.json.
-            time.sleep(max(0.0, chk.first_empty_at + terminate.POLL_S - time.monotonic()))
+            # Loop until monotonic >= deadline in case time.sleep wakes early on Windows.
+            while True:
+                now = time.monotonic()
+                if now - chk.first_empty_at >= terminate.POLL_S:
+                    break
+                time.sleep(max(chk.first_empty_at + terminate.POLL_S - now, 0.001))
             if testing_mode is None:
                 supervisor._watch_one(conn, home, after)
             else:
@@ -431,7 +535,7 @@ def _recover_run(conn: sqlite3.Connection, home: str, row: Mapping[str, Any], bo
             if time.monotonic() < live.wait_until:
                 raise _StillWaiting(run_id)
         return _lost(conn, home, run, "lost_before_spawn", boot_id, found=dict(live.found), live_ctx=live,
-                     testing_mode=testing_mode)
+                     testing_mode=testing_mode, env_empty=(not getattr(carriers, "uncertain", False)))
     carriers = _env_carriers(run_id)
     if carriers:
         deadline = time.monotonic() + WRAPPER_WAIT_S
@@ -448,7 +552,7 @@ def _recover_run(conn: sqlite3.Connection, home: str, row: Mapping[str, Any], bo
 
 def _lost(conn: sqlite3.Connection, home: str, run: Mapping[str, Any], end_reason: str, boot_id: str,
           found: Optional[Dict[int, int]] = None, live_ctx: Optional[_Live] = None,
-          testing_mode: Optional[bool] = None) -> str:
+          testing_mode: Optional[bool] = None, env_empty: bool = False) -> str:
     """``found``: identities an earlier scan of this recovery found (pid -> starttime);
     kept only while alive with the same starttime and handed to begin() with this scan's."""
     filled = False
@@ -476,6 +580,16 @@ def _lost(conn: sqlite3.Connection, home: str, run: Mapping[str, Any], end_reaso
                 filled = True
     if filled:
         run = _reload_run(conn, run["id"]) or run
+    if sys.platform == "win32":
+        _win_adopt_run_job(
+            home,
+            run["id"],
+            pgid=run["pgid"] if supervisor.wrapper_alive(run) else None,
+            wrapper_starttime=supervisor.close_identity(run)[1],
+        )
+        exit_members = _win_exit_job_members(home, run)
+        if exit_members:
+            found = _merge_found(found, exit_members)
     if run["pgid"] and run["kind"] in ("task", "lead_turn"):
         # r4b (N18): an adopted run's persisted members keep its group trusted across
         # any number of restarts. While a member recorded in seen.json lives with its
@@ -510,23 +624,28 @@ def _lost(conn: sqlite3.Connection, home: str, run: Mapping[str, Any], end_reaso
         if supervisor._SEEN_REASON.get(run["id"]) == "spawn_abort_pending":
             supervisor._SEEN_EVENT_PENDING.pop(run["id"], None)
             supervisor._SEEN_UNUSABLE.discard(run["id"])
-        if supervisor.group_still_ours(int(run["pgid"]), run["proc_starttime"]):
+        if sys.platform == "win32":
+            wst_scan = supervisor.close_identity(run)[1]
+            scanned = supervisor.scan_run_group(run["id"], int(run["pgid"]), wst_scan, home)
+        elif supervisor.group_still_ours(int(run["pgid"]), run["proc_starttime"]):
             scanned = supervisor._scan_group(int(run["pgid"]))
-            if scanned or getattr(scanned, "uncertain", False):
-                # Round 5 (Linear P1-b) + ClickUp P1-1: the wrapper died while meshd was down
-                # and processes remain in its pgid/session (or the scan was uncertain) that no
-                # recorded member covers. Never "no members": hold the run while the group is
-                # occupied/uncertain; nothing is signalled by pgid alone; operator release as usual.
-                supervisor.hold_wrapper_gone(run, home)
-                supervisor.report_seen_unusable(conn, run, home)
-                _terminate_group(conn, home, run, end_reason, {})
-                return "terminating"
+        else:
+            scanned = None
+        if scanned or getattr(scanned, "uncertain", False):
+            # Round 5 (Linear P1-b) + ClickUp P1-1: the wrapper died while meshd was down
+            # and processes remain in its pgid/session (or the scan was uncertain) that no
+            # recorded member covers. Never "no members": hold the run while the group is
+            # occupied/uncertain; nothing is signalled by pgid alone; operator release as usual.
+            supervisor.hold_wrapper_gone(run, home)
+            supervisor.report_seen_unusable(conn, run, home)
+            _terminate_group(conn, home, run, end_reason, {})
+            return "terminating"
     carriers = _live_members(found or {})
     for p, st in sorted(supervisor._load_prior_member_pairs(run)):
         if supervisor._identity_live(p, st):
             carriers[p] = st
     wst = supervisor.close_identity(run)[1]
-    env_scan = _env_carriers(run["id"], wst, live=live_ctx)
+    env_scan = ScanResult({}) if env_empty else _env_carriers(run["id"], wst, live=live_ctx)
     carriers.update(env_scan)
     if carriers or getattr(found, "uncertain", False) or getattr(env_scan, "uncertain", False):
         _terminate_carriers(conn, home, run, end_reason, carriers, wrapper_starttime=wst)
@@ -650,7 +769,7 @@ def retry_deferred(conn: sqlite3.Connection, home: str, testing_mode: Optional[b
                 live.found.update(exc.found)
             DEFERRED[run_id] = (boot_id, now + DEFERRED_RETRY_S, live, None)
             continue
-        _log(home, f"deferred recovery of run {run_id}: {outcome}")
+        _log(home, f"deferred recovery of run {run_id}: {outcome}", level="INFO" if outcome in ("adopted", "exited", "skipped") else "WARNING")
         if outcome.startswith("adopted"):
             DEFERRED.pop(run_id, None)  # live again: its messages stay with it
             continue
@@ -746,14 +865,14 @@ def _step_merge_runs(conn: sqlite3.Connection, home: str, counts: Dict[str, int]
     for run in rows:
         status = results.get(run["id"])
         if isinstance(status, merge.MergeRunHeld):
-            _log(home, f"merge run {run['id']} held: {status}")
+            _log(home, f"merge run {run['id']} held: {status}", level="WARNING")
             counts["merge_run_held"] = counts.get("merge_run_held", 0) + 1
             continue
         if status is None or isinstance(status, BaseException):
             _log(home, f"merge run {run['id']} failed: {type(status).__name__}: {status}")
             counts["errors"] = counts.get("errors", 0) + 1
             continue
-        _log(home, f"merge run {run['id']} closed {status} (interrupted)")
+        _log(home, f"merge run {run['id']} closed {status} (interrupted)", level="WARNING")
         counts[f"merge_run_{status}"] = counts.get(f"merge_run_{status}", 0) + 1
 
 
@@ -775,7 +894,7 @@ def _step_merging(conn: sqlite3.Connection, home: str, counts: Dict[str, int]) -
             _log(home, f"merging task {task['id']} left merging: its merge_test run is still open")
             counts["merge_errors"] = counts.get("merge_errors", 0) + 1
             continue
-        _log(home, f"merging task {task['id']}: {outcome}")
+        _log(home, f"merging task {task['id']}: {outcome}", level="INFO" if outcome == "reconciled" else "WARNING")
         counts[f"merge_{outcome}"] = counts.get(f"merge_{outcome}", 0) + 1
 
 
@@ -908,7 +1027,7 @@ def _step_ws_reservations(conn: sqlite3.Connection, home: str, counts: Dict[str,
                                 stripped, matched_root, project_id, task_id
                             )
                             ancestors_valid = vreal is not None and (
-                                not isinstance(expected_real, str) or vreal == expected_real
+                                not isinstance(expected_real, str) or _plat_paths.same_path(vreal, expected_real)
                             )
                         else:
                             match = _match_task_workspace_with_roots(
@@ -918,7 +1037,7 @@ def _step_ws_reservations(conn: sqlite3.Connection, home: str, counts: Dict[str,
                                 stripped,
                             )
                             ancestors_valid = match is not None and (
-                                not isinstance(expected_real, str) or match[1] == expected_real
+                                not isinstance(expected_real, str) or _plat_paths.same_path(match[1], expected_real)
                             )
                 check_paths = [
                     p.rstrip(os.sep)
@@ -1387,5 +1506,5 @@ def recover(
             via="system",
             payload=summary,
         )
-    _log(home, json.dumps(summary, sort_keys=True))
+    _log(home, json.dumps(summary, sort_keys=True), level=_recovery_summary_level(summary, counts))
     return summary

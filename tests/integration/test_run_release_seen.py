@@ -11,25 +11,40 @@ the run closes ``lost``, the lease is released, no process is signalled and
 import json
 import os
 import signal
+import sys
+import unittest
 from typing import Any, List
 
 from mesh.core.proc import get_proc_stat
+from mesh.platform import proc as plat_proc
+from tests.helpers import _win_terminate_and_wait_pid
 from tests.recovery.test_recovery import RecoveryBase, _alive
 
 
+@unittest.skipUnless(
+    sys.platform != "win32",
+    "POSIX PGID/session unanchored seen_held and run release (Windows Named Run Job members are proven targets; covered in test_win_close_gate_jobs and test_recovery_lead_seen)",
+)
 class TestRunReleaseSeen(RecoveryBase):
     def _guard(self, pid: int) -> None:
         info = get_proc_stat(pid)
         st = info["starttime"] if info else None
 
         def _cleanup() -> None:
-            cur = get_proc_stat(pid)
-            if cur is not None and st is not None and cur["starttime"] == st and cur["state"] != "Z":
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            if st is None:
+                return
+            try:
+                plat_proc.kill_if_same(pid, int(st))
+            except OSError:
+                pass
         self.addCleanup(_cleanup)
+
+    def _kill9(self, pid: int) -> None:
+        if sys.platform == "win32":
+            _win_terminate_and_wait_pid(pid)
+        else:
+            os.kill(pid, signal.SIGKILL)
+        self.assertTrue(self.harness.wait_for(lambda: not _alive(pid), timeout=10))
 
     def _lease(self, task_id: str) -> Any:
         return self.q1("SELECT * FROM leases WHERE key = ?;", (f"task:{task_id}",))
@@ -52,8 +67,12 @@ class TestRunReleaseSeen(RecoveryBase):
         env-less SIGTERM-ignoring member alive in its group: returns (task_id, run, member)."""
         pidfile = os.path.join(self.harness.fixtures_dir, "rel-member-pid")
         trigger = os.path.join(self.harness.fixtures_dir, "rel-member-trigger")
-        spec = ('FAKE {"steps":[{"spawn_envless_member":{"path":"%s","trigger":"%s"}},'
-                '{"succeed":{}}]}' % (pidfile, trigger))
+        spec = 'FAKE ' + json.dumps({
+            "steps": [
+                {"spawn_envless_member": {"path": pidfile, "trigger": trigger}},
+                {"succeed": {}},
+            ]
+        })
         self.set_setting("kill.grace_s", "2")
         task_id = self.create_task(spec)
         run = self.wait_running_run(task_id)
@@ -67,10 +86,8 @@ class TestRunReleaseSeen(RecoveryBase):
         self.harness.restart_daemon()
         self.assertTrue(self.harness.wait_for(lambda: os.path.exists(seen_path), timeout=15))
         self.harness.kill9_daemon()
-        os.kill(run["wrapper_pid"], signal.SIGKILL)
-        self.assertTrue(self.harness.wait_for(lambda: not _alive(run["wrapper_pid"]), timeout=10))
-        os.kill(fake_pid, signal.SIGKILL)
-        self.assertTrue(self.harness.wait_for(lambda: not _alive(fake_pid), timeout=10))
+        self._kill9(run["wrapper_pid"])
+        self._kill9(fake_pid)
         with open(seen_path, "w", encoding="utf-8") as f:
             f.write("{truncated")
         self.harness.restart_daemon()
@@ -137,8 +154,7 @@ class TestRunReleaseSeen(RecoveryBase):
         self.assertEqual(forced[0]["actor_kind"], "user")
         rc, resp = self.harness.cli("run", "release", run["id"], "--force-seen-unusable", user=True)
         self.assertEqual(rc, 6, resp)
-        os.kill(member, signal.SIGKILL)
-        self.assertTrue(self.harness.wait_for(lambda: not _alive(member), timeout=10))
+        self._kill9(member)
         self.wait_status(other, "submitted", timeout=40)
         self.doctor_ok()
 
@@ -187,8 +203,7 @@ class TestRunReleaseSeen(RecoveryBase):
         self.assertIsNone(self._lease(task_id))
         self.assertIsNone(self._hold_row(run["id"]), "force release must clear the persisted hold")
         self.assertTrue(_alive(member), "release must not signal any process")
-        os.kill(member, signal.SIGKILL)
-        self.assertTrue(self.harness.wait_for(lambda: not _alive(member), timeout=10))
+        self._kill9(member)
         self.harness.kill9_daemon()
         self.harness.restart_daemon()
         self.assertEqual(self._run(run["id"])["status"], "lost")

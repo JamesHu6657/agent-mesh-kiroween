@@ -4,17 +4,21 @@ Every git repo is a K0 fixture under /tmp/mh-*-git; meshd runs with the fixture'
 git env (GitMeshHarness). Nothing here touches the Mesh checkout.
 """
 
+import json
 import os
+import sys
 import unittest
 from typing import Any, Dict, List
 
 import mesh.constants as c
 from tests.gitfixture import GitFixture, GitMeshHarness
+from tests.helpers import assert_private_mode
 from tests.integration import test_projects as _projects
 
 create_agent = _projects.create_agent  # the function only: importing the class would re-run its tests
 
-TEST_ARGV = '["python3", "-m", "unittest", "discover", "-s", "tests"]'
+TEST_ARGV_LIST = [sys.executable, "-m", "unittest", "discover", "-s", "tests"]
+TEST_ARGV = json.dumps(TEST_ARGV_LIST)
 
 
 class TestRepoProjects(unittest.TestCase):
@@ -109,7 +113,7 @@ class TestRepoProjects(unittest.TestCase):
         self.assertNotIn("branch", wts[lead1_repo])
         self.assertEqual(wts[lead1_repo]["head"], self.main)
         self.assertNotEqual(lead1_repo, os.path.realpath(integ))
-        self.assertEqual(os.stat(os.path.join(self.ws, prj)).st_mode & 0o777, 0o700)
+        assert_private_mode(self, os.path.join(self.ws, prj), is_dir=True, posix_mode=0o700)
 
         # set-lead lead2: lead2 gets its own detached repo/, lead1's stays.
         rc, resp = self.harness.cli("project", "set-lead", prj, "lead2", "--reason", "handover", user=True)
@@ -128,11 +132,11 @@ class TestRepoProjects(unittest.TestCase):
                                     user=True)
         self.assertEqual(rc, 0, resp)
         prj2 = resp["data"]["id"]
-        self.assertEqual(resp["data"]["tests"], ["python3", "-m", "unittest", "discover", "-s", "tests"])
+        self.assertEqual(resp["data"]["tests"], TEST_ARGV_LIST)
         self.assertEqual(self.mesh_branches(), sorted([branch, f"mesh/{prj2}/integration"]))
         rc, show2 = self.harness.cli("project", "show", prj2, user=True)
         self.assertEqual(rc, 0, show2)
-        self.assertEqual(show2["data"]["tests"], ["python3", "-m", "unittest", "discover", "-s", "tests"])
+        self.assertEqual(show2["data"]["tests"], TEST_ARGV_LIST)
 
         # A non-repo project's show has no repo fields.
         rc, resp = self.harness.cli("project", "create", "--title", "plain", "--goal", "g", "--criterion", "c",

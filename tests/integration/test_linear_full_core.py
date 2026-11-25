@@ -7,6 +7,7 @@ import shutil
 import unittest
 
 import mesh.constants as c
+from mesh.platform import perms as plat_perms
 from tests.integration import test_merge as tm
 
 
@@ -17,7 +18,7 @@ class TestRootChangeWithLiveProjects(unittest.TestCase):
     def new_root(self) -> str:
         d = tempfile.mkdtemp(prefix="mh-root-")
         self.addCleanup(shutil.rmtree, d, True)
-        os.chmod(d, 0o700)
+        plat_perms.set_private_dir_acl(d)
         return os.path.realpath(d)
 
     def test_refused_while_a_repo_project_is_active(self) -> None:

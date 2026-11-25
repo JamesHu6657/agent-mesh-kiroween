@@ -12,12 +12,13 @@ ACC: K4 (merge clause), K6, K8, K9, K11 (partial: remote refs unchanged).
 import json
 import os
 import shutil
-import socket
+import sys
 import tempfile
 import unittest
 from typing import Any, Dict, List, Optional, Tuple
 
 import mesh.constants as c
+from mesh.platform import ipc as plat_ipc
 from tests.gitfixture import GitFixture, GitMeshHarness
 from tests.integration.test_execution_launch import create_agent
 from tests.stubs import create_test_stubs
@@ -134,10 +135,9 @@ class TestMerge(unittest.TestCase):
             self.assertEqual(self.fixture.remote_refs(repo), before, repo)
 
     def raw_request(self, cmd: str, args: Dict[str, Any], key: str, token: str) -> Dict[str, Any]:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(120.0)
+        s = plat_ipc.connect_endpoint(plat_ipc.daemon_endpoint_path(self.harness.home), timeout=120.0)
         try:
-            s.connect(os.path.join(self.harness.home, "run", "mesh.sock"))
+            s.settimeout(120.0)
             s.sendall((json.dumps({"v": 1, "cmd": cmd, "auth": {"type": "token", "token": token},
                                    "args": args, "idempotency_key": key}) + "\n").encode("utf-8"))
             raw = b""
@@ -418,7 +418,7 @@ class TestMerge(unittest.TestCase):
         self.assertEqual(rc, c.EXIT_USAGE, resp)
         self.assertEqual(resp["error"]["details"]["param"], "kind")
 
-        repo2, prj2 = self.make_project("R2", test_command='["python3","-m","unittest"]')
+        repo2, prj2 = self.make_project("R2", test_command=json.dumps([sys.executable, "-m", "unittest"]))
         tsk, _ = self.accepted_task(prj2, "T", "t.txt")
         rc, resp = self.merge(tsk)
         # B11-style conversion (m2-r6): the r5 stub (rc 2 NOT_IMPLEMENTED_IN_M1 `merge_tests`)

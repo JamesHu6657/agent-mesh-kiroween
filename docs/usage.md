@@ -4,9 +4,10 @@ This guide describes the current implementation and its limits. Where this guide
 disagree, the code and `mesh help <topic>` are authoritative. For a short end-to-end
 walkthrough run `mesh help quickstart`.
 
-Agent Mesh runs on a single Linux machine under one Unix user. It is a local scheduler:
+Agent Mesh runs on a single Linux or Windows machine under one OS user. It is a local scheduler:
 a daemon (`meshd`) owns one SQLite database, and the `mesh` CLI talks to it over a Unix
-domain socket in `$MESH_HOME/run/mesh.sock`. There is no network listener, no web UI,
+domain socket in `$MESH_HOME/run/mesh.sock` (Linux) or an owner-only Named Pipe
+`\\.\pipe\LOCAL\agent-mesh-<hash>` (Windows). There is no network listener, no web UI,
 and no remote endpoint.
 
 ---
@@ -53,7 +54,8 @@ each launched attempt. Whether a vendor adapter may launch depends on `adapter.e
 
 Committed evidence passes for two adapters. Today that is `droid` 1.6.0 and `kiro` (kiro-cli 3.1.0),
 which both passed
-real end-to-end readonly tasks; `agy` and `vibe` have no smoke results, so they launch with a
+real end-to-end readonly tasks; the `agy` 1.5.12 and `vibe` 3.1.0 smoke results pass the headless
+case and fail the SIGTERM case (S-X-6), so both launch with a
 warning in `warn` mode and are refused in `strict` mode. Explicit launch holds apply in both
 modes. `hermes` and `openclaw` are stubs and never launch. The `fake` test double launches
 only when meshd runs with `MESH_TESTING=1`. Inbox-mode execution (leases, fencing,
@@ -87,7 +89,7 @@ mesh --home "$MESH_HOME" setup --token-dir "$DEMO_ROOT/tokens" \
 # Use the token_file in this response; a custom home adds a filename suffix.
 ```
 
-The daemon's Unix socket, database, runs and workspaces live under this temporary
+The daemon's IPC endpoint (Unix socket on Linux, Named Pipe on Windows), database, runs and workspaces live under this temporary
 home; no TCP port is opened. Do not point a demo project at your Mesh installation
 or real repository. After the demo, stop only this daemon and remove its fixtures:
 
@@ -106,9 +108,9 @@ There are three kinds of credential.
 `mesh init` sets one user passphrase (at least 12 characters). It is stored only as a
 `scrypt` verifier (`N=2**15, r=8, p=1, dklen=64`); `K_user` (the MAC key) is derived at
 request time and never stored. User commands read the passphrase from the first of:
-`--passphrase-fd N`, `--passphrase-file PATH`, `MESH_PASSPHRASE_FILE`,
-`MESH_PASSPHRASE`, then `getpass` on `/dev/tty`. A passphrase file must be owned by
-the user and mode 0600 (else `INSECURE_PERMISSIONS`). `MESH_PASSPHRASE` is readable by
+`--passphrase-fd N` (Linux/POSIX only), `--passphrase-file PATH`, `MESH_PASSPHRASE_FILE`,
+`MESH_PASSPHRASE`, then interactive terminal prompt (`/dev/tty` on Linux, `CONIN$` on Windows). A passphrase file must be owned by
+the user and private (mode 0600 on Linux, owner-only DACL on Windows, else `INSECURE_PERMISSIONS`). `MESH_PASSPHRASE` is readable by
 other processes of the same user, so prefer the file; meshd strips every `MESH_*`
 variable from launched agents. A passphrase in argv or in the JSON stdin body is
 rejected (`PASSPHRASE_SOURCE_REJECTED`). `mesh setup` runs init, daemon start and the
@@ -185,6 +187,39 @@ Mesh gates the operations it controls:
 | `delete` | `workspace delete` | `direct_or_relayed` |
 | `deliver_to_base` | `project deliver` | `not_required` |
 | `spend_money`, `deploy`, `delete_external`, `external_other` | external actions Mesh cannot enforce: request/check/consume only | `direct_or_relayed` |
+| `plan_dispatch` | Chat-First plan dispatch confirmation (inline plan card button) | `direct_only` |
+| `step_dispatch` | per-step confirmation in `supervised` permission mode (inline approval card) | `direct_only` |
+
+### 3.5 Inline Approval Cards, Per-Project `permission_mode`, and Standing Grants
+
+Chat-First projects (`plan_gate_mode="require_approval"`) use inline approval cards in chat with **允许 (`allow`) / 始终允许 (`always_allow`) / 拒绝 (`reject`)** buttons, decided exclusively by a direct-authenticated user via `approval.decide`. **Chat text never approves or rejects anything** — there is no verbal-approval classifier and no confirm short codes. Direct-only card enforcement applies to `plan_dispatch`, `step_dispatch` (including escalated steps on `supervised` projects), `config`, and by default `permission_escalation`; categories whose `approval.policy.<category>` is `direct_or_relayed` (such as `retry_over_limit` by default) still permit relayed or delegated decisions via `approval.approve` under the rules in §3.3–§3.4 (standing grants and `always_allow` remain direct-user-only on internal gated cards).
+
+Per-project `permission_mode` is stored on the project and changed only by a direct user via `project.set_permission_mode` (or set at creation via `intake.submit` / `chat.send`):
+
+- **`"plan"` (default — 计划批了就放手):** the lead proposes a plan (`plan.propose`), which renders an inline plan card; clicking **允许** binds to the exact immutable `plan_hash` shown, is single-use, and lets `plan.dispatch` materialize all non-escalated steps to run automatically.
+- **`"supervised"` (每步问我):** every dispatched step starts in `created` and requires its own inline approval card (`step_dispatch` or `permission_escalation`) before `task.assign` can run it.
+- **`"auto"` (全自动):** no plan approval is required (`plan.propose` / `plan.dispatch` or direct `task.create`), and `retry_over_limit` is auto-approved.
+- **Forward-only mode transitions:** permission-mode changes apply forward-only. Switching away from `"supervised"` (`"supervised"` -> `"plan"` or `"auto"`, via `project.set_permission_mode` or confirmed `always_allow`) automatically sweep-cancels pending `step_dispatch` cards with audited `approval.cancelled` events (`cancelled_step_approvals` in the response) while leaving pending `permission_escalation` cards intact. Switching into `"auto"` (`"supervised"`/`"plan"` -> `"auto"`) additionally sweep-cancels obsolete pending `plan_dispatch` cards (`cancelled_plan_approvals` in the response) without cancelling the proposed plan itself, so the lead can dispatch it directly under `"auto"` mode (`policy.auto_allowed`). Switching into `"supervised"` gates future assignments without retroactively re-gating tasks already materialized in `"assigned"` or later states.
+- **Legacy projects (`plan_gate_mode="off"`):** behave identically to before.
+
+**Inline card buttons & standing grants:**
+- **允许 (`allow`):** single-use direct-user approval with signed `user_mac` (for plan cards, strictly bound to `plan_hash`); requires an active project (`PROJECT_NOT_ACTIVE`) and a bound task that is neither terminal (`INVALID_TRANSITION`, `reason: "task_terminal"`) nor already progressed past the op's expected gating state (`INVALID_TRANSITION`, `reason: "task_progressed"`, e.g. a `step_dispatch`/`task.assign` card whose task already left `created`, or a `task.retry` card whose task already left `failed`/`escalated`). Clicking **允许** on a relayed-approved card upgrades it to `direct_verified` with a signed `user_mac` and an `approval.decided` event recording `upgraded_from: "relayed"`. Attempting to decide an approval past its TTL immediately persists `status = "expired"`, emits `approval.expired` (`expired_on: "decide"`), cancels any bound plan, and returns `APPROVAL_EXPIRED`.
+- **拒绝 (`reject`):** rejects the approval/plan with an optional `reason`.
+- **始终允许 (`always_allow`):** requires an active project (`PROJECT_NOT_ACTIVE` on `completed`/`cancelled`/`paused` projects) and a bound task that is neither terminal (`reason: "task_terminal"`) nor progressed past its gating state (`reason: "task_progressed"`), and is also supported on an unconsumed, unexpired `approved` card (keeps the decision `approved` and creates the grant / switches mode on confirmation):
+  - `plan_dispatch` / `step_dispatch`: returns a confirmation prompt (`confirmation_required: true`) explaining that this switches the project to `"auto"` mode; re-sending with `confirm_auto_mode: true` approves the card and switches `projects.permission_mode = "auto"`. If the project is already in `"auto"` mode, skips the switch confirmation and returns `already_auto: true`, `mode_changed: false` with a truthful message.
+  - `permission_escalation`: creates a persistent standing grant scoped strictly to the exact `(project_id, agent_id, exact target profile)` — never broader and never widens `max_unapproved_profile`. `permission_escalation` is never auto-approved by mode alone.
+  - `retry_over_limit`: creates a persistent standing grant scoped to the project (auto in `"auto"` mode, card otherwise). Compound `retry_over_limit` + `permission_escalation` task requeue cards enumerate both exact scopes in `always_allow_effect.scopes`.
+  - `config`: does **not** support standing grants (`config` writes remain strictly direct-user-only; cards offer `allow` / `reject` only).
+- **Managing grants:** direct users inspect and revoke standing grants via `grant.list` and `grant.revoke`.
+- **Lead-change asymmetry & cancellation rules:** single-use approvals bind `requested_by`, so changing a project's lead invalidates unconsumed single-use approvals (the new lead must re-propose/re-request), whereas project-scoped standing grants survive lead changes until explicitly revoked via `grant.revoke`. Agents and leads may only cancel `pending` approvals/plans; once approved by the direct user, only the direct user may retract an unconsumed approval or approved plan.
+- **Chat roles & relayed `chat.send` standing right:** `chat.send` emits `role="user"` messages (and wakes the lead); `chat.reply` is strictly for acting project leads (`role="lead"`) and rejects direct user callers (direct users must use `chat.send`). Relayed `chat.send` requires `relay` capability, project origin (`origin_principal_id == relayer`), current project readability with an active enabled lead, and that the relayer is neither the current lead (`SELF_APPROVAL`) nor a removed/former lead of the project (`SCOPE_MISMATCH`). While that relationship holds, the originating relayer retains a standing right to relay visibly marked messages (`relayed: true`, `via: "relayed"`, `relayed_by_name`, and `[RELAYED via ...]` in lead prompts) with zero approval authority.
+- **Invisible security invariants & runtime `user_mac` note:** every card click, mode change, and standing grant creation/use/revocation is hash-chained in `events` with signed `user_mac` verified cryptographically by `audit.verify`. Because runtime agent RPCs do not hold `k_user`, runtime grant/approval checks verify `user_mac` presence and event-row correspondence while `audit.verify` (direct user passphrase) performs full HMAC and hash-chain verification. Plan freeze, `LEAD_CANNOT_BE_ASSIGNEE`, no profile broadening, no git push/rebase/reset, and lock-then-backup migration (`mesh.db.v1.bak`) all remain enforced. Leads, relayed agents, and run tokens can never approve cards, change `permission_mode`, or manage grants.
+
+### 3.6 Read-Only Diffs, Follow-Up Queue/Steer, and Structured Run Activity
+
+- **Read-only Git diffs (`task.diff`, `project.diff`):** read-only RPCs backed strictly by allow-listed `gitops.run_git` (`diff`, `status`, `rev-parse`, `merge-base`, `log`, `show-ref` — never push, rebase, reset, or fetch). Worktrees are verified with `resolve_trusted_path` and `is_registered_worktree`, capped at 512 KiB / 200 files, and redacted before truncation.
+- **Follow-up queue management & Lead turn interrupt/steer (`chat.queue_edit`, `chat.queue_cancel`, `lead.interrupt`):** direct-user-only RPCs. `chat.queue_edit` and `chat.queue_cancel` act strictly on unconsumed non-approval queued user messages (still `pending` in `outbox` with `delivering_run_id IS NULL`) and append signed `chat.edited` / `chat.cancelled` events without mutating audit history or touching `plan.dispatch` / approval-bound records. `lead.interrupt` terminates only an active read-only `lead_turn` run (never worker `task` or `merge_test` runs), records a signed `lead.interrupted` event, and optionally queues a `steer_text` follow-up to wake the next Lead turn immediately.
+- **Structured tool-call activity (`run.activity`):** read-only RPC that extracts normalized, redacted, bounded tool-call summaries (up to 200 entries) from `stdout.log` across all six vendor adapters (`claude`, `codex`, `agy`, `droid`, `kiro`, `vibe`) plus `mesh-actions` blocks.
 
 ### 3.2 Flow
 
@@ -298,8 +333,8 @@ Mesh has no magic push. The following table is the concrete delivery mechanism.
 | Agent kind | How it receives work | What wakes it | Status |
 |---|---|---|---|
 | **launch** executor (headless CLI: droid/agy/kiro/vibe) | Mesh starts a **new headless run for every attempt**. For rework or retry it resumes the vendor session only if that adapter's resume capability is smoke-verified and a session id was captured; otherwise it starts a fresh process with the previous deliverable and the feedback in the prompt. | The scheduler | Available for vendor CLIs: with the default `adapter.evidence_mode = "warn"` any installed, non-held vendor adapter launches (a warning names missing or stale evidence); with `strict` only those whose committed evidence passes (droid 1.6.0 and kiro-cli 3.1.0 today). The `fake` test double needs `MESH_TESTING=1` |
-| **launch** lead | A lead turn: a new headless run in the lead's own directory, again resuming only if verified. | The scheduler, after pending lead messages pass the debounce | Available only for the `fake` test double (`MESH_TESTING=1`). Vendor launch leads are refused (rc 13 `ADAPTER_UNSUPPORTED`; existing turns emit `lead.turn_refused`); use an inbox lead for vendors |
-| **inbox** agent (an already-running process: a chat bot, an interactive CLI session the user keeps open, any agent that can run shell commands) | The agent calls **`mesh inbox wait --timeout N`**, which blocks on the Unix socket with no model tokens, or calls **`mesh inbox list`** on its own schedule. It then acknowledges with **`mesh inbox ack <msg>`**. | Only its own next `inbox wait`/`list` call | Available now |
+| **launch** lead | A lead turn: a new headless run in the lead's own directory, again resuming only if verified. | The scheduler, after pending lead messages pass the debounce | Available only for the `fake` test double (`MESH_TESTING=1`) by default. Vendor launch leads are refused by default (rc 13 `ADAPTER_UNSUPPORTED`, `vendor_lead_m3_lite`; existing turns emit `lead.turn_refused`); use an inbox lead for vendors, or opt in directly via `mesh config set lead.vendor_leads true --user` (follows `adapter.evidence_mode` identically to workers: `"warn"` launches with an evidence warning, `"strict"` requires valid probe + smoke evidence; `lead.profile` defaults to `readonly`; `devin` launch hold and `hermes`/`openclaw` stubs stay refused) |
+| **inbox** agent (an already-running process: a chat bot, an interactive CLI session the user keeps open, any agent that can run shell commands) | The agent calls **`mesh inbox wait --timeout N`**, which blocks on the daemon IPC socket/pipe with no model tokens, or calls **`mesh inbox list`** on its own schedule. It then acknowledges with **`mesh inbox ack <msg>`**. | Only its own next `inbox wait`/`list` call | Available now |
 | **user** | The user inbox (`mesh inbox list --user`), plus copies of user-facing messages in the **origin agent's** inbox for relaying. No external notification hook is implemented. | The user or the origin agent | Available now |
 
 ### 4.1 Running an inbox worker
@@ -394,10 +429,11 @@ interactive session (ACP or JSON-RPC push) is not implemented.
 Read this section before relying on Mesh for isolation.
 
 **Mesh is not a security sandbox. Mesh does not sandbox external CLIs.** meshd, the
-CLI, and every agent Mesh launches or talks to run as the same Linux user. Any process
-of that uid can read every file the user can read, write every file the user can write
-(including Mesh's own code unless the user made it read-only), and, on a box with no
-yama ptrace restriction, read other processes' `/proc/<pid>/environ` and memory.
+CLI, and every agent Mesh launches or talks to run as the same OS user (Unix user on
+Linux; local user account on Windows). Any process of that user can read every file the
+user can read, write every file the user can write (including Mesh's own code unless made
+read-only), and inspect other same-user processes' environment/memory (via `/proc/<pid>/environ`
+without yama ptrace restriction on Linux, or PEB reads under the same token on Windows).
 Without OS-level separation, which v1 does not use, Mesh cannot isolate agents from each
 other or from itself. Vendor cwd/workdir flags are conventions, not jails: a CLI
 launched with edit or shell permission can write outside its workspace, and vendor
@@ -453,7 +489,7 @@ passphrase.** It cannot detect either.
 
 - **Keep token files outside every workspace; prefer the terminal prompt for real approvals.**
   The checklist's passphrase file `P` is a test fixture only. Real users type the
-  passphrase on `/dev/tty`; use mode 0600 token files under `~/.config/mesh/`.
+  passphrase at the terminal (`/dev/tty` or `CONIN$`); use mode 0600 (Linux) / owner-only ACL (Windows) token files under `~/.config/mesh/`.
 - **Mesh recommends a read-only install outside every workspace**
   (`chmod -R a-w <install_dir>`), and it refuses to run when the install root is inside
   `workspaces.root`, `$MESH_HOME/runs`, or a project repo (`INSTALL_PATH_INSECURE`).
@@ -646,19 +682,57 @@ but **keeps the branch, including unmerged commits**.
 
 ## 9. Launch-mode lead turns
 
-Only the `fake` test double can be a launch-mode lead, and only in testing mode.
-All vendor launch leads are refused, even with executor launch evidence. Creation or
-set-lead returns rc 13; an existing disabled launch lead keeps its messages pending
-and emits `lead.turn_refused` with legacy reason `vendor_lead_m3_lite` once per
-assignment. Use `delivery=inbox` for a real lead. No vendor lead inference starts.
+By default, only the `fake` test double can be a launch-mode lead, and only in testing mode.
+With default settings, all vendor launch leads are refused, even with executor launch
+evidence: creation, intake or `set-lead` returns rc 13 `ADAPTER_UNSUPPORTED`, and an
+existing disabled launch lead keeps its messages pending while emitting `lead.turn_refused`
+with legacy reason `vendor_lead_m3_lite` once per `(assignment, reason)`. Use `delivery=inbox` for
+real leads by default, or opt in explicitly as the direct user:
+
+```sh
+mesh config set lead.vendor_leads true --user    # default: false
+```
+
+`lead.vendor_leads` is a direct-user setting (passphrase required; agents and relayed calls
+fail rc 4). When `true`, launch-mode vendor leads follow the **same** C-5 `adapter.evidence_mode`
+launch-evidence policy as vendor workers (`evidence.effective_launch` against probe and smoke
+results under `tests/smoke/results/`): under `adapter.evidence_mode = "warn"`, missing or stale
+evidence is waived with an `evidence_warning` surfaced on `lead.turn_started` and in intake /
+`project create` / `project set-lead` warnings, while under `adapter.evidence_mode = "strict"`,
+missing or stale evidence refuses launch (`devin`'s launch hold and `hermes`/`openclaw` stubs
+stay refused in both modes; unimplemented `hermes`/`openclaw` stubs yield `no_smoke_evidence`
+because they lack smoke evidence and are not waived in `warn` mode). On refusal, creation,
+intake, and `set-lead` fail rc 13 with the evidence reason (`no_smoke_evidence`,
+`no_probe_version`, `evidence_stale`, `evidence_invalid`, `launch_cases_failed`, or
+`launch_held`); during turn planning, refusal records one `lead.turn_refused` event per
+`(assignment, reason)` and leaves the wake messages pending (a new refusal reason on the same
+assignment emits one event for that new reason). Toggle off anytime with
+`mesh config set lead.vendor_leads false --user`; toggling it off refuses new vendor turns and
+lead assignments, without cancelling or stopping a vendor lead turn that is already running.
+Remaining limits when opted in: `lead.profile` defaults to `readonly` (so adapters without
+`readonly` support such as `devin` cannot run `readonly` turns), vendor resume stays
+`unknown` (turns start fresh with the full prompt), and `hermes`/`openclaw` remain stubs.
+Lead turns use the same process-group seen tracking (`seen.json` / `adopt_pending`),
+close-safety gate, and `mesh run release <run_id> --force-seen-unusable` override as task runs
+(a spawn-aborted lead turn whose close is held by the gate emits one `run.kill_failed`
+event with `"close_held": true`, stays owned by `meshd`'s abort retry loop, and cannot be
+force-released with `run release`; restart `meshd` if `/proc` stays unreadable).
 
 For an active project, pending `lead_wake` messages trigger a turn after
-`lead.wake_debounce_s` (default 5 s), or when at least 20 are pending. The
-`leadturn:<prj>` lease prevents overlapping turns for the project. Up to 50
-messages fit in a turn; omitted messages stay pending. The prompt names omitted
+`lead.wake_debounce_s` (default 5 s), or when at least 20 are pending. Lead turns do not
+count against per-agent `max_concurrency` or global `scheduler.max_total_runs` (and are
+not throttled by either cap); concurrency is bounded to at most one active turn per project
+by the `leadturn:<prj>` lease. If an exited turn's
+finish is delayed past its run token expiry (by a gate hold or extended daemon downtime),
+`execute_lead_actions` rolls back (`result_json` records `actions_deferred: "token_expired"`) and
+the wake messages return to `pending` (counting toward retry backoff and `outbox.max_attempts`).
+Up to 50 messages fit in a turn; omitted messages stay pending. The prompt names omitted
 context and retains the authority rules and completion format. The lead runs in
 `lead/<agent_id>/`, using `lead.profile` (default `readonly`) and
-`lead.turn_timeout_s` (default 1800 s). A repo project's separate `repo/` is
+`lead.turn_timeout_s` (default 1800 s), and forwards the agent's resolved
+`default_model` and `default_effort` to `adapter.build` while recording them on the
+`runs` row (without repeating T6 executor checks, so an invalid default surfaces as
+`spawn_failed` with backoff up to `lead.unreachable`). A repo project's separate `repo/` is
 detached and refreshed to integration when clean, never an executor worktree.
 Approval decisions addressed to the current launch-mode lead also enqueue a wake,
 while retaining inbox delivery. Async merge success (`task.merged`) and failure
@@ -719,8 +793,14 @@ or times out and is retried. Correctness never depends on resume.
 default `warn` mode the same evaluation runs, but a failing result (other than a launch hold
 or a stub adapter) is reported as a warning instead of refusing the launch.
 
-**Evidence-driven launch.** For leads, every vendor launch lead is refused, even with launch evidence;
-its legacy machine reason remains `vendor_lead_m3_lite`.
+**Evidence-driven launch.** For leads, with default `lead.vendor_leads = false`, every vendor launch lead is refused, even with launch evidence;
+its legacy machine reason remains `vendor_lead_m3_lite`. When opted in via
+`mesh config set lead.vendor_leads true --user`, vendor launch leads follow the same
+`adapter.evidence_mode` policy via `effective_launch` as vendor workers: `"warn"` waives
+missing or stale evidence and surfaces `evidence_warning` on `lead.turn_started` and
+assignment warnings, while `"strict"` applies strict evidence checking and refuses launch
+without valid matching probe and smoke evidence (`devin` launch holds and `hermes`/`openclaw`
+stubs remain refused in both modes).
 
 **Strict executor evidence.** meshd decides `launch_enabled` per vendor at runtime; nobody
 sets it by hand. It is true only if the latest probe row for the agent's binary has
@@ -747,7 +827,9 @@ and `MESH_SMOKE_CONSENT` (optionally `MESH_SMOKE_CONSENT_REF` naming who agreed 
 `MESH_SMOKE_MAX_RUNS` (required, enforced); an explicit model
 `MESH_SMOKE_MODEL_<ADAPTER>` (`auto` is refused); and `MESH_SMOKE_OUT` under
 `/tmp/mh-*`, the only place results are written. `MESH_SMOKE_CASES` and
-`MESH_SMOKE_TIMEOUT_S` narrow a run. Stage it: run the first case alone, check the
+`MESH_SMOKE_TIMEOUT_S` narrow a run. Smoke runs use the `readonly` profile; `devin` supports only
+`unrestricted`, so its smoke runs use that profile and its results file says so
+([adapters.md](adapters.md), "Smoke tier for codex, claude and devin"). Stage it: run the first case alone, check the
 vendor's usage before and after, then run the rest. The real end-to-end tests
 (`tests.smoke.test_e2e`) need `MESH_SMOKE_E2E=<adapter>`, and `MESH_SMOKE_E2E_CODE=1` selects the code-task demo
 instead of the readonly run. Neither tier is part of `bash scripts/test.sh`; the default
@@ -763,8 +845,8 @@ results file offline into a new staging directory.
 **What the evidence does not change.**
 
 - Mesh does not sandbox external CLIs. A passing smoke case is evidence about a readonly
-  run, not a permission guarantee.
-- Vendor launch leads are refused (section 9).
+  run (an `unrestricted` run for devin), not a permission guarantee.
+- Vendor launch leads are refused by default (`lead.vendor_leads = false`, section 9).
 - The idle timeout stays off: `run.idle_timeout_s` defaults to `0`, and it is not
   validated against vendor output.
 - Resume is used only for a resume capability that is `supported: "yes"` and smoke

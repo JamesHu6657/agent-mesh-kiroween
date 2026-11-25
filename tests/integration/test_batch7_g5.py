@@ -3,23 +3,24 @@
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
 import unittest
 
 import mesh.constants as c
+from mesh.core.paths import mesh_cli_argv
+from mesh.platform import ipc as plat_ipc
 from tests.helpers import MeshHarness
+from tests.stubs import _write_python_stub
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def _raw_socket_call(sock_path: str, payload: bytes) -> dict:
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+    with plat_ipc.connect_endpoint(sock_path, timeout=10.0) as s:
         s.settimeout(10.0)
-        s.connect(sock_path)
         s.sendall(payload)
         buf = b""
         while b"\n" not in buf:
@@ -48,20 +49,29 @@ class TestBatch7G5Integration(unittest.TestCase):
         return tresp["data"]["token"]
 
     def _run_setup_with_passphrase(self, home: str, passphrase: str, *extra: str) -> tuple:
-        r_fd, w_fd = os.pipe()
-        os.write(w_fd, passphrase.encode("utf-8"))
-        os.close(w_fd)
-        cmd = [
-            sys.executable, "-m", "mesh", "--home", home, "--format", "json",
-            "setup", "--passphrase-fd", str(r_fd), *extra,
-        ]
-        try:
-            proc = subprocess.run(
-                cmd, cwd=REPO_ROOT, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                pass_fds=(r_fd,), timeout=60, env=self.harness.get_env(),
+        if sys.platform == "win32":
+            env = self.harness._with_direct_pythonpath(self.harness.get_env())
+            cmd = mesh_cli_argv(
+                "--home", home, "--format", "json", "setup", "--passphrase-fd", "0", *extra,
             )
-        finally:
-            os.close(r_fd)
+            proc = subprocess.run(
+                cmd, cwd=REPO_ROOT, input=passphrase, capture_output=True, text=True, timeout=60, env=env,
+            )
+        else:
+            r_fd, w_fd = os.pipe()
+            os.write(w_fd, passphrase.encode("utf-8"))
+            os.close(w_fd)
+            cmd = [
+                sys.executable, "-m", "mesh", "--home", home, "--format", "json",
+                "setup", "--passphrase-fd", str(r_fd), *extra,
+            ]
+            try:
+                proc = subprocess.run(
+                    cmd, cwd=REPO_ROOT, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                    pass_fds=(r_fd,), timeout=60, env=self.harness.get_env(),
+                )
+            finally:
+                os.close(r_fd)
         try:
             body = json.loads(proc.stdout.strip())
         except json.JSONDecodeError:
@@ -131,26 +141,44 @@ class TestBatch7G5Integration(unittest.TestCase):
     def test_f3_cli_probe_binary_validation_and_normalization(self) -> None:
         bin_dir = os.path.join(self.tok_dir, "bins")
         os.makedirs(bin_dir)
-        droid_path = os.path.join(bin_dir, "droid")
-        with open(droid_path, "w", encoding="utf-8") as f:
-            f.write("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'droid 1.6.0'; exit 0; fi\necho 'Usage: droid'\n")
-        os.chmod(droid_path, 0o755)
+        droid_path = _write_python_stub(
+            bin_dir,
+            "droid",
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "if sys.argv[1:2] == ['--version']:\n"
+            "    print('droid 1.6.0')\n"
+            "    sys.exit(0)\n"
+            "print('Usage: droid')\n",
+        )
 
         rc_bad, resp_bad = self.harness.cli("adapter", "probe", "--binary", droid_path, user=True)
         self.assertEqual(rc_bad, c.EXIT_USAGE, resp_bad)
         self.assertEqual(resp_bad["error"]["code"], c.INVALID_ARGUMENT)
 
-        # Invoke CLI from parent dir with relative ./bins/droid
-        pass_fd = os.open(self.harness.passphrase_file, os.O_RDONLY)
-        try:
+        # Invoke CLI from parent dir with relative ./bins/droid (or ./bins/droid.cmd on Windows)
+        rel_droid = "./bins/" + os.path.basename(droid_path)
+        if sys.platform == "win32":
             proc = subprocess.run(
-                [sys.executable, "-m", "mesh", "--home", self.harness.home, "--format", "json",
-                 "adapter", "probe", "droid", "--binary", "./bins/droid", "--user", "--passphrase-fd", str(pass_fd)],
+                mesh_cli_argv(
+                    "--home", self.harness.home, "--format", "json",
+                    "adapter", "probe", "droid", "--binary", rel_droid,
+                    "--user", "--passphrase-file", self.harness.passphrase_file,
+                ),
                 cwd=self.tok_dir, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                pass_fds=(pass_fd,), timeout=30, env={**self.harness.get_env(), "PYTHONPATH": REPO_ROOT},
+                timeout=30, env={**self.harness.get_env(), "PYTHONPATH": REPO_ROOT},
             )
-        finally:
-            os.close(pass_fd)
+        else:
+            pass_fd = os.open(self.harness.passphrase_file, os.O_RDONLY)
+            try:
+                proc = subprocess.run(
+                    [sys.executable, "-m", "mesh", "--home", self.harness.home, "--format", "json",
+                     "adapter", "probe", "droid", "--binary", rel_droid, "--user", "--passphrase-fd", str(pass_fd)],
+                    cwd=self.tok_dir, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                    pass_fds=(pass_fd,), timeout=30, env={**self.harness.get_env(), "PYTHONPATH": REPO_ROOT},
+                )
+            finally:
+                os.close(pass_fd)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         out = json.loads(proc.stdout)
         self.assertEqual(out["data"]["binary_path"], os.path.abspath(droid_path))
@@ -194,7 +222,7 @@ class TestBatch7G5Integration(unittest.TestCase):
 
     # F8: server socket envelope validation & CLI config set --input -------------
     def test_f8_daemon_malformed_envelopes_and_cli_input(self) -> None:
-        sock_path = os.path.join(self.harness.home, "run", "mesh.sock")
+        sock_path = plat_ipc.daemon_endpoint_path(self.harness.home)
         payloads = [
             b"\xff\xfe\n",
             b"{not valid json\n",

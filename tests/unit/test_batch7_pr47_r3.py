@@ -1,6 +1,5 @@
 """Regression tests for batch7 PR #47 round-3 review findings (2x P2)."""
 
-import fcntl
 import os
 import re
 import shutil
@@ -10,6 +9,11 @@ import sys
 import tempfile
 import time
 import unittest
+
+if sys.platform != "win32":
+    import fcntl
+else:
+    fcntl = None  # type: ignore[assignment]
 
 from tests import run_tier
 from tests.unit.test_inbox_worker_kit import SCRIPT as WORKER_SCRIPT, STUB as WORKER_STUB
@@ -144,6 +148,7 @@ def _kill_proc_group(proc):
         pass
 
 
+@unittest.skipUnless(sys.platform != "win32", "Linux/POSIX bash + scripts/coord/inbox-worker.sh + /proc leader-zombie test")
 class TestFinding1InboxWorkerLeaderZombieAndNoProcWait(unittest.TestCase):
     """P2: inbox-worker-example.sh must treat Z with live threads as alive and handle missing /proc + interrupted wait."""
 
@@ -585,6 +590,7 @@ class TestFinding2RunTierSymlinkAndIdentifierCheck(unittest.TestCase):
         env.pop("PYTHONPATH", None)
         return env
 
+    @unittest.skipUnless(sys.platform != "win32", "POSIX bash logical-$PWD symlink test in run_tier.py")
     def test_symlinked_working_dir_and_repo_root_lift_top_level_dir(self):
         with tempfile.TemporaryDirectory(prefix="mh-pr47r3-sym-") as tmp:
             env = self._clean_env(tmp)

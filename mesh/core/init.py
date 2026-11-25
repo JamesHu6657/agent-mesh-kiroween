@@ -2,12 +2,17 @@
 
 import json
 import os
+import re
 import sqlite3
 import stat
+import sys
 from typing import Any, Dict, Optional
 
 import mesh.constants as c
 from mesh.errors import MeshError
+from mesh.platform import perms
+from mesh.platform.paths import is_reparse_stat
+from mesh.platform.proc import is_process_alive
 from mesh.core.auth import derive_user_keys
 from mesh.core.clock import now_iso_utc
 from mesh.core.db import connect_db, init_db as init_db_file
@@ -21,6 +26,44 @@ from mesh.core.paths import (
     resolve_home,
 )
 from mesh.core.settings import get_default_settings
+
+_INIT_TMP_DB_RE = re.compile(r"^\.mesh\.db\.init\.(\d+)\.tmp(?:-wal|-shm)?$")
+
+
+def _cleanup_stale_init_tmp_dbs(home: str, *, db_exists: bool = False) -> int:
+    """Remove leftover ``.mesh.db.init.<pid>.tmp*`` files from crashed init attempts."""
+    removed = 0
+    try:
+        entries = os.listdir(home)
+    except OSError:
+        return 0
+    my_pid = os.getpid()
+    alive_cache: Dict[int, bool] = {}
+    for name in entries:
+        m = _INIT_TMP_DB_RE.match(name)
+        if not m:
+            continue
+        try:
+            pid = int(m.group(1))
+        except ValueError:
+            pid = -1
+        should_remove = db_exists or pid <= 0 or pid == my_pid
+        if not should_remove:
+            alive = alive_cache.get(pid)
+            if alive is None:
+                try:
+                    alive = is_process_alive(pid)
+                except Exception:
+                    alive = False
+                alive_cache[pid] = alive
+            should_remove = not alive
+        if should_remove:
+            try:
+                os.unlink(os.path.join(home, name))
+                removed += 1
+            except OSError:
+                pass
+    return removed
 
 
 def init_mesh_home(home: str, passphrase: str) -> Dict[str, Any]:
@@ -64,29 +107,47 @@ def init_mesh_home(home: str, passphrase: str) -> Dict[str, Any]:
         try:
             if os.path.lexists(home):
                 st_home = os.lstat(home)
-                if stat.S_ISLNK(st_home.st_mode) or not stat.S_ISDIR(st_home.st_mode):
+                if is_reparse_stat(st_home) or not stat.S_ISDIR(st_home.st_mode):
                     raise MeshError(
                         code=c.INSECURE_PERMISSIONS,
                         exit_code=c.EXIT_USAGE,
                         message=f"Storage root '{home}' must be a real directory, not a symlink or file",
                         details={"home": home},
                     )
+                if sys.platform == "win32" and not perms.is_owned_by_current_user(home):
+                    raise MeshError(
+                        code=c.INSECURE_PERMISSIONS,
+                        exit_code=c.EXIT_USAGE,
+                        message=f"Storage root '{home}' is not owned by the current Windows user",
+                        details={"home": home},
+                    )
             os.makedirs(home, mode=0o700, exist_ok=True)
-            os.chmod(home, 0o700)
+            if sys.platform == "win32":
+                perms.set_private_dir_acl(home, 0o700)
+            else:
+                os.chmod(home, 0o700)
             check_home_permissions(home)
 
             for sub in subdirs:
                 subpath = os.path.join(home, sub)
                 if os.path.lexists(subpath):
                     st_sub = os.lstat(subpath)
-                    if stat.S_ISLNK(st_sub.st_mode) or not stat.S_ISDIR(st_sub.st_mode):
+                    if is_reparse_stat(st_sub) or not stat.S_ISDIR(st_sub.st_mode):
                         raise MeshError(
                             code=c.INSECURE_PERMISSIONS,
                             exit_code=c.EXIT_USAGE,
                             message=f"Storage subdirectory '{subpath}' must be a real directory, not a symlink or file",
                             details={"home": home, "path": subpath},
                         )
-                    if st_sub.st_uid != os.getuid():
+                    if sys.platform == "win32":
+                        if not perms.is_owned_by_current_user(subpath):
+                            raise MeshError(
+                                code=c.INSECURE_PERMISSIONS,
+                                exit_code=c.EXIT_USAGE,
+                                message=f"Storage subdirectory '{subpath}' is not owned by the current Windows user",
+                                details={"home": home, "path": subpath},
+                            )
+                    elif st_sub.st_uid != os.getuid():
                         raise MeshError(
                             code=c.INSECURE_PERMISSIONS,
                             exit_code=c.EXIT_USAGE,
@@ -95,7 +156,10 @@ def init_mesh_home(home: str, passphrase: str) -> Dict[str, Any]:
                         )
                 else:
                     os.makedirs(subpath, mode=0o700, exist_ok=True)
-                os.chmod(subpath, 0o700)
+                if sys.platform == "win32":
+                    perms.set_private_dir_acl(subpath, 0o700)
+                else:
+                    os.chmod(subpath, 0o700)
         except (FileExistsError, NotADirectoryError) as exc:
             raise MeshError(
                 code=c.INSECURE_PERMISSIONS,
@@ -111,15 +175,35 @@ def init_mesh_home(home: str, passphrase: str) -> Dict[str, Any]:
                 message=f"Permission denied initializing storage root '{home}': {exc.strerror or exc}",
                 details={"home": home},
             ) from exc
+        except OSError as exc:
+            if sys.platform == "win32":
+                raise MeshError(
+                    code=c.INSECURE_PERMISSIONS,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Storage root '{home}' cannot be initialized safely: {exc.strerror or exc}",
+                    details={"home": home},
+                ) from exc
+            raise
     finally:
         os.umask(old_umask)
 
     # Derive user keys
     verifier, k_user, salt, kdf_params = derive_user_keys(passphrase, testing_kdf=testing)
 
-    # Initialize SQLite database
+    # Initialize SQLite database atomically when creating fresh mesh.db so a crash
+    # mid-init never leaves an empty schema without a user principal behind.
     db_path = os.path.join(home, "mesh.db")
-    conn = init_db_file(db_path)
+    creating_fresh = not os.path.exists(db_path)
+    _cleanup_stale_init_tmp_dbs(home, db_exists=not creating_fresh)
+    target_db = os.path.join(home, f".mesh.db.init.{os.getpid()}.tmp") if creating_fresh else db_path
+    if creating_fresh:
+        for suf in ("", "-wal", "-shm"):
+            try:
+                os.unlink(target_db + suf)
+            except FileNotFoundError:
+                pass
+
+    conn = init_db_file(target_db)
     try:
         now = now_iso_utc()
         user_id = new_id("usr")
@@ -183,12 +267,36 @@ def init_mesh_home(home: str, passphrase: str) -> Dict[str, Any]:
             )
 
             conn.execute("COMMIT;")
-    finally:
+        if creating_fresh:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            conn.execute("PRAGMA journal_mode=DELETE;")
+    except BaseException:
         conn.close()
+        if creating_fresh:
+            for suf in ("", "-wal", "-shm"):
+                try:
+                    os.unlink(target_db + suf)
+                except OSError:
+                    pass
+        raise
+    else:
+        conn.close()
+
+    if creating_fresh:
+        perms.set_private_file_acl(target_db, 0o600)
+        os.replace(target_db, db_path)
+        for suf in ("-wal", "-shm"):
+            try:
+                os.unlink(target_db + suf)
+            except OSError:
+                pass
+        # Re-open briefly to restore WAL mode on the final db_path
+        wal_conn = connect_db(db_path)
+        wal_conn.close()
 
     # Ensure mesh.db permissions are 0600
     if os.path.exists(db_path):
-        os.chmod(db_path, 0o600)
+        perms.set_private_file_acl(db_path, 0o600)
 
     return {
         "home": home,

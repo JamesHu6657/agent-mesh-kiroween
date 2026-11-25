@@ -229,7 +229,10 @@ class TestR4P2_3ForeignWorktree(unittest.TestCase):
         good = submission_git_info(ws, "mesh/t", base, repo_path=repo)
         self.assertNotIn("error", good)
         self.git(other, "worktree", "add", "-q", "-b", "x", os.path.join(tmp, "ow"))
-        with open(os.path.join(ws, ".git"), "w", encoding="utf-8") as f:  # the task rewrites it
+        ws_git = os.path.join(ws, ".git")
+        if os.path.isfile(ws_git):
+            os.unlink(ws_git)
+        with open(ws_git, "w", encoding="utf-8") as f:  # the task rewrites it
             f.write("gitdir: " + os.path.join(other, ".git", "worktrees", "ow") + "\n")
         bad = submission_git_info(ws, "mesh/t", base, repo_path=repo)
         self.assertEqual(bad["error"]["reason"], "foreign_repository")
@@ -252,7 +255,7 @@ class TestR4P1_1LeadActionRollback(unittest.TestCase):
         class Stop(Exception):
             pass
 
-        run = {"id": "run_1", "project_id": "prj", "run_dir": tmp, "adapter": "none"}
+        run = {"id": "run_1", "kind": "lead_turn", "project_id": "prj", "run_dir": tmp, "adapter": "none"}
         del lead_turns._PENDING_INTENT_UNLINKS[:]
         with mock.patch.object(lead_turns, "execute_lead_actions", side_effect=actions), \
                 mock.patch("mesh.daemon.supervisor.vendor_failure_meaning", return_value=None), \

@@ -8,12 +8,17 @@ import json
 import os
 import stat
 import subprocess
+import sys
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import mesh.constants as c
 from mesh.core.gitops import run_git
 from mesh.core.workspaces import compute_lead_workspace_path, ensure_workspace_dir
 from mesh.errors import MeshError
+from mesh.platform import fs as _plat_fs
+from mesh.platform import paths as _plat_paths
+from mesh.platform import perms as _plat_perms
+from mesh.platform.fs import fsync_dir
 
 TESTS_NONE = "none"
 LEAD_REPO_DIRNAME = "repo"
@@ -36,7 +41,9 @@ def integration_worktree_path(ws_root: str, project_id: str) -> str:
 
 def lead_repo_worktree_path(ws_root: str, project_id: str, agent_id: str) -> str:
     """`<workspaces.root>/<prj>/lead/<agent_id>/repo` (§10.1, §8)."""
-    return os.path.join(compute_lead_workspace_path(ws_root, project_id, agent_id), LEAD_REPO_DIRNAME)
+    lead_dir = _plat_paths.strip_trailing_seps(compute_lead_workspace_path(ws_root, project_id, agent_id))
+    path = os.path.join(lead_dir, LEAD_REPO_DIRNAME)
+    return os.path.normpath(path) if sys.platform == "win32" else path
 
 
 def _usage(param: str, message: str, **details: Any) -> MeshError:
@@ -142,9 +149,10 @@ def validate_repo(path: Any, base_branch: Any) -> Dict[str, str]:
     top = (cp.stdout or "").strip()
     if cp.returncode != 0 or not top:
         raise _usage("repo", f"'{path}' is not a git repository", repo=path, reason="not_a_repo")
-    if os.path.realpath(top) != real:
+    if not _plat_paths.same_path(top, real):
+        top_real = os.path.realpath(top)
         raise _usage("repo", f"'{path}' is not the top level of its git repository ('{top}')",
-                     repo=path, reason="not_toplevel", toplevel=os.path.realpath(top))
+                     repo=path, reason="not_toplevel", toplevel=top_real)
     branch = _check_ref_name(base_branch, "base_branch")
     # Only a local branch (review m2-r3 finding 3): `project deliver` advances
     # refs/heads/<base> (§10.6), so a tag, a sha or HEAD could never be delivered.
@@ -379,7 +387,7 @@ def _verify_legacy_worktree_paths(recs: List[List[str]], repo: str) -> None:
     if cp.returncode != 0 or not common:
         raise _git_failed("rev-parse --git-common-dir", cp, repo=repo)
     repo_common = os.path.realpath(os.path.join(repo, common))
-    main_paths = {os.path.realpath(repo), repo_common, os.path.dirname(repo_common)}
+    main_paths = {_plat_paths.norm_cmp(p) for p in (os.path.realpath(repo), repo_common, os.path.dirname(repo_common))}
     for lines in recs:
         path = lines[0][len("worktree "):]
         if (any(ln == "prunable" or ln.startswith("prunable ") for ln in lines[1:])
@@ -389,7 +397,7 @@ def _verify_legacy_worktree_paths(recs: List[List[str]], repo: str) -> None:
             raise _legacy_ambiguous(repo, path, "unusable path")
         if not os.path.isdir(path):
             raise _legacy_ambiguous(repo, path, "not a directory")
-        if os.path.realpath(path) in main_paths:
+        if _plat_paths.norm_cmp(os.path.realpath(path)) in main_paths:
             continue
         rem = remaining_git_budget()
         if rem <= 0:
@@ -428,7 +436,7 @@ def _worktree_for_branch(repo: str, branch: str) -> Optional[str]:
     for field in (cp.stdout or "").split(sep):
         if field == "":
             if current is not None and matched and not (prunable and not os.path.lexists(current)):
-                return current
+                return os.path.normpath(current) if sys.platform == "win32" else current
             current = None
             matched = False
             prunable = False
@@ -439,7 +447,7 @@ def _worktree_for_branch(repo: str, branch: str) -> Optional[str]:
         elif field == "prunable" or field.startswith("prunable "):
             prunable = True
     if current is not None and matched and not (prunable and not os.path.lexists(current)):
-        return current
+        return os.path.normpath(current) if sys.platform == "win32" else current
     return None
 
 
@@ -510,9 +518,9 @@ def _validate_deliver_worktree(worktree: str, repo: str, base_branch: str) -> st
     if wt_real is None or not os.path.isdir(wt_real):
         raise _foreign(f"Worktree '{worktree}' is missing, symlinked, or invalid")
     dot_git = os.path.join(wt_real, ".git")
-    if os.path.islink(dot_git) or not os.path.lexists(dot_git):
+    if _plat_paths.is_reparse_link(dot_git) or not os.path.lexists(dot_git):
         raise _foreign(f"Worktree '{worktree}' is not a registered worktree of '{repo}'")
-    if wt_real != os.path.realpath(repo) or os.path.isfile(dot_git):
+    if not _plat_paths.same_path(wt_real, repo) or os.path.isfile(dot_git):
         rem = remaining_git_budget()
         if rem <= 0:
             raise MeshError(
@@ -526,7 +534,7 @@ def _validate_deliver_worktree(worktree: str, repo: str, base_branch: str) -> st
             raise _foreign(f"Worktree '{worktree}' is not a registered worktree of '{repo}'")
     top_cp = _git("verify worktree", ["rev-parse", "--show-toplevel"], wt_real, worktree=worktree, repo=repo)
     top = (top_cp.stdout or "").strip()
-    if top_cp.returncode != 0 or not top or os.path.realpath(top) != wt_real:
+    if top_cp.returncode != 0 or not top or not _plat_paths.same_path(top, wt_real):
         raise _foreign(f"Worktree '{worktree}' top level does not match '{wt_real}'")
     return wt_real
 
@@ -708,7 +716,8 @@ def _dir_has_non_deleted_entry(root_dir: str, rel_prefix: str, deleted: Set[str]
         for entry in entries:
             entry_rel = f"{cur_rel}/{entry.name}" if cur_rel else entry.name
             try:
-                if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                est = entry.stat(follow_symlinks=False)
+                if _plat_paths.is_reparse_stat(est) or not stat.S_ISDIR(est.st_mode):
                     if entry_rel not in deleted:
                         return True
                 else:
@@ -757,7 +766,7 @@ def _ignored_paths_overwritten(worktree: str, repo: str, old: str, new: str) -> 
                 hits.append(path)
                 blocked_or_gone = True
                 break
-            if stat.S_ISLNK(pst.st_mode) or not stat.S_ISDIR(pst.st_mode):
+            if _plat_paths.is_reparse_stat(pst) or not stat.S_ISDIR(pst.st_mode):
                 if parent not in deleted:
                     hits.append(path)
                 blocked_or_gone = True
@@ -772,7 +781,7 @@ def _ignored_paths_overwritten(worktree: str, repo: str, old: str, new: str) -> 
         except OSError:
             hits.append(path)
             continue
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        if _plat_paths.is_reparse_stat(st) or not stat.S_ISDIR(st.st_mode):
             hits.append(path)
         elif _dir_has_non_deleted_entry(full, path, deleted):
             hits.append(path)
@@ -808,7 +817,9 @@ def deliver_heads(repo: str, base_branch: str, integration_branch: str) -> Optio
     for ref in (f"refs/heads/{base_branch}", f"refs/heads/{integration_branch}"):
         try:
             cp = _git("rev-parse", ["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], repo, repo=repo)
-        except MeshError:
+        except MeshError as exc:
+            if isinstance(exc.details, dict) and exc.details.get("reason") == "git_timeout":
+                raise
             return None
         sha = (cp.stdout or "").strip()
         if cp.returncode != 0 or not sha:
@@ -834,6 +845,8 @@ def write_deliver_intent(home: str, doc: Dict[str, Any]) -> str:
 
     parent = os.path.join(home, DELIVER_INTENT_DIR)
     os.makedirs(parent, mode=0o700, exist_ok=True)
+    if sys.platform == "win32":
+        _plat_perms.set_private_dir_acl(parent, 0o700)
     path = deliver_intent_path(home, doc["project_id"])
     data = (json.dumps(doc, sort_keys=True) + "\n").encode("utf-8")
     fd, tmp = tempfile.mkstemp(dir=parent, prefix=".intent_")
@@ -842,22 +855,21 @@ def write_deliver_intent(home: str, doc: Dict[str, Any]) -> str:
             view = memoryview(data)
             while view:
                 view = view[os.write(fd, view):]
-            os.fchmod(fd, 0o600)
+            if sys.platform != "win32" and hasattr(os, "fchmod"):
+                _plat_perms.fchmod_private(fd, 0o600)
             os.fsync(fd)
         finally:
             os.close(fd)
-        os.replace(tmp, path)
+        if sys.platform == "win32" or not hasattr(os, "fchmod"):
+            _plat_perms.set_private_file_acl(tmp, 0o600)
+        _plat_fs.atomic_replace(tmp, path)
     except BaseException:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
-    dfd = os.open(parent, os.O_RDONLY)
-    try:
-        os.fsync(dfd)
-    finally:
-        os.close(dfd)
+    fsync_dir(parent)
     return path
 
 
@@ -928,7 +940,7 @@ def is_registered_worktree(
         if wt_real is None or not os.path.isdir(wt_real):
             return False
         dot_git = os.path.join(wt_real, ".git")
-        if os.path.islink(dot_git) or not os.path.isfile(dot_git):
+        if _plat_paths.is_reparse_link(dot_git) or not os.path.isfile(dot_git):
             return False
         with open(dot_git, "r", encoding="utf-8") as f:
             raw = f.read(4096).strip()
@@ -940,21 +952,21 @@ def is_registered_worktree(
         if cp.returncode != 0 or not common:
             return False
         repo_common = os.path.realpath(os.path.join(repo_path, common))
-        if os.path.dirname(gitdir) != os.path.join(repo_common, "worktrees"):
+        if not _plat_paths.same_path(os.path.dirname(gitdir), os.path.join(repo_common, "worktrees")):
             return False
         commondir_file = os.path.join(gitdir, "commondir")
         if os.path.lexists(commondir_file):
-            if os.path.islink(commondir_file):
+            if _plat_paths.is_reparse_link(commondir_file):
                 return False
             with open(commondir_file, "r", encoding="utf-8") as f:
-                if os.path.realpath(os.path.join(gitdir, f.read(4096).strip())) != repo_common:
+                if not _plat_paths.same_path(os.path.join(gitdir, f.read(4096).strip()), repo_common):
                     return False
         back_file = os.path.join(gitdir, "gitdir")
-        if os.path.islink(back_file):
+        if _plat_paths.is_reparse_link(back_file):
             return False
         with open(back_file, "r", encoding="utf-8") as f:
-            back = os.path.realpath(os.path.join(gitdir, f.read(4096).strip()))
-        return back == dot_git
+            back = os.path.join(gitdir, f.read(4096).strip())
+        return _plat_paths.same_path(back, dot_git)
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
 
@@ -986,7 +998,7 @@ def _collect_git_info(workspace: str, branch: Optional[str], base_commit: Option
 
     if not workspace or not isinstance(workspace, str) or not workspace.strip():
         return fail("workspace", reason="workspace_missing", workspace=workspace)
-    ws_clean = workspace.rstrip(os.sep)
+    ws_clean = _plat_paths.strip_trailing_seps(workspace)
     ws_real = resolve_trusted_path(workspace)
     if ws_real is None:
         if not ws_clean or not os.path.lexists(ws_clean):
@@ -1017,7 +1029,7 @@ def _collect_git_info(workspace: str, branch: Optional[str], base_commit: Option
         cp = git("verify worktree", ["rev-parse", "--show-toplevel"])
         if cp is None:
             return info
-        if os.path.realpath((cp.stdout or "").strip()) != ws_real:
+        if not _plat_paths.same_path((cp.stdout or "").strip(), ws_real):
             return fail("verify worktree", reason="foreign_repository")
     if branch:
         sym = git("rev-parse HEAD symref", ["rev-parse", "--symbolic-full-name", "HEAD"])

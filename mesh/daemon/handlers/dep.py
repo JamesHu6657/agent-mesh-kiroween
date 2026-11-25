@@ -1,5 +1,6 @@
 """Dependency command handlers per plan §6.2, §7.3, §13.3."""
 
+import json
 import sqlite3
 from typing import Any, Dict, List, Set
 
@@ -8,6 +9,74 @@ from mesh.core.authz import check_authz, is_project_lead
 from mesh.core.events import record_event
 from mesh.daemon.handlers.base import HandlerContext, HandlerResult
 from mesh.errors import MeshError
+
+
+def _enforce_plan_dep_immutability(
+    conn: sqlite3.Connection,
+    ctx: HandlerContext,
+    project_id: str,
+    t1: sqlite3.Row,
+    t2: sqlite3.Row,
+    *,
+    action: str,
+) -> None:
+    """Enforce approved plan DAG immutability on gated ('plan'/'supervised') projects for non-user actors (P1-2)."""
+    if ctx.actor_kind == "user":
+        return
+    prow = conn.execute("SELECT plan_gate_mode, permission_mode FROM projects WHERE id = ?;", (project_id,)).fetchone()
+    if prow is None or prow["plan_gate_mode"] != "require_approval":
+        return
+    pmode = prow["permission_mode"] if "permission_mode" in prow.keys() and prow["permission_mode"] else "plan"
+    if pmode == "auto":
+        return
+    t1_plan = t1["plan_id"] if "plan_id" in t1.keys() else None
+    t1_key = t1["plan_step_key"] if "plan_step_key" in t1.keys() else None
+    t2_plan = t2["plan_id"] if "plan_id" in t2.keys() else None
+    t2_key = t2["plan_step_key"] if "plan_step_key" in t2.keys() else None
+
+    if not t1_plan or not t1_key:
+        raise MeshError(
+            code=c.PLAN_APPROVAL_REQUIRED,
+            exit_code=c.EXIT_APPROVAL_REQUIRED,
+            message=f"Project '{project_id}' has plan_gate_mode='require_approval'; cannot {action} dependencies outside an approved plan",
+            details={"project_id": project_id, "task_id": t1["id"], "on": t2["id"], "action": action},
+        )
+    pl = conn.execute("SELECT status, steps_json FROM plans WHERE id = ?;", (t1_plan,)).fetchone()
+    if pl is None or pl["status"] != "dispatched":
+        raise MeshError(
+            code=c.PLAN_APPROVAL_REQUIRED,
+            exit_code=c.EXIT_APPROVAL_REQUIRED,
+            message=f"Plan '{t1_plan}' is not dispatched; cannot {action} dependencies",
+            details={"project_id": project_id, "plan_id": t1_plan, "task_id": t1["id"], "on": t2["id"]},
+        )
+    try:
+        steps = json.loads(pl["steps_json"] or "[]")
+    except (TypeError, ValueError):
+        steps = []
+    step = next((s for s in steps if isinstance(s, dict) and s.get("key") == t1_key), None)
+    planned_deps = list(step.get("depends_on") or []) if step else []
+    in_plan = bool(t2_plan == t1_plan and t2_key in planned_deps)
+
+    if action == "dep.add" and not in_plan:
+        raise MeshError(
+            code=c.PLAN_APPROVAL_REQUIRED,
+            exit_code=c.EXIT_APPROVAL_REQUIRED,
+            message=(
+                f"Cannot add dependency {t1['id']} -> {t2['id']}: not in approved plan '{t1_plan}'. "
+                "Propose a revised plan instead."
+            ),
+            details={"project_id": project_id, "plan_id": t1_plan, "task_id": t1["id"], "on": t2["id"]},
+        )
+    if action == "dep.remove" and in_plan:
+        raise MeshError(
+            code=c.PLAN_APPROVAL_REQUIRED,
+            exit_code=c.EXIT_APPROVAL_REQUIRED,
+            message=(
+                f"Cannot remove dependency {t1['id']} -> {t2['id']}: required by approved plan '{t1_plan}'. "
+                "Propose a revised plan instead."
+            ),
+            details={"project_id": project_id, "plan_id": t1_plan, "task_id": t1["id"], "on": t2["id"]},
+        )
 
 
 def _dfs_cycle_check(conn: sqlite3.Connection, start_task_id: str, target_task_id: str) -> bool:
@@ -66,7 +135,7 @@ def handle_dep_add(ctx: HandlerContext) -> HandlerResult:
     on_task_id = _require_task_str(raw_on, "on", "Missing prerequisite task id (--on)")
 
     t1 = ctx.conn.execute(
-        "SELECT id, project_id, status FROM tasks WHERE id = ?;",
+        "SELECT id, project_id, status, plan_id, plan_step_key FROM tasks WHERE id = ?;",
         (task_id,),
     ).fetchone()
     if t1 is None:
@@ -90,7 +159,7 @@ def handle_dep_add(ctx: HandlerContext) -> HandlerResult:
         )
 
     t2 = ctx.conn.execute(
-        "SELECT id, project_id, status FROM tasks WHERE id = ?;",
+        "SELECT id, project_id, status, plan_id, plan_step_key FROM tasks WHERE id = ?;",
         (on_task_id,),
     ).fetchone()
     if t2 is None:
@@ -108,6 +177,8 @@ def handle_dep_add(ctx: HandlerContext) -> HandlerResult:
             message="Tasks must belong to the same project",
             details={"task_id": task_id, "on": on_task_id},
         )
+
+    _enforce_plan_dep_immutability(ctx.conn, ctx, project_id, t1, t2, action="dep.add")
 
     # Check for cycle (ACC: F5)
     if _dfs_cycle_check(ctx.conn, task_id, on_task_id):
@@ -176,7 +247,7 @@ def handle_dep_remove(ctx: HandlerContext) -> HandlerResult:
     on_task_id = _require_task_str(raw_on, "on", "Missing prerequisite task id (--on)")
 
     t1 = ctx.conn.execute(
-        "SELECT id, project_id FROM tasks WHERE id = ?;",
+        "SELECT id, project_id, plan_id, plan_step_key FROM tasks WHERE id = ?;",
         (task_id,),
     ).fetchone()
     if t1 is None:
@@ -192,7 +263,7 @@ def handle_dep_remove(ctx: HandlerContext) -> HandlerResult:
     check_authz(ctx.conn, "dep.remove", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id, task_id=task_id)
 
     t2 = ctx.conn.execute(
-        "SELECT id, project_id FROM tasks WHERE id = ?;",
+        "SELECT id, project_id, plan_id, plan_step_key FROM tasks WHERE id = ?;",
         (on_task_id,),
     ).fetchone()
     if t2 is None:
@@ -203,6 +274,7 @@ def handle_dep_remove(ctx: HandlerContext) -> HandlerResult:
             details={"task_id": on_task_id},
         )
 
+    _enforce_plan_dep_immutability(ctx.conn, ctx, project_id, t1, t2, action="dep.remove")
     _require_open_project(ctx.conn, project_id)
 
     del_cur = ctx.conn.execute(

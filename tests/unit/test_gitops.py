@@ -241,3 +241,103 @@ class TestCarbonGitAllowList(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 validate_git_args(["worktree", "remove", flag, "/tmp/worktree"])
         validate_git_args(["worktree", "add", "-b", "topic", "/tmp/worktree", "main"])
+
+
+class TestBundledMinGitFallback(unittest.TestCase):
+    """S10 / P3-8: prefer checksum-pinned bundled MinGit when present; fall back to system git."""
+
+    def test_bundled_mingit_preferred_when_present_and_falls_back_to_system_git(self) -> None:
+        import sys
+        import tempfile
+        from pathlib import Path
+        from mesh.core.gitops import (
+            augment_env_with_bundled_git,
+            bundled_mingit_cmd_dir,
+            resolve_git_binary,
+        )
+
+        with tempfile.TemporaryDirectory(prefix="mh-mingit-") as tmp:
+            root = Path(tmp)
+            py_exe = root / "python" / "python.exe"
+            py_exe.parent.mkdir(parents=True)
+            py_exe.write_text("", encoding="utf-8")
+
+            git_name = "git.exe" if sys.platform == "win32" else "git"
+
+            mingit_cmd = root / "mingit" / "cmd"
+            mingit_cmd.mkdir(parents=True)
+            mingit_git = mingit_cmd / git_name
+            mingit_git.write_text("#!/bin/sh\necho git version 2.56.1\n", encoding="utf-8")
+            os.chmod(mingit_git, 0o755)
+
+            sys_bin = root / "sysbin"
+            sys_bin.mkdir()
+            sys_git = sys_bin / git_name
+            sys_git.write_text("#!/bin/sh\necho git version 2.45.0\n", encoding="utf-8")
+            os.chmod(sys_git, 0o755)
+
+            empty_bin = root / "emptybin"
+            empty_bin.mkdir()
+
+            self.assertEqual(
+                os.path.realpath(bundled_mingit_cmd_dir(executable=str(py_exe)) or ""),
+                os.path.realpath(str(mingit_cmd)),
+            )
+
+            # 1. Bundled MinGit present + system git on PATH -> bundled MinGit wins (prevents PATH hijacking)
+            git_path, src = resolve_git_binary(str(sys_bin), executable=str(py_exe))
+            self.assertEqual(src, "bundled_mingit")
+            self.assertEqual(os.path.realpath(git_path or ""), os.path.realpath(str(mingit_git)))
+            env_sys = {"PATH": str(sys_bin)}
+            aug_sys = augment_env_with_bundled_git(env_sys, executable=str(py_exe))
+            parts = aug_sys["PATH"].split(os.pathsep)
+            self.assertEqual(os.path.realpath(parts[0]), os.path.realpath(str(mingit_cmd)))
+            self.assertEqual(parts[1], str(sys_bin))
+
+            # 2. Calling augment again is idempotent
+            aug_sys2 = augment_env_with_bundled_git(aug_sys, executable=str(py_exe))
+            self.assertEqual(aug_sys2["PATH"], aug_sys["PATH"])
+
+            # 3. Bundled MinGit absent -> falls back to system git on PATH, leaves PATH untouched
+            no_bundle_py = root / "nobundle" / "python" / "python.exe"
+            no_bundle_py.parent.mkdir(parents=True)
+            no_bundle_py.write_text("", encoding="utf-8")
+            git_path2, src2 = resolve_git_binary(str(sys_bin), executable=str(no_bundle_py))
+            self.assertEqual(src2, "system")
+            self.assertEqual(os.path.realpath(git_path2 or ""), os.path.realpath(str(sys_git)))
+            aug_nobundle = augment_env_with_bundled_git(env_sys, executable=str(no_bundle_py))
+            self.assertEqual(aug_nobundle["PATH"], str(sys_bin))
+
+            # 4. Both absent -> missing
+            git_path3, src3 = resolve_git_binary(str(empty_bin), executable=str(no_bundle_py))
+            self.assertIsNone(git_path3)
+            self.assertEqual(src3, "missing")
+
+    def test_win32_run_git_injects_longpaths_without_clobbering_caller_git_config(self) -> None:
+        captured = {}
+
+        def _fake_run_registered(kind, cmd, **kw):
+            captured["cmd"] = cmd
+            captured["env"] = kw.get("env", {})
+            return type("CP", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        base_env = {
+            "PATH": os.environ.get("PATH", ""),
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "user.name",
+            "GIT_CONFIG_VALUE_0": "Tester",
+        }
+        with patch("mesh.core.gitops.sys.platform", "win32"), \
+             patch("mesh.core.gitops.build_external_env", return_value=dict(base_env)), \
+             patch("mesh.core.gitops.resolve_git_binary", return_value=("C:\\Git\\git.exe", "system")), \
+             patch("mesh.daemon.children.run_registered", side_effect=_fake_run_registered):
+            run_git(["rev-parse", "HEAD"], cwd=".")
+
+        env = captured["env"]
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "3")
+        self.assertEqual(env["GIT_CONFIG_KEY_0"], "user.name")
+        self.assertEqual(env["GIT_CONFIG_VALUE_0"], "Tester")
+        self.assertEqual(env["GIT_CONFIG_KEY_1"], "core.fsmonitor")
+        self.assertEqual(env["GIT_CONFIG_VALUE_1"], "false")
+        self.assertEqual(env["GIT_CONFIG_KEY_2"], "core.longpaths")
+        self.assertEqual(env["GIT_CONFIG_VALUE_2"], "true")

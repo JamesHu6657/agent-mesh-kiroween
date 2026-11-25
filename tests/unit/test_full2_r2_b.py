@@ -1,5 +1,6 @@
 """Regression tests for full2-r2.md Group B findings (P1-2, P1-3, P1-5, P1-9)."""
 
+import sys
 import asyncio
 import json
 import os
@@ -26,6 +27,7 @@ from mesh.daemon.handlers import task as task_handlers
 from mesh.daemon.handlers.base import HandlerContext
 from mesh.daemon.server import DaemonServer, dispatch_internal_request
 from mesh.errors import MeshError
+from tests.helpers import fake_peer_creds
 
 MESH_PROC_LOCK = "shared"
 
@@ -126,7 +128,7 @@ async def _send_req(srv: DaemonServer, payload: dict, *, peer_pid: int | None = 
     try:
         with mock.patch(
             "mesh.daemon.server.get_peer_credentials",
-            return_value=(peer_pid if peer_pid is not None else os.getpid(), os.getuid(), os.getgid()),
+            return_value=fake_peer_creds(peer_pid),
         ), mock.patch("mesh.daemon.server.classify_peer_run_session", return_value=None), mock.patch.object(
             srv, "refresh_run_caches"
         ):
@@ -1188,7 +1190,7 @@ class TestP1_9RequestIdAndLogInjection(unittest.TestCase):
             try:
                 with mock.patch(
                     "mesh.daemon.server.get_peer_credentials",
-                    return_value=(os.getpid(), os.getuid(), os.getgid()),
+                    return_value=fake_peer_creds(),
                 ), mock.patch("mesh.daemon.server.classify_peer_run_session", return_value=None), mock.patch.object(
                     self.srv, "refresh_run_caches"
                 ):

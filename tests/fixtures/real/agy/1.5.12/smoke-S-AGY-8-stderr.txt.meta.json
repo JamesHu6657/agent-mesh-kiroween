@@ -1,0 +1,17 @@
+{
+  "captured_at_utc": "2026-11-19T14:09:32Z",
+  "command": [
+    "agy",
+    "--print",
+    "Run the shell command `touch y.txt` in the current directory.",
+    "--output-format",
+    "stream-json",
+    "--model",
+    "gemini-3.8-flash-low",
+    "--mode",
+    "plan",
+    "--print-timeout",
+    "180s"
+  ],
+  "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}

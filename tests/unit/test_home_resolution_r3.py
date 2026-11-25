@@ -17,16 +17,28 @@ import shutil
 import sqlite3
 import struct
 import subprocess
+import sys
 import time
 import unittest
 from typing import Dict, Optional, Tuple
+from urllib.parse import unquote
 
 import mesh.constants as c
 from mesh.core.db import sqlite_uri
-from mesh.core.paths import resolve_home
-from tests.helpers import MeshHarness, rmtree_deep
+from mesh.core.paths import mesh_cli_argv, resolve_home
+from mesh.platform import ipc as plat_ipc, pipe_pump
+from tests.helpers import (
+    MeshHarness,
+    restore_accessible_for_test,
+    rmtree_deep,
+    set_inaccessible_for_test,
+)
 
-RELATIVE_HOMES = ["file:rel", "file:q?mode=memory"]
+RELATIVE_HOMES = (
+    ["file_rel", "file_q_mode=memory"]
+    if sys.platform == "win32"
+    else ["file:rel", "file:q?mode=memory"]
+)
 
 
 def _prod_env() -> dict:
@@ -49,20 +61,34 @@ class _CwdCase(unittest.TestCase):
         env.pop("MESH_HOME", None)  # only --home chooses the home
         if extra_env:
             env.update(extra_env)
-        cmd = [self.h.bin_mesh, "--home", home]
-        fds: Tuple[int, ...] = ()
-        fd = None
-        try:
+        cwd_eff = cwd or self.base
+        if sys.platform == "win32":
+            if self.h._uses_default_bin_mesh():
+                self.h._with_direct_pythonpath(env)
+                cmd = mesh_cli_argv("--home", home)
+            else:
+                cmd = [self.h.bin_mesh, "--home", home]
             if user:
-                fd = os.open(self.h.passphrase_file, os.O_RDONLY)
-                fds = (fd,)
-                cmd += ["--user", "--passphrase-fd", str(fd)]
+                cmd += ["--user", "--passphrase-file", self.h.passphrase_file]
             cmd += list(args)
-            proc = subprocess.run(cmd, cwd=cwd or self.base, env=env, text=True,
-                                  capture_output=True, timeout=timeout, pass_fds=fds)
-        finally:
-            if fd is not None:
-                os.close(fd)
+            if not self.h._uses_default_bin_mesh():
+                cmd = pipe_pump.prepare_win_cmd_args(cmd, env=env)
+            proc = subprocess.run(cmd, cwd=cwd_eff, env=env, text=True, capture_output=True, timeout=timeout)
+        else:
+            cmd = [self.h.bin_mesh, "--home", home]
+            fds: Tuple[int, ...] = ()
+            fd = None
+            try:
+                if user:
+                    fd = os.open(self.h.passphrase_file, os.O_RDONLY)
+                    fds = (fd,)
+                    cmd += ["--user", "--passphrase-fd", str(fd)]
+                cmd += list(args)
+                proc = subprocess.run(cmd, cwd=cwd_eff, env=env, text=True,
+                                      capture_output=True, timeout=timeout, pass_fds=fds)
+            finally:
+                if fd is not None:
+                    os.close(fd)
         try:
             out = json.loads(proc.stdout.strip())
         except ValueError:
@@ -103,18 +129,24 @@ class TestRelativeHomes(_CwdCase):
         self.assertEqual(rc, 0, env)
         env_d = self.h.get_env()
         env_d.pop("MESH_HOME", None)
-        proc = subprocess.Popen([self.h.bin_mesh, "--home", name, "daemon", "run"], cwd=self.base,
+        if sys.platform == "win32" and self.h._uses_default_bin_mesh():
+            self.h._with_direct_pythonpath(env_d)
+            d_cmd = mesh_cli_argv("--home", name, "daemon", "run")
+        else:
+            d_cmd = [self.h.bin_mesh, "--home", name, "daemon", "run"]
+        proc = subprocess.Popen(d_cmd, cwd=self.base,
                                 env=env_d, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
         # Teardown stops it through the absolute path of the same home.
         self.h.home = real
         self.h.daemon_proc = proc
-        sock = os.path.join(real, "run", "mesh.sock")
         deadline = time.monotonic() + 15.0
-        while time.monotonic() < deadline and not os.path.exists(sock):
+        while time.monotonic() < deadline:
+            if plat_ipc.probe_daemon_endpoint(real, timeout=0.2):
+                break
             self.assertIsNone(proc.poll(), "meshd exited early")
             time.sleep(0.05)
-        self.assertTrue(os.path.exists(sock))
+        self.assertTrue(plat_ipc.probe_daemon_endpoint(real))
         rc, env = (None, None)
         while time.monotonic() < deadline:
             rc, env = self.run_cli(name, "whoami", user=True)
@@ -165,7 +197,12 @@ class TestRelativeHomes(_CwdCase):
                 path_part, _, query = uri.partition("?")
                 self.assertEqual(query, "mode=rwc")
                 self.assertTrue(path_part.startswith("file:///"))
-                self.assertIn(self.base.lstrip("/"), path_part)
+                decoded = unquote(path_part[len("file:///"):])
+                base_cmp = self.base.replace(os.sep, "/").lstrip("/")
+                if sys.platform == "win32":
+                    self.assertIn(base_cmp.lower(), decoded.lower())
+                else:
+                    self.assertIn(self.base.lstrip("/"), path_part)
                 self.assertNotIn("?", path_part)
         finally:
             os.chdir(old)
@@ -183,7 +220,7 @@ class TestSymlinkDotDot(_CwdCase):
         self.assertEqual(rc, 0, env)
         rc, env = self.run_cli("a", "init", user=True, extra_env=_prod_env())  # strong
         self.assertEqual(rc, 0, env)
-        os.symlink(os.path.join("..", "b", "child"), os.path.join(self.a, "link"))
+        os.symlink(os.path.join("..", "b", "child"), os.path.join(self.a, "link"), target_is_directory=True)
 
     def test_resolve_home_follows_symlink_before_dotdot(self) -> None:
         self.assertEqual(resolve_home(os.path.join(self.a, "link", "..")), self.b)
@@ -215,8 +252,8 @@ class TestUnreadableHome(_CwdCase):
         home = os.path.join(self.base, "h")
         rc, env = self.run_cli(home, "init", user=True, extra_env=_prod_env())
         self.assertEqual(rc, 0, env)
-        os.chmod(home, 0o000)
-        self.addCleanup(os.chmod, home, 0o700)
+        set_inaccessible_for_test(home)
+        self.addCleanup(restore_accessible_for_test, home)
         for extra in ({}, _prod_env()):
             for args in (("doctor",), ("doctor", "--check-invariants")):
                 with self.subTest(args=args, prod=bool(extra)):
@@ -225,7 +262,11 @@ class TestUnreadableHome(_CwdCase):
                     self.assertFalse(env.get("ok"), env)
                     self.assertNotIn("status", env.get("data") or {})
                     self.assertEqual(env["error"]["code"], c.DB_INTEGRITY_FAILED, env)
-                    self.assertIn("PermissionError", env["error"]["details"]["reason"])
+                    reason = env["error"]["details"]["reason"]
+                    self.assertTrue(
+                        "PermissionError" in reason or (sys.platform == "win32" and "database query failed" in reason),
+                        reason,
+                    )
 
     def test_really_absent_home_is_still_uninitialised(self) -> None:
         rc, env = self.run_cli(os.path.join(self.base, "nope"), "doctor")

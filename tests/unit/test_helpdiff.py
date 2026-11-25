@@ -10,6 +10,7 @@ from pathlib import Path
 from mesh.adapters import helpdiff
 from mesh.adapters.base import RunRequest, is_flag_present
 from mesh.adapters.registry import ADAPTER_CLASSES
+from mesh.platform.paths import temp_root
 
 VENDORS = ("droid", "agy", "kiro", "vibe")
 HELP_FILES = {"droid": ("help.txt", "exec-help.txt"), "agy": ("help.txt",), "kiro": ("help.txt", "chat-help.txt"),
@@ -120,9 +121,9 @@ class EmittedMatrixTest(unittest.TestCase):
 class NewestFixtureDirTest(unittest.TestCase):
     def test_numeric_version_order(self) -> None:
         """ACC: N22 - newest_fixture_dir compares versions numerically and ignores non-version names."""
-        root = Path(tempfile.mkdtemp(prefix="mh-hd-"))
+        root = Path(tempfile.mkdtemp(prefix="mh-hd-", dir=temp_root()))
         self.addCleanup(shutil.rmtree, str(root), True)
-        self.assertTrue(str(root).startswith("/tmp/mh-"))
+        self.assertTrue(str(root).startswith(os.path.join(temp_root(), "mh-")))
         for v in ("1.3.0", "1.9.2", "1.10.0", "notes", "1.10"):
             (root / "droid" / v).mkdir(parents=True)
         (root / "droid" / "2.0.0").write_text("a file, not a dir\n")

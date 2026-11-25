@@ -104,8 +104,9 @@ class TestMergeNote(unittest.TestCase):
         err = io.StringIO()
         with mock.patch.object(task_cmd, "MeshClient", return_value=shower), mock.patch("sys.stderr", err):
             task_cmd._merge_progress_note(client, args, threading.Event())
+        expected_log = os.path.join("/h", "merges", "mrg_1", "test.log")
         self.assertEqual(err.getvalue(),
-                         "mesh: merging tsk_1: running the project's tests if any (log: /h/merges/mrg_1/test.log)...\n")
+                         f"mesh: merging tsk_1: running the project's tests if any (log: {expected_log})...\n")
         self.assertEqual(args.idempotency_key, "k")  # the merge's own args are untouched
 
     def test_no_note_after_the_merge_returned(self) -> None:

@@ -22,9 +22,11 @@ from unittest import mock
 import mesh.constants as c
 from mesh.core.paths import get_install_root
 from mesh.daemon import children, merge, terminate
+from mesh.platform.paths import strip_trailing_seps
+from tests.helpers import assert_private_mode
 from tests.integration import test_merge as tm
 
-K0_TESTS = '["python3","-m","unittest"]'
+K0_TESTS = json.dumps([sys.executable, "-m", "unittest"])
 
 BROKEN_CALC = "def add(a, b):\n    return a - b\n"
 
@@ -106,11 +108,11 @@ class TestMergeTests(unittest.TestCase):
         run = runs[0]
         self.assertIn(f"ENV-PROBE-OK {run['id']}", text)  # stdout
         self.assertIn("Ran 2 tests", text)                 # unittest writes this to stderr
-        self.assertEqual(oct(os.stat(log).st_mode & 0o777), oct(0o600))
+        assert_private_mode(self, log, is_dir=False, posix_mode=0o600)
         self.assertEqual(run["status"], "exited")
         self.assertEqual(run["end_reason"], "merged")
         self.assertIsNotNone(run["wrapper_pid"])
-        self.assertEqual(run["run_dir"].rstrip("/"), os.path.dirname(log))
+        self.assertEqual(strip_trailing_seps(run["run_dir"]), os.path.dirname(log))
         self.assertEqual(terminate.run_targets(run["id"], None, None), {})
         self.assert_no_merge_lease(prj)
         self.assert_remote_unchanged()
@@ -198,7 +200,16 @@ class TestRunTestStep(unittest.TestCase):
 
     def test_timeout_terminates_group_and_escapee(self) -> None:
         """ACC: K7 (timeout clause) - 1 s limit, a sleeping command plus a setsid escapee: both terminated, timeout reported."""
-        p = self.plan(["sh", "-c", "setsid sleep 60 & echo started; sleep 60"], timeout_s=1)
+        script = (
+            "import subprocess, sys, time\n"
+            "kw = {'creationflags': subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP} "
+            "if sys.platform == 'win32' else {'start_new_session': True}\n"
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)\n"
+            "print('started', flush=True)\n"
+            "time.sleep(60)\n"
+        )
+        p = self.plan([sys.executable, "-c", script], timeout_s=1)
         t0 = time.monotonic()
         out = merge.run_test_step(p)
         elapsed = time.monotonic() - t0

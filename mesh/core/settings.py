@@ -2,12 +2,15 @@
 
 import os
 import stat
+import sys
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import mesh.constants as c
 from mesh.errors import MeshError
 from mesh.core.paths import check_install_path_secure, get_install_root, is_path_equal_or_parent
 from mesh.core.policy import parse_positive_int
+from mesh.platform import perms
+from mesh.platform.paths import is_reparse_link, norm_cmp, strip_trailing_seps
 
 PROFILES = {"readonly", "edit", "dev", "elevated", "unrestricted"}
 
@@ -28,6 +31,8 @@ APPROVAL_CATEGORIES = {
     "deploy": "direct_or_relayed",
     "delete_external": "direct_or_relayed",
     "external_other": "direct_or_relayed",
+    "plan_dispatch": "direct_only",
+    "step_dispatch": "direct_only",
 }
 
 
@@ -44,8 +49,11 @@ def get_default_settings(home: str, testing_mode: Optional[bool] = None) -> Dict
     defaults: Dict[str, Any] = {
         "lead.default_agent": None,
         "lead.wake_debounce_s": 5,
+        "lead.chat_wake_debounce_s": 0,
         "lead.profile": "readonly",
         "lead.turn_timeout_s": 1800,
+        "lead.vendor_leads": False,
+        "project.default_plan_gate": "off",
         "scheduler.max_total_runs": None,
         "workspaces.root": os.path.join(home, "workspaces"),
         "task.default_timeout_s": 3600,
@@ -87,6 +95,7 @@ def get_default_settings(home: str, testing_mode: Optional[bool] = None) -> Dict
 #: word for them (`lead.default_agent lead1`), see `string_setting`.
 STRING_SETTING_KEYS = frozenset({
     "lead.default_agent", "lead.profile", "workspaces.root", "adapter.evidence_mode", "approval.mode",
+    "project.default_plan_gate",
 })
 
 
@@ -287,11 +296,11 @@ def validate_setting(
         )
         home_real = os.path.realpath(home)
         default_ws_real = os.path.join(home_real, "workspaces")
-        val_clean = val.rstrip(os.sep) or os.sep
+        val_clean = strip_trailing_seps(val)
         sym_anc: Optional[str] = None
         cur = os.path.abspath(val_clean)
         while True:
-            if os.path.islink(cur):
+            if is_reparse_link(cur):
                 sym_anc = cur
                 break
             parent = os.path.dirname(cur)
@@ -299,7 +308,8 @@ def validate_setting(
                 break
             cur = parent
         if sym_anc is not None or (
-            os.path.abspath(val_clean) == default_ws_real and os.path.islink(default_ws_real)
+            norm_cmp(os.path.abspath(val_clean)) == norm_cmp(default_ws_real)
+            and is_reparse_link(default_ws_real)
         ):
             raise MeshError(
                 code=c.INVALID_SETTING,
@@ -308,7 +318,7 @@ def validate_setting(
                 details={"key": key, "got": val, "symlink": sym_anc or default_ws_real},
             )
         val_real = os.path.realpath(val)
-        if (val_real != default_ws_real or os.path.islink(default_ws_real)) and (
+        if (norm_cmp(val_real) != norm_cmp(default_ws_real) or is_reparse_link(default_ws_real)) and (
             is_path_equal_or_parent(home_real, val_real)
             or is_path_equal_or_parent(val_real, home_real)
         ):
@@ -346,20 +356,37 @@ def validate_setting(
                 message=f"Path for setting '{key}' is not a directory: '{val}'",
                 details={"key": key, "expected": "existing directory", "got": val},
             )
-        if st.st_uid != os.getuid():
-            raise MeshError(
-                code=c.INVALID_SETTING,
-                exit_code=c.EXIT_USAGE,
-                message=f"Directory for setting '{key}' is not owned by current uid",
-                details={"key": key, "expected": f"owner uid {os.getuid()}", "got": st.st_uid},
-            )
-        if (st.st_mode & 0o077) != 0:
-            raise MeshError(
-                code=c.INVALID_SETTING,
-                exit_code=c.EXIT_USAGE,
-                message=f"Directory for setting '{key}' must have mode 0700",
-                details={"key": key, "expected": "0700", "got": oct(stat.S_IMODE(st.st_mode))},
-            )
+        if sys.platform == "win32":
+            try:
+                perms.verify_private_owner_and_perms(
+                    val,
+                    is_dir=True,
+                    label=val,
+                    error_code=c.INVALID_SETTING,
+                    exit_code=c.EXIT_USAGE,
+                )
+            except OSError as exc:
+                raise MeshError(
+                    code=c.INVALID_SETTING,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Directory for setting '{key}' cannot be verified safely: {exc.strerror or exc}",
+                    details={"key": key, "expected": "existing private directory", "got": val},
+                ) from exc
+        else:
+            if st.st_uid != os.getuid():
+                raise MeshError(
+                    code=c.INVALID_SETTING,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Directory for setting '{key}' is not owned by current uid",
+                    details={"key": key, "expected": f"owner uid {os.getuid()}", "got": st.st_uid},
+                )
+            if (st.st_mode & 0o077) != 0:
+                raise MeshError(
+                    code=c.INVALID_SETTING,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Directory for setting '{key}' must have mode 0700",
+                    details={"key": key, "expected": "0700", "got": oct(stat.S_IMODE(st.st_mode))},
+                )
         return val_real
 
     # 5. notify.command (JSON argv array of strings or null)
@@ -397,8 +424,19 @@ def validate_setting(
             )
         return val
 
-    # 5d. approval.delegated_self_approve (bool)
-    if key == "approval.delegated_self_approve":
+    # 5c2. project.default_plan_gate
+    if key == "project.default_plan_gate":
+        if val not in ("off", "require_approval"):
+            raise MeshError(
+                code=c.INVALID_SETTING,
+                exit_code=c.EXIT_USAGE,
+                message=f"Setting '{key}' must be \"off\" or \"require_approval\"",
+                details={"key": key, "expected": ["off", "require_approval"], "got": val},
+            )
+        return val
+
+    # 5d. approval.delegated_self_approve and lead.vendor_leads (bool)
+    if key in ("approval.delegated_self_approve", "lead.vendor_leads"):
         if not isinstance(val, bool):
             raise MeshError(
                 code=c.INVALID_SETTING,
@@ -411,12 +449,12 @@ def validate_setting(
     # 6. approval.policy.<category>
     if key.startswith("approval.policy."):
         cat = key.split(".", 2)[2]
-        if cat == "config":
+        if cat in ("config", "plan_dispatch", "step_dispatch"):
             if val != "direct_only":
                 raise MeshError(
                     code=c.INVALID_SETTING,
                     exit_code=c.EXIT_USAGE,
-                    message="Policy for 'config' is fixed to 'direct_only' and cannot be changed",
+                    message=f"Policy for '{cat}' is fixed to 'direct_only' and cannot be changed",
                     details={"key": key, "expected": "direct_only", "got": val},
                 )
             return "direct_only"
@@ -486,6 +524,7 @@ def validate_setting(
 
     int_ranges: Dict[str, Tuple[int, int]] = {
         "lead.wake_debounce_s": (0 if testing else 0, 3600),
+        "lead.chat_wake_debounce_s": (0, 3600),
         "lead.turn_timeout_s": (1 if testing else 60, 86400),
         "task.default_timeout_s": (1 if testing else 60, 604800),
         "task.max_attempts_cap": (1, 100),

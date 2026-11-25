@@ -27,6 +27,8 @@ from typing import Any, Optional
 
 from mesh import constants as c
 from mesh.errors import MeshError
+from mesh.platform import perms
+from mesh.platform.fs import open_regular_nofollow
 
 ENV_PASSPHRASE = "MESH_PASSPHRASE"
 ENV_PASSPHRASE_FILE = "MESH_PASSPHRASE_FILE"
@@ -64,41 +66,82 @@ def _read_fd(fd: int) -> str:
 
 def _read_file(path: str, source: str) -> str:
     path = os.path.expanduser(path)
-    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
-    try:
-        fd = os.open(path, flags)
-    except OSError as exc:
-        msg = (
-            f"Passphrase file {path} ({source}) cannot be a symlink"
-            if exc.errno == errno.ELOOP
-            else f"Cannot read passphrase file {path} ({source}): {exc.strerror or exc}"
-        )
-        raise MeshError(
-            code=c.INVALID_ARGUMENT,
-            exit_code=c.EXIT_USAGE,
-            message=msg,
-            details={"path": path, "source": source},
-        ) from exc
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
+    if sys.platform == "win32":
+        try:
+            fd = open_regular_nofollow(path, os.O_RDONLY, label="passphrase file")
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                msg = f"Passphrase file {path} ({source}) cannot be a symlink"
+            elif exc.errno in (errno.EINVAL, errno.EISDIR):
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Passphrase file {path} ({source}) is not a regular file",
+                    details={"path": path, "source": source},
+                ) from exc
+            else:
+                msg = f"Cannot read passphrase file {path} ({source}): {exc.strerror or exc}"
             raise MeshError(
                 code=c.INVALID_ARGUMENT,
                 exit_code=c.EXIT_USAGE,
-                message=f"Passphrase file {path} ({source}) is not a regular file",
+                message=msg,
                 details={"path": path, "source": source},
+            ) from exc
+        try:
+            try:
+                perms.verify_private_owner_and_perms(
+                    fd,
+                    is_dir=False,
+                    label=path,
+                    error_code=c.INSECURE_PERMISSIONS,
+                    exit_code=c.EXIT_USAGE,
+                )
+            except OSError as exc:
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Passphrase file {path} ({source}) is not a regular file",
+                    details={"path": path, "source": source},
+                ) from exc
+        except BaseException:
+            os.close(fd)
+            raise
+    else:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+        try:
+            fd = os.open(path, flags)
+        except OSError as exc:
+            msg = (
+                f"Passphrase file {path} ({source}) cannot be a symlink"
+                if exc.errno == errno.ELOOP
+                else f"Cannot read passphrase file {path} ({source}): {exc.strerror or exc}"
             )
-        if st.st_uid != os.getuid() or st.st_mode & 0o077:
             raise MeshError(
-                code=c.INSECURE_PERMISSIONS,
+                code=c.INVALID_ARGUMENT,
                 exit_code=c.EXIT_USAGE,
-                message=(f"Passphrase file {path} ({source}) must be owned by you with mode 0600 "
-                         f"(run: chmod 600 {path})"),
-                details={"path": path, "source": source, "mode": oct(stat.S_IMODE(st.st_mode))},
-            )
-    except BaseException:
-        os.close(fd)
-        raise
+                message=msg,
+                details={"path": path, "source": source},
+            ) from exc
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Passphrase file {path} ({source}) is not a regular file",
+                    details={"path": path, "source": source},
+                )
+            if st.st_uid != os.getuid() or st.st_mode & 0o077:
+                raise MeshError(
+                    code=c.INSECURE_PERMISSIONS,
+                    exit_code=c.EXIT_USAGE,
+                    message=(f"Passphrase file {path} ({source}) must be owned by you with mode 0600 "
+                             f"(run: chmod 600 {path})"),
+                    details={"path": path, "source": source, "mode": oct(stat.S_IMODE(st.st_mode))},
+                )
+        except BaseException:
+            os.close(fd)
+            raise
     with os.fdopen(fd, "r", encoding="utf-8", errors="strict") as f:
         try:
             content = f.read(MAX_PASSPHRASE_BYTES + 1)
@@ -119,11 +162,34 @@ def _read_file(path: str, source: str) -> str:
     return content.rstrip("\r\n")
 
 
+def _win_stdin_is_console() -> bool:
+    """Return True iff fd 0 on Windows is backed by a real console input buffer."""
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetStdHandle.argtypes = [wintypes.DWORD]
+        k32.GetStdHandle.restype = wintypes.HANDLE
+        k32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k32.GetConsoleMode.restype = wintypes.BOOL
+        h_in = k32.GetStdHandle(wintypes.DWORD(-10))
+        if not h_in or h_in == wintypes.HANDLE(-1).value:
+            return False
+        mode = wintypes.DWORD(0)
+        return bool(k32.GetConsoleMode(h_in, ctypes.byref(mode)))
+    except Exception:
+        return False
+
+
 def _prompt(prompt: str) -> str:
     try:
-        if os.isatty(0):
+        if os.isatty(0) and _win_stdin_is_console():
             return getpass.getpass(prompt)
-        with open("/dev/tty", "r"):
+        tty_path = "CONIN$" if sys.platform == "win32" else "/dev/tty"
+        with open(tty_path, "r"):
             pass
         return getpass.getpass(prompt, stream=sys.stderr)
     except Exception:

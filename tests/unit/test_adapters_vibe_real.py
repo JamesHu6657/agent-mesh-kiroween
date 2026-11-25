@@ -13,6 +13,7 @@ import unittest
 
 from mesh.adapters.base import RunResult
 from mesh.adapters.vibe import VibeAdapter
+from mesh.platform.paths import temp_root
 from tests import tierlib
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -48,8 +49,8 @@ class VibeParseBase(unittest.TestCase):
         self.vibe = VibeAdapter()
 
     def run_dir(self, stdout_bytes=None, export_bytes=None) -> str:
-        d = tempfile.mkdtemp(prefix="mh-vibeparse-", dir="/tmp")
-        self.assertTrue(d.startswith("/tmp/mh-"), d)
+        d = tempfile.mkdtemp(prefix="mh-vibeparse-", dir=temp_root())
+        self.assertTrue(d.startswith(os.path.join(temp_root(), "mh-")), d)
         self.addCleanup(shutil.rmtree, d, True)
         if stdout_bytes is not None:
             with open(os.path.join(d, "stdout.log"), "wb") as f:
@@ -136,7 +137,7 @@ class TestVibeParseRobust(VibeParseBase):
         self.assertEqual(res.vendor_exit_meaning, "run_error")
 
     def test_missing_run_dir(self):
-        res = self.vibe.parse("/tmp/mh-vibeparse-does-not-exist-xyz")
+        res = self.vibe.parse(os.path.join(temp_root(), "mh-vibeparse-does-not-exist-xyz"))
         self.assertEqual(res.final_text, "")
         self.assertIsNone(res.session_id)
         self.assertEqual(res.usage, {"error": "no export"})

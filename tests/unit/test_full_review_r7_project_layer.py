@@ -23,7 +23,7 @@ class ProjectLayerTest(unittest.TestCase):
         self.root = os.path.realpath(self._tmp.name)
         self.home = os.path.join(self.root, "home")
         os.makedirs(self.home)
-        self._env = mock.patch.dict(os.environ, {"HOME": self.home})
+        self._env = mock.patch.dict(os.environ, {"HOME": self.home, "USERPROFILE": self.home})
         self._env.start()
         # A task worktree: its `.git` is a file, so it is its own git root.
         self.ws = os.path.join(self.root, "workspaces", "prj_x", "tasks", "tsk_x")

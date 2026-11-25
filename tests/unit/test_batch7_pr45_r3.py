@@ -18,6 +18,8 @@ from mesh.daemon import merge, recovery
 from mesh.daemon.handlers import run as run_handlers
 from mesh.daemon.handlers.approval import handle_approval_approve
 from mesh.daemon.handlers.base import HandlerContext
+from tests.gitfixture import GitFixture
+from tests.helpers import restore_accessible_for_test, set_inaccessible_for_test
 from mesh.daemon.handlers.run import (
     _prune_skip_reason,
     execute_workspace_prune_plan,
@@ -410,7 +412,8 @@ class TestP1_2GitlinkAndPreMergeSnapshots(unittest.TestCase):
         self.assertIs(res.get("restored"), True, res)
         self.assertTrue(os.path.isdir(os.path.join(self.repo, "vendor_sub")))
         self.assertTrue(os.path.isfile(sub_file))
-        self.assertEqual(os.stat(nested_dir).st_mode & 0o777, 0o555)
+        if sys.platform != "win32":
+            self.assertEqual(os.stat(nested_dir).st_mode & 0o777, 0o555)
         self.assertTrue(self.fixture.is_clean(self.repo))
 
     def test_task_adds_new_gitlink_and_passing_tests_preserves_gitlink(self) -> None:
@@ -483,8 +486,8 @@ class TestP2_1MergeAbortCrashWindowRecovery(unittest.TestCase):
         os.makedirs(top000, mode=0o700)
         with open(os.path.join(top000, "f"), "w", encoding="utf-8") as f:
             f.write("locked\n")
-        os.chmod(top000, 0o000)
-        self.addCleanup(lambda: os.path.isdir(top000) and os.chmod(top000, 0o700))
+        set_inaccessible_for_test(top000)
+        self.addCleanup(lambda: os.path.isdir(top000) and restore_accessible_for_test(top000))
         os.makedirs(os.path.join(self.repo, "crash_empty"), mode=0o700)
 
         self.assertFalse(self.fixture.has_merge_head(self.repo))

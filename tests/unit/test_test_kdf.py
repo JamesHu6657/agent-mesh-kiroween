@@ -12,6 +12,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -227,7 +228,7 @@ class TestInitGate(unittest.TestCase):
                 self.assertNotIn("testing", params)
 
     def test_testing_init_on_default_home_refused(self) -> None:
-        with mock.patch.dict(os.environ, {"HOME": self.tmp, "MESH_TESTING": "1"}):
+        with mock.patch.dict(os.environ, {"HOME": self.tmp, "USERPROFILE": self.tmp, "MESH_TESTING": "1"}):
             default = os.path.join(self.tmp, ".agent-mesh")
             with self.assertRaises(MeshError) as cm:
                 init_mesh_home(default, PASS)
@@ -235,10 +236,14 @@ class TestInitGate(unittest.TestCase):
             self.assertEqual(cm.exception.exit_code, c.EXIT_USAGE)
             self.assertIn("default home", cm.exception.message)
             self.assertFalse(os.path.exists(default))
-            # Same refusal through a symlink to the default home.
+            # Same refusal through a symlink / Win32 junction to the default home.
             os.makedirs(default, mode=0o700)
             link = os.path.join(self.tmp, "alias")
-            os.symlink(default, link)
+            if sys.platform == "win32":
+                import _winapi
+                _winapi.CreateJunction(default, link)
+            else:
+                os.symlink(default, link)
             with self.assertRaises(MeshError):
                 init_mesh_home(link, PASS)
             self.assertFalse(os.path.exists(os.path.join(default, "mesh.db")))
@@ -255,7 +260,7 @@ class TestInitGate(unittest.TestCase):
     def test_testing_init_on_alias_by_identity_refused(self) -> None:
         # A second path to the default home that realpath cannot see (bind mount);
         # simulated by making os.stat report the default home's (st_dev, st_ino).
-        with mock.patch.dict(os.environ, {"HOME": self.tmp, "MESH_TESTING": "1"}):
+        with mock.patch.dict(os.environ, {"HOME": self.tmp, "USERPROFILE": self.tmp, "MESH_TESTING": "1"}):
             default = os.path.join(self.tmp, ".agent-mesh")
             os.makedirs(default, mode=0o700)
             alias = os.path.join(self.tmp, "bind-alias")
@@ -275,7 +280,7 @@ class TestInitGate(unittest.TestCase):
     def test_testing_init_on_alias_of_parent_refused(self) -> None:
         # Neither home exists yet: an alias of the default home's PARENT plus the same
         # basename is the default home too (parent identity + basename).
-        with mock.patch.dict(os.environ, {"HOME": self.tmp, "MESH_TESTING": "1"}):
+        with mock.patch.dict(os.environ, {"HOME": self.tmp, "USERPROFILE": self.tmp, "MESH_TESTING": "1"}):
             other_parent = os.path.join(self.tmp, "mnt")
             os.makedirs(other_parent, mode=0o700)
             candidate = os.path.join(other_parent, ".agent-mesh")
@@ -287,7 +292,7 @@ class TestInitGate(unittest.TestCase):
                 self.assertFalse(mesh_paths.is_default_home(os.path.join(other_parent, "mh")))
             self.assertFalse(os.path.exists(candidate))
 
-    @unittest.skipUnless(os.geteuid() == 0 and shutil.which("mount"), "bind mount needs root")
+    @unittest.skipUnless(sys.platform != "win32" and os.geteuid() == 0 and shutil.which("mount"), "bind mount needs root")
     def test_testing_init_on_real_bind_mount_refused(self) -> None:  # pragma: no cover - root only
         with mock.patch.dict(os.environ, {"HOME": self.tmp, "MESH_TESTING": "1"}):
             default = os.path.join(self.tmp, ".agent-mesh")
@@ -303,7 +308,7 @@ class TestInitGate(unittest.TestCase):
                 subprocess.run(["umount", alias])
 
     def test_default_home_without_testing_is_production(self) -> None:
-        env = dict(_env_without_testing(), HOME=self.tmp)
+        env = dict(_env_without_testing(), HOME=self.tmp, USERPROFILE=self.tmp)
         with mock.patch.dict(os.environ, env, clear=True):
             default = os.path.join(self.tmp, ".agent-mesh")
             init_mesh_home(default, PASS)

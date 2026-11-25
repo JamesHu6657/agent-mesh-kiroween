@@ -4,6 +4,7 @@ import json
 import math
 import os
 import sqlite3
+import sys
 from typing import Any, Dict, List, Optional
 
 from mesh.adapters.base import (
@@ -26,6 +27,9 @@ from mesh.adapters.base import (
     validate_adapter_options,
     validate_run_request_tokens,
 )
+from mesh.platform import fs as _plat_fs
+from mesh.platform import paths as _plat_paths
+from mesh.platform import perms as _plat_perms
 
 
 class VibeAdapter(Adapter):
@@ -33,9 +37,15 @@ class VibeAdapter(Adapter):
 
     id = "vibe"
     kind = "vendor"
+    supported_profiles = ("readonly", "edit", "dev", "unrestricted")
     binary_names = ["vibe"]
     planned_version = "3.1.0"
     verified_version = "3.1.0"
+    model_presets = {
+        "chips": ["mistral-medium-3.5"],
+        "default_allowed": ["mistral-medium-3.5"],
+        "note": "Vibe 3.1.0 内置别名为 mistral-medium-3.5；其他模型名必须是 ~/.vibe/config.toml 中 [[models]] 定义的别名（可在 vibe 中用 /model 查看）",
+    }
     liveness = "stream"
     max_argv_prompt_bytes = 100_000
     launch_enabled = False
@@ -366,10 +376,15 @@ _EXPORT_NOT_OBJECT = object()
 _MAX_VIBE_FILE_BYTES = 50 * 1024 * 1024
 
 
+def _unlink_nonregular(path: str) -> None:
+    """Remove an unexpected file, symlink, or NTFS directory junction."""
+    _plat_fs.unlink_nonregular(path)
+
+
 def _redact_output_dir(out_dir: str) -> None:
     """Full review r5 P1-4 / r6 P1-5: vibe writes ``--output-dir`` itself (not through
     runwrap), so all files under it are redacted recursively in place with full JSONL
-    rules; symlinks (including ``vibe-out`` itself) and unrewritable files are unlinked."""
+    rules; symlinks/junctions (including ``vibe-out`` itself) and unrewritable files are unlinked."""
     import stat
     import tempfile
     from mesh.core.paths import resolve_trusted_path
@@ -377,8 +392,8 @@ def _redact_output_dir(out_dir: str) -> None:
 
     if not isinstance(out_dir, str) or not out_dir.strip():
         return
-    out_clean = out_dir.rstrip(os.sep)
-    if not out_clean:
+    out_clean = _plat_paths.strip_trailing_seps(out_dir)
+    if not out_clean or _plat_paths.is_fs_root(out_clean):
         return
     try:
         st_top = os.lstat(out_clean)
@@ -386,9 +401,9 @@ def _redact_output_dir(out_dir: str) -> None:
         return
     except OSError:
         return
-    if stat.S_ISLNK(st_top.st_mode) or not stat.S_ISDIR(st_top.st_mode):
+    if _plat_paths.is_reparse_stat(st_top) or not stat.S_ISDIR(st_top.st_mode):
         try:
-            os.unlink(out_clean)
+            _unlink_nonregular(out_clean)
         except OSError:
             pass
         return
@@ -399,36 +414,35 @@ def _redact_output_dir(out_dir: str) -> None:
     )
     if trusted_out is None:
         return
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
-        os.chmod(trusted_out, 0o700)
+        _plat_perms.set_private_dir_acl(trusted_out, 0o700)
     except OSError:
         pass
     for dirpath, dirnames, _ in os.walk(trusted_out, topdown=True, followlinks=False):
-        if dirpath != trusted_out and resolve_trusted_path(dirpath, root=trusted_out) is None:
+        if not _plat_paths.same_path(dirpath, trusted_out) and resolve_trusted_path(dirpath, root=trusted_out) is None:
             dirnames[:] = []
             continue
         for dname in list(dirnames):
             dpath = os.path.join(dirpath, dname)
-            if os.path.islink(dpath):
+            if _plat_paths.is_reparse_link(dpath):
                 try:
-                    os.unlink(dpath)
+                    _unlink_nonregular(dpath)
                 except OSError:
                     pass
                 dirnames.remove(dname)
                 continue
             try:
-                os.chmod(dpath, 0o700)
+                _plat_perms.set_private_dir_acl(dpath, 0o700)
             except OSError:
                 pass
     for dirpath, dirnames, filenames in os.walk(trusted_out, topdown=False, followlinks=False):
-        if dirpath != trusted_out and resolve_trusted_path(dirpath, root=trusted_out) is None:
+        if not _plat_paths.same_path(dirpath, trusted_out) and resolve_trusted_path(dirpath, root=trusted_out) is None:
             continue
         for dname in dirnames:
             dpath = os.path.join(dirpath, dname)
             try:
-                if os.path.islink(dpath):
-                    os.unlink(dpath)
+                if _plat_paths.is_reparse_link(dpath):
+                    _unlink_nonregular(dpath)
             except OSError:
                 pass
         for name in filenames:
@@ -436,8 +450,8 @@ def _redact_output_dir(out_dir: str) -> None:
             tmp = None
             try:
                 lst = os.lstat(path)
-                if stat.S_ISLNK(lst.st_mode) or not stat.S_ISREG(lst.st_mode):
-                    os.unlink(path)
+                if _plat_paths.is_reparse_stat(lst) or not stat.S_ISREG(lst.st_mode):
+                    _unlink_nonregular(path)
                     continue
                 if lst.st_size > _MAX_VIBE_FILE_BYTES:
                     os.unlink(path)
@@ -454,13 +468,13 @@ def _redact_output_dir(out_dir: str) -> None:
                     tfd, tmp = tempfile.mkstemp(dir=dirpath, prefix=f".{name}.redact.")
                     with os.fdopen(tfd, "w", encoding="utf-8") as wf:
                         wf.write(red)
-                    os.chmod(tmp, 0o600)
-                    if os.path.islink(path):
+                    _plat_perms.chmod_private(tmp, 0o600)
+                    if _plat_paths.is_reparse_link(path):
                         os.unlink(tmp)
                         tmp = None
-                        os.unlink(path)
+                        _unlink_nonregular(path)
                         continue
-                    os.replace(tmp, path)
+                    _plat_fs.atomic_replace(tmp, path)
                     tmp = None
             except Exception:  # noqa: BLE001 - fail closed
                 if tmp is not None:
@@ -469,12 +483,19 @@ def _redact_output_dir(out_dir: str) -> None:
                     except OSError:
                         pass
                 try:
-                    os.chmod(dirpath, 0o700)
-                    os.unlink(path)
+                    _plat_perms.set_private_dir_acl(dirpath, 0o700)
+                    _unlink_nonregular(path)
                 except OSError:
                     try:
-                        os.chmod(path, 0o600)
-                        tfd = os.open(path, os.O_WRONLY | os.O_TRUNC | nofollow)
+                        _plat_perms.chmod_private(path, 0o600)
+                        if sys.platform == "win32":
+                            try:
+                                os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+                            except OSError:
+                                pass
+                        tfd = _plat_fs.open_regular_nofollow(
+                            path, os.O_WRONLY | os.O_TRUNC, label="vibe output file"
+                        )
                         os.close(tfd)
                     except OSError:
                         pass
@@ -484,13 +505,15 @@ def _read_export(path: str) -> Any:
     """vibe-out/export.json as a dict; None if missing, unreadable or not valid JSON;
     _EXPORT_NOT_OBJECT if it is valid JSON but not an object.
 
-    Opened as utf-8-sig so a leading BOM is stripped. Symlinks and non-regular files are rejected.
+    Opened as utf-8-sig so a leading BOM is stripped. Symlinks/junctions and non-regular files are rejected.
     """
     if not isinstance(path, str) or not path.strip():
         return None
-    clean = path.rstrip(os.sep)
+    clean = _plat_paths.strip_trailing_seps(path)
+    if not clean or _plat_paths.is_fs_root(clean):
+        return None
     parent = os.path.dirname(clean)
-    if (parent and os.path.islink(parent)) or os.path.islink(clean):
+    if (parent and _plat_paths.is_reparse_link(parent)) or _plat_paths.is_reparse_link(clean):
         return None
     try:
         with open_run_file_nofollow(

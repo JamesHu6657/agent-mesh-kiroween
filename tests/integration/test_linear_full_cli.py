@@ -13,6 +13,7 @@ import tempfile
 import unittest
 
 import mesh.constants as c
+from mesh.platform import pipe_pump
 from tests.integration import test_merge as tm
 
 
@@ -29,9 +30,11 @@ class TestLinearFullCli(unittest.TestCase):
     def test_c1_dry_run_refused(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             home = os.path.join(d, "h")
-            cp = subprocess.run([self.harness.bin_mesh, "--home", home, "init", "--dry-run"],
+            env_c1 = {**os.environ, "MESH_TESTING": "1"}
+            cmd_c1 = pipe_pump.prepare_win_cmd_args([self.harness.bin_mesh, "--home", home, "init", "--dry-run"], env=env_c1)
+            cp = subprocess.run(cmd_c1,
                                 capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
-                                env={**os.environ, "MESH_TESTING": "1"})
+                                env=env_c1)
             self.assertEqual(cp.returncode, c.EXIT_USAGE, cp.stdout + cp.stderr)
             self.assertFalse(os.path.exists(os.path.join(home, "mesh.db")))
         rc, resp = self.harness.cli("doctor", "--fix-perms", "--dry-run", user=True)

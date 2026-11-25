@@ -5,15 +5,24 @@ A stub ``agy`` written under /tmp/mh-smoke-a-* prints lines in the agy 1.5.3
 conversation_id / model / cwd, the ``user_input`` and ``agent_response`` step_update events,
 a ``tool`` step that ends in state ERROR as in stream-fixC-denied.jsonl, the ``result`` event,
 and the ``AGY_ERROR: {json}`` stderr line of stream-step6-network-error-stderr.txt). It reacts
-to the argv AgyAdapter.build() makes. agy 1.5.3 left ``result.response`` empty and put no text
+to the argv AgyAdapter.build() makes and reads its prompt as agy 1.5.12 does: the argv item
+directly after ``--print``. An item there that starts with ``--`` gets the real 1.5.12 stderr
+(``--print took "<item>" as its prompt ...``) and exit 2 with no output, as every run of the
+first real 1.5.12 smoke attempt of 2026-11-19 did (rc 2; results and captures in 44cca5c).
+agy 1.5.3 left ``result.response`` empty and put no text
 on any ``agent_response`` step in every real capture. By default the stub fills
 ``result.response`` via ``stub_agy_response_hypothetical()`` so the R1 pass path can be exercised:
-that is HYPOTHETICAL behaviour no real fixture shows. ``STUB_SHAPE=real_1_5_3`` mirrors the real
-shape (response "", reply text nowhere) and AgyRealShapeTest pins what S-X-1 records then.
+no real 1.5.3 fixture shows that, hence the name. The real 1.5.12 rerun does: its S-X-1 capture
+(tests/fixtures/real/agy/1.5.12/smoke-S-X-1-stdout.jsonl) has the reply token in
+``result.response`` and as ``text_delta`` on the ``agent_response`` steps, and S-X-1 passed
+(Agy1512RealCaptureTest; more in test_agy_1_5_12_evidence.py). ``STUB_SHAPE=real_1_5_3`` mirrors
+the real 1.5.3 shape (response "", reply text nowhere) and AgyRealShapeTest pins what S-X-1
+records then.
 Every env is a dict;
 os.environ never gets MESH_SMOKE* or MESH_PROBE*. No real vendor binary runs.
 """
 
+import sys
 import io
 import json
 import os
@@ -46,7 +55,11 @@ if "--print" not in args:
 def opt(name):
     return args[args.index(name) + 1] if name in args else None
 mode = os.environ.get("STUB_MODE", "ok")
-prompt = args[-1]
+prompt = opt("--print") or ""
+if prompt.startswith("--"):
+    sys.stderr.write("Error: --print took " + json.dumps(prompt) + " as its prompt, so the intended prompt was left as an argument and ignored.\n")
+    sys.stderr.write("Attach the prompt to the flag (--print='your prompt') and move " + prompt + " elsewhere on the command line.\n")
+    sys.exit(2)
 cid = opt("--conversation") or "agy-stub-conv-5"
 def emit(obj):
     print(json.dumps(obj), flush=True)
@@ -69,7 +82,8 @@ if mode == "no_result":
     sys.stderr.write('AGY_ERROR: {"short_error":"agent executor error: generating and executing: request failed: net/http: cannot rewind body after connection loss","status":"UNKNOWN","error_code":2,"code_kind":"grpc","retryable":false,"error_id":"stub-101"}\n')
     sys.exit(0)
 def stub_agy_response_hypothetical(text):
-    # HYPOTHETICAL: real agy 1.5.3 captures all have result.response "" (impl-notes-m3-agyparse.md).
+    # HYPOTHETICAL for 1.5.3: its real captures all have result.response "" (impl-notes-m3-agyparse.md).
+    # Real agy 1.5.12 fills it (tests/fixtures/real/agy/1.5.12/smoke-S-X-1-stdout.jsonl).
     return text
 denied = []
 response = "MESH_SMOKE_OK"
@@ -100,6 +114,7 @@ sys.exit(0)
 '''
 
 
+@unittest.skipUnless(sys.platform != "win32", 'Smoke harness (tests/smoke/harness.py) is POSIX/Linux-only')
 class AgyCasesBase(unittest.TestCase):
     MODEL = "claude-sonnet-4-6"
 
@@ -140,9 +155,10 @@ class AgyCasesBase(unittest.TestCase):
         return {c["id"]: c for c in doc["cases"]}
 
 
+@unittest.skipUnless(sys.platform != "win32", 'Smoke harness (tests/smoke/harness.py) is POSIX/Linux-only')
 class AgyFlowTest(AgyCasesBase):
     def test_all_runs_results_and_reevaluate(self) -> None:
-        """ACC: N11, N12, N24 - R1..R6 against the agy stub (S-X-1 pass relies on the HYPOTHETICAL stub_agy_response_hypothetical; see AgyRealShapeTest): readonly argv (--mode plan, never --dangerously-skip-permissions), the smoke model, --conversation, --effort; S-X-1/2/3/4/6 pass, S-X-5 observed(not_echoed), S-X-7 observed, S-AGY-8 deny with the ERROR tool step and denied_actions; results validate and list AGY_CASES; reevaluate re-parses S-X-1/2/4/5 without spawning."""
+        """ACC: N11, N12, N24 - R1..R6 against the agy stub (S-X-1 pass relies on stub_agy_response_hypothetical, which no 1.5.3 capture shows and the real 1.5.12 capture does; see AgyRealShapeTest and Agy1512RealCaptureTest): readonly argv (--mode plan, never --dangerously-skip-permissions), the smoke model, --conversation, --effort; S-X-1/2/3/4/6 pass, S-X-5 observed(not_echoed), S-X-7 observed, S-AGY-8 deny with the ERROR tool step and denied_actions; results validate and list AGY_CASES; reevaluate re-parses S-X-1/2/4/5 without spawning."""
         s = self.session()
         sid = cases.run_r1(s)
         self.assertEqual(sid, "agy-stub-conv-5")
@@ -154,7 +170,10 @@ class AgyFlowTest(AgyCasesBase):
         runs = self.model_runs()
         self.assertEqual(len(runs), 6)
         for argv in runs:
-            self.assertEqual(argv[:3], ["--print", "--output-format", "stream-json"])
+            self.assertEqual(argv[0], "--print")
+            self.assertFalse(argv[1].startswith("-"), argv[1])
+            self.assertEqual(argv[2:4], ["--output-format", "stream-json"])
+            self.assertEqual(argv[-2], "--print-timeout")
             self.assertEqual(argv[argv.index("--model") + 1], self.MODEL)
             self.assertEqual(argv[argv.index("--mode") + 1], "plan")
             self.assertNotIn("--dangerously-skip-permissions", argv)
@@ -199,6 +218,23 @@ class AgyFlowTest(AgyCasesBase):
         for cid in ("S-X-3", "S-X-6", "S-X-7", "S-AGY-8"):
             self.assertEqual(nc[cid]["carried_from"], src, cid)
         self.assertEqual(tierlib.read_sidecar(new_path)["command"][:3], ["python3", "-m", "tests.smoke.reevaluate"])
+
+    def test_stub_refuses_the_pre_1_5_12_argv_shape(self) -> None:
+        """ACC: N11, N6 - the stub reads --print as agy 1.5.12 does: the earlier argv (--print --output-format stream-json ... <prompt last>) exits non-zero with the real stderr and no stdout, and AgyAdapter classifies that stderr as cli_usage_error; build()'s argv runs."""
+        import subprocess
+
+        old = [self.binary, "--print", "--output-format", "stream-json", "--model", self.MODEL, "--mode", "plan",
+               "--print-timeout", "20s", "Reply with exactly: MESH_SMOKE_OK"]
+        p = subprocess.run(old, capture_output=True, text=True, timeout=20, cwd=self.tmp, stdin=subprocess.DEVNULL)
+        self.assertEqual((p.returncode, p.stdout), (2, ""))
+        self.assertTrue(p.stderr.startswith('Error: --print took "--output-format" as its prompt, so the intended '
+                                            "prompt was left as an argument and ignored.\n"), p.stderr)
+        err = AgyAdapter.parse_stderr_error(p.stderr)
+        self.assertEqual((err["reason"], err["details"]["consumed_as_prompt"]), ("cli_usage_error", "--output-format"))
+        s = self.session(MESH_SMOKE_MAX_RUNS="1")
+        self.assertEqual(cases.run_r1(s), "agy-stub-conv-5")
+        c = {x["id"]: x for x in s.cases}
+        self.assertEqual((c["S-X-1"]["status"], c["S-X-1"]["rc"]), ("pass", 0))
 
     def test_no_result_with_agy_error_is_vendor_error(self) -> None:
         """ACC: N11, N6 - rc 0, no result event, AGY_ERROR on stderr: S-X-1 fail(vendor_error, run_error); no session id handed to R2."""
@@ -257,9 +293,10 @@ class AgyFlowTest(AgyCasesBase):
         self.assertEqual(self.model_runs(), [])
 
 
+@unittest.skipUnless(sys.platform != "win32", 'Smoke harness (tests/smoke/harness.py) is POSIX/Linux-only')
 class AgyRealShapeTest(AgyCasesBase):
     def test_real_shape_no_final_text(self) -> None:
-        """ACC: N11 - STUB_SHAPE=real_1_5_3 (result.response "", no text on any agent_response step, as in every real 1.5.3 capture): parse() finds no final text, so S-X-1 records fail(parse_pending) with raw_token_seen False; S-X-2 still passes from the init conversation_id and R1 still hands the session id on (no vendor error). This is what a real agy smoke would record today."""
+        """ACC: N11 - STUB_SHAPE=real_1_5_3 (result.response "", no text on any agent_response step, as in every real 1.5.3 capture): parse() finds no final text, so S-X-1 records fail(parse_pending) with raw_token_seen False; S-X-2 still passes from the init conversation_id and R1 still hands the session id on (no vendor error). This is what a stream of the 1.5.3 shape records; the real agy 1.5.12 smoke of 2026-11-19 carries the reply text and passed S-X-1 (Agy1512RealCaptureTest)."""
         s = self.session(STUB_SHAPE="real_1_5_3", MESH_SMOKE_MAX_RUNS="1")
         sid = cases.run_r1(s)
         c = {x["id"]: x for x in s.cases}
@@ -269,6 +306,45 @@ class AgyRealShapeTest(AgyCasesBase):
         self.assertEqual(c["S-X-2"]["status"], "pass")
         self.assertEqual(sid, "agy-stub-conv-5")
         self.assertEqual(len(self.model_runs()), 1)
+
+
+@unittest.skipUnless(sys.platform != "win32", 'Smoke harness (tests/smoke/harness.py) is POSIX/Linux-only')
+class Agy1512RealCaptureTest(unittest.TestCase):
+    """The real agy 1.5.12 S-X-1 capture (rerun of 2026-11-19 with the prompt after --print)."""
+
+    REAL_1_5_12 = os.path.join(REPO_ROOT, "tests", "fixtures", "real", "agy", "1.5.12")
+
+    def test_real_1_5_12_stream_has_the_reply_text_and_passes_sx1(self) -> None:
+        """ACC: N11, N24 - unlike every 1.5.3 capture, the real 1.5.12 S-X-1 stream carries the reply: text_delta on the agent_response steps and result.response (the token and a newline); parse() returns it as final text with the init conversation_id, so eval_sx1 / eval_sx2 / eval_sx4 give pass for the recorded rc 0 and model, the statuses the committed results file records; its sidecar command has the prompt directly after --print."""
+        path = os.path.join(self.REAL_1_5_12, "smoke-S-X-1-stdout.jsonl")
+        meta = tierlib.read_sidecar(path)
+        self.assertEqual(meta["command"][:5],
+                         ["agy", "--print", cases.PROMPTS["R1"], "--output-format", "stream-json"])
+        with open(path, encoding="utf-8") as f:
+            stdout = f.read()
+        events = [json.loads(line) for line in stdout.splitlines()]
+        deltas = [e["step_update"].get("text_delta", "") for e in events
+                  if e["event"] == "step_update" and e["step_update"]["step_type"] == "agent_response"]
+        self.assertEqual("".join(deltas), "MESH_SMOKE_OK\n")
+        self.assertEqual(events[-1]["result"]["response"], "MESH_SMOKE_OK\n")
+        model = events[0]["init"]["model"]
+        run_dir = tempfile.mkdtemp(prefix="mh-smoke-a-")
+        self.addCleanup(shutil.rmtree, run_dir, True)
+        shutil.copyfile(path, os.path.join(run_dir, "stdout.log"))
+        shutil.copyfile(os.path.join(self.REAL_1_5_12, "smoke-S-X-1-stderr.txt"), os.path.join(run_dir, "stderr.log"))
+        parsed = AgyAdapter().parse(run_dir)
+        self.assertEqual(parsed.final_text, "MESH_SMOKE_OK\n")
+        self.assertEqual(ev.eval_sx1(stdout, 0, False, parsed), ("pass", None, {"raw_token_seen": True}))
+        self.assertEqual(ev.eval_sx2(stdout, 0, False, parsed, adapter_id="agy")[:2], ("pass", None))
+        self.assertEqual(ev.eval_sx4(stdout, 0, False, model, adapter_id="agy")[:2], ("pass", None))
+        results = os.path.join(REPO_ROOT, "tests", "smoke", "results", "agy-1.5.12-2026-11-19.json")
+        with open(results, encoding="utf-8") as f:
+            doc = json.load(f)
+        recorded = {c["id"]: c for c in doc["cases"]}
+        self.assertEqual(doc["model"], model)
+        for cid in ("S-X-1", "S-X-2", "S-X-4"):
+            self.assertEqual((recorded[cid]["status"], recorded[cid]["rc"], recorded[cid]["fixture_sha256"]),
+                             ("pass", 0, meta["sha256"]), cid)
 
 
 class AgyStreamFactsTest(unittest.TestCase):

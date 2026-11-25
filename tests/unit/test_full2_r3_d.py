@@ -45,6 +45,7 @@ from mesh.daemon.handlers.base import HandlerContext
 from mesh.daemon.handlers.event import _stream_still_authorized, handle_event_list, handle_event_tail_live
 from mesh.daemon.merge import reviewed_head
 from mesh.errors import MeshError
+from mesh.platform import proc as plat_proc
 from tests.gitfixture import GitFixture
 
 MESH_PROC_LOCK = "shared"
@@ -61,9 +62,7 @@ def _wait_until(pred, timeout: float = 10.0, step: float = 0.02) -> bool:
 
 def _kill_proc(pid: int, starttime: int) -> None:
     try:
-        info = get_proc_stat(pid)
-        if info is not None and int(info["starttime"]) == int(starttime):
-            os.kill(pid, signal.SIGKILL)
+        plat_proc.kill_if_same(pid, int(starttime))
     except OSError:
         pass
 
@@ -733,7 +732,10 @@ class TestP2_5SupervisorLeaseAndLeftoversGitRefresh(unittest.TestCase):
         # Watch pass 1: collects initial git (first_head) in background
         supervisor.watch_launch_runs(self.conn, self.home, testing_mode=True)
         self.assertTrue(
-            _wait_until(lambda: supervisor._GIT_INFO.get(self.run_id, {}).get("done") is True, timeout=5.0)
+            _wait_until(
+                lambda: supervisor._GIT_INFO.get(self.run_id, {}).get("done") is True,
+                timeout=15.0 if sys.platform == "win32" else 5.0,
+            )
         )
 
         # Watch pass 2: sees leftover, auto-submits task with first_head, begins leftovers termination
@@ -937,7 +939,7 @@ class TestP2_8SpawnAbortKillFailedDeferral(unittest.TestCase):
             proc.wait(timeout=5)
             return True, {}
 
-        with mock.patch.object(supervisor, "SPAWN_ABORT_WAIT_S", 0.15), \
+        with mock.patch.object(supervisor, "SPAWN_ABORT_WAIT_S", 10.0), \
              mock.patch.object(supervisor, "_abort_collect", return_value=True), \
              mock.patch.object(supervisor, "_abort_kill_pass", side_effect=fake_pass):
             self._run_event_loop_failure(proc)
@@ -947,18 +949,19 @@ class TestP2_8SpawnAbortKillFailedDeferral(unittest.TestCase):
             supervisor.retry_spawn_aborts(self.conn, self.tmp, testing_mode=True)
             self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM events WHERE type = 'run.kill_failed';").fetchone()[0], 0)
 
-            # Wait past SPAWN_ABORT_WAIT_S -> emits run.kill_failed exactly once
-            time.sleep(0.2)
-            supervisor.retry_spawn_aborts(self.conn, self.tmp, testing_mode=True)
-            self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM events WHERE type = 'run.kill_failed';").fetchone()[0], 1)
+            # Advance monotonic clock past SPAWN_ABORT_WAIT_S -> emits run.kill_failed exactly once
+            real_monotonic = time.monotonic
+            with mock.patch.object(supervisor.time, "monotonic", side_effect=lambda: real_monotonic() + 10.5):
+                supervisor.retry_spawn_aborts(self.conn, self.tmp, testing_mode=True)
+                self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM events WHERE type = 'run.kill_failed';").fetchone()[0], 1)
 
-            # Subsequent retry while still alive -> still only 1 event
-            supervisor.retry_spawn_aborts(self.conn, self.tmp, testing_mode=True)
-            self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM events WHERE type = 'run.kill_failed';").fetchone()[0], 1)
+                # Subsequent retry while still alive -> still only 1 event
+                supervisor.retry_spawn_aborts(self.conn, self.tmp, testing_mode=True)
+                self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM events WHERE type = 'run.kill_failed';").fetchone()[0], 1)
 
-            state["alive"] = False
-            closed = supervisor.retry_spawn_aborts(self.conn, self.tmp, testing_mode=True)
-            self.assertEqual(closed, ["run_p28"])
+                state["alive"] = False
+                closed = supervisor.retry_spawn_aborts(self.conn, self.tmp, testing_mode=True)
+                self.assertEqual(closed, ["run_p28"])
 
 
 if __name__ == "__main__":

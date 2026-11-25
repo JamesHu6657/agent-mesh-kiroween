@@ -12,6 +12,7 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -146,18 +147,22 @@ class TestPR54R1LongMultilineExact(unittest.TestCase):
         # Adversarial repeating prefix ("aa\n" * 499 + "bb") in 2 MB of "aa\n" and normal logs
         secret = ("aa\n" * 499) + "bb"
         exact = [("REP_500", secret)]
+        # GitHub windows-latest VMs execute ~3.55M Python per-line calls ~4-6x slower than Linux
+        # (observed 2.032s vs 0.34-0.53s on Linux); quadratic behavior still takes >50s.
+        # Slow shared CI hosts (2-core VPS runner sets MESH_TEST_SLOW_HOST=1) get the Windows budget too.
+        budget_s = 8.0 if (sys.platform == "win32" or os.environ.get("MESH_TEST_SLOW_HOST")) else 2.0
 
         rep_log = "aa\n" * 60000
         t0 = time.monotonic()
         rep_out = redact(rep_log, exact, jsonl=True)
-        self.assertLess(time.monotonic() - t0, 2.0)
+        self.assertLess(time.monotonic() - t0, budget_s)
         self.assertEqual(rep_out, rep_log)
 
         # Now actually embed the 500-line secret inside a 2 MB log
         log_2mb = ("hello world " * 80 + "\n") * 2000 + secret + "\ntail\n"
         t1 = time.monotonic()
         out_2mb = redact(log_2mb, exact, jsonl=True)
-        self.assertLess(time.monotonic() - t1, 2.0)
+        self.assertLess(time.monotonic() - t1, budget_s)
         self.assertNotIn("bb\ntail", out_2mb)
         self.assertIn("[REDACTED:REP_500]\ntail\n", out_2mb)
 
@@ -168,7 +173,7 @@ class TestPR54R1LongMultilineExact(unittest.TestCase):
         log_short = ("hello world " * 80 + "\n") * 2000 + "pre " + short_500 + " post\n"
         t2 = time.monotonic()
         out_short = redact(log_short, exact_short, jsonl=True)
-        self.assertLess(time.monotonic() - t2, 2.0)
+        self.assertLess(time.monotonic() - t2, budget_s)
         self.assertEqual(_stream(log_short, exact_short, jsonl=True, steps=(4096, 65536)), out_short)
         for ln in short_500_lines:
             self.assertNotIn(ln, out_short)

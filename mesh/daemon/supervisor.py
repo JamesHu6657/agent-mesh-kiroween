@@ -7,8 +7,11 @@ meshd's 200 ms termination loop (``advance_terminations``).
 """
 
 import asyncio
+import contextvars
+import errno
 import json
 import os
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -18,7 +21,7 @@ import time
 from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Set, Tuple
 
 import mesh.constants as c
-from mesh.adapters.base import CommandSpec, RunRequest, is_safe_cli_token
+from mesh.adapters.base import CommandSpec, RunRequest, is_safe_cli_token, positional_prompt
 from mesh.adapters.registry import get_adapter
 from mesh.core.auth import generate_run_token
 from mesh.core.clock import now_iso_utc
@@ -52,10 +55,300 @@ from mesh.core.workspaces import (
     has_task_ws_reservation,
 )
 from mesh.daemon import children, terminate
+from mesh.platform import fs as plat_fs, ipc as plat_ipc, perms as plat_perms, proc as plat_proc
+from mesh.platform.fs import fsync_dir
+from mesh.platform.proc import crash_self_now
 
 RUN_TOKEN_EXPIRY_GRACE_S = 300
 DEFAULT_TIMEOUT_S = 600
 STDERR_TAIL_LINES = 50
+
+_WIN_CMD_UNSAFE_CHARS = frozenset('"\r\n%&|<>^!')
+_WIN_CMD_EXTS = (".cmd", ".bat")
+
+_RUN_JOBS_LOCK = threading.RLock()
+_RUN_JOBS: Dict[str, Any] = {}
+_RUN_HOMES: Dict[str, str] = {}
+_PGID_RUN_INFO: Dict[int, Tuple[str, Optional[int], Optional[str]]] = {}
+_SCAN_RUN_CTX: contextvars.ContextVar[Optional[Tuple[str, Optional[int], Optional[int], Optional[str]]]] = (
+    contextvars.ContextVar("supervisor_scan_run_ctx", default=None)
+)
+
+
+def normalize_exit_info(exit_info: Optional[Mapping[str, Any]]) -> Tuple[Optional[int], Optional[int]]:
+    """Return ``(exit_code, signal)``, mapping Win32 synthetic 137/143 kill exit codes."""
+    if not exit_info:
+        return None, None
+    exit_code = exit_info.get("exit_code")
+    signo = exit_info.get("signal")
+    if sys.platform == "win32" and signo is None and exit_code in (137, 143):
+        return None, (9 if exit_code == 137 else 15)
+    return exit_code, signo
+
+
+def record_run_home(run_id: str, home: Optional[str]) -> None:
+    """Remember *home* for *run_id* so Win32 scans/signals can resolve named kernel objects."""
+    if home:
+        with _RUN_JOBS_LOCK:
+            _RUN_HOMES[run_id] = home
+
+
+def get_run_home(run_id: str) -> Optional[str]:
+    """Return the recorded *home* for *run_id*, if known."""
+    with _RUN_JOBS_LOCK:
+        return _RUN_HOMES.get(run_id)
+
+
+def register_pgid_run(
+    run_id: str,
+    pgid: Optional[int],
+    wrapper_starttime: Optional[int] = None,
+    home: Optional[str] = None,
+) -> None:
+    """Associate *pgid* with Win32 run metadata (``run_id``, ``wrapper_starttime``, ``home``)."""
+    with _RUN_JOBS_LOCK:
+        if home:
+            _RUN_HOMES[run_id] = home
+        eff_home = home or _RUN_HOMES.get(run_id)
+        if pgid is not None and _is_int(pgid) and int(pgid) > 1:
+            _PGID_RUN_INFO[int(pgid)] = (run_id, known_starttime(wrapper_starttime), eff_home)
+
+
+def register_run_job(
+    run_id: str,
+    job: Any,
+    *,
+    pgid: Optional[int] = None,
+    wrapper_starttime: Optional[int] = None,
+    home: Optional[str] = None,
+) -> None:
+    """Store an open Win32 Named Run Job handle for *run_id* until close gate passes."""
+    prev = None
+    with _RUN_JOBS_LOCK:
+        if home:
+            _RUN_HOMES[run_id] = home
+        if job is not None:
+            existing = _RUN_JOBS.get(run_id)
+            if existing is not None and existing is not job:
+                prev = existing
+            _RUN_JOBS[run_id] = job
+        if pgid is not None and _is_int(pgid) and int(pgid) > 1:
+            _PGID_RUN_INFO[int(pgid)] = (
+                run_id,
+                known_starttime(wrapper_starttime),
+                home or _RUN_HOMES.get(run_id),
+            )
+    if prev is not None:
+        try:
+            prev.close()
+        except Exception:
+            pass
+
+
+def get_run_job(run_id: str) -> Optional[Any]:
+    """Return the active Win32 Job handle registered for *run_id*, or None."""
+    with _RUN_JOBS_LOCK:
+        job = _RUN_JOBS.get(run_id)
+        if job is not None and getattr(job, "closed", False):
+            _RUN_JOBS.pop(run_id, None)
+            return None
+        return job
+
+
+def active_run_jobs() -> Dict[str, Any]:
+    """Return a snapshot mapping ``run_id -> JobHandle`` for all active Win32 run jobs."""
+    with _RUN_JOBS_LOCK:
+        stale = [rid for rid, job in _RUN_JOBS.items() if job is None or getattr(job, "closed", False)]
+        for rid in stale:
+            _RUN_JOBS.pop(rid, None)
+        return dict(_RUN_JOBS)
+
+
+def resolve_run_job(
+    run_id: str,
+    *,
+    home: Optional[str] = None,
+    terminate: bool = True,
+) -> Tuple[Optional[Any], bool]:
+    """Return ``(job_handle, should_close)`` for *run_id*.
+
+    If *run_id* has an active registered handle, returns ``(job, False)`` (owned by
+    supervisor). Otherwise, on ``win32``, tries opening the Named Run Job by *home*.
+    """
+    job = get_run_job(run_id)
+    if job is not None:
+        return job, False
+    if sys.platform != "win32":
+        return None, False
+    eff_home = home or get_run_home(run_id) or os.environ.get("MESH_HOME")
+    if not eff_home:
+        return None, False
+    try:
+        opened = plat_proc.open_run_job(eff_home, run_id, terminate=terminate)
+    except ValueError:
+        return None, False
+    if opened is not None:
+        return opened, True
+    return None, False
+
+
+def close_run_job(run_id: str) -> None:
+    """Close and forget the registered Win32 Job handle and metadata for *run_id*."""
+    if sys.platform != "win32" and not _RUN_JOBS and not _RUN_HOMES and not _PGID_RUN_INFO:
+        return
+    with _RUN_JOBS_LOCK:
+        job = _RUN_JOBS.pop(run_id, None)
+        _RUN_HOMES.pop(run_id, None)
+        stale_pgids = [p for p, info in _PGID_RUN_INFO.items() if info[0] == run_id]
+        for p in stale_pgids:
+            _PGID_RUN_INFO.pop(p, None)
+    if job is not None:
+        try:
+            job.close()
+        except Exception:
+            pass
+
+
+def _infer_run_home(run: Mapping[str, Any]) -> Optional[str]:
+    keys = run.keys()
+    run_dir = (run["run_dir"] if "run_dir" in keys else "") or ""
+    if not run_dir:
+        return None
+    parent = os.path.dirname(os.path.abspath(run_dir))
+    if os.path.basename(parent) in ("runs", "merges"):
+        return os.path.dirname(parent)
+    return None
+
+
+def _win_run_home(run: Mapping[str, Any]) -> Optional[str]:
+    return get_run_home(run["id"]) or _infer_run_home(run)
+
+
+def scan_run_group(
+    run_id: str,
+    pgid: Optional[int],
+    wrapper_starttime: Optional[int] = None,
+    home: Optional[str] = None,
+) -> ScanResult:
+    """Scan a run's group, binding ``_SCAN_RUN_CTX`` on Windows to prevent PGID reuse collisions."""
+    if not pgid:
+        return ScanResult()
+    ipgid = int(pgid)
+    if sys.platform != "win32":
+        return _scan_group(ipgid)
+    eff_home = home or get_run_home(run_id)
+    tok = _SCAN_RUN_CTX.set((run_id, ipgid, known_starttime(wrapper_starttime), eff_home))
+    try:
+        return _scan_group(ipgid)
+    finally:
+        _SCAN_RUN_CTX.reset(tok)
+
+
+def _evict_run_jobs(active_ids: Set[str]) -> None:
+    from mesh.daemon import merge as _merge
+
+    with _RUN_JOBS_LOCK:
+        keep_ids = set(active_ids) | _merge.in_memory_active_job_runs()
+        stale_jobs = [rid for rid in _RUN_JOBS if rid not in keep_ids]
+        stale_homes = [rid for rid in _RUN_HOMES if rid not in keep_ids]
+        stale_pgids = [p for p, info in _PGID_RUN_INFO.items() if info[0] not in keep_ids]
+        popped = [_RUN_JOBS.pop(rid) for rid in stale_jobs]
+        for rid in stale_homes:
+            _RUN_HOMES.pop(rid, None)
+        for p in stale_pgids:
+            _PGID_RUN_INFO.pop(p, None)
+    for job in popped:
+        if job is not None:
+            try:
+                job.close()
+            except Exception:
+                pass
+
+
+def is_win_cmd_shim(binary: str) -> bool:
+    """Return True on Windows when *binary* targets (or resolves via PATH to) ``.cmd``/``.bat``."""
+    if sys.platform != "win32" or not isinstance(binary, str) or not binary:
+        return False
+    if binary.lower().endswith(_WIN_CMD_EXTS):
+        return True
+    resolved = shutil.which(binary)
+    return bool(resolved and resolved.lower().endswith(_WIN_CMD_EXTS))
+
+
+def apply_cmd_pointer_fallback(
+    argv: List[str],
+    strategy: str,
+    *,
+    prompt_path: str,
+    prompt_text: str,
+    run_dir: str,
+    adapter_id: str,
+    profile: Optional[str] = None,
+) -> Tuple[str, List[str]]:
+    """Enforce pointer-prompt argv on Win32 ``.cmd``/``.bat`` shims when prompt has unsafe chars."""
+    out = list(argv)
+    eff_strategy = strategy
+    if sys.platform != "win32":
+        if eff_strategy == "pointer":
+            ptr = pointer_prompt(run_dir)
+            out = [ptr if part == prompt_path else part for part in out]
+        return eff_strategy, out
+    if eff_strategy in ("argv", "inline", "pointer") and out:
+        resolved = shutil.which(out[0]) if not out[0].lower().endswith(_WIN_CMD_EXTS) else out[0]
+        if (out[0].lower().endswith(_WIN_CMD_EXTS) or (resolved and resolved.lower().endswith(_WIN_CMD_EXTS))):
+            if resolved and not out[0].lower().endswith(_WIN_CMD_EXTS):
+                out[0] = resolved
+            if eff_strategy in ("argv", "inline") and any(ch in _WIN_CMD_UNSAFE_CHARS for ch in prompt_text):
+                if adapter_id == "kiro" and profile == "readonly":
+                    raise ValueError(
+                        f"Cannot pass cmd.exe-unsafe prompt to {out[0]} under kiro profile 'readonly' "
+                        "(pointer prompt fallback cannot read prompt.md)"
+                    )
+                eff_strategy = "pointer"
+    if eff_strategy == "pointer":
+        ptr = pointer_prompt(run_dir)
+        pos_ptr = positional_prompt(ptr)
+        pos_text = positional_prompt(prompt_text)
+        out = [
+            pos_ptr if (part == prompt_path or part == prompt_text or part == pos_text) else part
+            for part in out
+        ]
+        if adapter_id == "agy":
+            abs_dir = os.path.dirname(os.path.abspath(prompt_path))
+            has_dir = any(
+                out[i] == "--add-dir" and i + 1 < len(out) and out[i + 1] == abs_dir
+                for i in range(len(out))
+            )
+            if not has_dir:
+                out.extend(["--add-dir", abs_dir])
+    return eff_strategy, out
+
+
+def _win_exit_job_member_pairs(run: Mapping[str, Any]) -> Set[Tuple[int, int]]:
+    """Extract recorded ``(pid, starttime)`` entries from Win32 ``exit.json`` ``job_members_at_exit``."""
+    if sys.platform != "win32":
+        return set()
+    keys = run.keys()
+    run_dir = (run["run_dir"] if "run_dir" in keys else "") or ""
+    if not run_dir:
+        return set()
+    doc = _read_json_file(os.path.join(run_dir, "exit.json"))
+    if not isinstance(doc, dict):
+        return set()
+    raw = doc.get("job_members_at_exit")
+    if not isinstance(raw, list):
+        return set()
+    out: Set[Tuple[int, int]] = set()
+    for m in raw:
+        if (
+            isinstance(m, dict)
+            and _is_int(m.get("pid"))
+            and _is_int(m.get("starttime"))
+            and int(m["pid"]) > 1
+            and int(m["starttime"]) > 0
+        ):
+            out.add((int(m["pid"]), int(m["starttime"])))
+    return out
 
 
 def _get_current_boot_id(conn: sqlite3.Connection) -> str:
@@ -102,8 +395,7 @@ def count_active_runs(conn: sqlite3.Connection, agent_id: Optional[str] = None) 
         )
     else:
         cur = conn.execute(
-            "SELECT COUNT(*) FROM runs WHERE agent_id = ? AND status IN ('starting', 'running') "
-            "AND kind IN ('task', 'external');",
+            "SELECT COUNT(*) FROM runs WHERE agent_id = ? AND status IN ('starting', 'running') AND kind IN ('task', 'external');",
             (agent_id,),
         )
     return cur.fetchone()[0]
@@ -199,12 +491,15 @@ def _write_text(path: str, text: str, mode: int = 0o600) -> None:
     try:
         os.write(fd, text.encode("utf-8"))
         os.fsync(fd)
+        if sys.platform == "win32":
+            plat_perms.fchmod_private(fd, mode)
     finally:
         os.close(fd)
-    try:
-        os.chmod(path, mode)
-    except OSError:
-        pass
+    if sys.platform != "win32":
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            pass
 
 
 def _write_json(path: str, obj: Any, mode: int = 0o600) -> None:
@@ -508,12 +803,8 @@ def _persist_abort_members(ab: "_SpawnAbort") -> None:
             json.dump(doc, f, sort_keys=True)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
-        dfd = os.open(ab.run_dir, os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
+        plat_fs.atomic_replace(tmp, path)
+        fsync_dir(ab.run_dir)
         ab.persisted = set(pairs)
     except OSError as exc:
         if ab.home:
@@ -548,6 +839,7 @@ class _SpawnAbort:
         self.retries = 0
         self.started_at: float = time.monotonic()
         self.kill_failed_emitted: bool = False
+        self.close_held_emitted: bool = False
 
 
 #: run id -> pending spawn abort (round 8). In memory: after a meshd restart the open run
@@ -573,6 +865,7 @@ def _reap_aborted_wrapper(ab: _SpawnAbort) -> None:
         children.unhold(pid)
         children.unregister_if(pid, "wrapper")
         _SPAWN_ABORTS.pop(ab.run_id, None)
+        close_run_job(ab.run_id)
 
 
 def _close_spawn_abort_db(conn: sqlite3.Connection, ab: _SpawnAbort, details: Dict[str, Any],
@@ -608,8 +901,12 @@ def _abort_collect(ab: _SpawnAbort) -> bool:
     scan failed."""
     pid = ab.proc.pid
     ok = True
+    if sys.platform == "win32":
+        if ab.home:
+            record_run_home(ab.run_id, ab.home)
+        register_pgid_run(ab.run_id, pid, ab.wrapper_starttime, ab.home)
     try:
-        group_scan = _scan_group(pid)
+        group_scan = scan_run_group(ab.run_id, pid, ab.wrapper_starttime, ab.home)
         if getattr(group_scan, "uncertain", False):
             ok = False
         group = {p: st for p, st in group_scan.items() if p != pid}
@@ -639,12 +936,36 @@ def _abort_kill_pass(ab: _SpawnAbort) -> Tuple[bool, Dict[int, int]]:
     ``(everything gone, live pid->starttime)``."""
     pid = ab.proc.pid
     ok = _abort_collect(ab)
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-    for p, st in sorted(ab.known):
-        terminate.signal_if_same(p, st, signal.SIGKILL)
+    if sys.platform == "win32":
+        try:
+            job, should_close = resolve_run_job(ab.run_id, home=ab.home, terminate=True)
+        except OSError:
+            job, should_close = None, False
+            ok = False
+        if job is not None:
+            try:
+                try:
+                    plat_proc.terminate_job(job, 137)
+                except OSError:
+                    ok = False
+            finally:
+                if should_close:
+                    try:
+                        job.close()
+                    except Exception:
+                        pass
+        st0 = known_starttime((ab.out or {}).get("starttime") or ab.wrapper_starttime)
+        if st0 is not None:
+            terminate.signal_if_same(pid, st0, plat_proc.SIGKILL)
+        for p, st in sorted(ab.known):
+            terminate.signal_if_same(p, st, plat_proc.SIGKILL)
+    else:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        for p, st in sorted(ab.known):
+            terminate.signal_if_same(p, st, signal.SIGKILL)
     ok = _abort_collect(ab) and ok
     live_pairs: Set[Tuple[int, int]] = set()
     for p, st in sorted(ab.known):
@@ -705,20 +1026,39 @@ def _abort_spawned(ab: _SpawnAbort) -> bool:
     return done
 
 
-def _emit_spawn_kill_failed(conn: sqlite3.Connection, ab: _SpawnAbort, pids: List[int]) -> None:
+def _emit_spawn_kill_failed(conn: sqlite3.Connection, ab: _SpawnAbort, pids: List[int],
+                            *, close_held: bool = False) -> None:
     """Record the immutable ``run.kill_failed`` event for a persistent spawn abort (caller owns tx)."""
     if ab.kind == "lead_turn":
         project_id = ab.fail_args[0]
         task_id = None
     else:
         task_id, project_id = ab.fail_args[0], ab.fail_args[1]
+    payload: Dict[str, Any] = {
+        "run_id": ab.run_id, "task_id": task_id, "end_reason": "spawn_failed",
+        "pids": pids, "lease_released": False,
+        "retrying": True, "after_popen": True,
+    }
+    if close_held:
+        payload["close_held"] = True
     record_event(
         conn=conn, type_="run.kill_failed", actor_id="system", actor_kind="system", via="system",
-        project_id=project_id, task_id=task_id, run_id=ab.run_id,
-        payload={"run_id": ab.run_id, "task_id": task_id, "end_reason": "spawn_failed",
-                 "pids": pids, "lease_released": False,
-                 "retrying": True, "after_popen": True},
+        project_id=project_id, task_id=task_id, run_id=ab.run_id, payload=payload,
     )
+
+
+def _record_spawn_close_held_event(conn: sqlite3.Connection, home: Optional[str],
+                                   ab: _SpawnAbort, held: "CloseHeld") -> None:
+    """Record one ``run.kill_failed`` (``close_held=True``) event per gate-held spawn abort."""
+    if ab.close_held_emitted:
+        return
+    try:
+        with transaction(conn):
+            _emit_spawn_kill_failed(conn, ab, sorted(held.live), close_held=True)
+        ab.close_held_emitted = True
+    except Exception as db_exc:  # noqa: BLE001 - retry on next abort tick
+        if home:
+            _log_meshd(home, f"run {ab.run_id}: close_held event deferred: {type(db_exc).__name__}: {db_exc}")
 
 
 def retry_spawn_aborts(conn: sqlite3.Connection, home: str, testing_mode: Optional[bool] = None) -> List[str]:
@@ -727,6 +1067,23 @@ def retry_spawn_aborts(conn: sqlite3.Connection, home: str, testing_mode: Option
     commits, the wrapper is reaped and the run closes ``spawn_failed`` (lease released)."""
     closed: List[str] = []
     for run_id, a in list(_SPAWN_ABORTS.items()):
+        run_row = conn.execute("SELECT * FROM runs WHERE id = ?;", (run_id,)).fetchone()
+        if run_row is None or run_row["status"] not in ("starting", "running"):
+            try:
+                done, _live = _abort_kill_pass(a)
+            except Exception as exc:  # noqa: BLE001 - keep pending abort until kill pass succeeds
+                _log_meshd(home, f"run {run_id}: spawn abort cleanup retry failed: {type(exc).__name__}: {exc}")
+                continue
+            if not done:
+                continue
+            _reap_aborted_wrapper(a)
+            _redact_aborted_run_output(a.run_dir)
+            _log_meshd(
+                home,
+                f"run {run_id}: spawn abort skipped (run already {run_row['status'] if run_row is not None else 'missing'})",
+            )
+            closed.append(run_id)
+            continue
         a.retries += 1
         eff_tmode = a.testing_mode if testing_mode is None else testing_mode
         try:
@@ -763,6 +1120,22 @@ def retry_spawn_aborts(conn: sqlite3.Connection, home: str, testing_mode: Option
             out["escapees"] = sorted(a.outside)
         try:
             _close_spawn_abort_db(conn, a, out, testing_mode=eff_tmode)
+        except CloseHeld as held:
+            try:
+                fresh = conn.execute("SELECT * FROM runs WHERE id = ?;", (run_id,)).fetchone()
+                if fresh is not None:
+                    hold_close(conn, home, fresh, held)
+            except Exception as hold_exc:  # noqa: BLE001 - keep _SPAWN_ABORTS active; retry on next tick
+                if home:
+                    _log_meshd(home, f"run {run_id}: hold_close deferred on CloseHeld: {type(hold_exc).__name__}: {hold_exc}")
+            try:
+                if a.kind == "lead_turn":
+                    _call_renew_lead_turn_lease(conn, {"id": run_id, "project_id": a.fail_args[0]}, eff_tmode)
+            except Exception:
+                pass
+            _record_spawn_close_held_event(conn, home, a, held)
+            _log_meshd(home, f"run {run_id}: spawn abort close held by close-safety gate; retrying")
+            continue
         except Exception as db_exc:
             _log_meshd(home, f"run {run_id}: spawn abort close deferred: {type(db_exc).__name__}: {db_exc}")
             continue
@@ -784,7 +1157,7 @@ def _zombie(pid: int) -> bool:
 def _crash_now(home: str, point: str, run_id: str) -> None:
     """Simulate `kill -9 meshd` at a spawn crash point (no cleanup, no flush)."""
     _log_meshd(home, f"MESH_TEST_CRASH_AT={point}: killing meshd during run {run_id}")
-    os.kill(os.getpid(), signal.SIGKILL)
+    crash_self_now()
 
 
 def handle_spawn_failure(
@@ -855,6 +1228,21 @@ def handle_spawn_failure(
         if done:
             try:
                 _close_spawn_abort_db(conn, ab, details, testing_mode=tmode)
+            except CloseHeld as held:
+                ab.kill_done = True
+                _SPAWN_ABORTS[run_id] = ab
+                _WRAPPERS.pop(run_id, None)
+                try:
+                    fresh = conn.execute("SELECT * FROM runs WHERE id = ?;", (run_id,)).fetchone()
+                    if fresh is not None:
+                        hold_close(conn, home, fresh, held)
+                except Exception as hold_exc:  # noqa: BLE001 - keep held in _SPAWN_ABORTS; never escape spawn failure
+                    if home:
+                        _log_meshd(home, f"run {run_id}: hold_close deferred on CloseHeld: {type(hold_exc).__name__}: {hold_exc}")
+                _record_spawn_close_held_event(conn, home, ab, held)
+                if home:
+                    _log_meshd(home, f"run {run_id}: spawn abort close held by close-safety gate; retrying")
+                return None
             except Exception as db_exc:  # noqa: BLE001 - keep held in _SPAWN_ABORTS; retry_spawn_aborts closes
                 ab.kill_done = True
                 _SPAWN_ABORTS[run_id] = ab
@@ -900,6 +1288,7 @@ def handle_spawn_failure(
             )
             revoke_run_token(conn, run_id)
     _WRAPPERS.pop(run_id, None)
+    close_run_job(run_id)
     unregister_secret(f"run_token:{run_id}")
     _redact_aborted_run_output(run_dir)
     return None
@@ -1045,13 +1434,10 @@ def _spawn_run(conn, home, task, agent, adapter, adapter_id, profile, model, eff
             require_task_worktree(ws_path)  # r2 P1-C: never an empty dir in a worktree slot
         else:
             ensure_workspace_dir(ws_path)
-        _write_text(os.path.join(run_dir, "prompt.md"), prompt_text)
-        if strategy == "pointer":
-            argv_prompt = pointer_prompt(run_dir)
-        else:
-            argv_prompt = prompt_text
+        prompt_path = os.path.join(run_dir, "prompt.md")
+        _write_text(prompt_path, prompt_text)
         request = RunRequest(
-            prompt_path=os.path.join(run_dir, "prompt.md"),
+            prompt_path=prompt_path,
             workspace=ws_path,
             model=model,
             effort=effort,
@@ -1067,9 +1453,15 @@ def _spawn_run(conn, home, task, agent, adapter, adapter_id, profile, model, eff
             options=build_run_options(agent, run_id),
         )
         spec_cmd: CommandSpec = adapter.build(request)
-        argv = list(spec_cmd.argv)
-        if strategy == "pointer":
-            argv = [argv_prompt if part == request.prompt_path else part for part in argv]
+        strategy, argv = apply_cmd_pointer_fallback(
+            list(spec_cmd.argv),
+            strategy,
+            prompt_path=request.prompt_path,
+            prompt_text=prompt_text,
+            run_dir=run_dir,
+            adapter_id=adapter_id,
+            profile=profile,
+        )
         spec = build_spec(
             argv=argv,
             cwd=spec_cmd.cwd,
@@ -1083,7 +1475,7 @@ def _spawn_run(conn, home, task, agent, adapter, adapter_id, profile, model, eff
             spec["testing_wrapper_delay_s"] = TESTING_WRAPPER_DELAY_S
         _write_json(os.path.join(run_dir, "spec.json"), spec)
 
-        socket_path = os.path.join(home, "run", "mesh.sock")
+        socket_path = plat_ipc.daemon_endpoint_path(home)
         child_env = build_child_env(
             base_env=dict(os.environ),
             token=token,
@@ -1093,6 +1485,11 @@ def _spawn_run(conn, home, task, agent, adapter, adapter_id, profile, model, eff
             project_id=project_id,
             socket_path=socket_path,
         )
+        run_job = None
+        if sys.platform == "win32":
+            run_job = plat_proc.create_run_job(home, run_id, kill_on_close=False)
+            register_run_job(run_id, run_job, home=home)
+        popen_extra: Dict[str, Any] = {"job": run_job} if run_job is not None else {}
         proc = children.popen_registered(
             "wrapper",
             [sys.executable, "-P", "-s", "-m", "mesh.runwrap", run_dir],
@@ -1103,12 +1500,21 @@ def _spawn_run(conn, home, task, agent, adapter, adapter_id, profile, model, eff
             env=child_env,
             start_new_session=True,
             close_fds=True,
+            **popen_extra,
         )
         _WRAPPERS[run_id] = proc
         if _crash_at() == "after_popen":
             _crash_now(home, "after_popen", run_id)
         # --- TX B: run running with wrapper identity (inside try so any TX B error aborts) ---
         stat_info = get_proc_stat(proc.pid)
+        if sys.platform == "win32":
+            register_run_job(
+                run_id,
+                run_job,
+                pgid=proc.pid,
+                wrapper_starttime=stat_info["starttime"] if stat_info else None,
+                home=home,
+            )
         with transaction(conn):
             conn.execute(
                 "UPDATE runs SET status = 'running', wrapper_pid = ?, pgid = ?, proc_starttime = ?, "
@@ -1337,10 +1743,10 @@ def run_token_scope(conn: sqlite3.Connection, run_id: str) -> Optional[Dict[str,
         return None
 
 
-def _log_meshd(home: str, msg: str) -> None:
+def _log_meshd(home: str, msg: str, *, level: str = "ERROR") -> None:
     from mesh.daemon.scheduler import _log_to_meshd
 
-    _log_to_meshd(home, msg)
+    _log_to_meshd(home, msg, level=level)
 
 
 # ---------------------------------------------------------------------------
@@ -1551,9 +1957,13 @@ def _testing_mode() -> bool:
 
 def _read_json_file(path: str) -> Optional[Dict[str, Any]]:
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            value = json.load(f)
-    except (OSError, ValueError):
+        if sys.platform == "win32":
+            raw = plat_fs.read_bytes_shared(path)
+            value = json.loads(raw.decode("utf-8"))
+        else:
+            with open(path, "r", encoding="utf-8") as f:
+                value = json.load(f)
+    except (OSError, ValueError, UnicodeDecodeError):
         return None
     return value if isinstance(value, dict) else None
 
@@ -1638,6 +2048,108 @@ def is_adopted(run: Mapping[str, Any]) -> bool:
     return run["id"] not in _WRAPPERS
 
 
+def _scan_group_win(pgid: int) -> ScanResult:
+    """Windows counterpart to ``_scan_group``: Job Object PIDs + verified Toolhelp descendants."""
+    found = ScanResult()
+    me = os.getpid()
+    excluded = {0, 1, 4, me}
+
+    ctx = _SCAN_RUN_CTX.get()
+    run_id: Optional[str] = None
+    wst: Optional[int] = None
+    home: Optional[str] = None
+    if ctx is not None and (ctx[1] is None or int(ctx[1]) == int(pgid)):
+        run_id, _c_pgid, wst, home = ctx
+    if run_id is None:
+        with _RUN_JOBS_LOCK:
+            meta = _PGID_RUN_INFO.get(int(pgid))
+        if meta is not None:
+            run_id, wst, home = meta
+
+    job_pids: Set[int] = set()
+    job_live = False
+    if run_id is not None:
+        try:
+            job, should_close = resolve_run_job(run_id, home=home, terminate=False)
+        except OSError:
+            job, should_close = None, False
+            found.uncertain = True
+        if job is not None:
+            try:
+                try:
+                    job_pids = {int(p) for p in plat_proc.query_job_pids(job) if int(p) > 0}
+                    job_live = True
+                except OSError:
+                    found.uncertain = True
+            finally:
+                if should_close:
+                    try:
+                        job.close()
+                    except Exception:
+                        pass
+
+    for pid in sorted(job_pids):
+        if pid in excluded:
+            continue
+        try:
+            info = get_proc_stat(pid)
+            if info is not None and is_tgid_alive(pid, info):
+                found[pid] = int(info["starttime"])
+        except OSError:
+            found.uncertain = True
+
+    # Toolhelp descent anchored at pgid ONLY if wrapper identity still holds or Job is live.
+    anchors: Dict[int, int] = dict(found)
+    if pgid and int(pgid) not in excluded and wst is not None:
+        try:
+            winfo = get_proc_stat(int(pgid))
+            if winfo is not None and int(winfo["starttime"]) == int(wst) and is_tgid_alive(int(pgid), winfo):
+                found[int(pgid)] = int(wst)
+                anchors[int(pgid)] = int(wst)
+        except OSError:
+            found.uncertain = True
+
+    if anchors:
+        try:
+            parent_map = plat_proc.list_toolhelp_processes()
+        except OSError:
+            parent_map = {}
+            found.uncertain = True
+        if parent_map:
+            stats: Dict[int, Dict[str, Any]] = {}
+            cands: List[int] = []
+            for pid in sorted(parent_map):
+                if pid in excluded or pid in found:
+                    continue
+                try:
+                    info = get_proc_stat(pid)
+                    alive = info is not None and is_tgid_alive(pid, info)
+                except PermissionError:
+                    continue
+                except OSError as exc:
+                    gone = exc.errno in (errno.ENOENT, errno.ESRCH) or getattr(exc, "winerror", None) == 87
+                    if not gone and terminate._same_uid(pid):
+                        found.uncertain = True
+                    continue
+                if alive:
+                    stats[pid] = info
+                    cands.append(pid)
+            progress = True
+            while cands and progress:
+                progress = False
+                rest: List[int] = []
+                for pid in cands:
+                    if terminate._descends_from(pid, stats, anchors):
+                        st = int(stats[pid]["starttime"])
+                        found[pid] = st
+                        anchors[pid] = st
+                        progress = True
+                    else:
+                        rest.append(pid)
+                cands = rest
+    return found
+
+
 def _scan_group(pgid: int) -> ScanResult:
     """Live (non-zombie) processes whose pgrp or session equals ``pgid``: {pid: starttime}.
 
@@ -1645,6 +2157,8 @@ def _scan_group(pgid: int) -> ScanResult:
     ``is_tgid_alive`` marks ``found.uncertain = True`` so callers never read an unreadable
     ``/proc`` entry as "group empty".
     """
+    if sys.platform == "win32":
+        return _scan_group_win(pgid)
     found = ScanResult()
     me = os.getpid()
     try:
@@ -1729,8 +2243,11 @@ def _load_seen(run: Mapping[str, Any]) -> Tuple[str, Dict[int, int], Optional[st
     try:
         # r4c: open the path itself; only a missing file means "no members recorded".
         # Any other error (a directory, no permission, EIO) makes the state unusable.
-        with open(path, "rb") as f:
-            raw = f.read()
+        if sys.platform == "win32":
+            raw = plat_fs.read_bytes_shared(path)
+        else:
+            with open(path, "rb") as f:
+                raw = f.read()
     except FileNotFoundError:
         return SEEN_ABSENT, {}, None, False
     except OSError:
@@ -1804,8 +2321,11 @@ def _load_prior_member_pairs(run: Mapping[str, Any]) -> Set[Tuple[int, int]]:
     duplicate PIDs across reuse generations."""
     path = os.path.join(run["run_dir"] or "", SEEN_FILE)
     try:
-        with open(path, "rb") as f:
-            data = json.loads(f.read().decode("utf-8"))
+        if sys.platform == "win32":
+            data = json.loads(plat_fs.read_bytes_shared(path).decode("utf-8"))
+        else:
+            with open(path, "rb") as f:
+                data = json.loads(f.read().decode("utf-8"))
     except (OSError, ValueError, UnicodeDecodeError):
         return set()
     if not isinstance(data, dict) or SEEN_MARKER_KEY not in data or data.get("run_id") != run["id"]:
@@ -1852,7 +2372,11 @@ def _write_seen(run: Mapping[str, Any], seen: Dict[int, int]) -> None:
         f.flush()
         os.fsync(f.fileno())
     try:
-        os.replace(tmp, path)
+        if sys.platform == "win32":
+            plat_perms.chmod_private(tmp, 0o600)
+            plat_fs.atomic_replace(tmp, path)
+        else:
+            os.replace(tmp, path)
     except OSError:
         try:
             os.unlink(tmp)
@@ -2195,6 +2719,8 @@ def seen_held(run: Mapping[str, Any], home: Optional[str] = None) -> bool:
     t = terminate.get(run_id)
     if t is not None and any(_identity_live(int(p), int(st)) for p, st in list(t.seen.items())):
         return False
+    if sys.platform == "win32" and home:
+        record_run_home(run_id, home)
     pgid, wst = close_identity(run)
     view = dict(run)
     if pgid is not None:
@@ -2205,6 +2731,8 @@ def seen_held(run: Mapping[str, Any], home: Optional[str] = None) -> bool:
     _st, from_file, _r, _l = _load_seen(view)
     recorded_pairs.update((int(p), int(s)) for p, s in from_file.items())
     recorded_pairs.update(_load_prior_member_pairs(view))
+    if sys.platform == "win32":
+        recorded_pairs.update(_win_exit_job_member_pairs(view))
     if any(_identity_live(p, s) for p, s in sorted(recorded_pairs)):
         return False
     seen = dict(seen_for(run, home) or {})
@@ -2236,6 +2764,7 @@ def finish_forced_release(home: Optional[str], run_id: str, reason: Optional[str
     run's in-memory seen/termination state and log the release. Called only after the
     request's transaction committed (server effect ``seen_release_forced``)."""
     release_seen_hold(run_id)
+    close_run_job(run_id)
     _log_seen(home, f"run {run_id}: seen hold released by {actor} "
                     f"(--force-seen-unusable, reason={reason}); run lost, no signal")
 
@@ -2307,7 +2836,7 @@ _CLOSE_REFUSED_LOGGED: Dict[str, Tuple[Any, ...]] = {}
 
 
 def close_gate(run: Mapping[str, Any], end_reason: str = "") -> None:
-    """Round 6 (N18): the one close-safety gate for task runs (called by _close_run).
+    """Round 6 (N18): the one close-safety gate for task and launch-mode lead-turn runs.
 
     1. identity from the DB and the disk (wrapper.json; seen.json incl. a marker's
        ``prior_members`` or a token-mismatched file; the in-memory map);
@@ -2328,11 +2857,16 @@ def close_gate(run: Mapping[str, Any], end_reason: str = "") -> None:
     _st, from_file, _r, _l = _load_seen(view)
     recorded_pairs.update((int(p), int(s)) for p, s in from_file.items())
     recorded_pairs.update(_load_prior_member_pairs(view))
+    if sys.platform == "win32":
+        recorded_pairs.update(_win_exit_job_member_pairs(view))
     if wst is not None:
         recorded_pairs.add((int(pgid), int(wst)))
     live = {p: s for p, s in sorted(recorded_pairs) if _identity_live(p, s)}
     occupied = False
-    if group_still_ours(pgid, wst):
+    if sys.platform == "win32":
+        scanned = scan_run_group(run["id"], pgid, wst, _win_run_home(run))
+        occupied = bool(scanned) or getattr(scanned, "uncertain", False)
+    elif group_still_ours(pgid, wst):
         scanned = _scan_group(pgid)
         occupied = bool(scanned) or getattr(scanned, "uncertain", False)
     if live or occupied:
@@ -2355,6 +2889,10 @@ def hold_close(conn: sqlite3.Connection, home: Optional[str], run: Mapping[str, 
         _CLOSE_REFUSED_LOGGED[run_id] = state
         _log_seen(home, f"run {run_id}: close refused by the close-safety gate (end_reason={held.end_reason}, "
                         f"live recorded {sorted(held.live)}, group occupied={held.occupied}); held")
+    if run_id in _SPAWN_ABORTS:
+        # P3-2 / r2 P3-5: a spawn-aborted run stays exclusively owned by retry_spawn_aborts so a second
+        # Termination cannot race, and no unreachable seen_hold / run.seen_unusable is emitted.
+        return
     if held.occupied and (run_id not in _SEEN_UNUSABLE or _SEEN_REASON.get(run_id) not in ADOPT_HOLD_REASONS):
         hold_wrapper_gone(fresh, home)
     if held.occupied:
@@ -2405,6 +2943,9 @@ def _group_occupied(pgid: Optional[int]) -> bool:
     return bool(scanned) or getattr(scanned, "uncertain", False)
 
 
+_DEFAULT_GROUP_OCCUPIED = _group_occupied
+
+
 class SeenSnapshot(NamedTuple):
     """r4d: one read of a run's seen state per tick, used for both the target scan and
     the hold decision. ``changed``: this read (a flush or a reload of a held run's
@@ -2434,6 +2975,14 @@ def snapshot_hold(run: Mapping[str, Any], snap: SeenSnapshot) -> bool:
         return False
     if wrapper_alive(run):
         return False
+    if not run["pgid"]:
+        return False
+    if sys.platform == "win32":
+        if _group_occupied is not _DEFAULT_GROUP_OCCUPIED:
+            return _group_occupied(run["pgid"])
+        wst = close_identity(run)[1]
+        scanned = scan_run_group(run["id"], run["pgid"], wst, _win_run_home(run))
+        return bool(scanned) or getattr(scanned, "uncertain", False)
     return _group_occupied(run["pgid"])
 
 
@@ -2450,6 +2999,14 @@ def seen_hold(run: Mapping[str, Any]) -> bool:
         return False
     if wrapper_alive(run):
         return False
+    if not run["pgid"]:
+        return False
+    if sys.platform == "win32":
+        if _group_occupied is not _DEFAULT_GROUP_OCCUPIED:
+            return _group_occupied(run["pgid"])
+        wst = close_identity(run)[1]
+        scanned = scan_run_group(run["id"], run["pgid"], wst, _win_run_home(run))
+        return bool(scanned) or getattr(scanned, "uncertain", False)
     return _group_occupied(run["pgid"])
 
 
@@ -2476,7 +3033,13 @@ def track_adopted_seen(run: Mapping[str, Any], home: Optional[str] = None) -> Op
         flush_seen(run, home)
         return None
     old = seen_for(run, home)
-    scanned = _scan_group(int(run["pgid"]))
+    if sys.platform == "win32":
+        record_run_home(run_id, home)
+        wst = close_identity(run)[1]
+        register_pgid_run(run_id, run["pgid"], wst, home)
+        scanned = scan_run_group(run_id, int(run["pgid"]), wst, home or _win_run_home(run))
+    else:
+        scanned = _scan_group(int(run["pgid"]))
     liveness = _effective_wrapper_liveness(run)
     if liveness != "alive":
         if liveness == "uncertain":
@@ -2551,12 +3114,12 @@ def write_unusable_marker(run: Mapping[str, Any], reason: str, home: Optional[st
             json.dump(doc, f, sort_keys=True)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
-        dfd = os.open(run_dir, os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
+        if sys.platform == "win32":
+            plat_perms.chmod_private(tmp, 0o600)
+            plat_fs.atomic_replace(tmp, path)
+        else:
+            os.replace(tmp, path)
+        fsync_dir(run_dir)
     except OSError as exc:
         try:
             os.unlink(tmp)
@@ -2732,8 +3295,8 @@ def _close_run(
 ) -> None:
     """Close the run, release the lease and revoke the run token (caller owns the tx).
 
-    Round 6: every close of a task run passes :func:`close_gate` first; a held close
-    raises :class:`CloseHeld`, which rolls the caller's transaction back."""
+    Round 6 / L4: every close of a task or launch-mode lead-turn run passes :func:`close_gate`
+    first; a held close raises :class:`CloseHeld`, which rolls the caller's transaction back."""
     if gate:  # only `run release --force-seen-unusable` (operator override) passes gate=False
         close_gate(run, end_reason)
     _CLOSE_REFUSED_LOGGED.pop(run["id"], None)
@@ -2768,6 +3331,7 @@ def _close_run(
     _SEEN_PERSISTED.pop(run["id"], None)
     _SEEN_HOLD_TOKEN.pop(run["id"], None)
     revoke_run_token(conn, run["id"])
+    close_run_job(run["id"])
 
 
 def _task_failed(
@@ -2925,8 +3489,7 @@ def _finish_run(
                 _task_failed(conn, task, run, "lost", {}, stderr_tail(run["run_dir"]))
             return "lost"
 
-        exit_code = exit_info.get("exit_code")
-        signo = exit_info.get("signal")
+        exit_code, signo = normalize_exit_info(exit_info)
         result = {"exit_code": exit_code, "signal": signo, "ended_at": exit_info.get("ended_at")}
         _close_run(conn, run, "exited", "exited", exit_code, result, testing_mode=testing_mode)
         if signo is not None:
@@ -3154,20 +3717,69 @@ def _finalize_lead_turn_termination(
 
     tmode = _testing_mode() if testing_mode is None else bool(testing_mode)
     with transaction(conn):
+        close_gate(run, t.end_reason)
         result: Dict[str, Any] = {"end_reason": t.end_reason, "kill_failed": t.kill_failed,
                                   "pids": sorted(t.seen)}
         exit_code = None
+        signo = None
         if exit_info:
-            exit_code = exit_info.get("exit_code")
+            exit_code, signo = normalize_exit_info(exit_info)
             result["exit_code"] = exit_code
-            result["signal"] = exit_info.get("signal")
-        counts = lead_turns._release_messages(conn, run["id"], False, run["project_id"],
-                                              tmode)
+            result["signal"] = signo
+        if t.end_reason == "user_interrupted":
+            # Stop/steer: ack only in-flight chat.message lead wakes so Stop does not
+            # auto-restart the interrupted user message, while any newly queued pending
+            # steer message wakes immediately. Non-chat lead wakes (approval.decided,
+            # approval.expired, task.failed, task.merged, etc.) are released back to
+            # pending via the normal failure path so lifecycle outcomes are never lost.
+            now_ack = now_iso_utc()
+            cur_ack = conn.execute(
+                """UPDATE outbox
+                   SET status = 'acked', acked_at = ?, delivering_run_id = NULL, last_error = 'user_interrupted'
+                   WHERE delivering_run_id = ? AND channel = 'lead_wake' AND status = 'delivering'
+                     AND type = 'chat.message';""",
+                (now_ack, run["id"]),
+            )
+            acked_chat = int(cur_ack.rowcount or 0)
+            rem_counts = lead_turns._release_messages(conn, run["id"], False, run["project_id"],
+                                                      tmode)
+            counts = {
+                "acked": acked_chat + int(rem_counts.get("acked", 0)),
+                "pending": int(rem_counts.get("pending", 0)),
+                "dead": int(rem_counts.get("dead", 0)),
+            }
+        else:
+            counts = lead_turns._release_messages(conn, run["id"], False, run["project_id"],
+                                                  tmode)
+        conn.execute(
+            "DELETE FROM meta WHERE key = ?;",
+            (lead_turns.lead_interrupt_meta_key(run["id"]),),
+        )
         result["messages"] = counts
         _close_run(conn, run, RECOVERY_END_STATUS.get(t.end_reason, "killed"), t.end_reason,
                    exit_code, result, testing_mode=tmode)
-        if exit_info and exit_info.get("signal") is not None:
-            conn.execute("UPDATE runs SET signal = ? WHERE id = ?;", (exit_info.get("signal"), run["id"]))
+        if signo is not None:
+            conn.execute("UPDATE runs SET signal = ? WHERE id = ?;", (signo, run["id"]))
+        if t.end_reason == "user_interrupted" and run["project_id"]:
+            record_event(
+                conn=conn,
+                type_="lead.turn_finished",
+                actor_id="system",
+                actor_kind="system",
+                via="system",
+                project_id=run["project_id"],
+                run_id=run["id"],
+                payload={
+                    "run_id": run["id"],
+                    "project_id": run["project_id"],
+                    "ok": False,
+                    "interrupted": True,
+                    "end_reason": t.end_reason,
+                    "exit_code": exit_code,
+                    "chat_reply_count": 0,
+                    "actions_summary": {"ok": 0, "failed": 0},
+                },
+            )
     return "killed"
 
 
@@ -3210,7 +3822,7 @@ def _finalize_termination(
             from mesh.daemon import lead_turns
 
             reason = lead_turns.lead_turn_termination_reason(conn, run)
-            if reason in ("project_cancelled", "lead_superseded"):
+            if reason in ("project_cancelled", "lead_superseded", "user_interrupted"):
                 t.end_reason = reason
         if t.end_reason == "leftovers":
             # Review m2-r9 finding 2: a turn that exited 0 and left an escapee is a
@@ -3255,10 +3867,11 @@ def _finalize_termination(
     with transaction(conn):
         result: Dict[str, Any] = {"end_reason": t.end_reason, "kill_failed": t.kill_failed, "pids": sorted(t.seen)}
         exit_code = None
+        signo = None
         if exit_info:
-            exit_code = exit_info.get("exit_code")
+            exit_code, signo = normalize_exit_info(exit_info)
             result["exit_code"] = exit_code
-            result["signal"] = exit_info.get("signal")
+            result["signal"] = signo
         # Recovery terminations (§11.7) close the run as lost / spawn_failed, not killed.
         _close_run(
             conn,
@@ -3269,8 +3882,8 @@ def _finalize_termination(
             result,
             testing_mode=testing_mode,
         )
-        if exit_info and exit_info.get("signal") is not None:
-            conn.execute("UPDATE runs SET signal = ? WHERE id = ?;", (exit_info.get("signal"), run["id"]))
+        if signo is not None:
+            conn.execute("UPDATE runs SET signal = ? WHERE id = ?;", (signo, run["id"]))
         if task is None:
             return "killed"
         if task["status"] == "cancelling":
@@ -3456,6 +4069,10 @@ def watch_launch_runs(
         if run["kind"] == "merge_test":
             # The merge pipeline owns its run (no process; m2-r5). Explicit skip (m2-plan risk 5).
             continue
+        if sys.platform == "win32":
+            record_run_home(run["id"], home)
+            if run["pgid"] and (int(run["pgid"]) not in _PGID_RUN_INFO or wrapper_alive(run)):
+                register_pgid_run(run["id"], run["pgid"], run["proc_starttime"], home)
         try:
             outcome = _watch_one(conn, home, run, testing_mode=testing_mode)
         except Exception as exc:  # one run must not stop the others
@@ -3466,6 +4083,19 @@ def watch_launch_runs(
     active_ids = {r["id"] for r in runs} | set(_SPAWN_ABORTS)
     _evict_git_info(active_ids)
     _evict_seen(active_ids)
+    if sys.platform == "win32":
+        from mesh.daemon import recovery as _rec
+
+        merge_rows = conn.execute(
+            "SELECT id FROM runs WHERE kind = 'merge_test' AND status IN ('starting', 'running');"
+        ).fetchall()
+        _evict_run_jobs(
+            active_ids
+            | {r["id"] for r in merge_rows}
+            | terminate.active_run_ids()
+            | set(_rec.DEFERRED)
+            | set(_WRAPPERS)
+        )
     for run_id in [r for r in _CLEAR if r not in active_ids]:
         _CLEAR.pop(run_id, None)
     flush_pending_seen_events(conn, home)
@@ -3480,6 +4110,8 @@ def advance_terminations(
     """Advance only the runs being terminated (meshd's 200 ms loop, §11.4)."""
     closed: List[str] = []
     for run_id, t in terminate.active().items():
+        if run_id in _SPAWN_ABORTS:
+            continue
         run = conn.execute("SELECT * FROM runs WHERE id = ?;", (run_id,)).fetchone()
         if run is None or run["status"] not in ("starting", "running"):
             terminate.forget(run_id)
@@ -3555,7 +4187,7 @@ def _watch_lead_turn(
     else:
         _CLEAR.pop(run["id"], None)
     cancel_reason = lead_turns.lead_turn_termination_reason(conn, run)
-    override_reason = cancel_reason if cancel_reason in ("project_cancelled", "lead_superseded") else None
+    override_reason = cancel_reason if cancel_reason in ("project_cancelled", "lead_superseded", "user_interrupted") else None
     if leftovers:
         # Hand the identities recorded for the run plus every identity this scan found to
         # begin() (review #20b L1 handoff).
@@ -3646,6 +4278,10 @@ def _watch_one_inner(
     run: Mapping[str, Any],
     testing_mode: Optional[bool] = None,
 ) -> Optional[str]:
+    if sys.platform == "win32":
+        record_run_home(run["id"], home)
+        if run["pgid"] and (int(run["pgid"]) not in _PGID_RUN_INFO or wrapper_alive(run)):
+            register_pgid_run(run["id"], run["pgid"], run["proc_starttime"], home)
     t = terminate.get(run["id"])
     if t is not None:
         return _advance(conn, home, run, t, testing_mode=testing_mode)

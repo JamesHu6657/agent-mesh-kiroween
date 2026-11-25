@@ -27,7 +27,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-#: The 16 commands a lead turn may execute (plan §12.4 + task.close).
+#: The commands a lead turn may execute (plan §12.4 + task.close + Chat-First chat.reply/plan.*).
 ALLOWED_ACTION_CMDS: List[str] = [
     "task.create",
     "task.assign",
@@ -45,6 +45,10 @@ ALLOWED_ACTION_CMDS: List[str] = [
     "project.complete",
     "project.deliver",
     "approval.request",
+    "chat.reply",
+    "plan.propose",
+    "plan.dispatch",
+    "plan.cancel",
 ]
 
 #: At most this many actions per turn (plan §12.4).
@@ -220,12 +224,83 @@ _TASK_ARG_CMDS = frozenset({
 })
 
 #: Commands whose handler names the project `project_id` (the CLI's positional).
-_PROJECT_ID_CMDS = frozenset({"project.note", "project.complete", "project.deliver"})
+_PROJECT_ID_CMDS = frozenset({
+    "project.note", "project.complete", "project.deliver",
+    "chat.reply", "plan.propose", "plan.dispatch", "plan.cancel",
+})
 
 
 def _alias(args: Dict[str, Any], src: str, dst: str) -> None:
     if src in args and dst not in args:
         args[dst] = args.pop(src)
+
+
+def strip_mesh_actions_blocks(final_text: str) -> str:
+    """Remove all fenced `mesh-actions` blocks from lead final text."""
+    if not isinstance(final_text, str) or not final_text:
+        return ""
+    lines = [line[:-1] if line.endswith("\r") else line for line in final_text.split("\n")]
+    out: List[str] = []
+    index = 0
+    while index < len(lines):
+        opening = _OPEN_RE.match(lines[index])
+        if opening is not None and opening.group(2).strip() == "mesh-actions":
+            fence = opening.group(1)
+            index += 1
+            while index < len(lines):
+                closing = _CLOSE_RE.match(lines[index])
+                if closing is not None and len(closing.group(1)) >= len(fence):
+                    index += 1
+                    break
+                index += 1
+            continue
+        out.append(lines[index])
+        index += 1
+    return "\n".join(out).strip()
+
+
+def extract_fallback_reply_text(final_text: str, max_len: int = 500) -> str:
+    """Extract a safe first concise paragraph for fallback replies (P3-2, DESIGN §3.5).
+
+    Strips ALL fenced code blocks (mesh-actions, mesh-deliverable, json, etc.,
+    including unclosed trailing fences) so private protocol payloads never leak
+    into chat, and returns only the first non-empty paragraph bounded to `max_len`.
+    """
+    if not isinstance(final_text, str) or not final_text:
+        return ""
+    lines = [line[:-1] if line.endswith("\r") else line for line in final_text.split("\n")]
+    stripped_lines: List[str] = []
+    index = 0
+    while index < len(lines):
+        opening = _OPEN_RE.match(lines[index])
+        if opening is not None:
+            fence = opening.group(1)
+            index += 1
+            while index < len(lines):
+                closing = _CLOSE_RE.match(lines[index])
+                if closing is not None and len(closing.group(1)) >= len(fence):
+                    index += 1
+                    break
+                index += 1
+            # Separate paragraphs around stripped code blocks
+            stripped_lines.append("")
+            continue
+        stripped_lines.append(lines[index])
+        index += 1
+
+    # Collect first non-empty paragraph
+    para_lines: List[str] = []
+    for line in stripped_lines:
+        if line.strip():
+            para_lines.append(line.strip())
+        elif para_lines:
+            break
+    if not para_lines:
+        return ""
+    para = " ".join(para_lines).strip()
+    if len(para) > max_len:
+        para = para[: max(1, max_len - 1)].rstrip() + "…"
+    return para
 
 
 def action_request_args(cmd: str, args: Dict[str, Any], scope_project_id: Optional[str]) -> Dict[str, Any]:
@@ -252,6 +327,8 @@ def action_request_args(cmd: str, args: Dict[str, Any], scope_project_id: Option
             out["project_id"] = scope_project_id
     if cmd == "project.note":
         _alias(out, "note", "text")
+    if cmd == "chat.reply":
+        _alias(out, "message", "text")
     if cmd == "approval.request":
         named = any(out.get(k) for k in ("project", "project_id", "task", "task_id"))
         if not named and scope_project_id:

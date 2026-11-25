@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -22,13 +23,18 @@ from mesh.core.auth import derive_user_keys
 from mesh.core.db import connect, sqlite_ro_uri
 from mesh.core.init import init_mesh_home
 from mesh.errors import MeshError
+from mesh.platform import perms as plat_perms
 from tests.helpers import MeshHarness
 
 PASS = "test-passphrase-at-least-16-chars-long"
 
 # Home names a URI would break on: "?" starts the query, "#" the fragment, "%" an
-# escape (%41 would decode to "A"), plus spaces.
-HOSTILE_NAMES = ["h?mode=rw", "h#frag", "h%41b", "h with space", "h ?#%3F mixed"]
+# escape (%41 would decode to "A"), plus spaces. Windows NTFS forbids "?".
+HOSTILE_NAMES = (
+    ["h#frag", "h%41b", "h with space", "h #%23%3F mixed"]
+    if sys.platform == "win32"
+    else ["h?mode=rw", "h#frag", "h%41b", "h with space", "h ?#%3F mixed"]
+)
 
 # Independent cost oracle: known-answer vectors computed once with hashlib.scrypt
 # and frozen here as literals (not derived from mesh constants), so a change that
@@ -104,7 +110,7 @@ class _HostileHomeCase(unittest.TestCase):
         self.addCleanup(h.teardown)
         h.home = os.path.join(base, name)
         os.makedirs(h.home, mode=0o700)
-        os.chmod(h.home, 0o700)
+        plat_perms.set_private_dir_acl(h.home)
         return h
 
 
@@ -190,8 +196,12 @@ class TestDoctorCliFailClosed(_HostileHomeCase):
         finally:
             conn.close()
 
+    @staticmethod
+    def _hname(name: str) -> str:
+        return name.replace("?", "#") if sys.platform == "win32" else name
+
     def test_missing_credential_row(self) -> None:
-        h = self._broken_home("h?cred", lambda db: self._sql(
+        h = self._broken_home(self._hname("h?cred"), lambda db: self._sql(
             db, "DELETE FROM credentials WHERE kind = 'passphrase';"))
         self._assert_not_healthy(h)
 
@@ -217,7 +227,7 @@ class TestDoctorCliFailClosed(_HostileHomeCase):
         self._assert_not_healthy(h)
 
     def test_missing_settings_or_projects_table(self) -> None:
-        for name, table in (("h?set", "settings"), ("h?prj", "projects")):
+        for name, table in ((self._hname("h?set"), "settings"), (self._hname("h?prj"), "projects")):
             with self.subTest(table=table):
                 h = self._broken_home(name, lambda db, t=table: self._sql(db, f"DROP TABLE {t};"))
                 self._assert_not_healthy(h)
@@ -253,11 +263,11 @@ class TestDoctorCliFailClosed(_HostileHomeCase):
                 if os.path.exists(db + suffix):
                     os.remove(db + suffix)
             os.makedirs(db, mode=0o700)
-        h = self._broken_home("h?open", make_dir)
+        h = self._broken_home(self._hname("h?open"), make_dir)
         self._assert_not_healthy(h)
 
     def test_null_params_still_kdf_invalid(self) -> None:
-        h = self._broken_home("h?null", lambda db: self._sql(
+        h = self._broken_home(self._hname("h?null"), lambda db: self._sql(
             db, "UPDATE credentials SET kdf_params = NULL WHERE kind = 'passphrase';"))
         for extra in ({}, _prod_env()):
             rc, env = h.cli("doctor", extra_env=extra)
@@ -278,7 +288,7 @@ class TestDefaultHomeGuardEverywhere(unittest.TestCase):
         with mock.patch.dict(os.environ, {"MESH_TESTING": "1"}):
             init_mesh_home(src, PASS)
         shutil.copytree(src, self.default)
-        os.chmod(self.default, 0o700)
+        plat_perms.set_private_dir_acl(self.default)
 
     def test_doctor_testing_mode_on_default_home_refused(self) -> None:
         link = os.path.join(self.fake_user_home, "link")
@@ -286,7 +296,7 @@ class TestDefaultHomeGuardEverywhere(unittest.TestCase):
         for home in (self.default, link):
             with self.subTest(home=home):
                 self.harness.home = home
-                rc, env = self.harness.cli("doctor", extra_env={"HOME": self.fake_user_home})
+                rc, env = self.harness.cli("doctor", extra_env={"HOME": self.fake_user_home, "USERPROFILE": self.fake_user_home})
                 self.assertEqual(rc, c.EXIT_USAGE, env)
                 self.assertEqual(env["error"]["code"], c.INVALID_ARGUMENT)
                 self.assertIn("default home", env["error"]["message"])
@@ -303,7 +313,7 @@ class TestDefaultHomeGuardEverywhere(unittest.TestCase):
             path = os.fspath(path)
             return real_stat(self.default if path == os.path.realpath(alias) else path, *a, **kw)
 
-        with mock.patch.dict(os.environ, {"HOME": self.fake_user_home, "MESH_TESTING": "1"}), \
+        with mock.patch.dict(os.environ, {"HOME": self.fake_user_home, "USERPROFILE": self.fake_user_home, "MESH_TESTING": "1"}), \
                 mock.patch.object(mesh_paths.os, "stat", side_effect=fake_stat):
             with self.assertRaises(MeshError) as cm:
                 handle_doctor(argparse.Namespace(home=alias, check_invariants=False, fix_perms=False))
@@ -320,7 +330,7 @@ class TestDefaultHomeGuardEverywhere(unittest.TestCase):
             path = os.fspath(path)
             return real_stat(self.default if path == os.path.realpath(alias) else path, *a, **kw)
 
-        with mock.patch.dict(os.environ, {"HOME": self.fake_user_home}):
+        with mock.patch.dict(os.environ, {"HOME": self.fake_user_home, "USERPROFILE": self.fake_user_home}):
             srv = DaemonServer(alias, testing_mode=True)
             with mock.patch.object(mesh_paths.os, "stat", side_effect=fake_stat):
                 with self.assertRaises(MeshError) as cm:
@@ -370,7 +380,7 @@ class TestKdfCostOracle(unittest.TestCase):
     def test_stored_verifier_equals_independent_scrypt(self) -> None:
         tmp = tempfile.mkdtemp(prefix="mh-oracle-")
         self.addCleanup(shutil.rmtree, tmp, True)
-        os.chmod(tmp, 0o700)
+        plat_perms.set_private_dir_acl(tmp)
         cases = (("prod", {"MESH_TESTING": "0"}, KV_PROD_N), ("test", {"MESH_TESTING": "1"}, KV_TEST_N))
         for name, env, n in cases:
             with self.subTest(home=name):

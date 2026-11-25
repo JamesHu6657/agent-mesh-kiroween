@@ -1,5 +1,6 @@
 """Focused unit regression tests for batch7 g4 findings."""
 
+import sys
 import asyncio
 import datetime
 import json
@@ -27,6 +28,7 @@ from mesh.core.settings import (
     validate_setting,
 )
 from mesh.daemon import merge as merge_mod
+from tests.helpers import fake_peer_creds
 from mesh.daemon import scheduler as scheduler_mod
 from mesh.daemon.handlers.base import Effect, HandlerContext
 from mesh.daemon.handlers.dep import handle_dep_add, handle_dep_remove
@@ -114,7 +116,11 @@ class TestBatch7G4Unit(unittest.TestCase):
                     f.write("precious\n")
 
                 ws_path = os.path.join(tasks_dir, "tsk_1")
-                os.symlink(integ_dir, ws_path)
+                if sys.platform == "win32":
+                    import _winapi
+                    _winapi.CreateJunction(integ_dir, ws_path)
+                else:
+                    os.symlink(integ_dir, ws_path)
                 with transaction(conn):
                     conn.execute(
                         "INSERT INTO tasks (id, project_id, title, spec, kind, status, profile, timeout_s, max_attempts, workspace_path, branch, created_by, created_at, updated_at) "
@@ -127,13 +133,21 @@ class TestBatch7G4Unit(unittest.TestCase):
                     reason = _remove_worktree_and_branch(ctx, task_row, integ_dir)
                 self.assertEqual(reason, "outside_workspaces_root")
                 m_git.assert_not_called()
-                self.assertTrue(os.path.islink(ws_path))
+                from mesh.platform.paths import is_reparse_link
+                self.assertTrue(is_reparse_link(ws_path))
                 self.assertTrue(os.path.exists(os.path.join(integ_dir, "keep.txt")))
 
                 # Also verify symlinked tasks/ parent dir is rejected
-                os.unlink(ws_path)
+                if sys.platform == "win32":
+                    os.rmdir(ws_path)
+                else:
+                    os.unlink(ws_path)
                 shutil.rmtree(tasks_dir)
-                os.symlink(integ_dir, tasks_dir)
+                if sys.platform == "win32":
+                    import _winapi
+                    _winapi.CreateJunction(integ_dir, tasks_dir)
+                else:
+                    os.symlink(integ_dir, tasks_dir)
                 reason2 = _remove_worktree_and_branch(ctx, task_row, integ_dir)
                 self.assertEqual(reason2, "outside_workspaces_root")
             finally:
@@ -179,7 +193,11 @@ class TestBatch7G4Unit(unittest.TestCase):
             os.makedirs(os.path.join(repo, "reports"))
             with open(os.path.join(repo, "reports", "junit.xml"), "w") as f:
                 f.write("<xml/>")
-            os.symlink(outside, os.path.join(repo, "reports", "escape_link"))
+            if sys.platform == "win32":
+                import _winapi
+                _winapi.CreateJunction(outside, os.path.join(repo, "reports", "escape_link"))
+            else:
+                os.symlink(outside, os.path.join(repo, "reports", "escape_link"))
 
             res = merge_mod._abort_and_verify(repo, pre_head, pre_untracked=pre_untracked)
             self.assertTrue(res["restored"], res)
@@ -270,7 +288,7 @@ class TestBatch7G4Unit(unittest.TestCase):
                         async def wait_closed(self) -> None:
                             pass
 
-                    with mock.patch("mesh.daemon.server.get_peer_credentials", return_value=(os.getpid(), os.getuid(), os.getgid())), \
+                    with mock.patch("mesh.daemon.server.get_peer_credentials", return_value=fake_peer_creds()), \
                          mock.patch.object(srv, "authenticate_and_authorize", return_value=({"id": "usr_1", "kind": "user", "name": "user"}, "user", "direct", None)):
                         await srv.handle_client(reader_s, _W())
                     return json.loads(buf.decode("utf-8").splitlines()[0])
@@ -461,7 +479,7 @@ class TestBatch7G4Unit(unittest.TestCase):
                             async def wait_closed(self) -> None:
                                 pass
 
-                        with mock.patch("mesh.daemon.server.get_peer_credentials", return_value=(os.getpid(), os.getuid(), os.getgid())), \
+                        with mock.patch("mesh.daemon.server.get_peer_credentials", return_value=fake_peer_creds()), \
                              mock.patch.object(srv, "authenticate_and_authorize", return_value=({"id": "usr_1", "kind": "user", "name": "user"}, "user", "direct", None)):
                             await srv.handle_client(reader_s, _W())
                         return json.loads(buf.decode("utf-8").splitlines()[0])

@@ -28,6 +28,7 @@ from mesh.daemon.handlers.task import handle_task_close
 from mesh.daemon.server import DaemonServer, dispatch_internal_request
 from mesh.errors import MeshError
 from tests.gitfixture import GitFixture
+from tests.helpers import fake_peer_creds
 
 
 def _make_ctx(
@@ -64,7 +65,7 @@ async def _send_req(srv: DaemonServer, payload: dict) -> dict:
     try:
         with mock.patch(
             "mesh.daemon.server.get_peer_credentials",
-            return_value=(os.getpid(), os.getuid(), os.getgid()),
+            return_value=fake_peer_creds(),
         ), mock.patch(
             "mesh.daemon.server.classify_peer_run_session", return_value=None
         ), mock.patch.object(srv, "refresh_run_caches"):

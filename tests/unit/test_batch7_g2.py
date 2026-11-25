@@ -1,7 +1,6 @@
 """Focused unit/DB/supervisor/recovery regression tests for batch7 g2 findings."""
 
 import asyncio
-import fcntl
 import json
 import os
 import select
@@ -15,6 +14,11 @@ import time
 import unittest
 from typing import Any, Dict, Optional
 from unittest import mock
+
+if sys.platform != "win32":
+    import fcntl
+else:
+    fcntl = None  # type: ignore[assignment]
 
 import mesh.constants as c
 import mesh.core.schema as schema_mod
@@ -33,6 +37,8 @@ from mesh.daemon.handlers.run import handle_run_release
 from mesh.daemon.handlers.task import handle_task_retry
 from mesh.daemon.server import DaemonServer
 from mesh.errors import MeshError, SchemaTooNewError
+from mesh.platform import proc as plat_proc
+from mesh.platform.paths import temp_root
 from tests import tierlib
 
 MESH_PROC_LOCK = "shared"
@@ -125,7 +131,7 @@ def _is_pid_dead(pid: int, st: int, proc: Optional[subprocess.Popen] = None) -> 
 
 class _Batch7G2Base(unittest.TestCase):
     def setUp(self) -> None:
-        self.home = tempfile.mkdtemp(prefix="mh-b7g2-", dir="/tmp")
+        self.home = tempfile.mkdtemp(prefix="mh-b7g2-", dir=temp_root())
         self.addCleanup(shutil.rmtree, self.home, True)
         for sub in ("logs", "run", "runs", "workspaces"):
             os.makedirs(os.path.join(self.home, sub), mode=0o700, exist_ok=True)
@@ -287,12 +293,15 @@ class _Batch7G2Base(unittest.TestCase):
         proc: Optional[subprocess.Popen] = None,
         check: bool = True,
     ) -> None:
-        info = get_proc_stat(pid)
-        if info is not None and int(info["starttime"]) == st and info["state"] not in ("Z", "X"):
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
+        if sys.platform == "win32":
+            terminate.signal_if_same(pid, st, plat_proc.SIGKILL)
+        else:
+            info = get_proc_stat(pid)
+            if info is not None and int(info["starttime"]) == st and info["state"] not in ("Z", "X"):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
         if proc is not None:
             try:
                 proc.wait(timeout=5)
@@ -304,6 +313,7 @@ class _Batch7G2Base(unittest.TestCase):
 
 
 class TestBatch7G2Unit(_Batch7G2Base):
+    @unittest.skipUnless(sys.platform != "win32", "POSIX os.fork/PGID detached carrier and seen_held PGID scan (Windows carrier close-gate covered in test_win_close_gate_jobs)")
     def test_f1_seen_held_rejects_live_carrier_and_prior_members(self) -> None:
         """Finding 1: `seen_held` / `run release --force-seen-unusable` must refuse while a
         `MESH_RUN_ID` carrier, `prior_members` entry, or `t.seen` target is still alive."""
@@ -426,13 +436,18 @@ class TestBatch7G2Unit(_Batch7G2Base):
         run_a = "run_f2a"
         dir_a = os.path.join(self.home, "runs", run_a)
         os.makedirs(dir_a, mode=0o700, exist_ok=True)
+        clean_env = (
+            {k: v for k, v in os.environ.items() if k.upper() in ("SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT")}
+            if sys.platform == "win32"
+            else {}
+        )
         live_wrap = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(60)"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
-            env={},
+            env=clean_env,
         )
         wrap_st = int(get_proc_stat(live_wrap.pid)["starttime"])
         self.addCleanup(lambda: self._kill_pid(live_wrap.pid, wrap_st, live_wrap, check=False))
@@ -450,7 +465,7 @@ class TestBatch7G2Unit(_Batch7G2Base):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
-            env={},
+            env=clean_env,
         )
         dead_stat = get_proc_stat(dead_wrap.pid)
         dead_st = int(dead_stat["starttime"]) if dead_stat is not None else 1
@@ -525,7 +540,7 @@ class TestBatch7G2Unit(_Batch7G2Base):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
-            env={},
+            env=clean_env,
         )
         ab_st = int(get_proc_stat(ab_proc.pid)["starttime"])
         self.addCleanup(lambda: self._kill_pid(ab_proc.pid, ab_st, ab_proc, check=False))
@@ -718,6 +733,7 @@ class TestBatch7G2Unit(_Batch7G2Base):
         self.assertEqual(len(unreachable), 1)
         self.assertEqual(json.loads(unreachable[0]["payload_json"])["messages"], ["msg_wake_dead"])
 
+    @unittest.skipUnless(sys.platform != "win32", "POSIX os.fork/PGID detached carrier and seen_held PGID scan (Windows carrier close-gate covered in test_win_close_gate_jobs)")
     def test_f8_adopted_lead_turn_seen_tracking_close_gate_and_forced_release(self) -> None:
         """Finding 8: adopted `lead_turn` tracks `seen.json`, terminates env-stripped leftovers,
         enforces `close_gate`, and supports `run release --force-seen-unusable`."""
@@ -877,11 +893,15 @@ class TestBatch7G2Unit(_Batch7G2Base):
         # Part A: vendor smoke evidence check on fresh DroidAdapter (static verification == 'help').
         stage = os.path.join(self.home, "smoke_stage")
         results_dir = os.path.join(stage, "results")
-        binary = os.path.join(self.home, "bin", "droid")
+        binary = os.path.join(self.home, "bin", "droid.cmd" if sys.platform == "win32" else "droid")
         os.makedirs(os.path.dirname(binary), exist_ok=True)
         with open(binary, "w", encoding="utf-8") as f:
-            f.write("#!/bin/sh\nexit 0\n")
-        os.chmod(binary, 0o755)
+            if sys.platform == "win32":
+                f.write("@echo off\r\nexit /b 0\r\n")
+            else:
+                f.write("#!/bin/sh\nexit 0\n")
+        if sys.platform != "win32":
+            os.chmod(binary, 0o755)
         version = "1.3.0"
         probed_at = now_iso_utc(time.time() + 10)
         with transaction(self.conn):
@@ -1021,6 +1041,7 @@ class TestBatch7G2Unit(_Batch7G2Base):
         self.assertIn("--model", vibe_spec.argv)
         self.assertEqual(vibe_spec.argv[vibe_spec.argv.index("--model") + 1], "model-b")
 
+    @unittest.skipUnless(sys.platform != "win32", "POSIX fcntl.flock and /proc/self/fd leak checks (Windows locking covered in test_platform_locks_perms)")
     def test_f11_lock_storage_startup_and_registered_exec_cleanup(self) -> None:
         """Finding 11: failed `acquire_lock` / `setup_storage` / `run_server` never leak fds or
         delete a live daemon's `meshd.pid` / `mesh.sock`, and `create_subprocess_exec_registered`

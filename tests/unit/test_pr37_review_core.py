@@ -6,6 +6,7 @@ bystander exception is sshd-only; #8/#9 MERGE_HELD text and log path; #5 the ros
 for run tokens is current-lead only.
 """
 
+import sys
 import sqlite3
 import unittest
 from unittest import mock
@@ -106,6 +107,7 @@ class TestRedactedSessionHint(unittest.TestCase):
         self.assertEqual(cm.exception.code, c.FENCE_MISMATCH)
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "Linux /proc/<pid>/status and sshd bystander UID checks")
 class TestBystanderSshdOnly(unittest.TestCase):
     # listener (root, old) -> parent (root, young) -> candidate (us, young)
     def _check(self, comms, pid=901, ruid=None, exe_bad=()):

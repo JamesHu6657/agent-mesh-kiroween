@@ -7,11 +7,14 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
 from mesh.adapters.evidence import apply_to_probe, load_evidence
 from mesh.adapters.registry import get_adapter
+from mesh.core.paths import mesh_cli_argv
+from mesh.platform import perms as plat_perms
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BIN_MESH = os.path.join(ROOT, "bin", "mesh")
@@ -39,10 +42,18 @@ def normalize(text):
 
 def run_help(topic):
     home = tempfile.mkdtemp(prefix="mh-docs-")
-    os.chmod(home, 0o700)
+    if sys.platform == "win32":
+        plat_perms.set_private_dir_acl(home)
+        argv = mesh_cli_argv("--home", home, "help", topic)
+        env = dict(os.environ, PYTHONPATH=ROOT)
+    else:
+        os.chmod(home, 0o700)
+        argv = [BIN_MESH, "--home", home, "help", topic]
+        env = None
     try:
         proc = subprocess.run(
-            [BIN_MESH, "--home", home, "help", topic],
+            argv,
+            env=env,
             capture_output=True,
             text=True,
             timeout=120,

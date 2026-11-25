@@ -19,6 +19,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import json
 import tempfile
 import unittest
@@ -29,7 +30,7 @@ from mesh.cli.commands import doctor
 from tests.helpers import rmtree_deep
 from tests.unit.test_home_resolution_r3 import _CwdCase, _prod_env
 
-_IS_ROOT = os.getuid() == 0
+_IS_ROOT = os.getuid() == 0 if sys.platform != "win32" else False
 
 
 def _mode(path: str) -> int:
@@ -42,6 +43,7 @@ def _write(path: str, mode: int, data: str = "x") -> None:
     os.chmod(path, mode)
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), 'Linux O_PATH/lstat/mode-bit fix-perms tests')
 @unittest.skipIf(_IS_ROOT, "root ignores file modes; needs a non-root uid")
 class TestOrderInstallDirAsHome(_CwdCase):
     def setUp(self) -> None:
@@ -77,6 +79,7 @@ class TestOrderInstallDirAsHome(_CwdCase):
                     os.chmod(target, 0o755)
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), 'Linux O_PATH/lstat/mode-bit fix-perms tests')
 @unittest.skipIf(_IS_ROOT, "root ignores file modes; needs a non-root uid")
 class TestFdBasedWalkRaces(unittest.TestCase):
     """In-process: doctor._fix_perms with the race hook swapping components."""
@@ -166,6 +169,7 @@ class TestFdBasedWalkRaces(unittest.TestCase):
         self.assertEqual(_mode(self.home), 0o755)
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), 'Linux O_PATH/lstat/mode-bit fix-perms tests')
 @unittest.skipIf(_IS_ROOT, "root ignores file modes; needs a non-root uid")
 class TestWalkShapeAndModes(_CwdCase):
     def _init(self, name: str) -> str:
@@ -237,17 +241,25 @@ class TestWalkShapeAndModes(_CwdCase):
 
 class TestEmptyMeshHomeFallsBack(_CwdCase):
     def test_empty_mesh_home_uses_default(self) -> None:
+        from mesh.core.paths import mesh_cli_argv
+
         fake_home = os.path.join(self.base, "user")
         os.mkdir(fake_home)
         env = self.h.get_env()
         env.update(_prod_env())
         env["MESH_HOME"] = ""
         env["HOME"] = fake_home
-        proc = subprocess.run([self.h.bin_mesh, "doctor"], cwd=self.base, env=env,
+        if sys.platform == "win32":
+            env["USERPROFILE"] = fake_home
+            self.h._with_direct_pythonpath(env)
+            cmd = mesh_cli_argv("doctor")
+        else:
+            cmd = [self.h.bin_mesh, "doctor"]
+        proc = subprocess.run(cmd, cwd=self.base, env=env,
                               text=True, capture_output=True, timeout=15)
         out = json.loads(proc.stdout.strip())
         self.assertEqual(proc.returncode, 0, out)
-        self.assertEqual(out["data"]["home"], os.path.join(fake_home, ".agent-mesh"))
+        self.assertEqual(os.path.realpath(out["data"]["home"]), os.path.realpath(os.path.join(fake_home, ".agent-mesh")))
         self.assertFalse(os.path.exists(os.path.join(self.base, "mesh.db")))
 
     def test_documented_in_help_env(self) -> None:

@@ -20,8 +20,11 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 from typing import Dict, List, Sequence, Tuple
+
+from mesh.platform.paths import is_path_equal_or_parent, is_reparse_link, norm_cmp, strip_trailing_seps, temp_root
 
 SIDECAR_SUFFIX = ".meta.json"
 SIDECAR_KEYS = frozenset({"command", "captured_at_utc", "sha256"})
@@ -69,7 +72,14 @@ def _check_rel(rel_path: str) -> List[str]:
 
 def _excl_write(path: str, data: bytes) -> None:
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_BINARY", 0)
+        )
+        fd = os.open(path, flags, 0o644)
     except FileExistsError:
         raise TierError(f"refused: {path} already exists")
     with os.fdopen(fd, "wb") as f:
@@ -106,13 +116,25 @@ def write_capture(staging: str, rel_path: str, data: bytes, command: Sequence[st
 
 
 def _check_no_symlinks(path: str) -> None:
-    if os.path.islink(path):
+    if is_reparse_link(path):
         raise TierError(f"refused symlink {path}")
     cur = os.path.dirname(os.path.abspath(path))
+    stop_roots = {
+        norm_cmp(temp_root()),
+        "/tmp",
+        "/var",
+        "/private",
+        "/private/tmp",
+        "/private/var",
+        "/home",
+    }
+    if sys.platform == "win32":
+        stop_roots.add(norm_cmp(os.path.abspath(tempfile.gettempdir())))
     while cur and cur != os.path.dirname(cur):
-        if cur in ("/tmp", "/var", "/private", "/private/tmp", "/private/var", "/home"):
+        cur_cmp = norm_cmp(strip_trailing_seps(cur))
+        if cur_cmp in stop_roots:
             break
-        if os.path.islink(cur):
+        if is_reparse_link(cur):
             raise TierError(f"refused symlinked directory {cur}")
         cur = os.path.dirname(cur)
 
@@ -123,7 +145,7 @@ def read_sidecar(data_path: str) -> Dict[str, object]:
     if not os.path.isfile(data_path):
         raise TierError(f"missing file for sidecar check: {data_path}")
     side = data_path + SIDECAR_SUFFIX
-    if not os.path.isfile(side) or os.path.islink(side):
+    if not os.path.isfile(side) or is_reparse_link(side):
         raise TierError(f"missing sidecar for {data_path}")
     with open(side, "rb") as f:
         try:
@@ -154,7 +176,7 @@ def _destination(repo_root: str, parts: List[str]) -> str:
 def plan_promotion(staging: str, repo_root: str) -> List[Tuple[str, str]]:
     """Validate a whole staging tree; return ``[(src, dst)]`` for data files. Raises on any
     problem, before anything is written."""
-    if os.path.islink(staging.rstrip(os.sep) or staging):
+    if is_reparse_link(staging):
         raise TierError(f"refused symlinked staging dir {staging}")
     staging = os.path.realpath(staging)
     repo_root = os.path.realpath(repo_root)
@@ -162,17 +184,17 @@ def plan_promotion(staging: str, repo_root: str) -> List[Tuple[str, str]]:
         raise TierError(f"no staging dir {staging}")
     if not os.path.isdir(os.path.join(repo_root, "tests", "fixtures", "real")):
         raise TierError(f"{repo_root} is not a Mesh checkout (no tests/fixtures/real)")
-    if repo_root == staging or staging.startswith(repo_root + os.sep):
+    if is_path_equal_or_parent(repo_root, staging):
         raise TierError("staging must be outside the repository")
     pairs: List[Tuple[str, str]] = []
     sidecars = set()
     for dirpath, dirnames, filenames in os.walk(staging):
         for d in dirnames:
-            if os.path.islink(os.path.join(dirpath, d)):
+            if is_reparse_link(os.path.join(dirpath, d)):
                 raise TierError(f"refused symlink {os.path.join(dirpath, d)}")
         for name in filenames:
             src = os.path.join(dirpath, name)
-            if os.path.islink(src):
+            if is_reparse_link(src):
                 raise TierError(f"refused symlink {src}")
             rel = os.path.relpath(src, staging).replace(os.sep, "/")
             if name.endswith(SIDECAR_SUFFIX):
@@ -198,7 +220,7 @@ def _check_dest_parent(repo_root: str, dst: str) -> None:
     parent = os.path.realpath(os.path.dirname(dst))
     allowed = [os.path.realpath(os.path.join(repo_root, "tests", "fixtures", "real")),
                os.path.realpath(os.path.join(repo_root, "tests", "smoke", "results"))]
-    if not any(parent == a or parent.startswith(a + os.sep) for a in allowed):
+    if not any(is_path_equal_or_parent(a, parent) for a in allowed):
         raise TierError(f"refused: {dst} resolves outside the allowed trees ({parent})")
 
 

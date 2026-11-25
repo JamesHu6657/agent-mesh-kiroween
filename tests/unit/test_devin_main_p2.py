@@ -1,5 +1,6 @@
 """Regression tests for the Devin full review of main e20a5d2 (P2-1, P2-2, P2-3)."""
 
+import sys
 import asyncio
 import os
 import shutil
@@ -18,6 +19,7 @@ from mesh.daemon.handlers import project as project_handlers
 from mesh.daemon.handlers.base import Effect, HandlerResult
 from mesh.daemon.server import DaemonServer
 from mesh.errors import MeshError
+from mesh.platform.paths import temp_root
 from tests.unit.test_full2_r3_b import _send_req
 from tests.unit.test_full2_r3_c import _GitEnvMixin, _create_approved_approval, _ctx, _setup_home_and_repo
 
@@ -28,15 +30,30 @@ def _old_git_path(tmp: str) -> str:
     real = shutil.which("git")
     shim_dir = os.path.join(tmp, "oldgit")
     os.makedirs(shim_dir)
-    shim = os.path.join(shim_dir, "git")
-    with open(shim, "w", encoding="utf-8") as f:
-        f.write(
-            "#!/bin/sh\nwt=0; ls=0; z=0\n"
-            'for a in "$@"; do case "$a" in worktree) wt=1;; list) ls=1;; -z) z=1;; esac; done\n'
-            'if [ "$wt$ls$z" = 111 ]; then echo "error: unknown switch \\`z\'" >&2; exit 129; fi\n'
-            f'exec "{real}" "$@"\n'
-        )
-    os.chmod(shim, stat.S_IRWXU)
+    if sys.platform == "win32":
+        py_shim = os.path.join(shim_dir, "git_shim.py")
+        with open(py_shim, "w", encoding="utf-8") as f:
+            f.write(
+                "import subprocess, sys\n"
+                "args = sys.argv[1:]\n"
+                "if 'worktree' in args and 'list' in args and '-z' in args:\n"
+                "    sys.stderr.write(\"error: unknown switch `z'\\n\")\n"
+                "    sys.exit(129)\n"
+                f"sys.exit(subprocess.call([{real!r}] + args))\n"
+            )
+        shim = os.path.join(shim_dir, "git.cmd")
+        with open(shim, "w", encoding="utf-8") as f:
+            f.write(f'@echo off\r\n"{sys.executable}" -P -s "{py_shim}" %*\r\n')
+    else:
+        shim = os.path.join(shim_dir, "git")
+        with open(shim, "w", encoding="utf-8") as f:
+            f.write(
+                "#!/bin/sh\nwt=0; ls=0; z=0\n"
+                'for a in "$@"; do case "$a" in worktree) wt=1;; list) ls=1;; -z) z=1;; esac; done\n'
+                'if [ "$wt$ls$z" = 111 ]; then echo "error: unknown switch \\`z\'" >&2; exit 129; fi\n'
+                f'exec "{real}" "$@"\n'
+            )
+        os.chmod(shim, stat.S_IRWXU)
     return shim_dir + os.pathsep + os.environ.get("PATH", "")
 
 
@@ -45,7 +62,7 @@ class TestP2_3WorktreeListFallback(unittest.TestCase):
 
 
     def test_rc129_falls_back_to_newline_porcelain(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="mh-dp2-p23-", dir="/tmp") as tmp:
+        with tempfile.TemporaryDirectory(prefix="mh-dp2-p23-", dir=temp_root()) as tmp:
             live = os.path.join(tmp, "base wt ")
             os.makedirs(live)
             gone = os.path.join(tmp, "gone")
@@ -66,7 +83,7 @@ class TestP2_3WorktreeListFallback(unittest.TestCase):
             with mock.patch.object(repos, "_git", side_effect=fake_git), \
                 mock.patch.object(repos, "_verify_legacy_worktree_paths"):
                 self.assertEqual(repos._worktree_for_branch(tmp, "main"), live)
-                self.assertEqual(repos._worktree_for_branch(tmp, "other"), f"{tmp}/repo")
+                self.assertEqual(repos._worktree_for_branch(tmp, "other"), os.path.normpath(f"{tmp}/repo"))
                 self.assertIsNone(repos._worktree_for_branch(tmp, "nope"))
             self.assertEqual(calls[0], ["worktree", "list", "--porcelain", "-z"])
             self.assertEqual(calls[1], ["worktree", "list", "--porcelain"])
@@ -122,7 +139,7 @@ class TestP2_3WorktreeListFallback(unittest.TestCase):
 
         with mock.patch.object(repos, "_git", side_effect=fake_git), \
                 mock.patch.object(repos, "_verify_legacy_worktree_paths"):
-            self.assertEqual(repos._worktree_for_branch("/w", "main"), "/w/b")
+            self.assertEqual(repos._worktree_for_branch("/w", "main"), os.path.normpath("/w/b"))
 
     def test_other_git_failure_still_raises(self) -> None:
         def fake_git(step, args, cwd, **kw):  # type: ignore[no-untyped-def]
@@ -133,7 +150,7 @@ class TestP2_3WorktreeListFallback(unittest.TestCase):
                 repos._worktree_for_branch("/nonexistent", "main")
 
     def test_real_git_lists_checked_out_branch(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="mh-dp2-p23r-", dir="/tmp") as tmp:
+        with tempfile.TemporaryDirectory(prefix="mh-dp2-p23r-", dir=temp_root()) as tmp:
             repo = os.path.join(tmp, "r")
             env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
             subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True, env=env)
@@ -147,7 +164,7 @@ class TestA1LegacyWorktreeForgery(unittest.TestCase):
     listed worktree must exist and share this repository's common dir."""
 
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory(prefix="mh-dp2-a1-", dir="/tmp")
+        self._tmp = tempfile.TemporaryDirectory(prefix="mh-dp2-a1-", dir=temp_root())
         self.addCleanup(self._tmp.cleanup)
         root = os.path.realpath(self._tmp.name)
         env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@e", GIT_COMMITTER_NAME="t",
@@ -218,6 +235,10 @@ class TestA1LegacyWorktreeForgery(unittest.TestCase):
                     repos._worktree_for_branch(self.repo, branch)
                 self.assertEqual(cm.exception.details.get("reason"), "worktree_list_ambiguous", branch)
 
+    @unittest.skipUnless(
+        sys.platform != "win32",
+        "NTFS forbids ASCII control char '\\n' in directory names; synthetic newline handling tested in test_ambiguous_newline_paths_fail_closed",
+    )
     def test_real_newline_path_with_two_blank_lines_is_refused_under_old_git(self) -> None:
         """Review r2 P2-1 with real git behind a PATH shim that rejects `worktree list -z`."""
         h = self.h
@@ -240,6 +261,8 @@ class TestA1LegacyWorktreeForgery(unittest.TestCase):
 
         def recording(args, cwd=None, timeout_s=30.0, **kw):  # type: ignore[no-untyped-def]
             seen.append((list(args), timeout_s))
+            if sys.platform == "win32" and list(args) == ["worktree", "list", "--porcelain", "-z"]:
+                return subprocess.CompletedProcess(args, 129, stdout="", stderr="error: unknown switch `z'\n")
             return real(args, cwd=cwd, timeout_s=timeout_s, **kw)
 
         with mock.patch.dict(os.environ, {"PATH": _old_git_path(self._root)}), \
@@ -304,11 +327,16 @@ class TestP2_3DoctorGitVersion(unittest.TestCase):
     def _checks(self, version_line: str):
         from mesh.cli.commands import doctor_env
 
-        with tempfile.TemporaryDirectory(prefix="mh-dp2-doc-", dir="/tmp") as tmp:
-            fake = os.path.join(tmp, "git")
-            with open(fake, "w", encoding="utf-8") as f:
-                f.write(f"#!/bin/sh\necho '{version_line}'\n")
-            os.chmod(fake, stat.S_IRWXU)
+        with tempfile.TemporaryDirectory(prefix="mh-dp2-doc-", dir=temp_root()) as tmp:
+            if sys.platform == "win32":
+                fake = os.path.join(tmp, "git.cmd")
+                with open(fake, "w", encoding="utf-8") as f:
+                    f.write(f"@echo off\r\necho {version_line}\r\n")
+            else:
+                fake = os.path.join(tmp, "git")
+                with open(fake, "w", encoding="utf-8") as f:
+                    f.write(f"#!/bin/sh\necho '{version_line}'\n")
+                os.chmod(fake, stat.S_IRWXU)
             with mock.patch.dict(os.environ, {"PATH": tmp + os.pathsep + os.environ.get("PATH", "")}):
                 return doctor_env.environment_checks(tmp, False)
 
@@ -360,7 +388,7 @@ class TestP2_2PostCommitReconcileFailure(unittest.TestCase, _GitEnvMixin):
 
     def setUp(self) -> None:
         self._init_git_env()
-        self._tmp = tempfile.TemporaryDirectory(prefix="mh-dp2-p22-", dir="/tmp")
+        self._tmp = tempfile.TemporaryDirectory(prefix="mh-dp2-p22-", dir=temp_root())
         self.addCleanup(self._tmp.cleanup)
         self.fixture.allow_root(self._tmp.name)
         self.home, self.conn, self.repo, _base, _integ = _setup_home_and_repo(self._tmp.name, self.fixture)
@@ -485,7 +513,7 @@ class TestP2_1DeliverPostWriteBaseMove(unittest.TestCase, _GitEnvMixin):
 
     def setUp(self) -> None:
         self._init_git_env()
-        self._tmp = tempfile.TemporaryDirectory(prefix="mh-dp2-p21-", dir="/tmp")
+        self._tmp = tempfile.TemporaryDirectory(prefix="mh-dp2-p21-", dir=temp_root())
         self.addCleanup(self._tmp.cleanup)
         self.fixture.allow_root(self._tmp.name)
         self.home, self.conn, self.repo, self.base_sha, self.integ = _setup_home_and_repo(

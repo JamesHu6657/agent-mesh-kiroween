@@ -15,6 +15,7 @@ from unittest import mock
 from mesh.adapters.base import RunRequest
 from mesh.adapters.kiro import KiroAdapter
 from mesh.core import lead_prompt
+from mesh.platform.paths import temp_root
 from mesh.core.lead_actions import ALLOWED_ACTION_CMDS, parse_actions
 from mesh.core.lead_prompt import (
     AUTHORITY_CATEGORIES_BUDGET,
@@ -118,7 +119,7 @@ class TestLeadPrompt(unittest.TestCase):
         self.assertEqual(rendered.omitted["messages"], len(messages) - len(included))
 
         # Exercise the checklist's readonly argv path, without launching a vendor.
-        with tempfile.TemporaryDirectory(prefix="mh-lead-cap-", dir="/tmp") as home:
+        with tempfile.TemporaryDirectory(prefix="mh-lead-cap-", dir=temp_root()) as home:
             prompt_path = os.path.join(home, "prompt.md")
             with open(prompt_path, "w", encoding="utf-8") as handle:
                 handle.write(rendered.text)

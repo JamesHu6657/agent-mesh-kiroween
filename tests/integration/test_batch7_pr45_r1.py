@@ -78,7 +78,7 @@ class TestBatch7PR45R1Integration(unittest.TestCase):
         os.makedirs(old_ws, mode=0o700)
         os.makedirs(new_ws, mode=0o700)
 
-        rc1, r1 = self.harness.cli("config", "set", "workspaces.root", f'"{old_ws}"', user=True)
+        rc1, r1 = self.harness.cli("config", "set", "workspaces.root", json.dumps(old_ws), user=True)
         self.assertEqual(rc1, 0, r1)
 
         _, prj_old = self._create_repo_project("P11Old")
@@ -91,7 +91,7 @@ class TestBatch7PR45R1Integration(unittest.TestCase):
             rc_can, r_can = self.harness.cli("project", "cancel", prj_old, user=True)
             self.assertEqual(rc_can, 0, r_can)
 
-        rc2, r2 = self.harness.cli("config", "set", "workspaces.root", f'"{new_ws}"', user=True)
+        rc2, r2 = self.harness.cli("config", "set", "workspaces.root", json.dumps(new_ws), user=True)
         self.assertEqual(rc2, 0, r2)
 
         # Registering the historical task worktree as a new project's repo must be refused!

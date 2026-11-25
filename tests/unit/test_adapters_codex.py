@@ -103,10 +103,11 @@ class TestCodexBuild(_Tmp):
 
     def test_binary_option_resolved(self):
         d = self.tmpdir()
-        path = os.path.join(d, "codex")
-        with open(path, "w") as f:
-            f.write("#!/bin/sh\n")
-        os.chmod(path, 0o755)
+        path = os.path.join(d, "codex.cmd" if sys.platform == "win32" else "codex")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("@echo off\r\nexit /b 0\r\n" if sys.platform == "win32" else "#!/bin/sh\n")
+        if sys.platform != "win32":
+            os.chmod(path, 0o755)
         self.assertEqual(CodexAdapter().build(self.req(options={"binary": path})).argv[0], path)
 
     def test_helpdiff_emitted_flags(self):
@@ -228,10 +229,19 @@ class TestCodexProbe(_Tmp):
     def stub(self, version="codex-cli 0.166.0", version_rc=0, drop="@@none@@",
              login="Logged in using an API key - " + FAKE_KEY[:8] + "***", login_rc=0):
         d = self.tmpdir()
+        body = STUB.format(python=sys.executable, version=version, version_rc=version_rc, drop=drop,
+                           login=login, login_rc=login_rc)
+        if sys.platform == "win32":
+            py_path = os.path.join(d, "codex_stub.py")
+            with open(py_path, "w", encoding="utf-8") as f:
+                f.write(body)
+            path = os.path.join(d, "codex.cmd")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f'@echo off\r\n"{sys.executable}" -P -s "{py_path}" %*\r\n')
+            return path
         path = os.path.join(d, "codex")
         with open(path, "w", encoding="utf-8") as f:
-            f.write(STUB.format(python=sys.executable, version=version, version_rc=version_rc, drop=drop,
-                                login=login, login_rc=login_rc))
+            f.write(body)
         os.chmod(path, 0o755)
         return path
 
@@ -281,19 +291,23 @@ class TestCodexProbe(_Tmp):
         other = os.path.join(root, "bin")
         os.makedirs(shims)
         os.makedirs(other)
+        fname = "codex.cmd" if sys.platform == "win32" else "codex"
+        content = "@echo off\r\nexit /b 99\r\n" if sys.platform == "win32" else "#!/bin/sh\nexit 99\n"
         for d in (shims, other):
-            with open(os.path.join(d, "codex"), "w") as f:
-                f.write("#!/bin/sh\nexit 99\n")
-            os.chmod(os.path.join(d, "codex"), 0o755)
+            with open(os.path.join(d, fname), "w", encoding="utf-8") as f:
+                f.write(content)
+            if sys.platform != "win32":
+                os.chmod(os.path.join(d, fname), 0o755)
         with mock.patch.dict(os.environ, {"PATH": shims + os.pathsep + other}):
             self.assertIsNone(CodexAdapter().resolve_binary())
             self.assertEqual(CodexAdapter().probe().status, "not_installed")
         with mock.patch.dict(os.environ, {"PATH": other}):
-            self.assertEqual(CodexAdapter().resolve_binary(), os.path.join(other, "codex"))
-        # A shim checked out without its exec bit still hides the real binary.
-        os.chmod(os.path.join(shims, "codex"), 0o644)
-        with mock.patch.dict(os.environ, {"PATH": shims + os.pathsep + other}):
-            self.assertIsNone(CodexAdapter().resolve_binary())
+            self.assertEqual(CodexAdapter().resolve_binary(), os.path.join(other, fname))
+        if sys.platform != "win32":
+            # A shim checked out without its exec bit still hides the real binary.
+            os.chmod(os.path.join(shims, fname), 0o644)
+            with mock.patch.dict(os.environ, {"PATH": shims + os.pathsep + other}):
+                self.assertIsNone(CodexAdapter().resolve_binary())
 
     def test_list_models_is_user_supplied(self):
         self.assertIsNone(CodexAdapter().list_models(self.stub()))
@@ -399,14 +413,19 @@ class TestCodexProbeHelpTimeoutPR49R3(unittest.TestCase):
         real = cx.run_readonly_cmd
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
-        binp = os.path.join(d, "codex")
-        with open(binp, "w") as f:
-            f.write("#!/bin/sh\necho codex-cli 0.166.0\n")
-        os.chmod(binp, 0o755)
+        if sys.platform == "win32":
+            binp = os.path.join(d, "codex.cmd")
+            with open(binp, "w", encoding="utf-8") as f:
+                f.write("@echo off\r\necho codex-cli 0.166.0\r\n")
+        else:
+            binp = os.path.join(d, "codex")
+            with open(binp, "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\necho codex-cli 0.166.0\n")
+            os.chmod(binp, 0o755)
 
         def fake(argv, timeout_s=None, **kw):
             if argv[1:] == ["--help"]:
-                res = real(["/bin/sh", "-c", "exit 0"], timeout_s=timeout_s)
+                res = real([sys.executable, "-c", "import sys; sys.exit(0)"], timeout_s=timeout_s)
                 res.returncode = -1
                 return res
             return real(argv, timeout_s=timeout_s, **kw)

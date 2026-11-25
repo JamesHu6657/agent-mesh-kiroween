@@ -10,7 +10,8 @@ import tempfile
 import unittest
 
 import mesh.constants as c
-from tests.helpers import MeshHarness
+from mesh.platform import perms as plat_perms, pipe_pump
+from tests.helpers import MeshHarness, assert_private_mode
 from tests.integration.test_submit_cli import create_agent
 from tests.stubs import create_test_stubs
 
@@ -116,10 +117,13 @@ class TestCliUsabilityLive(unittest.TestCase):
         self.assertNotIn("token", resp["data"])
         self.assertNotIn("mesh_at_", json.dumps(resp))  # no token value anywhere in the output
         self.assertEqual(resp["data"]["token_file"], path)
-        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode), 0o700)
-        p = subprocess.run([self.h.bin_mesh, "--home", self.h.home, "whoami", "--token-file", path],
-                           capture_output=True, text=True, env=self.h.get_env(), timeout=30)
+        assert_private_mode(self, path, is_dir=False, posix_mode=0o600)
+        assert_private_mode(self, os.path.dirname(path), is_dir=True, posix_mode=0o700)
+        env = self.h.get_env()
+        cmd = pipe_pump.prepare_win_cmd_args(
+            [self.h.bin_mesh, "--home", self.h.home, "whoami", "--token-file", path], env=env,
+        )
+        p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=30)
         self.assertEqual(p.returncode, 0, p.stdout)
         self.assertEqual(json.loads(p.stdout)["data"]["name"], "ibx")
 
@@ -127,7 +131,7 @@ class TestCliUsabilityLive(unittest.TestCase):
         path = os.path.join(self.tokdir, "ibx.token")
         with open(path, "w") as f:
             f.write("old\n")
-        os.chmod(path, 0o600)
+        plat_perms.set_private_file_acl(path)
         _, before = self.h.cli("agent", "token", "list", "ibx", user=True)
         rc, resp = self.h.cli("agent", "token", "issue", "ibx", "--out", path, user=True)
         self.assertEqual(rc, c.EXIT_USAGE, resp)
@@ -141,7 +145,7 @@ class TestCliUsabilityLive(unittest.TestCase):
         self.assertEqual(rc, 0, resp)
         with open(path) as f:
             self.assertNotEqual(f.read(), "old\n")
-        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        assert_private_mode(self, path, is_dir=False, posix_mode=0o600)
 
     def test_token_issue_out_refuses_workspace_location(self) -> None:
         path = os.path.join(self.h.home, "workspaces", "ibx.token")

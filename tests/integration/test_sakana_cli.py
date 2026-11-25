@@ -11,19 +11,20 @@ import json
 import os
 import shutil
 import signal
-import socket
 import subprocess
+import sys
 import tempfile
-import threading
 import time
+from typing import Optional
 import unittest
 
 import mesh.constants as c
 from mesh.daemon.merge import merge_lease_key
-from tests.helpers import MeshHarness
+from mesh.platform import ipc as plat_ipc, perms as plat_perms
+from tests.helpers import HungIpcServer, MeshHarness, cli_popen_argv
 from tests.integration import test_merge as tm
 
-FAIL_IF_MARKER = '["sh","-c","test ! -e fail.txt"]'
+FAIL_IF_MARKER = json.dumps([sys.executable, "-c", "import os, sys; sys.exit(1 if os.path.exists('fail.txt') else 0)"])
 
 
 class TestMergeAllMidBatchFailure(unittest.TestCase):
@@ -120,54 +121,38 @@ class TestMergeAllMidBatchFailure(unittest.TestCase):
         self.assert_clean_and_unlocked(self.prj)
 
 
-class _HungDaemon:
-    """A unix socket that accepts requests and never answers (a stuck meshd)."""
-
-    def __init__(self, path: str) -> None:
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.bind(path)
-        self.sock.listen(8)
-        self.conns = []
-        self.accepted = threading.Event()
-        self.thread = threading.Thread(target=self._serve, daemon=True)
-        self.thread.start()
-
-    def _serve(self) -> None:
-        while True:
-            try:
-                conn, _ = self.sock.accept()
-            except OSError:
-                return
-            self.conns.append(conn)
-            self.accepted.set()
-
-    def close(self) -> None:
-        for conn in self.conns:
-            conn.close()
-        self.sock.close()
-
-
 class TestKeepaliveSignalDuringBlockedCall(unittest.TestCase):
     def setUp(self) -> None:
         self.harness = MeshHarness(init_db=False, start_daemon=False)
         self.addCleanup(self.harness.teardown)
         os.makedirs(os.path.join(self.harness.home, "run"), exist_ok=True)
-        self.daemon = _HungDaemon(os.path.join(self.harness.home, "run", "mesh.sock"))
+        self.daemon = HungIpcServer(plat_ipc.daemon_endpoint_path(self.harness.home))
         self.addCleanup(self.daemon.close)
         self.tokdir = tempfile.mkdtemp(prefix="mh-tok-")
         self.addCleanup(shutil.rmtree, self.tokdir, True)
-        os.chmod(self.tokdir, 0o700)
+        plat_perms.set_private_dir_acl(self.tokdir)
         self.tf = os.path.join(self.tokdir, "w.token")
         with open(self.tf, "w", encoding="utf-8") as f:
             f.write("mesh_at_fake_" + "x" * 32 + "\n")
-        os.chmod(self.tf, 0o600)
+        plat_perms.set_private_file_acl(self.tf)
 
     def run_and_signal(self, sig: int):
-        cmd = [self.harness.bin_mesh, "--home", self.harness.home, "task", "keepalive", "tsk_x",
-               "--run", "run_x", "--fence", "1", "--every", "30", "--token-file", self.tf]
         env = self.harness.get_env()
         env["MESH_SESSION"] = "ses_test"
-        proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        cmd, env = cli_popen_argv(
+            self.harness, "task", "keepalive", "tsk_x",
+            "--run", "run_x", "--fence", "1", "--every", "30", "--token-file", self.tf,
+            env=env,
+        )
+        popen_kw = {
+            "env": env,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+        }
+        if sys.platform == "win32":
+            popen_kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        proc = subprocess.Popen(cmd, **popen_kw)
         try:
             self.assertTrue(self.daemon.accepted.wait(20), "keepalive never called the daemon")
             time.sleep(0.3)  # the heartbeat is now blocked reading the reply
@@ -181,17 +166,22 @@ class TestKeepaliveSignalDuringBlockedCall(unittest.TestCase):
                 proc.communicate()
         return proc.returncode, out, err, took
 
-    def check(self, sig: int) -> None:
-        rc, out, err, took = self.run_and_signal(sig)
+    def check(self, send_sig: int, expected_sig: Optional[int] = None) -> None:
+        rc, out, err, took = self.run_and_signal(send_sig)
         self.assertEqual(rc, 0, out + err)
         self.assertLess(took, 3.0, f"exit took {took:.1f}s after the signal")
         self.assertNotIn("Traceback", err)
         data = json.loads(out)["data"]
-        self.assertEqual((data["ended"], data["signal"], data["beats"]), ("stopped", sig, 0))
+        want_sig = send_sig if expected_sig is None else expected_sig
+        self.assertEqual((data["ended"], data["signal"], data["beats"]), ("stopped", want_sig, 0))
 
     def test_sigterm_during_blocked_heartbeat_exits_promptly(self) -> None:
-        self.check(signal.SIGTERM)
+        if sys.platform == "win32":
+            self.check(signal.CTRL_BREAK_EVENT, signal.SIGBREAK)
+        else:
+            self.check(signal.SIGTERM)
 
+    @unittest.skipIf(sys.platform == "win32", "Windows keepalive graceful signal uses CTRL_BREAK_EVENT/SIGBREAK")
     def test_sigint_during_blocked_heartbeat_exits_promptly(self) -> None:
         self.check(signal.SIGINT)
 

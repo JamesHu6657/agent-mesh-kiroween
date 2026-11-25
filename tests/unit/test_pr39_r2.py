@@ -1,6 +1,7 @@
 """PR #39 Linear review round 2: B5 request-wide git budget (validation included), D1
 disowned launchers keep the admission lock."""
 
+import sys
 import os
 import subprocess
 import time
@@ -40,6 +41,7 @@ class TestRequestWideBudget(unittest.TestCase):
         self.assertIsNone(getattr(repos._budget, "deadline", None))
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash + disown + scripts/coord/coder-guard.sh lock test")
 class TestDisownedLauncher(RepoCase):
     def test_d1_disowned_slow_start_keeps_lock(self):
         wt = os.path.join(self.tmp, "workspace", "mesh-d1d")

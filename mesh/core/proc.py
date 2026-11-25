@@ -2,6 +2,7 @@
 
 import errno
 import os
+import sys
 from typing import Any, Dict, Optional, Set
 
 #: M3 gate re-review P3-2: the gVisor fallback in :func:`_sibling_thread_environ` probes at
@@ -66,6 +67,10 @@ def get_proc_stat(pid: int) -> Optional[Dict[str, Any]]:
     Non-lookup ``OSError`` (e.g. ``EACCES`` / ``EIO``) propagates so callers treat
     unreadable ``/proc`` state as unknown rather than gone (Linear r10 P1-1).
     """
+    if sys.platform == "win32":
+        from mesh.platform import proc as _plat_proc
+
+        return _plat_proc.get_proc_stat(pid)
     path = f"/proc/{pid}/stat"
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -87,6 +92,10 @@ def is_tgid_alive(pid: int, info: Optional[Dict[str, Any]] = None) -> bool:
     entries under ``/proc/<pid>/task``). Propagates non-lookup ``OSError``
     (``EACCES`` / ``EIO``) so callers never misread an unreadable check as gone.
     """
+    if sys.platform == "win32":
+        from mesh.platform import proc as _plat_proc
+
+        return _plat_proc.is_tgid_alive(pid, info)
     if info is None:
         info = get_proc_stat(pid)
     if info is None:
@@ -206,6 +215,10 @@ def get_proc_environ(pid: int) -> Optional[Dict[str, str]]:
     multithreaded leader-zombie whose leader ``/proc/<pid>/environ`` is empty or
     unreadable, falls back to a live sibling thread's ``environ``.
     """
+    if sys.platform == "win32":
+        from mesh.platform import proc as _plat_proc
+
+        return _plat_proc.get_proc_environ(pid)
     leader_empty = False
     leader_err: Optional[OSError] = None
     try:
@@ -249,6 +262,10 @@ def get_proc_environ(pid: int) -> Optional[Dict[str, str]]:
 
 def get_proc_ancestry(pid: int, stop_at_pids: Optional[Set[int]] = None) -> list[int]:
     """Walk PPid upward from pid until pid 1 or a stop pid is encountered."""
+    if sys.platform == "win32":
+        from mesh.platform import proc as _plat_proc
+
+        return _plat_proc.get_proc_ancestry(pid, stop_at_pids)
     if stop_at_pids is None:
         stop_at_pids = set()
 
@@ -283,6 +300,10 @@ def find_run_processes(
     listing or stat error sets ``uncertain`` on the result instead of reading as "gone"
     (ClickUp recheck P3); test and smoke-harness helper only.
     """
+    if sys.platform == "win32":
+        from mesh.platform import proc as _plat_proc
+
+        return _plat_proc.find_run_processes(run_id, pgid, exclude)
     skip = set(exclude or ())
     found: list[int] = []
     uncertain = False

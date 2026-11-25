@@ -7,6 +7,7 @@ ACC: C15 E17 F8 H1 H2 H3 H5 H16 H17 A8
 
 import json
 import os
+import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional, Set
@@ -14,13 +15,14 @@ from typing import Any, Dict, List, Optional, Set
 import mesh.constants as c
 from mesh.core.clock import parse_utc
 from mesh.core.proc import get_proc_environ, get_proc_stat
-from tests.helpers import assert_h5, idle_bound
+from mesh.platform import proc as plat_proc
+from mesh.platform.proc import get_proc_cmdline
+from tests.helpers import _win_terminate_and_wait_pid, assert_h5, idle_bound
 from tests.integration.test_execution_acc_run2 import Run2AccBase
 
 
 def _alive(pid: int) -> bool:
-    info = get_proc_stat(pid)
-    return info is not None and info["state"] != "Z"
+    return plat_proc.is_tgid_alive(pid)
 
 
 def _ts(value: Optional[str]) -> float:
@@ -30,10 +32,11 @@ def _ts(value: Optional[str]) -> float:
 def procs_with_run_id(run_id: str) -> List[int]:
     """Live processes whose environ carries MESH_RUN_ID=<run_id> (zombies excluded)."""
     found = []
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
-        pid = int(entry)
+    if sys.platform == "win32":
+        pids = plat_proc.list_toolhelp_processes()
+    else:
+        pids = [int(e) for e in os.listdir("/proc") if e.isdigit()]
+    for pid in pids:
         try:
             env = get_proc_environ(pid)
         except OSError:
@@ -124,7 +127,7 @@ class TestTermination(TerminationBase):
     def test_h1_timeout_kills_before_failed(self) -> None:
         """ACC: H1, H5 - --timeout 2s: failed(timeout), run killed(timeout), pids dead before task.failed ts, one task.failed."""
         path = self.pid_file("h1-pids")
-        spec = 'FAKE {"steps": [{"record_pid": {"path": "%s"}}, {"sleep": {"seconds": 60}}]}' % path
+        spec = 'FAKE ' + json.dumps({"steps": [{"record_pid": {"path": path}}, {"sleep": {"seconds": 60}}]})
         task_id = self.create_task(spec, "--timeout", "2s")
         pids = self.recorded_pids(path)
         self.assert_h5()
@@ -158,11 +161,14 @@ class TestTermination(TerminationBase):
         self.wait_status(task_id, "cancelled", timeout=2 + 10 + 2)
         self.assertLessEqual(time.monotonic() - t0, 2 + 10)
         self.assertEqual(procs_with_run_id(run["id"]), [])
-        for entry in os.listdir("/proc"):
-            if entry.isdigit():
-                info = get_proc_stat(int(entry))
-                if info and info["state"] != "Z":
-                    self.assertNotIn(run["pgid"], (info["pgrp"], info["session"]), entry)
+        if sys.platform == "win32":
+            self.assertEqual(plat_proc.find_run_processes(run["id"], run["pgid"]), [])
+        else:
+            for entry in os.listdir("/proc"):
+                if entry.isdigit():
+                    info = get_proc_stat(int(entry))
+                    if info and info["state"] != "Z":
+                        self.assertNotIn(run["pgid"], (info["pgrp"], info["session"]), entry)
         run = self.runs_of(task_id)[0]
         self.assertEqual((run["status"], run["end_reason"]), ("killed", "cancelled"))
         states = self.transitions(task_id)
@@ -191,8 +197,7 @@ class TestTermination(TerminationBase):
         """ACC: H16, A8 - post_submit_grace 60: submit then cancel → submitted→cancelling→cancelled; pids dead before the cancelled ts."""
         self.set_config("kill.post_submit_grace_s", 60)
         path = self.pid_file("h16-pids")
-        spec = ('FAKE {"steps": [{"record_pid": {"path": "%s"}}, {"submit_via_cli": {}}, '
-                '{"sleep": {"seconds": 30}}]}' % path)
+        spec = 'FAKE ' + json.dumps({"steps": [{"record_pid": {"path": path}}, {"submit_via_cli": {}}, {"sleep": {"seconds": 30}}]})
         task_id = self.create_task(spec)
         pids = self.recorded_pids(path)
         self.wait_status(task_id, "submitted")
@@ -261,7 +266,7 @@ class TestTermination(TerminationBase):
     def test_h5_no_overlap_across_retry(self) -> None:
         """ACC: H5 - timeout then retry: attempt 1 pid dead before attempt 2 starts; one active run; fences agree."""
         path = self.pid_file("h5-pids")
-        spec = 'FAKE {"steps": [{"record_pid": {"path": "%s"}}, {"sleep": {"seconds": 60}}]}' % path
+        spec = 'FAKE ' + json.dumps({"steps": [{"record_pid": {"path": path}}, {"sleep": {"seconds": 60}}]})
         task_id = self.create_task(spec, "--timeout", "1s")
         first = self.recorded_pids(path, 1)[0]
         self.wait_status(task_id, "failed", timeout=30.0)
@@ -288,9 +293,12 @@ class TestTermination(TerminationBase):
         # Attempt 1 finds the file already there and fails at once.
         release = self.pid_file("acc-c15-release")
         open(release, "w").close()
-        spec = ('FAKE {"steps": [{"write_file": {"path": "mesh/__init__.py", "content": ""}}, '
-                '{"write_file": {"path": "mesh/runwrap.py", "content": "open(\'%s\',\'w\')"}}, '
-                '{"wait_release": {"path": "%s"}}, {"fail": {}}]}' % (shadow, release))
+        spec = 'FAKE ' + json.dumps({"steps": [
+            {"write_file": {"path": "mesh/__init__.py", "content": ""}},
+            {"write_file": {"path": "mesh/runwrap.py", "content": f"open({shadow!r},'w')"}},
+            {"wait_release": {"path": release}},
+            {"fail": {}},
+        ]})
         task_id = self.create_task(spec)
         self.wait_status(task_id, "failed", timeout=30.0)
         os.unlink(release)
@@ -299,8 +307,7 @@ class TestTermination(TerminationBase):
         self.assertTrue(self.harness.wait_for(
             lambda: any(r["status"] == "running" for r in self.runs_of(task_id)[1:]), timeout=15.0))
         run2 = self.runs_of(task_id)[1]
-        with open(f"/proc/{run2['wrapper_pid']}/cmdline", "rb") as f:
-            cmdline = f.read().replace(b"\0", b" ").decode()
+        cmdline = " ".join(get_proc_cmdline(run2["wrapper_pid"]) or [])
         self.assertIn("-P -s -m mesh.runwrap", cmdline)
         open(release, "w").close()
         self.wait_status(task_id, "failed", timeout=30.0)
@@ -496,7 +503,10 @@ class TestKillFailed(TerminationBase):
                 # The processes finally die.
                 for pid in procs_with_run_id(run["id"]):
                     try:
-                        os.kill(pid, 9)
+                        if sys.platform == "win32":
+                            _win_terminate_and_wait_pid(pid)
+                        else:
+                            os.kill(pid, 9)
                     except OSError:
                         pass
                 self.assertTrue(self.harness.wait_for(lambda: procs_with_run_id(run["id"]) == [], timeout=10.0))
@@ -547,6 +557,8 @@ class TestCancelSparesUnrelatedChildren(TerminationBase):
             self.assertEqual(f.read().strip(), "0")
 
         def zombies() -> List[int]:
+            if sys.platform == "win32":
+                return []
             found = []
             for entry in os.listdir("/proc"):
                 if entry.isdigit():

@@ -1,5 +1,6 @@
 """Focused unit regression tests for batch7 g5 findings (adapters and CLI)."""
 
+import sys
 import argparse
 import io
 import json
@@ -73,7 +74,13 @@ class TestBatch7G5Unit(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="mh-g5-u-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
-    def _exe(self, rel_path: str, script: str) -> str:
+    def _exe(self, rel_path: str, script: str, win_cmd: str = "@echo off\r\necho ok\r\n") -> str:
+        if sys.platform == "win32":
+            p = os.path.join(self.tmp, rel_path + ".cmd")
+            os.makedirs(os.path.dirname(p), mode=0o755, exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(win_cmd)
+            return p
         p = os.path.join(self.tmp, rel_path)
         os.makedirs(os.path.dirname(p), mode=0o755, exist_ok=True)
         with open(p, "w", encoding="utf-8") as f:
@@ -173,7 +180,11 @@ class TestBatch7G5Unit(unittest.TestCase):
 
     # F3: adapter probe normalized --binary & require adapter_id with --binary --
     def test_f3_probe_binary_requires_adapter_id_and_normalizes_path(self) -> None:
-        droid_bin = self._exe("relbin/droid", "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'droid 1.6.0'; fi\necho 'Usage: droid'\n")
+        droid_bin = self._exe(
+            "relbin/droid",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'droid 1.6.0'; fi\necho 'Usage: droid'\n",
+            "@echo off\r\nif \"%~1\"==\"--version\" echo droid 1.6.0\r\necho Usage: droid\r\n",
+        )
         rel_bin = os.path.relpath(droid_bin, self.tmp)
         home, conn = _setup_home_db(self.tmp)
         self.addCleanup(conn.close)
@@ -195,7 +206,7 @@ class TestBatch7G5Unit(unittest.TestCase):
         try:
             os.chdir(self.tmp)
             res = handle_adapter_probe(
-                _user_ctx(conn, home, "adapter.probe", {"adapter": "droid", "binary": "./" + rel_bin}),
+                _user_ctx(conn, home, "adapter.probe", {"adapter": "droid", "binary": os.path.join(".", rel_bin)}),
                 testing_mode=True,
             )
         finally:
@@ -220,6 +231,10 @@ class TestBatch7G5Unit(unittest.TestCase):
             "if [ \"$1\" = \"--version\" ]; then echo 'droid 1.6.0'; exit 0; fi\n"
             "if [ \"$1\" = \"exec\" ]; then echo 'broken exec' >&2; exit 2; fi\n"
             "echo 'Usage: droid'\nexit 0\n",
+            "@echo off\r\n"
+            "if \"%~1\"==\"--version\" (echo droid 1.6.0& exit /b 0)\r\n"
+            "if \"%~1\"==\"exec\" (echo broken exec>&2& exit /b 2)\r\n"
+            "echo Usage: droid\r\nexit /b 0\r\n",
         )
         p_d = DroidAdapter().probe(binary_path=droid_bad_exec)
         self.assertEqual(p_d.status, "error")
@@ -231,6 +246,10 @@ class TestBatch7G5Unit(unittest.TestCase):
             "if [ \"$1\" = \"--version\" ]; then echo 'kiro-cli 3.1.0'; exit 0; fi\n"
             "if [ \"$1\" = \"chat\" ]; then echo 'broken chat' >&2; exit 2; fi\n"
             "echo 'Usage: kiro-cli'\nexit 0\n",
+            "@echo off\r\n"
+            "if \"%~1\"==\"--version\" (echo kiro-cli 3.1.0& exit /b 0)\r\n"
+            "if \"%~1\"==\"chat\" (echo broken chat>&2& exit /b 2)\r\n"
+            "echo Usage: kiro-cli\r\nexit /b 0\r\n",
         )
         p_k = KiroAdapter().probe(binary_path=kiro_bad_chat)
         self.assertEqual(p_k.status, "error")
@@ -241,6 +260,9 @@ class TestBatch7G5Unit(unittest.TestCase):
             "#!/bin/sh\n"
             "if [ \"$1\" = \"--version\" ]; then echo 'droid 1.6.0'; exit 0; fi\n"
             "echo 'help failed' >&2; exit 1\n",
+            "@echo off\r\n"
+            "if \"%~1\"==\"--version\" (echo droid 1.6.0& exit /b 0)\r\n"
+            "echo help failed>&2\r\nexit /b 1\r\n",
         )
         p_h = DroidAdapter().probe(binary_path=droid_bad_help)
         self.assertEqual(p_h.status, "error")
@@ -252,7 +274,13 @@ class TestBatch7G5Unit(unittest.TestCase):
         os.makedirs(home, mode=0o700)
         world_dir = os.path.join(self.tmp, "world-tok")
         os.makedirs(world_dir)
-        os.chmod(world_dir, 0o777)
+        if sys.platform == "win32":
+            from mesh.platform import perms as plat_perms
+            from tests.helpers import restore_accessible_for_test
+            plat_perms.grant_everyone_write_for_test(world_dir)
+            self.addCleanup(restore_accessible_for_test, world_dir)
+        else:
+            os.chmod(world_dir, 0o777)
         with self.assertRaises(MeshError) as cm:
             setup_cli._check_token_destination(home, os.path.join(world_dir, "lead.token"))
         self.assertEqual(cm.exception.code, c.INVALID_ARGUMENT)
@@ -613,6 +641,7 @@ class TestBatch7G5Unit(unittest.TestCase):
         self.assertEqual(res["beats"], 1)
 
     # F14: smoke_schema symlinks/pass fixtures + reevaluate stderr/vibe export -----
+    @unittest.skipUnless(sys.platform != "win32", "Smoke harness (tests/smoke/harness.py) is POSIX/Linux-only")
     def test_f14_smoke_symlinks_pass_fixtures_stderr_vibe_export_and_reeval(self) -> None:
         vibe_bin = self._exe(
             "bin-v14/vibe",
@@ -746,7 +775,8 @@ class TestBatch7G5Unit(unittest.TestCase):
                     options={"binary": bpath, "run_id": "r15"},
                 )
                 spec = ad.build(req)
-                self.assertIn(abs_prompt, spec.argv[-1], ad.id)
+                prompt_arg = spec.argv[spec.argv.index("--print") + 1] if ad.id == "agy" else spec.argv[-1]
+                self.assertIn(abs_prompt, prompt_arg, ad.id)
         finally:
             os.chdir(old_cwd)
 

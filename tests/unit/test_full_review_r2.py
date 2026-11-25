@@ -1,5 +1,6 @@
 """Full-codebase review r2 (fix/full-review-r1 @ 6142135) regressions."""
 
+import sys
 import json
 import os
 import unittest
@@ -219,7 +220,7 @@ class TestR2P1E_DeliverIntentHorizon(unittest.TestCase):
 
 
 class TestR2P1F_MergeTestRunSession(unittest.TestCase):
-    mesh_serial = True  # real runwrap and /proc walks
+    mesh_serial = True  # real runwrap and process walks
 
     def test_test_command_without_mesh_run_id_is_inside_the_run(self) -> None:
         import shutil
@@ -229,19 +230,32 @@ class TestR2P1F_MergeTestRunSession(unittest.TestCase):
         from mesh.core.auth import classify_peer_run_session
         from mesh.daemon import merge, terminate
         from mesh.daemon.server import DaemonServer
+        from mesh.platform.paths import temp_root
 
-        tmp = tempfile.mkdtemp(prefix="mh-r2f-", dir="/tmp")
+        tmp = tempfile.mkdtemp(prefix="mh-r2f-", dir=temp_root())
         self.addCleanup(shutil.rmtree, tmp, True)
         cwd = os.path.join(tmp, "integ")
         os.makedirs(cwd)
         pidfile = os.path.join(tmp, "child.pid")
         run_id = f"run_r2f{os.getpid()}"
         self.addCleanup(terminate.forget, run_id)
-        # The test command's child drops MESH_RUN_ID (`env -u`), as a hostile test would.
-        cmd = (f"env -u MESH_RUN_ID sh -c 'echo $$ > {pidfile}.tmp && mv {pidfile}.tmp {pidfile}; "
-               f"exec {shutil.which('sleep')} 3'")
+        if sys.platform == "win32":
+            code = (
+                "import os, subprocess, sys, time\n"
+                f"pf = {pidfile!r}\n"
+                "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(3)'], env={})\n"
+                "open(pf + '.tmp', 'w').write(str(p.pid))\n"
+                "os.replace(pf + '.tmp', pf)\n"
+                "p.wait()\n"
+            )
+            test_argv = [sys.executable, "-c", code]
+        else:
+            # The test command's child drops MESH_RUN_ID (`env -u`), as a hostile test would.
+            cmd = (f"env -u MESH_RUN_ID sh -c 'echo $$ > {pidfile}.tmp && mv {pidfile}.tmp {pidfile}; "
+                   f"exec {shutil.which('sleep')} 3'")
+            test_argv = ["sh", "-c", cmd]
         plan = {"run_id": run_id, "run_dir": os.path.join(tmp, "merges", "mrg_r2f"), "integration": cwd,
-                "test_argv": ["sh", "-c", cmd], "test_timeout_s": 30, "kill_grace_s": 1}
+                "test_argv": test_argv, "test_timeout_s": 30, "kill_grace_s": 1}
         out = {}
         th = threading.Thread(target=lambda: out.update(merge.run_test_step(plan)), daemon=True)
         th.start()

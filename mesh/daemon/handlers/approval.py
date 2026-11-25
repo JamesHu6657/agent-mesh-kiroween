@@ -19,6 +19,7 @@ from mesh.core.approvals import (
     get_row_approval_policy,
     validate_delegated_decision_at_consume,
     requested_event_problem,
+    sync_plan_on_approval_terminal,
     verify_row_for_consume,
     is_legacy_consumed_approval,
     verify_approval_event_history,
@@ -189,7 +190,25 @@ def check_approval_replay_authz(
     if row is None:
         return
     _check_approval_run_scope(ctx, row)
+    if cmd == "approval.decide":
+        if actor_kind != "user" or via != "direct":
+            raise MeshError(
+                code=c.CAPABILITY_MISSING,
+                exit_code=c.EXIT_FORBIDDEN,
+                message="Command 'approval.decide' requires direct user authentication",
+                details={"cmd": "approval.decide", "required": "user_direct"},
+            )
+        return
     if cmd in ("approval.approve", "approval.reject"):
+        if row["category"] in ("plan_dispatch", "step_dispatch"):
+            if actor_kind != "user" or via != "direct":
+                raise MeshError(
+                    code=c.CHANNEL_NOT_ALLOWED,
+                    exit_code=c.EXIT_APPROVAL_INVALID,
+                    message=f"Category '{row['category']}' requires direct user card approval",
+                    details={"approval_id": approval_id, "category": row["category"]},
+                )
+            return
         human_confirmed = req_args.get("human_confirmed")
         delegated = human_confirmed is not None
         if delegated:
@@ -228,6 +247,16 @@ def check_approval_replay_authz(
                 code=c.NOT_REQUESTER,
                 exit_code=c.EXIT_FORBIDDEN,
                 message="Only the requester, project lead, or user can cancel an approval request",
+            )
+        if row["status"] == "approved" and actor_kind != "user" and (
+            row["category"] in ("plan_dispatch", "step_dispatch", "permission_escalation")
+            or row["decided_via"] == "direct"
+        ):
+            raise MeshError(
+                code=c.CAPABILITY_MISSING,
+                exit_code=c.EXIT_FORBIDDEN,
+                message="Only the direct user can cancel an approved user-signed approval",
+                details={"approval_id": approval_id, "category": row["category"], "required": "user_direct"},
             )
     elif cmd == "approval.consume":
         if row["requested_by"] != effective_principal["id"]:
@@ -372,6 +401,784 @@ def _check_delegated_decision(ctx: HandlerContext, row: sqlite3.Row, human_confi
         )
 
 
+def _load_and_verify_plan_for_approval(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    provided_plan_hash: Optional[str],
+    *,
+    provided_plan_id: Optional[str] = None,
+    provided_plan_version: Optional[Any] = None,
+) -> sqlite3.Row:
+    """Load the plan bound to a `plan_dispatch` approval and verify exact plan_hash & integrity."""
+    from mesh.daemon.handlers.plan import compute_plan_hash
+
+    plan = conn.execute(
+        "SELECT * FROM plans WHERE approval_id = ?;",
+        (row["id"],),
+    ).fetchone()
+    if plan is None:
+        raise MeshError(
+            code=c.APPROVAL_INVALID,
+            exit_code=c.EXIT_APPROVAL_INVALID,
+            message=f"Plan bound to approval '{row['id']}' was not found",
+            details={"approval_id": row["id"]},
+        )
+    if provided_plan_id is not None and provided_plan_id != plan["id"]:
+        raise MeshError(
+            code=c.OP_HASH_MISMATCH,
+            exit_code=c.EXIT_APPROVAL_INVALID,
+            message="Provided plan_id does not match the plan bound to this approval",
+            details={"approval_id": row["id"], "expected_plan_id": plan["id"], "got": provided_plan_id},
+        )
+    if provided_plan_version is not None:
+        if isinstance(provided_plan_version, bool) or not isinstance(provided_plan_version, int) or provided_plan_version != plan["version"]:
+            raise MeshError(
+                code=c.OP_HASH_MISMATCH,
+                exit_code=c.EXIT_APPROVAL_INVALID,
+                message="Provided plan_version does not match the plan bound to this approval",
+                details={"approval_id": row["id"], "expected_version": plan["version"], "got": provided_plan_version},
+            )
+    if not isinstance(provided_plan_hash, str) or not provided_plan_hash.strip():
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Field 'plan_hash' is required to decide a plan_dispatch approval card",
+            details={"param": "plan_hash", "approval_id": row["id"], "plan_id": plan["id"]},
+        )
+    try:
+        steps = json.loads(plan["steps_json"] or "[]")
+        if not isinstance(steps, list) or not steps:
+            raise ValueError("empty steps")
+        recomputed_plan_hash = compute_plan_hash(plan["title"], plan["summary"], steps)
+    except Exception as exc:
+        raise MeshError(
+            code=c.APPROVAL_INVALID,
+            exit_code=c.EXIT_APPROVAL_INVALID,
+            message=f"Stored plan document is corrupt: {exc}",
+            details={"approval_id": row["id"], "plan_id": plan["id"]},
+        )
+    if recomputed_plan_hash != plan["plan_hash"]:
+        raise MeshError(
+            code=c.OP_HASH_MISMATCH,
+            exit_code=c.EXIT_APPROVAL_INVALID,
+            message="Database corruption detected: stored plan_hash does not match immutable plan steps",
+            details={"plan_id": plan["id"], "expected": plan["plan_hash"], "computed": recomputed_plan_hash},
+        )
+    if provided_plan_hash.strip() != plan["plan_hash"]:
+        raise MeshError(
+            code=c.OP_HASH_MISMATCH,
+            exit_code=c.EXIT_APPROVAL_INVALID,
+            message="Provided plan_hash does not match the current plan version shown",
+            details={"plan_id": plan["id"], "expected": plan["plan_hash"], "got": provided_plan_hash.strip()},
+        )
+    return plan
+
+
+def _expire_if_past_ttl(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    now: str,
+    *,
+    dry_run: bool = False,
+) -> None:
+    """If an open approval is past TTL, persist expiry + plan sync and raise APPROVAL_EXPIRED.
+
+    Callers MUST invoke this before any other database mutation in the transaction so that
+    `commit_tx=True` commits strictly the expiry transition and plan cancellation sync.
+    """
+    if row["status"] == "expired":
+        raise MeshError(
+            code=c.APPROVAL_EXPIRED,
+            exit_code=c.EXIT_APPROVAL_INVALID,
+            message=f"Approval '{row['id']}' has expired",
+            details={"approval_id": row["id"], "expires_at": row["expires_at"]},
+        )
+    if row["status"] in ("pending", "approved") and row["expires_at"] < now:
+        expired_written = False
+        if not dry_run:
+            upd = conn.execute(
+                "UPDATE approvals SET status = 'expired' WHERE id = ? AND status IN ('pending', 'approved');",
+                (row["id"],),
+            )
+            if upd.rowcount == 1:
+                expired_written = True
+                record_event(
+                    conn=conn,
+                    type_="approval.expired",
+                    actor_id="system",
+                    actor_kind="system",
+                    via="system",
+                    project_id=row["project_id"],
+                    task_id=row["task_id"],
+                    approval_id=row["id"],
+                    payload={
+                        "approval_id": row["id"],
+                        "category": row["category"],
+                        "op": row["op_type"],
+                        "requested_by": row["requested_by"],
+                        "expires_at": row["expires_at"],
+                        "status": "expired",
+                        "expired_on": "decide",
+                    },
+                )
+                sync_plan_on_approval_terminal(
+                    conn,
+                    row["id"],
+                    "approval_expired",
+                    actor_id="system",
+                    actor_kind="system",
+                    via="system",
+                )
+        raise MeshError(
+            code=c.APPROVAL_EXPIRED,
+            exit_code=c.EXIT_APPROVAL_INVALID,
+            message=f"Approval '{row['id']}' has expired",
+            details={"approval_id": row["id"], "expires_at": row["expires_at"]},
+            commit_tx=expired_written,
+        )
+
+
+def _enforce_approval_liveness_for_approve(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    action_label: str,
+    *,
+    allow_paused_project: bool = False,
+) -> None:
+    """Refuse approving an approval bound to a dead project or dead (terminal/progressed) task.
+
+    Shared by ``handle_approval_decide`` and legacy ``_handle_approval_decision`` so server-side
+    liveness refusal stays aligned across both RPC surfaces. ``handle_approval_decide`` (inline
+    cards) always requires ``project.status == 'active'``; legacy ``approval.approve`` allows
+    ``paused`` projects only for non-plan/non-step task ops (``task.assign`` / ``task.reassign`` /
+    ``task.retry`` / ``task.reject``), which intentionally permit staging work while paused, while
+    still blocking terminal projects (``completed`` / ``cancelled``) and all dead/progressed tasks.
+    """
+    from mesh.core.grants import evaluate_bound_task_for_approval
+
+    approval_id = row["id"]
+    if row["project_id"]:
+        prow = conn.execute(
+            "SELECT id, status FROM projects WHERE id = ?;",
+            (row["project_id"],),
+        ).fetchone()
+        if prow is None:
+            raise MeshError(
+                code=c.NOT_FOUND,
+                exit_code=c.EXIT_NOT_FOUND,
+                message=f"Project '{row['project_id']}' not found",
+                details={"project_id": row["project_id"]},
+            )
+        allowed_statuses = ("active", "paused") if allow_paused_project else ("active",)
+        if prow["status"] not in allowed_statuses:
+            raise MeshError(
+                code=c.PROJECT_NOT_ACTIVE,
+                exit_code=c.EXIT_CONFLICT,
+                message=f"Project '{row['project_id']}' is {prow['status']}, not active",
+                details={"project_id": row["project_id"], "status": prow["status"]},
+            )
+    if row["task_id"]:
+        task_eval = evaluate_bound_task_for_approval(conn, row)
+        if task_eval["task_terminal"]:
+            t_status = task_eval["task_status"] if task_eval["task_status"] is not None else "missing"
+            raise MeshError(
+                code=c.INVALID_TRANSITION,
+                exit_code=c.EXIT_CONFLICT,
+                message=(
+                    f"Task '{row['task_id']}' is in terminal state '{t_status}'; "
+                    f"cannot '{action_label}' a dead-task approval card"
+                ),
+                details={
+                    "approval_id": approval_id,
+                    "task_id": row["task_id"],
+                    "task_status": t_status,
+                    "task_kind": task_eval["task_kind"],
+                    "reason": "task_terminal",
+                },
+            )
+        if task_eval["task_progressed"]:
+            t_status = task_eval["task_status"]
+            expected_list = list(task_eval["expected_statuses"] or ())
+            raise MeshError(
+                code=c.INVALID_TRANSITION,
+                exit_code=c.EXIT_CONFLICT,
+                message=(
+                    f"Task '{row['task_id']}' has progressed to '{t_status}' "
+                    f"(expected {', '.join(expected_list)} for '{row['op_type']}'); "
+                    f"cannot '{action_label}' a stale task approval card"
+                ),
+                details={
+                    "approval_id": approval_id,
+                    "task_id": row["task_id"],
+                    "task_status": t_status,
+                    "task_kind": task_eval["task_kind"],
+                    "op_type": row["op_type"],
+                    "expected_task_statuses": expected_list,
+                    "reason": "task_progressed",
+                },
+            )
+
+
+def handle_approval_decide(ctx: HandlerContext) -> HandlerResult:
+    """Inline approval card button handler: allow / always_allow / reject (direct user ONLY)."""
+    if ctx.actor_kind != "user" or ctx.via != "direct":
+        raise MeshError(
+            code=c.CAPABILITY_MISSING,
+            exit_code=c.EXIT_FORBIDDEN,
+            message="Command 'approval.decide' requires direct user authentication",
+            details={"cmd": "approval.decide", "required": "user_direct", "actor_kind": ctx.actor_kind, "via": ctx.via},
+        )
+    if not ctx.k_user:
+        raise MeshError(
+            code=c.PASSPHRASE_REQUIRED,
+            exit_code=c.EXIT_UNAUTHENTICATED,
+            message="Direct user approval requires passphrase key",
+        )
+
+    approval_id = _require_nonempty_str(ctx.args.get("approval_id"), "approval_id", "approval_id is required")
+    action = _require_nonempty_str(ctx.args.get("action"), "action", "action is required ('allow', 'always_allow', or 'reject')")
+    if action not in ("allow", "always_allow", "reject"):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Field 'action' must be 'allow', 'always_allow', or 'reject'",
+            details={"param": "action", "expected": ["allow", "always_allow", "reject"], "got": action},
+        )
+
+    raw_reason = _validate_optional_str(ctx.args.get("reason"), "reason", max_len=4000)
+    raw_note = _validate_optional_str(ctx.args.get("note"), "note", max_len=4000)
+    if raw_reason is not None and raw_note is not None and raw_reason != raw_note:
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Conflicting 'reason' and 'note' arguments",
+            details={"param": "reason"},
+        )
+    chosen_note = raw_reason if raw_reason is not None else raw_note
+    note = redact(chosen_note) if chosen_note else chosen_note
+
+    confirm_auto_mode = ctx.args.get("confirm_auto_mode", False)
+    if not isinstance(confirm_auto_mode, bool):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Field 'confirm_auto_mode' must be a boolean",
+            details={"param": "confirm_auto_mode", "got": confirm_auto_mode},
+        )
+
+    row = ctx.conn.execute("SELECT * FROM approvals WHERE id = ?;", (approval_id,)).fetchone()
+    if not row:
+        raise MeshError(
+            code=c.NOT_FOUND,
+            exit_code=c.EXIT_NOT_FOUND,
+            message=f"Approval '{approval_id}' not found",
+            details={"approval_id": approval_id},
+        )
+
+    # Verify stored op_json & approval.requested integrity
+    try:
+        recomputed_hash = verify_stored_op_json(row)
+    except Exception:
+        recomputed_hash = None
+    req_problem = requested_event_problem(ctx.conn, row)
+    if req_problem:
+        raise MeshError(
+            code=c.OP_HASH_MISMATCH,
+            exit_code=c.EXIT_APPROVAL_INVALID,
+            message=f"Database corruption detected: {req_problem}",
+            details={"approval_id": row["id"], "reason": req_problem},
+        )
+    if recomputed_hash != row["op_hash"]:
+        raise MeshError(
+            code=c.OP_HASH_MISMATCH,
+            exit_code=c.EXIT_APPROVAL_INVALID,
+            message="Database corruption detected: stored op_json does not match stored op_hash",
+            details={"stored": row["op_hash"], "recomputed": recomputed_hash},
+        )
+
+    is_plan_card = (row["category"] == "plan_dispatch" and row["op_type"] == "plan.dispatch")
+    plan_row: Optional[sqlite3.Row] = None
+    provided_op_hash = _validate_optional_str(ctx.args.get("op_hash"), "op_hash")
+    provided_plan_hash = _validate_optional_str(ctx.args.get("plan_hash"), "plan_hash")
+    provided_plan_id = _validate_optional_str(ctx.args.get("plan_id"), "plan_id")
+    provided_plan_version = ctx.args.get("plan_version")
+
+    if is_plan_card:
+        plan_row = _load_and_verify_plan_for_approval(
+            ctx.conn,
+            row,
+            provided_plan_hash,
+            provided_plan_id=provided_plan_id,
+            provided_plan_version=provided_plan_version,
+        )
+        if provided_op_hash is not None and provided_op_hash.strip() != row["op_hash"]:
+            raise MeshError(
+                code=c.OP_HASH_MISMATCH,
+                exit_code=c.EXIT_APPROVAL_INVALID,
+                message="Provided op_hash does not match stored approval op_hash",
+                details={"expected": row["op_hash"], "got": provided_op_hash.strip()},
+            )
+    else:
+        req_op_hash = _require_nonempty_str(provided_op_hash, "op_hash", "Field 'op_hash' is required")
+        if req_op_hash.strip() != row["op_hash"]:
+            raise MeshError(
+                code=c.OP_HASH_MISMATCH,
+                exit_code=c.EXIT_APPROVAL_INVALID,
+                message="Provided op_hash does not match stored approval op_hash",
+                details={"expected": row["op_hash"], "got": req_op_hash.strip()},
+            )
+
+    if is_approval_pinned_by_ws_reservation(ctx.conn, approval_id):
+        raise MeshError(
+            code=c.CONCURRENCY_LIMIT,
+            exit_code=c.EXIT_BUSY,
+            message=f"Approval '{approval_id}' is pinned by an in-progress workspace operation",
+            details={"approval_id": approval_id},
+        )
+
+    now = now_iso_utc()
+    status = row["status"]
+    decision = "rejected" if action == "reject" else "approved"
+
+    ev_rows = ctx.conn.execute(
+        "SELECT seq, type, actor_id, via, payload_json FROM events "
+        "WHERE approval_id = ? AND type IN ('approval.decided', 'approval.cancelled', 'approval.expired', 'approval.consumed') "
+        "ORDER BY seq ASC;",
+        (approval_id,),
+    ).fetchall()
+    ev_dec, ev_terminal, hist_err = verify_approval_event_history(ev_rows)
+    if hist_err:
+        raise MeshError(
+            code=c.APPROVAL_INVALID,
+            exit_code=c.EXIT_APPROVAL_INVALID,
+            message=f"Database corruption detected: {hist_err}",
+            details={"approval_id": approval_id, "reason": "decision_event_mismatch"},
+        )
+    if ev_terminal == "expired":
+        raise MeshError(
+            code=c.APPROVAL_EXPIRED,
+            exit_code=c.EXIT_APPROVAL_INVALID,
+            message=f"Approval '{approval_id}' has expired",
+            details={"approval_id": approval_id, "expires_at": row["expires_at"]},
+        )
+    if ev_terminal == "consumed" or status == "consumed":
+        raise MeshError(
+            code=c.APPROVAL_CONSUMED,
+            exit_code=c.EXIT_APPROVAL_INVALID,
+            message=f"Approval '{approval_id}' was already consumed",
+            details={"approval_id": approval_id},
+        )
+    if ev_terminal == "cancelled" or status == "cancelled":
+        raise MeshError(
+            code=c.APPROVAL_CANCELLED,
+            exit_code=c.EXIT_APPROVAL_INVALID,
+            message=f"Approval '{approval_id}' was cancelled",
+            details={"approval_id": approval_id},
+        )
+    _expire_if_past_ttl(ctx.conn, row, now, dry_run=ctx.dry_run)
+
+    if ev_terminal in ("approved", "rejected") and ev_terminal != decision:
+        raise MeshError(
+            code=c.DECISION_CONFLICT,
+            exit_code=c.EXIT_CONFLICT,
+            message=f"Approval '{approval_id}' was already {ev_terminal}; cannot {action}",
+            details={"approval_id": approval_id, "status": ev_terminal},
+        )
+    if (decision == "approved" and status == "rejected") or (decision == "rejected" and status == "approved"):
+        raise MeshError(
+            code=c.DECISION_CONFLICT,
+            exit_code=c.EXIT_CONFLICT,
+            message=f"Approval '{approval_id}' was already {status}; cannot {action}",
+            details={"approval_id": approval_id, "status": status},
+        )
+
+    has_consumed_ev = any(r["type"] == "approval.consumed" for r in ev_rows)
+    if ev_terminal == decision and status != decision:
+        ev_chan = ("relayed" if ev_dec["via"] == "delegated" else ev_dec["via"]) if ev_dec else None
+        is_valid_upgrade = (decision in ("approved", "rejected") and ev_chan == "relayed")
+        if not is_valid_upgrade and not is_legacy_consumed_approval(status, ev_terminal, ev_dec, has_consumed_ev):
+            raise MeshError(
+                code=c.APPROVAL_INVALID,
+                exit_code=c.EXIT_APPROVAL_INVALID,
+                message="Database corruption detected: approval row status differs from event chain",
+                details={"approval_id": approval_id, "row_status": status, "event_state": ev_terminal},
+            )
+
+    # Direct-user card clicks on an already-decided approval support two upgrades:
+    # 1. Relayed -> Direct upgrade (for either 'approved' or 'rejected': signs user_mac and
+    #    emits approval.decided with upgraded_from="relayed").
+    # 2. Upgrading an unconsumed, unexpired approved card to `always_allow` (decision stays approved;
+    #    standing grants are created or auto-mode switch is confirmed without duplicating direct approval.decided).
+    upgrade_to_direct = (
+        status == decision
+        and status in ("approved", "rejected")
+        and row["decided_via"] == "relayed"
+    )
+    upgrade_approved_to_always_allow = (status == decision == "approved" and action == "always_allow")
+
+    if status == decision and not upgrade_to_direct and not upgrade_approved_to_always_allow:
+        resp_idem: Dict[str, Any] = {
+            "approval_id": approval_id,
+            "action": action,
+            "status": decision,
+            "already_decided": True,
+            "decided_via": row["decided_via"],
+            "trust": "direct_verified" if row["decided_via"] == "direct" else "relayed_unverified",
+            "user_mac": row["user_mac"],
+        }
+        if plan_row is not None:
+            resp_idem["plan_id"] = plan_row["id"]
+            resp_idem["plan_version"] = plan_row["version"]
+            resp_idem["plan_hash"] = plan_row["plan_hash"]
+            resp_idem["plan_status"] = plan_row["status"]
+        return HandlerResult(data=resp_idem)
+
+    if status == "pending" and is_plan_card and plan_row is not None and plan_row["status"] != "proposed":
+        raise MeshError(
+            code=c.INVALID_TRANSITION,
+            exit_code=c.EXIT_CONFLICT,
+            message=f"Plan '{plan_row['id']}' is in status '{plan_row['status']}', expected 'proposed'",
+            details={"plan_id": plan_row["id"], "status": plan_row["status"]},
+        )
+
+    # Handle 'always_allow' pre-validation & two-step confirmation for plan_dispatch / step_dispatch
+    from mesh.core.grants import (
+        create_or_get_standing_grant,
+        extract_grant_scopes_from_approval,
+        get_project_permission_mode,
+        preview_grant_scope_for_card,
+    )
+
+    # Reject approving / granting from an inactive project or a dead (terminal/progressed) bound task.
+    if decision == "approved":
+        _enforce_approval_liveness_for_approve(ctx.conn, row, action)
+
+    switch_to_auto = False
+    already_auto_mode = False
+    grant_scopes: List[Dict[str, Any]] = []
+    if action == "always_allow":
+        if row["category"] in ("plan_dispatch", "step_dispatch"):
+            if not row["project_id"]:
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Category '{row['category']}' requires a project_id to switch to auto mode",
+                    details={"approval_id": approval_id},
+                )
+            preview = preview_grant_scope_for_card(ctx.conn, row, testing_mode=ctx.testing_mode)
+            if not isinstance(preview, dict) or preview.get("kind") != "switch_permission_mode":
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message="Refusing 'always_allow': card preview cannot describe auto-mode switch for this approval",
+                    details={"approval_id": approval_id, "category": row["category"]},
+                )
+            current_mode = get_project_permission_mode(ctx.conn, row["project_id"])
+            if current_mode == "auto":
+                # Project is already in 'auto' mode — no mode transition will occur, so skip the
+                # switch-confirmation prompt and report truthful already_auto metadata.
+                already_auto_mode = True
+                switch_to_auto = True
+            elif not confirm_auto_mode:
+                prow = ctx.conn.execute(
+                    "SELECT name FROM projects WHERE id = ?;",
+                    (row["project_id"],),
+                ).fetchone()
+                project_name = (prow["name"] if prow and prow["name"] else None)
+                project_label = project_name or row["project_id"]
+                return HandlerResult(
+                    data={
+                        "confirmation_required": True,
+                        "action": "always_allow",
+                        "effect": "switch_project_to_auto_mode",
+                        "approval_id": approval_id,
+                        "category": row["category"],
+                        "project_id": row["project_id"],
+                        "project_name": project_name,
+                        "current_permission_mode": current_mode,
+                        "target_permission_mode": "auto",
+                        "message": (
+                            f"选择「始终允许」会将项目「{project_label}」的权限模式切换为「全自动 (auto)」："
+                            "后续计划派发与超限重试将自动放行（提权操作 permission_escalation 仍需单独授权）。"
+                            "请传入 confirm_auto_mode=true 确认此操作。"
+                        ),
+                    }
+                )
+            else:
+                switch_to_auto = True
+        else:
+            grant_scopes = extract_grant_scopes_from_approval(
+                ctx.conn, row, testing_mode=ctx.testing_mode
+            )
+            preview = preview_grant_scope_for_card(ctx.conn, row, testing_mode=ctx.testing_mode)
+            preview_keys = (
+                {s.get("scope_key") for s in preview.get("scopes", []) if isinstance(s, dict) and s.get("scope_key")}
+                if isinstance(preview, dict)
+                and preview.get("kind") == "standing_grant"
+                and isinstance(preview.get("scopes"), list)
+                else set()
+            )
+            actual_keys = {sc["scope_key"] for sc in grant_scopes}
+            if not actual_keys or preview_keys != actual_keys:
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message="Refusing 'always_allow': card preview cannot describe every standing grant scope",
+                    details={
+                        "approval_id": approval_id,
+                        "category": row["category"],
+                        "preview_scopes": sorted(preview_keys),
+                        "actual_scopes": sorted(actual_keys),
+                    },
+                )
+
+    needs_decision_write = (status == "pending") or upgrade_to_direct
+    if needs_decision_write:
+        # Sign and persist direct user decision (or relayed -> direct upgrade)
+        user_mac = compute_user_approval_mac(ctx.k_user, approval_id, row["op_hash"], decision, now)
+        if upgrade_to_direct:
+            upd_cur = ctx.conn.execute(
+                """UPDATE approvals SET
+                    status = ?,
+                    decided_by = ?,
+                    decided_via = 'direct',
+                    relayed_by = NULL,
+                    relayer_credential_id = NULL,
+                    user_statement = NULL,
+                    evidence_ref = NULL,
+                    decision_note = ?,
+                    decided_at = ?,
+                    user_mac = ?
+                WHERE id = ? AND status = ? AND decided_via = 'relayed';""",
+                (decision, ctx.principal["id"], note, now, user_mac, approval_id, decision),
+            )
+        else:
+            upd_cur = ctx.conn.execute(
+                """UPDATE approvals SET
+                    status = ?,
+                    decided_by = ?,
+                    decided_via = 'direct',
+                    relayed_by = NULL,
+                    relayer_credential_id = NULL,
+                    user_statement = NULL,
+                    evidence_ref = NULL,
+                    decision_note = ?,
+                    decided_at = ?,
+                    user_mac = ?
+                WHERE id = ? AND status = 'pending';""",
+                (decision, ctx.principal["id"], note, now, user_mac, approval_id),
+            )
+        if upd_cur.rowcount != 1:
+            raise MeshError(
+                code=c.DECISION_CONFLICT,
+                exit_code=c.EXIT_CONFLICT,
+                message=f"Approval '{approval_id}' changed state concurrently",
+                details={"approval_id": approval_id},
+            )
+    else:
+        user_mac = row["user_mac"]
+
+    events_emitted: List[str] = []
+    created_grants: List[Dict[str, Any]] = []
+    any_grant_created = False
+    for sc in grant_scopes:
+        gr, newly_created = create_or_get_standing_grant(
+            ctx.conn,
+            project_id=sc["project_id"],
+            category=sc["category"],
+            scope_agent_id=sc["scope_agent_id"],
+            scope_profile=sc["scope_profile"],
+            scope_config_key=sc["scope_config_key"],
+            source_approval_id=approval_id,
+            actor_id=ctx.principal["id"],
+            k_user=ctx.k_user,
+            request_id=ctx.request_id,
+            now=now,
+        )
+        created_grants.append(gr)
+        if newly_created:
+            any_grant_created = True
+            if "grant.created" not in events_emitted:
+                events_emitted.append("grant.created")
+
+    if needs_decision_write:
+        dec_payload: Dict[str, Any] = {
+            "decision": decision,
+            "action": action,
+            "note": note,
+            "approval_id": approval_id,
+            "category": row["category"],
+            "op": row["op_type"],
+            "op_hash": row["op_hash"],
+        }
+        if upgrade_to_direct:
+            dec_payload["upgraded_from"] = "relayed"
+        if plan_row is not None:
+            dec_payload["plan_id"] = plan_row["id"]
+            dec_payload["plan_version"] = plan_row["version"]
+            dec_payload["plan_hash"] = plan_row["plan_hash"]
+        if created_grants:
+            dec_payload["grant_ids"] = [g["id"] for g in created_grants]
+        if switch_to_auto and not already_auto_mode:
+            dec_payload["switched_permission_mode_to"] = "auto"
+
+        record_event(
+            conn=ctx.conn,
+            type_="approval.decided",
+            actor_id=ctx.principal["id"],
+            actor_kind="user",
+            via="direct",
+            credential_id=ctx.credential_id,
+            project_id=row["project_id"],
+            task_id=row["task_id"],
+            approval_id=approval_id,
+            reason=note,
+            payload=dec_payload,
+            request_id=ctx.request_id,
+            k_user=ctx.k_user,
+        )
+        events_emitted.insert(0, "approval.decided")
+
+    new_plan_status: Optional[str] = None
+    if is_plan_card and plan_row is not None:
+        if status == "pending":
+            new_plan_status = "approved_pending_dispatch" if decision == "approved" else "rejected"
+            ctx.conn.execute(
+                "UPDATE plans SET status = ?, updated_at = ? WHERE id = ?;",
+                (new_plan_status, now, plan_row["id"]),
+            )
+            plan_ev_type = "plan.approved" if decision == "approved" else "plan.rejected"
+            record_event(
+                conn=ctx.conn,
+                type_=plan_ev_type,
+                actor_id=ctx.principal["id"],
+                actor_kind="user",
+                via="direct",
+                credential_id=ctx.credential_id,
+                project_id=row["project_id"],
+                approval_id=approval_id,
+                reason=note,
+                payload={
+                    "plan_id": plan_row["id"],
+                    "version": plan_row["version"],
+                    "plan_hash": plan_row["plan_hash"],
+                    "approval_id": approval_id,
+                    "action": action,
+                    "from_status": "proposed",
+                    "to_status": new_plan_status,
+                    "reason": note,
+                },
+                request_id=ctx.request_id,
+                k_user=ctx.k_user,
+            )
+            events_emitted.append(plan_ev_type)
+        else:
+            new_plan_status = plan_row["status"]
+
+    mode_changed = False
+    prev_mode: Optional[str] = None
+    cancelled_step_approvals: List[str] = []
+    cancelled_plan_approvals: List[str] = []
+    if switch_to_auto and row["project_id"]:
+        prev_mode = get_project_permission_mode(ctx.conn, row["project_id"])
+        if prev_mode != "auto":
+            ctx.conn.execute(
+                "UPDATE projects SET permission_mode = 'auto', updated_at = ?, version = version + 1 WHERE id = ?;",
+                (now, row["project_id"]),
+            )
+            record_event(
+                conn=ctx.conn,
+                type_="project.permission_mode_changed",
+                actor_id=ctx.principal["id"],
+                actor_kind="user",
+                via="direct",
+                credential_id=ctx.credential_id,
+                project_id=row["project_id"],
+                approval_id=approval_id,
+                payload={
+                    "project_id": row["project_id"],
+                    "from_mode": prev_mode,
+                    "to_mode": "auto",
+                    "source": "always_allow",
+                    "approval_id": approval_id,
+                },
+                request_id=ctx.request_id,
+                k_user=ctx.k_user,
+            )
+            mode_changed = True
+            events_emitted.append("project.permission_mode_changed")
+            from mesh.core.approvals import (
+                cancel_pending_plan_dispatch_approvals,
+                cancel_pending_step_dispatch_approvals,
+            )
+
+            cancelled_step_approvals = cancel_pending_step_dispatch_approvals(
+                ctx.conn,
+                row["project_id"],
+                from_mode=prev_mode,
+                to_mode="auto",
+                actor_id=ctx.principal["id"],
+                actor_kind="user",
+                via="direct",
+                request_id=ctx.request_id,
+                k_user=ctx.k_user,
+            )
+            cancelled_plan_approvals = cancel_pending_plan_dispatch_approvals(
+                ctx.conn,
+                row["project_id"],
+                from_mode=prev_mode,
+                to_mode="auto",
+                actor_id=ctx.principal["id"],
+                actor_kind="user",
+                via="direct",
+                request_id=ctx.request_id,
+                k_user=ctx.k_user,
+            )
+            if cancelled_step_approvals or cancelled_plan_approvals:
+                events_emitted.append("approval.cancelled")
+
+    resp: Dict[str, Any] = {
+        "approval_id": approval_id,
+        "category": row["category"],
+        "action": action,
+        "status": decision,
+        "decided_via": "direct",
+        "trust": "direct_verified",
+        "user_mac": user_mac,
+        "confirmation_required": False,
+    }
+    if upgrade_to_direct:
+        resp["upgraded_from"] = "relayed"
+    if upgrade_approved_to_always_allow:
+        resp["upgraded_to_always_allow"] = True
+        if not upgrade_to_direct:
+            resp["already_decided"] = True
+    if plan_row is not None:
+        resp["plan_id"] = plan_row["id"]
+        resp["plan_version"] = plan_row["version"]
+        resp["plan_hash"] = plan_row["plan_hash"]
+        resp["plan_status"] = new_plan_status
+    if created_grants:
+        resp["grant"] = created_grants[0]
+        resp["grants"] = created_grants
+        resp["grant_created"] = any_grant_created
+    if switch_to_auto:
+        resp["permission_mode"] = "auto"
+        resp["previous_permission_mode"] = prev_mode
+        resp["mode_changed"] = mode_changed
+        resp["already_auto"] = already_auto_mode
+        resp["cancelled_step_approvals"] = cancelled_step_approvals
+        resp["cancelled_plan_approvals"] = cancelled_plan_approvals
+        if mode_changed:
+            resp["message"] = "已批准当前操作，并将项目权限模式切换为「全自动 (auto)」。"
+        elif needs_decision_write:
+            resp["message"] = "已批准当前操作；当前项目已处于「全自动 (auto)」模式，无需重复切换。"
+        else:
+            resp["message"] = "当前操作已批准，且项目已处于「全自动 (auto)」模式，无需重复切换。"
+
+    return HandlerResult(data=resp, events=events_emitted)
+
+
 def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResult:
     """Decide (approve or reject) a pending approval request per plan §7.3 and §7.4."""
     approval_id = _require_nonempty_str(ctx.args.get("approval_id"), "approval_id", "approval_id is required")
@@ -410,6 +1217,35 @@ def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResu
             message=f"Approval '{approval_id}' not found",
             details={"approval_id": approval_id},
         )
+
+    # Plan dispatch approvals are strictly direct-user-only and require exact plan_hash so plan & approval never drift.
+    if row["category"] == "plan_dispatch" and row["op_type"] == "plan.dispatch":
+        if ctx.actor_kind != "user" or ctx.via != "direct":
+            raise MeshError(
+                code=c.CHANNEL_NOT_ALLOWED,
+                exit_code=c.EXIT_APPROVAL_INVALID,
+                message="Plan dispatch approvals require direct user approval on the plan card",
+                details={"approval_id": approval_id, "category": "plan_dispatch"},
+            )
+        plan_action = "allow" if decision == "approved" else "reject"
+        sub_args = dict(ctx.args)
+        sub_args["action"] = plan_action
+        sub_ctx = HandlerContext(
+            conn=ctx.conn,
+            principal=ctx.principal,
+            actor_kind=ctx.actor_kind,
+            via=ctx.via,
+            request_id=ctx.request_id,
+            home=ctx.home,
+            cmd="approval.decide",
+            args=sub_args,
+            dry_run=ctx.dry_run,
+            k_user=ctx.k_user,
+            effects=ctx.effects,
+            testing_mode=ctx.testing_mode,
+            credential_id=ctx.credential_id,
+        )
+        return handle_approval_decide(sub_ctx)
 
     human_confirmed = ctx.args.get("human_confirmed")
     delegated = human_confirmed is not None
@@ -568,7 +1404,7 @@ def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResu
     if ev_terminal == decision and status != decision:
         ev_chan = ("relayed" if ev_dec["via"] == "delegated" else ev_dec["via"]) if ev_dec else None
         is_valid_upgrade = (
-            decision == "approved"
+            decision in ("approved", "rejected")
             and ev_chan == "relayed"
             and not delegated
             and ctx.actor_kind == "user"
@@ -582,7 +1418,7 @@ def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResu
                 details={"approval_id": approval_id, "row_status": status, "event_state": ev_terminal},
             )
 
-    if row["expires_at"] < now or status == "expired":
+    if status == "expired" or (status in ("pending", "approved") and row["expires_at"] < now):
         raise MeshError(
             code=c.APPROVAL_EXPIRED,
             exit_code=c.EXIT_APPROVAL_INVALID,
@@ -605,8 +1441,14 @@ def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResu
         )
 
     # Idempotency: same decision again -> rc 0, already_decided: true, no new event
-    upgrade_to_direct = (status == decision == "approved" and row["decided_via"] == "relayed"
-                         and not delegated and ctx.actor_kind == "user" and ctx.via == "direct")
+    upgrade_to_direct = (
+        status == decision
+        and status in ("approved", "rejected")
+        and row["decided_via"] == "relayed"
+        and not delegated
+        and ctx.actor_kind == "user"
+        and ctx.via == "direct"
+    )
     if status == decision and not upgrade_to_direct:
         decided_via = row["decided_via"]
         return HandlerResult(data={
@@ -625,6 +1467,17 @@ def _handle_approval_decision(ctx: HandlerContext, decision: str) -> HandlerResu
             exit_code=c.EXIT_CONFLICT,
             message=f"Approval '{approval_id}' was already {status}; cannot {decision}",
             details={"approval_id": approval_id, "status": status},
+        )
+
+    # Reject approving dead cards (terminal project, paused plan/step card, or terminal/progressed
+    # bound task) on the legacy RPC surface too. Non-plan/non-step task ops permit staging approvals
+    # while a project is paused (matching task.assign/task.reassign/task.retry).
+    if decision == "approved":
+        _enforce_approval_liveness_for_approve(
+            ctx.conn,
+            row,
+            "approve",
+            allow_paused_project=(row["category"] not in ("plan_dispatch", "step_dispatch")),
         )
 
     if delegated:
@@ -822,6 +1675,25 @@ def handle_approval_cancel(ctx: HandlerContext) -> HandlerResult:
             message=f"Approval '{approval_id}' is '{status}'; only pending or unconsumed approved approvals can be cancelled",
             details={"approval_id": approval_id, "status": status},
         )
+    if status == "approved" and ctx.actor_kind != "user" and (
+        row["category"] in ("plan_dispatch", "step_dispatch", "permission_escalation")
+        or row["decided_via"] == "direct"
+    ):
+        raise MeshError(
+            code=c.CAPABILITY_MISSING,
+            exit_code=c.EXIT_FORBIDDEN,
+            message=(
+                f"Only the direct user can cancel an approved '{row['category']}' approval; "
+                f"agents and leads may only cancel pending requests"
+            ),
+            details={
+                "approval_id": approval_id,
+                "status": status,
+                "category": row["category"],
+                "decided_via": row["decided_via"],
+                "required": "user_direct",
+            },
+        )
 
     default_reason = (
         "cancelled_by_requester" if is_requester
@@ -839,6 +1711,16 @@ def handle_approval_cancel(ctx: HandlerContext) -> HandlerResult:
         approval_id=approval_id,
         payload={"reason": cancel_reason or default_reason, "approval_id": approval_id,
                  "from_status": status, "category": row["category"], "op": row["op_type"]},
+        request_id=ctx.request_id,
+        k_user=ctx.k_user,
+    )
+    sync_plan_on_approval_terminal(
+        ctx.conn,
+        approval_id,
+        cancel_reason or default_reason,
+        actor_id=ctx.principal["id"],
+        actor_kind=ctx.actor_kind,
+        via=ctx.via,
         request_id=ctx.request_id,
         k_user=ctx.k_user,
     )
@@ -904,7 +1786,11 @@ def handle_approval_consume(ctx: HandlerContext) -> HandlerResult:
 
     _check_approval_run_scope(ctx, row)
 
-    # 1. Authority: the requester only (else 4 NOT_REQUESTER, G19)
+    # 1. Authority: the requester only (else 4 NOT_REQUESTER, G19).
+    # Note on lead-change asymmetry: single-use approvals bind `requested_by`, so a lead change
+    # between approval creation and consume invalidates the approval (the new lead must re-request),
+    # whereas project-scoped standing grants (`permission_escalation`, `retry_over_limit`) survive
+    # lead changes until explicitly revoked by the direct user via `grant.revoke`.
     if row["requested_by"] != ctx.principal["id"]:
         raise MeshError(
             code=c.NOT_REQUESTER,
@@ -1131,6 +2017,13 @@ def handle_approval_request(ctx: HandlerContext) -> HandlerResult:
             message=f"Unknown approval category: '{category}'",
             details={"param": "category", "category": category},
         )
+    if category in ("plan_dispatch", "step_dispatch"):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message=f"Approval category '{category}' is internal-only and cannot be requested via approval.request",
+            details={"param": "category", "category": category},
+        )
 
     if not summary or not isinstance(summary, str) or not summary.strip():
         raise MeshError(
@@ -1304,6 +2197,7 @@ def handle_approval_request(ctx: HandlerContext) -> HandlerResult:
             )
 
     op_string = f"external.{category}"
+    # Note: 'config' writes remain strictly direct-user-only and do not support standing grants.
     apr_info = create_or_get_pending_approval(
         conn=ctx.conn,
         category=category,
@@ -1374,9 +2268,60 @@ def handle_approval_show(ctx: HandlerContext) -> HandlerResult:
 
 
 def handle_approval_list(ctx: HandlerContext) -> HandlerResult:
-    """List approvals with optional status and project filters."""
+    """List approvals with optional status, project, actionable, include_ids, limit, and card hydration filters."""
     status_filter = _validate_optional_str(ctx.args.get("status"), "status")
     project_filter = _validate_optional_str(ctx.args.get("project"), "project")
+    actionable_only = ctx.args.get("actionable_only", False)
+    if not isinstance(actionable_only, bool):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Field 'actionable_only' must be a boolean",
+            details={"param": "actionable_only"},
+        )
+    include_card_fields = ctx.args.get("include_card_fields", False)
+    if not isinstance(include_card_fields, bool):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Field 'include_card_fields' must be a boolean",
+            details={"param": "include_card_fields"},
+        )
+    raw_include_ids = ctx.args.get("include_ids")
+    include_ids: List[str] = []
+    if raw_include_ids is not None:
+        if not isinstance(raw_include_ids, list) or len(raw_include_ids) > 200:
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message="Field 'include_ids' must be a list of at most 200 approval IDs",
+                details={"param": "include_ids"},
+            )
+        seen_inc: set[str] = set()
+        for aid in raw_include_ids:
+            if not isinstance(aid, str) or not aid.strip():
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message="Every entry in 'include_ids' must be a non-empty string",
+                    details={"param": "include_ids"},
+                )
+            if aid not in seen_inc:
+                seen_inc.add(aid)
+                include_ids.append(aid)
+
+    raw_limit = ctx.args.get("limit")
+    limit: Optional[int] = None
+    if raw_limit is not None:
+        if isinstance(raw_limit, bool) or not isinstance(raw_limit, int) or raw_limit < 1 or raw_limit > 500:
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message="Field 'limit' must be an integer between 1 and 500",
+                details={"param": "limit"},
+            )
+        limit = raw_limit
+
     scope_project = lead_run_token_scope(ctx.principal, ctx.via)
     if scope_project is not None:
         # Review m2-r9c N1: a lead run token lists only its own project's approvals,
@@ -1388,27 +2333,142 @@ def handle_approval_list(ctx: HandlerContext) -> HandlerResult:
         check_authz(ctx.conn, "approval.list", ctx.principal, ctx.actor_kind, ctx.via,
                     project_id=project_filter)
 
-    query = "SELECT * FROM approvals WHERE 1=1"
-    params: List[Any] = []
-    if status_filter:
-        query += " AND status = ?"
-        params.append(status_filter)
-    if project_filter:
-        query += " AND project_id = ?"
-        params.append(project_filter)
-    query += " ORDER BY requested_at ASC, id ASC;"
-
-    cur = ctx.conn.execute(query, params)
     is_user_or_relayer = (ctx.actor_kind == "user") or ("relay" in ctx.principal.get("capabilities", []))
     agent_id = ctx.principal["id"] if ctx.actor_kind != "user" else None
 
+    def _run_approval_query(extra_where: str, extra_params: List[Any], *, apply_limit: Optional[int]) -> List[sqlite3.Row]:
+        q = "SELECT * FROM approvals WHERE 1=1"
+        p: List[Any] = []
+        if project_filter:
+            q += " AND project_id = ?"
+            p.append(project_filter)
+        if extra_where:
+            q += f" AND ({extra_where})"
+            p.extend(extra_params)
+        if apply_limit is not None and is_user_or_relayer:
+            q += " ORDER BY requested_at DESC, id DESC LIMIT ?;"
+            p.append(apply_limit)
+            fetched = list(ctx.conn.execute(q, p).fetchall())
+            fetched.reverse()
+            return fetched
+        if apply_limit is not None:
+            q += " ORDER BY requested_at DESC, id DESC;"
+            fetched = list(ctx.conn.execute(q, p).fetchall())
+            return fetched
+        q += " ORDER BY requested_at ASC, id ASC;"
+        return list(ctx.conn.execute(q, p).fetchall())
+
+    where_clauses: List[str] = []
+    where_params: List[Any] = []
+    if status_filter:
+        where_clauses.append("status = ?")
+        where_params.append(status_filter)
+    elif actionable_only:
+        where_clauses.append(
+            "(status = 'pending'"
+            " OR (decided_via = 'relayed' AND status IN ('approved', 'rejected'))"
+            " OR (status = 'approved' AND decided_via = 'direct' AND consumed_at IS NULL))"
+        )
+
+    base_rows = _run_approval_query(
+        " AND ".join(where_clauses),
+        where_params,
+        apply_limit=limit,
+    )
+
+    if not is_user_or_relayer:
+        filtered_base: List[sqlite3.Row] = []
+        for r in base_rows:
+            if r["requested_by"] == agent_id or (
+                r["project_id"] and can_principal_read_project(ctx.conn, agent_id, r["project_id"])
+            ):
+                filtered_base.append(r)
+        if limit is not None:
+            filtered_base = filtered_base[:limit]
+            filtered_base.reverse()
+        rows = filtered_base
+    else:
+        rows = base_rows
+
+    if include_ids:
+        existing_ids = {r["id"] for r in rows}
+        missing_ids = [aid for aid in include_ids if aid not in existing_ids]
+        if missing_ids:
+            placeholders = ",".join("?" for _ in missing_ids)
+            inc_rows = _run_approval_query(
+                f"id IN ({placeholders})",
+                list(missing_ids),
+                apply_limit=None,
+            )
+            for r in inc_rows:
+                if not is_user_or_relayer:
+                    if r["requested_by"] != agent_id and not (
+                        r["project_id"] and can_principal_read_project(ctx.conn, agent_id, r["project_id"])
+                    ):
+                        continue
+                rows.append(r)
+            rows.sort(key=lambda r: ((r["requested_at"] or ""), r["id"]))
+
+    prefetched_projects: Dict[str, Any] = {}
+    prefetched_tasks: Dict[str, Any] = {}
+    prefetched_plans_by_apr: Dict[str, Dict[str, Any]] = {}
+    now_ts: Optional[str] = None
+    if include_card_fields and rows:
+        from mesh.core.grants import compute_approval_card_actions, serialize_approval_card_summary
+
+        now_ts = now_iso_utc()
+        pids = sorted({r["project_id"] for r in rows if r["project_id"]})
+        if pids:
+            ph = ",".join("?" for _ in pids)
+            for prow in ctx.conn.execute(
+                f"SELECT id, status, permission_mode, plan_gate_mode FROM projects WHERE id IN ({ph});",
+                tuple(pids),
+            ).fetchall():
+                prefetched_projects[prow["id"]] = prow
+        tids = sorted({r["task_id"] for r in rows if r["task_id"]})
+        if tids:
+            ph = ",".join("?" for _ in tids)
+            for trow in ctx.conn.execute(
+                f"SELECT id, status, kind FROM tasks WHERE id IN ({ph});",
+                tuple(tids),
+            ).fetchall():
+                prefetched_tasks[trow["id"]] = trow
+        plan_apr_ids = sorted({r["id"] for r in rows if r["category"] == "plan_dispatch"})
+        if plan_apr_ids:
+            has_plans = ctx.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'plans';"
+            ).fetchone()
+            if has_plans:
+                ph = ",".join("?" for _ in plan_apr_ids)
+                for plrow in ctx.conn.execute(
+                    f"SELECT id, approval_id, version, status, plan_hash FROM plans WHERE approval_id IN ({ph});",
+                    tuple(plan_apr_ids),
+                ).fetchall():
+                    if plrow["approval_id"]:
+                        prefetched_plans_by_apr[plrow["approval_id"]] = dict(plrow)
+
     items = []
-    for r in cur.fetchall():
-        if not is_user_or_relayer:
-            if r["requested_by"] != agent_id:
-                if not r["project_id"] or not can_principal_read_project(ctx.conn, agent_id, r["project_id"]):
-                    continue
+    for r in rows:
         d = _format_approval_dict(ctx.conn, r)
+        if include_card_fields:
+            _, policy = get_row_approval_policy(ctx.conn, r)
+            pl_meta = prefetched_plans_by_apr.get(r["id"])
+            card_ui = compute_approval_card_actions(
+                ctx.conn,
+                r,
+                now=now_ts,
+                testing_mode=ctx.testing_mode,
+                plan_status=pl_meta["status"] if pl_meta is not None else None,
+                prefetched_project=prefetched_projects.get(r["project_id"]) if r["project_id"] else None,
+                prefetched_tasks=prefetched_tasks,
+            )
+            card_summary = serialize_approval_card_summary(
+                r,
+                policy=policy,
+                card_ui=card_ui,
+                plan_meta=pl_meta,
+            )
+            d.update(card_summary)
         if ctx.args.get("with_channel"):
             d["decision_channel"] = _decision_channel(ctx.conn, ctx, r)
         items.append(d)

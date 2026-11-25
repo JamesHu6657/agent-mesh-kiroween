@@ -17,7 +17,10 @@ from mesh.daemon import merge, recovery
 from mesh.daemon.handlers import run as run_handlers
 from mesh.daemon.handlers.approval import handle_approval_approve
 from tests.gitfixture import GitFixture
+from tests.helpers import restore_accessible_for_test, set_inaccessible_for_test
 from tests.unit.test_batch7_pr45_r4 import _ctx, _setup_home_and_db
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 MESH_PROC_LOCK = "shared"
 
@@ -216,10 +219,13 @@ class TestR5NestedGitlinkParent000(unittest.TestCase):
         base = fx.head(repo, "main")
         self._branch_ok(repo, base, "tsk_pns")
         _pipeline(fx, repo, "run_pns", "tsk_pns", "mesh/prj_1/tsk_pns", base, "custom",
-                  [sys.executable, "-c", "import os; os.chmod('deps', 0o000)"])
-        os.chmod(os.path.join(repo, "deps"), 0o755)
-        self.assertEqual(os.stat(nested).st_mode & 0o777, 0o555)
-        self.assertEqual(os.stat(os.path.join(nested, "ro_sub")).st_mode & 0o777, 0o555)
+                  [sys.executable, "-c",
+                   f"import sys; sys.path.insert(0, {_REPO_ROOT!r}); "
+                   "from tests.helpers import set_inaccessible_for_test; set_inaccessible_for_test('deps')"])
+        restore_accessible_for_test(os.path.join(repo, "deps"))
+        if sys.platform != "win32":
+            self.assertEqual(os.stat(nested).st_mode & 0o777, 0o555)
+            self.assertEqual(os.stat(os.path.join(nested, "ro_sub")).st_mode & 0o777, 0o555)
 
     def test_empty_nested_gitlink_litter_cleaned_and_merged(self):
         fx = self.fx
@@ -233,7 +239,9 @@ class TestR5NestedGitlinkParent000(unittest.TestCase):
         out = _pipeline(
             fx, repo, "run_ens", "tsk_ens", "mesh/prj_1/tsk_ens", base, "custom",
             [sys.executable, "-c",
-             "import os; open('deps/nested_sub/leaked.txt', 'w').write('x'); os.chmod('deps', 0o000)"],
+             f"import sys; sys.path.insert(0, {_REPO_ROOT!r}); "
+             "from tests.helpers import set_inaccessible_for_test; "
+             "open('deps/nested_sub/leaked.txt', 'w').write('x'); set_inaccessible_for_test('deps')"],
         )
         self.assertEqual(out["outcome"], "merged", out)
         self.assertFalse(os.path.exists(os.path.join(repo, "deps", "nested_sub", "leaked.txt")))
@@ -290,45 +298,49 @@ class TestR5WorkspaceDeleteAndPrune(unittest.TestCase):
     def test_tasks_dir_000_is_reopened_and_really_deleted(self):
         with tempfile.TemporaryDirectory(prefix="mh-r5-d1-") as tmp:
             home, conn, ws_dir, apr = self._setup_task(tmp, "tsk_d000")
-            tasks_dir = os.path.dirname(ws_dir)
-            orig = run_handlers._delete_workspace_dir_sync
-
-            def _chmod_000(*a, **kw):
-                os.chmod(tasks_dir, 0o000)
-                return orig(*a, **kw)
-
             try:
-                with mock.patch.object(run_handlers, "_delete_workspace_dir_sync", side_effect=_chmod_000):
-                    res = self._delete(conn, home, "tsk_d000", apr, "req_d1")
+                tasks_dir = os.path.dirname(ws_dir)
+                orig = run_handlers._delete_workspace_dir_sync
+
+                def _chmod_000(*a, **kw):
+                    set_inaccessible_for_test(tasks_dir)
+                    return orig(*a, **kw)
+
+                try:
+                    with mock.patch.object(run_handlers, "_delete_workspace_dir_sync", side_effect=_chmod_000):
+                        res = self._delete(conn, home, "tsk_d000", apr, "req_d1")
+                finally:
+                    restore_accessible_for_test(tasks_dir)
+                self.assertTrue(res.data["deleted"], res.data)
+                self.assertFalse(os.path.lexists(ws_dir))
+                self.assertEqual(self._approval_status(conn, apr), "consumed")
+                self.assertEqual([n for n in os.listdir(os.path.join(home, "run")) if n.startswith("ws_del_")], [])
             finally:
-                os.chmod(tasks_dir, 0o700)
-            self.assertTrue(res.data["deleted"], res.data)
-            self.assertFalse(os.path.lexists(ws_dir))
-            self.assertEqual(self._approval_status(conn, apr), "consumed")
-            self.assertEqual([n for n in os.listdir(os.path.join(home, "run")) if n.startswith("ws_del_")], [])
-            conn.close()
+                conn.close()
 
     def test_unreadable_target_never_consumes_approval(self):
         with tempfile.TemporaryDirectory(prefix="mh-r5-d2-") as tmp:
             home, conn, ws_dir, apr = self._setup_task(tmp, "tsk_dacc")
-            tasks_dir = os.path.dirname(ws_dir)
-            orig = run_handlers._delete_workspace_dir_sync
-
-            def _chmod_000(*a, **kw):
-                os.chmod(tasks_dir, 0o000)
-                return orig(*a, **kw)
-
             try:
-                with mock.patch.object(run_handlers, "_delete_workspace_dir_sync", side_effect=_chmod_000), \
-                        mock.patch.object(run_handlers, "make_owned_ancestors_writable", return_value=False):
-                    with self.assertRaises(BaseException):
-                        self._delete(conn, home, "tsk_dacc", apr, "req_d2")
+                tasks_dir = os.path.dirname(ws_dir)
+                orig = run_handlers._delete_workspace_dir_sync
+
+                def _chmod_000(*a, **kw):
+                    set_inaccessible_for_test(tasks_dir)
+                    return orig(*a, **kw)
+
+                try:
+                    with mock.patch.object(run_handlers, "_delete_workspace_dir_sync", side_effect=_chmod_000), \
+                            mock.patch.object(run_handlers, "make_owned_ancestors_writable", return_value=False):
+                        with self.assertRaises(BaseException):
+                            self._delete(conn, home, "tsk_dacc", apr, "req_d2")
+                finally:
+                    restore_accessible_for_test(tasks_dir)
+                self.assertTrue(os.path.isfile(os.path.join(ws_dir, "keep.txt")))
+                self.assertEqual(self._approval_status(conn, apr), "approved")
+                self.assertEqual(self._deleted_events(conn, "tsk_dacc"), 0)
             finally:
-                os.chmod(tasks_dir, 0o700)
-            self.assertTrue(os.path.isfile(os.path.join(ws_dir, "keep.txt")))
-            self.assertEqual(self._approval_status(conn, apr), "approved")
-            self.assertEqual(self._deleted_events(conn, "tsk_dacc"), 0)
-            conn.close()
+                conn.close()
 
     def _reserve_delete(self, conn, home, ws_dir, task_id, apr, marker):
         import json
@@ -349,55 +361,61 @@ class TestR5WorkspaceDeleteAndPrune(unittest.TestCase):
         import shutil
         with tempfile.TemporaryDirectory(prefix="mh-r5-d3-") as tmp:
             home, conn, ws_dir, apr = self._setup_task(tmp, "tsk_nomark")
-            # Crashed right after reserve; the dir later vanished for unrelated reasons.
-            shutil.rmtree(ws_dir)
-            self._reserve_delete(conn, home, ws_dir, "tsk_nomark", apr,
-                                 os.path.join(home, "run", "ws_del_tsk_nomark_x.json"))
-            counts = {}
-            recovery._step_ws_reservations(conn, home, counts)
-            self.assertEqual(counts.get("workspace_deletes_rolled_back"), 1, counts)
-            self.assertEqual(self._approval_status(conn, apr), "approved")
-            self.assertEqual(self._deleted_events(conn, "tsk_nomark"), 0)
-            conn.close()
+            try:
+                # Crashed right after reserve; the dir later vanished for unrelated reasons.
+                shutil.rmtree(ws_dir)
+                self._reserve_delete(conn, home, ws_dir, "tsk_nomark", apr,
+                                     os.path.join(home, "run", "ws_del_tsk_nomark_x.json"))
+                counts = {}
+                recovery._step_ws_reservations(conn, home, counts)
+                self.assertEqual(counts.get("workspace_deletes_rolled_back"), 1, counts)
+                self.assertEqual(self._approval_status(conn, apr), "approved")
+                self.assertEqual(self._deleted_events(conn, "tsk_nomark"), 0)
+            finally:
+                conn.close()
 
     def test_recovery_tasks_dir_000_is_unknown_not_deleted(self):
         import json
         with tempfile.TemporaryDirectory(prefix="mh-r5-d4-") as tmp:
             home, conn, ws_dir, apr = self._setup_task(tmp, "tsk_rec000")
-            marker = os.path.join(home, "run", "ws_del_tsk_rec000_x.json")
-            with open(marker, "w") as f:
-                json.dump({"rmtree_started": True}, f)
-            self._reserve_delete(conn, home, ws_dir, "tsk_rec000", apr, marker)
-            tasks_dir = os.path.dirname(ws_dir)
-            os.chmod(tasks_dir, 0o000)
             try:
-                counts = {}
-                recovery._step_ws_reservations(conn, home, counts)
+                marker = os.path.join(home, "run", "ws_del_tsk_rec000_x.json")
+                with open(marker, "w") as f:
+                    json.dump({"rmtree_started": True}, f)
+                self._reserve_delete(conn, home, ws_dir, "tsk_rec000", apr, marker)
+                tasks_dir = os.path.dirname(ws_dir)
+                set_inaccessible_for_test(tasks_dir)
+                try:
+                    counts = {}
+                    recovery._step_ws_reservations(conn, home, counts)
+                finally:
+                    restore_accessible_for_test(tasks_dir)
+                self.assertNotEqual(counts.get("workspace_deletes_finalized"), 1, counts)
+                self.assertTrue(os.path.isfile(os.path.join(ws_dir, "keep.txt")))
+                self.assertEqual(self._approval_status(conn, apr), "approved")
+                self.assertEqual(self._deleted_events(conn, "tsk_rec000"), 0)
+                self.assertFalse(os.path.exists(marker))
             finally:
-                os.chmod(tasks_dir, 0o700)
-            self.assertNotEqual(counts.get("workspace_deletes_finalized"), 1, counts)
-            self.assertTrue(os.path.isfile(os.path.join(ws_dir, "keep.txt")))
-            self.assertEqual(self._approval_status(conn, apr), "approved")
-            self.assertEqual(self._deleted_events(conn, "tsk_rec000"), 0)
-            self.assertFalse(os.path.exists(marker))
-            conn.close()
+                conn.close()
 
     def test_recovery_with_marker_and_enoent_finalizes(self):
         import json
         import shutil
         with tempfile.TemporaryDirectory(prefix="mh-r5-d5-") as tmp:
             home, conn, ws_dir, apr = self._setup_task(tmp, "tsk_done")
-            marker = os.path.join(home, "run", "ws_del_tsk_done_x.json")
-            with open(marker, "w") as f:
-                json.dump({"rmtree_started": True}, f)
-            shutil.rmtree(ws_dir)
-            self._reserve_delete(conn, home, ws_dir, "tsk_done", apr, marker)
-            counts = {}
-            recovery._step_ws_reservations(conn, home, counts)
-            self.assertEqual(counts.get("workspace_deletes_finalized"), 1, counts)
-            self.assertEqual(self._approval_status(conn, apr), "consumed")
-            self.assertFalse(os.path.exists(marker))
-            conn.close()
+            try:
+                marker = os.path.join(home, "run", "ws_del_tsk_done_x.json")
+                with open(marker, "w") as f:
+                    json.dump({"rmtree_started": True}, f)
+                shutil.rmtree(ws_dir)
+                self._reserve_delete(conn, home, ws_dir, "tsk_done", apr, marker)
+                counts = {}
+                recovery._step_ws_reservations(conn, home, counts)
+                self.assertEqual(counts.get("workspace_deletes_finalized"), 1, counts)
+                self.assertEqual(self._approval_status(conn, apr), "consumed")
+                self.assertFalse(os.path.exists(marker))
+            finally:
+                conn.close()
 
     def test_prune_reconcile_without_active_list_ignores_history(self):
         doc = {"kind": "prune", "project_id": "prj_1", "projects": ["prj_1"],

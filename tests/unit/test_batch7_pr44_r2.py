@@ -15,9 +15,20 @@ from unittest import mock
 
 from mesh.cli import entry
 from mesh.core.paths import get_mesh_bin_dir, is_site_packages_dir
+from mesh.platform.paths import temp_root
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _subproc_env(extra: dict | None = None) -> dict:
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    for k in ("SYSTEMROOT", "WINDIR", "COMSPEC"):
+        if k in os.environ:
+            env[k] = os.environ[k]
+    if extra:
+        env.update(extra)
+    return env
 
 
 def _copy_mesh_pkg(target_dir: str) -> None:
@@ -29,7 +40,9 @@ def _copy_mesh_pkg(target_dir: str) -> None:
 
 
 def _create_venv(vdir: str, *, system_site_packages: bool = False) -> str:
-    venv.create(vdir, system_site_packages=system_site_packages, with_pip=False, symlinks=True)
+    venv.create(vdir, system_site_packages=system_site_packages, with_pip=False, symlinks=(sys.platform != "win32"))
+    if sys.platform == "win32":
+        return os.path.join(vdir, "Scripts", "python.exe")
     return os.path.join(vdir, "bin", "python3")
 
 
@@ -43,11 +56,18 @@ class TestBatch7Pr44R2SitePackagesConsistency(unittest.TestCase):
 
         top_level_imports = set()
         for node in tree.body:
-            if isinstance(node, ast.Import):
-                top_level_imports.update(alias.name for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                top_level_imports.add(node.module)
-        self.assertEqual(top_level_imports, {"posix", "sys"})
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Import):
+                    top_level_imports.update(alias.name for alias in sub.names)
+                elif isinstance(sub, ast.ImportFrom) and sub.module:
+                    top_level_imports.add(sub.module)
+        self.assertTrue(top_level_imports.issubset({"posix", "nt", "_winapi", "sys"}), top_level_imports)
+        expected_active = {"posix", "sys"} if sys.platform != "win32" else {"nt", "_winapi", "sys"}
+        self.assertTrue(expected_active.issubset(top_level_imports), top_level_imports)
+        for name in expected_active:
+            self.assertIn(name, sys.builtin_module_names)
 
         for node in tree.body:
             if isinstance(node, ast.FunctionDef) and node.name != "main":
@@ -126,10 +146,15 @@ class TestBatch7Pr44R2SitePackagesConsistency(unittest.TestCase):
             with open(os.path.join(v_dup_false, "pyvenv.cfg"), "a", encoding="utf-8") as fh:
                 fh.write("include-system-site-packages = false\n")
 
-            # Symlinked venv path.
+            # Symlinked / Win32 junctioned venv path.
             v_link = os.path.join(d, "venv_link")
-            os.symlink(v_true, v_link)
-            vpy_link = os.path.join(v_link, "bin", "python3")
+            if sys.platform == "win32":
+                import _winapi
+                _winapi.CreateJunction(v_true, v_link)
+                vpy_link = os.path.join(v_link, "Scripts", "python.exe")
+            else:
+                os.symlink(v_true, v_link)
+                vpy_link = os.path.join(v_link, "bin", "python3")
 
             interpreters = [
                 ("host", sys.executable, None),
@@ -141,7 +166,7 @@ class TestBatch7Pr44R2SitePackagesConsistency(unittest.TestCase):
                 ("venv_link", vpy_link, True),
             ]
             host_expected = None
-            base_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+            base_env = _subproc_env()
             for label, py, expects_system in interpreters:
                 with self.subTest(interpreter=label):
                     proc = subprocess.run(
@@ -194,7 +219,8 @@ class TestBatch7Pr44R2SitePackagesConsistency(unittest.TestCase):
             _copy_mesh_pkg(local_sp)
 
             cache_dir = os.path.join(d, "cache")
-            base_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "XDG_CACHE_HOME": cache_dir}
+            cache_env = {"LOCALAPPDATA": cache_dir} if sys.platform == "win32" else {"XDG_CACHE_HOME": cache_dir}
+            base_env = _subproc_env(cache_env)
             shim_dir = subprocess.run(
                 [vpy, "-P", "-s", "-c", "from mesh.core.paths import get_mesh_bin_dir; print(get_mesh_bin_dir())"],
                 env={**base_env, "PYTHONPATH": local_sp},
@@ -203,12 +229,21 @@ class TestBatch7Pr44R2SitePackagesConsistency(unittest.TestCase):
                 timeout=15,
                 check=True,
             ).stdout.strip()
-            shim_path = os.path.join(shim_dir, "mesh")
-            with open(shim_path, "r", encoding="utf-8") as fh:
-                self.assertIn("export PYTHONPATH=", fh.read())
+            if sys.platform == "win32":
+                from mesh.platform import pipe_pump
+
+                shim_path = os.path.join(shim_dir, "mesh.cmd")
+                with open(shim_path, "r", encoding="utf-8") as fh:
+                    self.assertIn('set "PYTHONPATH=', fh.read())
+                shim_cmd = pipe_pump.prepare_win_cmd_args([shim_path, "--version"], env=base_env)
+            else:
+                shim_path = os.path.join(shim_dir, "mesh")
+                with open(shim_path, "r", encoding="utf-8") as fh:
+                    self.assertIn("export PYTHONPATH=", fh.read())
+                shim_cmd = [shim_path, "--version"]
 
             p_shim = subprocess.run(
-                [shim_path, "--version"],
+                shim_cmd,
                 cwd=d,
                 env=base_env,
                 capture_output=True,
@@ -284,19 +319,24 @@ class TestBatch7Pr44R2SitePackagesConsistency(unittest.TestCase):
 
             # Patch mesh/__init__.py check via shim: pre-isolated shim must not re-exec
             # and must keep PYTHONPATH unset inside the running process.
-            probe = subprocess.run(
-                [
-                    vpy,
-                    "-P",
-                    "-s",
-                    "-c",
+            if sys.platform == "win32":
+                probe_code = (
+                    "import _winapi, os, sys, mesh.cli.entry as e; "
+                    "_winapi.CreateProcess = lambda *a: (_ for _ in ()).throw(AssertionError(f'unexpected CreateProcess: {a}')); "
+                    "e.ensure_isolated_process(); "
+                    "print('PYTHONPATH' in os.environ, os.environ.get('_MESH_ORIG_PYTHONPATH'))"
+                )
+            else:
+                probe_code = (
                     "import os, posix, sys, mesh.cli.entry as e; "
                     "orig_execve = posix.execve; "
                     "posix.execve = lambda *a: (_ for _ in ()).throw(AssertionError(f'unexpected execve: {a}')); "
                     "e.ensure_isolated_process(); "
-                    "print('PYTHONPATH' in os.environ, os.environ.get('_MESH_ORIG_PYTHONPATH'))",
-                ],
-                env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "_MESH_ORIG_PYTHONPATH": "__UNSET__"},
+                    "print('PYTHONPATH' in os.environ, os.environ.get('_MESH_ORIG_PYTHONPATH'))"
+                )
+            probe = subprocess.run(
+                [vpy, "-P", "-s", "-c", probe_code],
+                env=_subproc_env({"_MESH_ORIG_PYTHONPATH": "__UNSET__"}),
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -304,21 +344,27 @@ class TestBatch7Pr44R2SitePackagesConsistency(unittest.TestCase):
             )
             self.assertEqual(probe.stdout.strip(), "False __UNSET__")
 
-            # Verify get_mesh_bin_dir() generates `unset PYTHONPATH` for venv_sp and runs cleanly.
+            # Verify get_mesh_bin_dir() generates clean PYTHONPATH clearing for venv_sp and runs cleanly.
             cache_dir = os.path.join(d, "cache")
+            cache_env = {"LOCALAPPDATA": cache_dir} if sys.platform == "win32" else {"XDG_CACHE_HOME": cache_dir}
             shim_dir = subprocess.run(
                 [vpy, "-P", "-s", "-c", "from mesh.core.paths import get_mesh_bin_dir; print(get_mesh_bin_dir())"],
-                env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "XDG_CACHE_HOME": cache_dir},
+                env=_subproc_env(cache_env),
                 capture_output=True,
                 text=True,
                 timeout=10,
                 check=True,
             ).stdout.strip()
-            shim_path = os.path.join(shim_dir, "mesh")
-            with open(shim_path, "r", encoding="utf-8") as fh:
-                self.assertIn("unset PYTHONPATH", fh.read())
+            if sys.platform == "win32":
+                shim_path = os.path.join(shim_dir, "mesh.cmd")
+                with open(shim_path, "r", encoding="utf-8") as fh:
+                    self.assertIn('set "PYTHONPATH="', fh.read())
+            else:
+                shim_path = os.path.join(shim_dir, "mesh")
+                with open(shim_path, "r", encoding="utf-8") as fh:
+                    self.assertIn("unset PYTHONPATH", fh.read())
 
-            # Also test console-script entry with dirty PYTHONPATH=<evil>:<venv_sp>:
+            # Also test console-script entry with dirty PYTHONPATH=<evil><sep><venv_sp>:
             # ensure_isolated_process strips PYTHONPATH completely and never re-injects venv_sp.
             evil_dir = os.path.join(d, "evil")
             os.makedirs(evil_dir)
@@ -327,11 +373,12 @@ class TestBatch7Pr44R2SitePackagesConsistency(unittest.TestCase):
             script = os.path.join(d, "probe_entry.py")
             with open(script, "w", encoding="utf-8") as fh:
                 fh.write("import sys\nfrom mesh.cli.entry import main\nsys.exit(main())\n")
+            dirty_pp = f"{evil_dir}{os.pathsep}{venv_sp}"
             # Run entry.main() with --version from dirty env; must succeed with -P -s and strip evil_dir.
             res = subprocess.run(
                 [vpy, script, "--version"],
                 cwd=evil_dir,
-                env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONPATH": f"{evil_dir}:{venv_sp}"},
+                env=_subproc_env({"PYTHONPATH": dirty_pp}),
                 capture_output=True,
                 text=True,
                 timeout=15,
@@ -354,11 +401,10 @@ class TestBatch7Pr44R2SitePackagesConsistency(unittest.TestCase):
                     "else:\n"
                     "    sys.exit(main())\n"
                 )
-            dirty_pp = f"{evil_dir}:{venv_sp}"
             probe_reexec = subprocess.run(
                 [vpy, script, "--probe-isolated-env"],
                 cwd=evil_dir,
-                env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONPATH": dirty_pp},
+                env=_subproc_env({"PYTHONPATH": dirty_pp}),
                 capture_output=True,
                 text=True,
                 timeout=15,
@@ -372,7 +418,7 @@ class TestBatch7Pr44R2SitePackagesConsistency(unittest.TestCase):
             probe_shim = subprocess.run(
                 [shim_path, "--probe-isolated-env"],
                 cwd=evil_dir,
-                env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONPATH": dirty_pp},
+                env=_subproc_env({"PYTHONPATH": dirty_pp}),
                 capture_output=True,
                 text=True,
                 timeout=15,
@@ -390,7 +436,8 @@ class TestBatch7Pr44R2SitePackagesConsistency(unittest.TestCase):
             self.assertIsNone(entry._stdlib_site_module())
             self.assertEqual(entry._global_site_packages_dirs(), set())
 
-        fake_site = SimpleNamespace(__file__="/tmp/evil/site.py", getsitepackages=lambda: ["/tmp/evil"])
+        evil_root = os.path.join(temp_root(), "evil")
+        fake_site = SimpleNamespace(__file__=os.path.join(evil_root, "site.py"), getsitepackages=lambda: [evil_root])
         with mock.patch.dict(entry.sys.modules, {"site": fake_site}):
             self.assertIsNone(entry._stdlib_site_module())
             self.assertEqual(entry._global_site_packages_dirs(), set())
@@ -418,7 +465,7 @@ class TestBatch7Pr44R2SitePackagesConsistency(unittest.TestCase):
             p_poison = subprocess.run(
                 [sys.executable, "-X", "frozen_modules=off", "-m", "mesh", "--version"],
                 cwd=d,
-                env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONPATH": f"{evil_dir}:{REPO_ROOT}"},
+                env=_subproc_env({"PYTHONPATH": f"{evil_dir}{os.pathsep}{REPO_ROOT}"}),
                 capture_output=True,
                 text=True,
                 timeout=15,
@@ -456,11 +503,10 @@ class TestBatch7Pr44R2SitePackagesConsistency(unittest.TestCase):
                 p_dash_s = subprocess.run(
                     args,
                     cwd=evil_dir,
-                    env={
-                        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                    env=_subproc_env({
                         "PYTHONPATH": vsp,
                         **extra_env,
-                    },
+                    }),
                     capture_output=True,
                     text=True,
                     timeout=15,

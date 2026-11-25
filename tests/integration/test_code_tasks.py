@@ -16,6 +16,7 @@ import unittest
 from typing import Any, Dict, List
 
 import mesh.constants as c
+from mesh.platform.paths import strip_trailing_seps
 from tests.gitfixture import GitFixture, GitMeshHarness
 from tests.integration.test_execution_launch import create_agent
 from tests.stubs import create_test_stubs
@@ -239,7 +240,7 @@ class TestCodeTasks(unittest.TestCase):
         new_branch = f"mesh/{self.prj}/{tsk}-a2"
         self.assertEqual(st2["data"]["branch"], new_branch, st2)
         new_ws = st2["data"]["workspace"]
-        self.assertTrue(new_ws.rstrip("/").endswith(f"tasks/{tsk}.a2"), new_ws)
+        self.assertTrue(strip_trailing_seps(new_ws).endswith(os.path.join("tasks", f"{tsk}.a2")), new_ws)
         d = self.show(tsk)
         self.assertEqual(d["branch"], new_branch)
         self.assertEqual(d["workspace_path"], new_ws)
@@ -304,7 +305,7 @@ class TestCodeTasks(unittest.TestCase):
         self.assertEqual(rc, 0, st2)
         self.assertEqual(st2["data"]["branch"], new_branch, st2)
         new_ws = st2["data"]["workspace"]
-        self.assertTrue(new_ws.rstrip("/").endswith(f"tasks/{b}.a2"), new_ws)
+        self.assertTrue(strip_trailing_seps(new_ws).endswith(os.path.join("tasks", f"{b}.a2")), new_ws)
         d = self.show(b)
         self.assertEqual(d["status"], "running")
         self.assertEqual(d["branch"], new_branch)
@@ -324,7 +325,7 @@ class TestCodeTasks(unittest.TestCase):
         # `busy` holds fx1's only slot until both other tasks are queued (load-independent:
         # a fixed sleep could end before `code` exists on a loaded host, letting `g` start first).
         release = os.path.join(self.stubs_dir, "busy.release")
-        busy = self.create_task('FAKE {"wait_release": {"path": "%s"}}' % release, "fx1", "--kind", "general",
+        busy = self.create_task('FAKE ' + json.dumps({"wait_release": {"path": release}}), "fx1", "--kind", "general",
                                 title="busy")
         self.wait_status(busy, "running", timeout=30.0)
         g = self.create_task('FAKE {"sleep": {"seconds": 1}}', "fx1", "--kind", "general", "--priority", "0",

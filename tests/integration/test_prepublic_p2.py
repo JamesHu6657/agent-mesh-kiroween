@@ -219,15 +219,15 @@ class TestRunTokenScopeOverSocket(unittest.TestCase):
 
     def _tail_proc(self, token, seconds):
         import subprocess
+        from mesh.platform import perms as plat_perms
+        from tests.helpers import cli_popen_argv
 
         path = os.path.join(self.h.fixtures_dir, f"tail-{time.monotonic_ns()}.tok")
         with open(path, "w", encoding="utf-8") as f:
             f.write(token)
-        os.chmod(path, 0o600)
-        return subprocess.Popen(
-            [self.h.bin_mesh, "--home", self.h.home, "--token-file", path,
-             "event", "tail", "--timeout", f"{seconds}s"],
-            env=self.h.get_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        plat_perms.set_private_file_acl(path)
+        cmd, env = cli_popen_argv(self.h, "--token-file", path, "event", "tail", "--timeout", f"{seconds}s")
+        return subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
     def _note_a(self, text):
         rc, r = self.h.cli("project", "note", self.prj["a"], "--text", text, user=True)

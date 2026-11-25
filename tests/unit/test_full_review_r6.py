@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -31,6 +32,8 @@ from mesh.core.workspaces import (
     run_code_workspace_plan,
 )
 from mesh.daemon import lead_turns, recovery, scheduler, supervisor
+from mesh.platform.fs import unlink_nonregular
+from mesh.platform.paths import strip_trailing_seps
 from mesh.daemon.handlers.adapter import handle_adapter_list, handle_adapter_models
 from mesh.daemon.handlers.base import HandlerContext
 from mesh.daemon.handlers.run import (
@@ -76,6 +79,7 @@ class TestFullReviewR6(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
         self.tmp = os.path.realpath(self._tmp.name)
         self._orig_testing = os.environ.get("MESH_TESTING")
         os.environ["MESH_TESTING"] = "1"
@@ -85,7 +89,6 @@ class TestFullReviewR6(unittest.TestCase):
             os.environ.pop("MESH_TESTING", None)
         else:
             os.environ["MESH_TESTING"] = self._orig_testing
-        self._tmp.cleanup()
 
     def _make_home(self, name: str = "home"):
         home = os.path.join(self.tmp, name)
@@ -179,7 +182,7 @@ class TestFullReviewR6(unittest.TestCase):
 
         ws1 = compute_task_workspace_path(ws_root, "prj_1", "tsk_1", attempt=1)
         ws2 = compute_task_workspace_path(ws_root, "prj_1", "tsk_2", attempt=1)
-        self.assertTrue(ws1.endswith("/"))
+        self.assertTrue(ws1.endswith(os.sep))
 
         res1 = run_code_workspace_plan({
             "task_id": "tsk_1", "project_id": "prj_1", "repo": repo,
@@ -193,10 +196,10 @@ class TestFullReviewR6(unittest.TestCase):
         })
 
         # Replace tsk_1 directory with a symlink to clean tsk_2; ws1 has trailing "/".
-        ws1_stripped = ws1.rstrip("/")
+        ws1_stripped = strip_trailing_seps(ws1)
         moved_ws1 = os.path.join(self.tmp, "moved_tsk1")
         os.rename(ws1_stripped, moved_ws1)
-        os.symlink(ws2.rstrip("/"), ws1_stripped)
+        os.symlink(strip_trailing_seps(ws2), ws1_stripped, target_is_directory=True)
 
         self.assertFalse(is_registered_worktree(ws1, integ_wt))
         git_info = submission_git_info(ws1, res1["branch"], res1["base_commit"], repo_path=repo)
@@ -204,7 +207,7 @@ class TestFullReviewR6(unittest.TestCase):
         self.assertEqual(git_info["error"]["reason"], "foreign_repository")
 
         # Also test workspaces._reuse rejecting a fake .git / commondir spoof without trusting it.
-        os.unlink(ws1_stripped)
+        unlink_nonregular(ws1_stripped)
         os.makedirs(ws1_stripped, exist_ok=True)
         fake_gitdir = os.path.join(self.tmp, "fake_gitdir")
         os.makedirs(fake_gitdir, exist_ok=True)
@@ -241,9 +244,9 @@ class TestFullReviewR6(unittest.TestCase):
         # Case 1: Lead 1's workspace dir is a symlink to external dir (ext_dir/repo missing).
         ext_dir = os.path.join(self.tmp, "ext_outside")
         os.makedirs(ext_dir, exist_ok=True)
-        ag1_ws = compute_lead_workspace_path(ws_root, "prj_l", "ag_lead1").rstrip("/")
+        ag1_ws = strip_trailing_seps(compute_lead_workspace_path(ws_root, "prj_l", "ag_lead1"))
         os.makedirs(os.path.dirname(ag1_ws), exist_ok=True)
-        os.symlink(ext_dir, ag1_ws)
+        os.symlink(ext_dir, ag1_ws, target_is_directory=True)
 
         plan1 = {
             "repo": repo,
@@ -258,9 +261,9 @@ class TestFullReviewR6(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(ext_dir, "repo")))
 
         # Case 2: Lead 1's workspace dir is a symlink to Lead 2's workspace dir.
-        os.unlink(ag1_ws)
-        ag2_ws = compute_lead_workspace_path(ws_root, "prj_l", "ag_lead2").rstrip("/")
-        os.symlink(ag2_ws, ag1_ws)
+        unlink_nonregular(ag1_ws)
+        ag2_ws = strip_trailing_seps(compute_lead_workspace_path(ws_root, "prj_l", "ag_lead2"))
+        os.symlink(ag2_ws, ag1_ws, target_is_directory=True)
         lead_turns.run_lead_repo_refresh(home, plan1)
         self.assertTrue(os.path.isdir(ag2_repo))
         self.assertTrue(is_registered_worktree(ag2_repo, repo))
@@ -275,9 +278,10 @@ class TestFullReviewR6(unittest.TestCase):
         empty_home = os.path.join(self.tmp, "empty_home")
         os.makedirs(empty_home, exist_ok=True)
         pwn_file = os.path.join(self.tmp, "fsmonitor_param_pwn")
+        pwn_git = pwn_file.replace("\\", "/")
 
         with open(os.path.join(repo, ".git", "config"), "a", encoding="utf-8") as f:
-            f.write(f"\n[core]\n\tfsmonitor = touch {pwn_file}\n")
+            f.write(f"\n[core]\n\tfsmonitor = touch {pwn_git}\n")
 
         env_patch = {
             "HOME": empty_home,
@@ -288,7 +292,7 @@ class TestFullReviewR6(unittest.TestCase):
             "GIT_CONFIG_VALUE_0": "K8EnvIdentity",
             "GIT_CONFIG_KEY_1": "user.email",
             "GIT_CONFIG_VALUE_1": "k8env@example.com",
-            "GIT_CONFIG_PARAMETERS": f"'core.fsmonitor=touch {pwn_file}'",
+            "GIT_CONFIG_PARAMETERS": f"'core.fsmonitor=touch {pwn_git}'",
         }
         removed_keys = ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL")
         with mock.patch.dict(os.environ, env_patch, clear=False):
@@ -513,7 +517,7 @@ class TestFullReviewR6(unittest.TestCase):
         out_fast = redact(many_leaves, exact_values=pairs, jsonl=True)
         elapsed = time.perf_counter() - t0
         self.assertEqual(out_fast, many_leaves)
-        self.assertLess(elapsed, 0.5)
+        self.assertLess(elapsed, 2.0 if sys.platform == "win32" else 0.5)  # loaded Windows runners
 
     # ------------------------------------------------------------------
     # P2-2: stored_op_json convergence on cascading near-LINE_CAP lines + fail-closed
@@ -639,8 +643,9 @@ class TestFullReviewR6(unittest.TestCase):
 
         ws_root = os.path.join(home, "workspaces")
         ws_link = compute_task_workspace_path(ws_root, "prj_s", "tsk_sym", attempt=1)
-        os.makedirs(os.path.dirname(ws_link.rstrip("/")), exist_ok=True)
-        os.symlink(ext_secret_dir, ws_link.rstrip("/"))
+        ws_link_stripped = strip_trailing_seps(ws_link)
+        os.makedirs(os.path.dirname(ws_link_stripped), exist_ok=True)
+        os.symlink(ext_secret_dir, ws_link_stripped, target_is_directory=True)
 
         now = now_iso_utc()
         with transaction(conn):

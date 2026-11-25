@@ -9,6 +9,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -17,14 +18,19 @@ from typing import Any, Dict, Optional, Tuple
 import mesh.constants as c
 from mesh.core.clock import parse_utc
 from mesh.core.proc import find_run_processes, get_proc_environ
-from tests.helpers import MeshHarness, assert_h5
+from mesh.platform import pipe_pump
+from mesh.platform.proc import get_proc_cmdline
+from tests.helpers import MeshHarness, _win_terminate_and_wait_pid, assert_h5
 from tests.integration.test_execution_launch import create_agent
 from tests.stubs import create_test_stubs
 
 
 def run_cli_as(env: Dict[str, str], *args: str) -> Tuple[int, Dict[str, Any]]:
     """Run the real CLI with a launched run's environment (the executor's view)."""
-    res = subprocess.run(["mesh", *args], capture_output=True, text=True, env=dict(env), timeout=60)
+    e = dict(env)
+    resolved = shutil.which("mesh", path=e.get("PATH")) or "mesh"
+    cmd = pipe_pump.prepare_win_cmd_args([resolved, *args], env=e)
+    res = subprocess.run(cmd, capture_output=True, text=True, env=e, timeout=60)
     try:
         return res.returncode, json.loads(res.stdout)
     except ValueError:
@@ -32,11 +38,7 @@ def run_cli_as(env: Dict[str, str], *args: str) -> Tuple[int, Dict[str, Any]]:
 
 
 def _cmdline(pid: int) -> str:
-    try:
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            return f.read().replace(b"\0", b" ").decode("utf-8", errors="replace")
-    except OSError:
-        return ""
+    return " ".join(get_proc_cmdline(pid) or [])
 
 
 class TestLaunchReviewFixes(unittest.TestCase):
@@ -135,7 +137,7 @@ class TestLaunchReviewFixes(unittest.TestCase):
     def test_launch_submit_keeps_meshd_lease_and_run(self) -> None:
         """§6.4/T7: a run-token submit while the wrapper lives keeps the meshd lease and the run; the slot stays taken."""
         gate = os.path.join(self.harness.fixtures_dir, "submit-gate")
-        task_id = self._create('FAKE {"wait_release": {"path": "%s"}}' % gate)
+        task_id = self._create('FAKE ' + json.dumps({"wait_release": {"path": gate}}))
         run = self._wait_running(task_id)
         env = get_proc_environ(run["wrapper_pid"])
         second = self._create('FAKE {"sleep": {"seconds": 120}}')
@@ -173,7 +175,7 @@ class TestLaunchReviewFixes(unittest.TestCase):
     def test_launch_fail_keeps_meshd_lease_until_exit(self) -> None:
         """§6.4/T8: a run-token fail while the wrapper lives keeps the task running with its lease; the reason is redacted."""
         gate = os.path.join(self.harness.fixtures_dir, "fail-gate")
-        task_id = self._create('FAKE {"wait_release": {"path": "%s"}}' % gate)
+        task_id = self._create('FAKE ' + json.dumps({"wait_release": {"path": gate}}))
         run = self._wait_running(task_id)
         env = get_proc_environ(run["wrapper_pid"])
         secret = "sk-" + "Q" * 24
@@ -209,9 +211,12 @@ class TestLaunchReviewFixes(unittest.TestCase):
         # The child waits for a release file (not a 1 s sleep that can end before the kill on
         # a loaded host); it is released right after the wrapper is killed, so it exits soon.
         release = os.path.join(self.harness.fixtures_dir, "lost-release")
-        task_id = self._create('FAKE {"wait_release": {"path": "%s"}}' % release)
+        task_id = self._create('FAKE ' + json.dumps({"wait_release": {"path": release}}))
         run = self._wait_running(task_id)
-        os.kill(run["wrapper_pid"], 9)
+        if sys.platform == "win32":
+            _win_terminate_and_wait_pid(run["wrapper_pid"])
+        else:
+            os.kill(run["wrapper_pid"], 9)
         open(release, "w").close()
         self.assertTrue(self.harness.wait_for(
             lambda: self._row("SELECT status FROM tasks WHERE id = ?;", (task_id,))["status"] == "failed", timeout=30.0))

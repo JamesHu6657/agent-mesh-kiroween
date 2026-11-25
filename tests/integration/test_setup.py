@@ -8,26 +8,31 @@ import sys
 import tempfile
 import unittest
 
+import mesh.constants as c
+from mesh.platform import paths as plat_paths, perms as plat_perms, pipe_pump
+from tests.helpers import assert_private_mode
+
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-BIN = os.path.join(REPO, "bin", "mesh")
+BIN = os.path.join(REPO, "bin", "mesh.cmd" if sys.platform == "win32" else "mesh")
 
 
 class TestSetup(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.mkdtemp(prefix="mh-setup-", dir="/tmp")
+        self.tmp = tempfile.mkdtemp(prefix="mh-setup-", dir=plat_paths.temp_root())
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.home = os.path.join(self.tmp, "home")
         self.pfile = os.path.join(self.tmp, "pass")
         with open(self.pfile, "w", encoding="utf-8") as f:
             f.write("setup-test-passphrase-123")
-        os.chmod(self.pfile, 0o600)
+        plat_perms.set_private_file_acl(self.pfile)
         self.env = {k: v for k, v in os.environ.items() if not k.startswith("MESH_")}
         self.env["MESH_TESTING"] = "1"
         self.env["MESH_PASSPHRASE_FILE"] = self.pfile
         self.addCleanup(self._stop)
 
     def _mesh(self, *argv):
-        p = subprocess.run([BIN, "--home", self.home, *argv], env=self.env, capture_output=True, text=True,
+        cmd = pipe_pump.prepare_win_cmd_args([BIN, "--home", self.home, *argv], env=self.env)
+        p = subprocess.run(cmd, env=self.env, capture_output=True, text=True,
                            stdin=subprocess.DEVNULL, timeout=240)
         return p.returncode, (json.loads(p.stdout) if p.stdout.strip() else {"stderr": p.stderr})
 
@@ -42,7 +47,7 @@ class TestSetup(unittest.TestCase):
         d = r["data"]
         self.assertEqual(d["done"][:3], ["init", "daemon start", "agent create lead"])
         tok = d["token_file"]
-        self.assertEqual(os.stat(tok).st_mode & 0o777, 0o600)
+        assert_private_mode(self, tok, is_dir=False, posix_mode=0o600)
         rc, who = self._mesh("whoami", "--token-file", tok)
         self.assertEqual(rc, 0, who)
         self.assertEqual(who["data"]["name"], "lead")

@@ -50,6 +50,7 @@ def _wait_for(pred: Callable[[], bool], timeout: float = 30.0, step: float = 0.0
     return False
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX os.fork() PGID session leader + SIGTERM SIG_IGN member + os.killpg semantics (Windows Job Object close-gate covered in test_win_close_gate_jobs)")
 class _SeenDb(unittest.TestCase):
     def setUp(self) -> None:
         self.home = tempfile.mkdtemp(prefix="mh-r4d-", dir="/tmp")
@@ -142,6 +143,7 @@ def _same_alive(pid: int, starttime: int) -> bool:
     return info is not None and info["state"] != "Z" and int(info["starttime"]) == int(starttime)
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX os.fork() PGID session leader + SIGTERM SIG_IGN member + os.killpg semantics (Windows Job Object close-gate covered in test_win_close_gate_jobs)")
 class TestOneSeenReadPerTick(_SeenDb):
     """r4d item 1 (MAJOR): the target scan and the hold decision use one read of the
     seen state. seen.json is repaired exactly between the two read points of the old
@@ -248,6 +250,7 @@ class TestOneSeenReadPerTick(_SeenDb):
         self._assert_closed_after_kill("run_a", "tsk_a", g, violations)
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX os.fork() PGID session leader + SIGTERM SIG_IGN member + os.killpg semantics (Windows Job Object close-gate covered in test_win_close_gate_jobs)")
 class TestSeenUnusableEventStored(_SeenDb):
     """r4d item 2 (MINOR): `run.seen_unusable` is done only once it is stored."""
 

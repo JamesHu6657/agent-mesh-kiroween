@@ -11,6 +11,7 @@ for `touch y.txt`). It reacts to the argv VibeAdapter.build() makes. Every env i
 vendor binary runs.
 """
 
+import sys
 import io
 import json
 import os
@@ -110,6 +111,7 @@ sys.exit(exit_code)
 '''
 
 
+@unittest.skipUnless(sys.platform != "win32", 'Smoke harness (tests/smoke/harness.py) is POSIX/Linux-only')
 class VibeCasesBase(unittest.TestCase):
     MODEL = "ds-flash"
 
@@ -150,6 +152,7 @@ class VibeCasesBase(unittest.TestCase):
         return {c["id"]: c for c in doc["cases"]}
 
 
+@unittest.skipUnless(sys.platform != "win32", 'Smoke harness (tests/smoke/harness.py) is POSIX/Linux-only')
 class VibeFlowTest(VibeCasesBase):
     def test_all_runs_results_and_reevaluate(self) -> None:
         """ACC: N11, N12, N24 - R1..R6 against the vibe stub: readonly argv (--agent ask, never auto-approve or --trust), the smoke model (omitted on --resume), --output-dir in the run dir; S-X-1/2/3/6 pass, S-X-4 observed(not_observable), S-X-5 not_applicable (no effort flag, nothing spawned), S-X-7 observed, S-VIBE-8 deny with one failed/denied effect; results validate and list VIBE_CASES; reevaluate re-parses S-X-1/2/4 without spawning."""

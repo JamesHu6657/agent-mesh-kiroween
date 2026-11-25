@@ -25,6 +25,9 @@ PREFIXES: Set[str] = {
     "lead",
     "mrg",
     "crit",
+    "pln",
+    "cmsg",
+    "grt",
 }
 
 # RFC 4648 lowercase base32 alphabet

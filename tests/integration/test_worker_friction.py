@@ -4,16 +4,19 @@ messages, config set bare strings, the lead roster, --no-intake and agent onboar
 
 import json
 import os
+import shlex
 import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
 
 import mesh.constants as c
-from tests.helpers import MeshHarness, serial
+from mesh.platform import perms as plat_perms, pipe_pump
+from tests.helpers import MeshHarness, assert_private_mode, cli_popen_argv, serial
 from tests.integration.test_execution_inbox import create_agent
 from tests.stubs import create_test_stubs
 
@@ -31,7 +34,7 @@ class TestWorkerFriction(unittest.TestCase):
         self.assertEqual(rc, 0, resp)
         self.project_id = resp["data"]["id"]
         self.tokdir = tempfile.mkdtemp(prefix="mh-tok-")
-        os.chmod(self.tokdir, 0o700)
+        plat_perms.set_private_dir_acl(self.tokdir)
 
     def tearDown(self) -> None:
         self.harness.teardown()
@@ -62,16 +65,18 @@ class TestWorkerFriction(unittest.TestCase):
         return resp["data"]
 
     def keepalive(self, tf, tsk, run, fence, *extra):
-        cmd = [self.harness.bin_mesh, "--home", self.harness.home, "task", "keepalive", tsk,
-               "--run", run, "--fence", str(fence), "--token-file", tf, *extra]
-        return subprocess.Popen(cmd, env=self.harness.get_env(), stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True)
+        cmd, env = cli_popen_argv(
+            self.harness, "task", "keepalive", tsk, "--run", run, "--fence", str(fence), "--token-file", tf, *extra
+        )
+        popen_kw = {"env": env, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "text": True}
+        if sys.platform == "win32":
+            popen_kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        return subprocess.Popen(cmd, **popen_kw)
 
     # 8. onboard
     def test_onboard_writes_0600_token_file_and_cheat_sheet(self) -> None:
         path, resp = self.onboard("w1", "--ack-timeout", "30m")
-        st = os.stat(path)
-        self.assertEqual(stat.S_IMODE(st.st_mode), 0o600)
+        assert_private_mode(self, path, is_dir=False, posix_mode=0o600)
         self.assertNotIn("mesh_at_", json.dumps(resp))  # the token never reaches stdout
         d = resp["data"]
         self.assertEqual(d["token_file"], path)
@@ -80,16 +85,20 @@ class TestWorkerFriction(unittest.TestCase):
         self.assertEqual(d["agent"]["max_concurrency"], 1)
         self.assertEqual(d["agent"]["capabilities"], ["intake"])
         self.assertEqual(d["agent"]["ack_timeout_s"], 1800)
-        for needle in (f"--token-file {path}", "task keepalive <tsk>", "task submit <tsk>", "within 1800s"):
+        for needle in (f"--token-file {shlex.quote(path)}", "task keepalive <tsk>", "task submit <tsk>", "within 1800s"):
             self.assertIn(needle, d["cheat_sheet"])
         rc, who = self.cli_tf(path, "whoami")
         self.assertEqual(rc, 0, who)
         self.assertEqual(who["data"]["name"], "w1")
         # text mode prints the cheat-sheet readably
-        rc_t = subprocess.run([self.harness.bin_mesh, "--home", self.harness.home, "--format", "text",
-                               "agent", "onboard", "w2", "--out", os.path.join(self.tokdir, "w2.token"),
-                               "--user", "--passphrase-file", self.harness.passphrase_file],
-                              env=self.harness.get_env(), capture_output=True, text=True, timeout=20)
+        env_t = self.harness.get_env()
+        cmd_t = pipe_pump.prepare_win_cmd_args(
+            [self.harness.bin_mesh, "--home", self.harness.home, "--format", "text",
+             "agent", "onboard", "w2", "--out", os.path.join(self.tokdir, "w2.token"),
+             "--user", "--passphrase-file", self.harness.passphrase_file],
+            env=env_t,
+        )
+        rc_t = subprocess.run(cmd_t, env=env_t, capture_output=True, text=True, timeout=20)
         self.assertEqual(rc_t.returncode, 0, rc_t.stdout + rc_t.stderr)
         self.assertIn("Worker cheat-sheet for w2", rc_t.stdout)
         self.assertIn("task keepalive <tsk>", rc_t.stdout)
@@ -143,9 +152,11 @@ class TestWorkerFriction(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertNotIn("live_run", shl["data"])
         # text mode renders the nested block
-        rc_t = subprocess.run([self.harness.bin_mesh, "--home", self.harness.home, "--format", "text", "task",
-                               "show", tsk, "--token-file", tf], env=self.harness.get_env(),
-                              capture_output=True, text=True, timeout=20)
+        cmd_t = pipe_pump.prepare_win_cmd_args(
+            [self.harness.bin_mesh, "--home", self.harness.home, "--format", "text", "task", "show", tsk, "--token-file", tf],
+            env=self.harness.get_env(),
+        )
+        rc_t = subprocess.run(cmd_t, env=self.harness.get_env(), capture_output=True, text=True, timeout=20)
         self.assertEqual(rc_t.returncode, 0, rc_t.stderr)
         self.assertIn("heartbeat_every_s", rc_t.stdout)
 
@@ -214,7 +225,7 @@ class TestWorkerFriction(unittest.TestCase):
         proc = self.keepalive(tf, tsk, d["run_id"], d["fence"], "--every", "1")
         try:
             time.sleep(2.5)
-            proc.send_signal(signal.SIGTERM)
+            proc.send_signal(signal.CTRL_BREAK_EVENT if sys.platform == "win32" else signal.SIGTERM)
             out, err = proc.communicate(timeout=20)
         finally:
             if proc.poll() is None:

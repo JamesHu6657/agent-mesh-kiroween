@@ -25,11 +25,9 @@ Merge test step (m2-r6, §10.5 step 3) options:
 """
 
 import codecs
-import errno
 import io
 import json
 import os
-import selectors
 import signal
 import stat
 import subprocess
@@ -42,6 +40,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from mesh.core.clock import now_iso_utc
 from mesh.core.proc import get_proc_stat
 from mesh.core.redact import StreamRedactor, collect_exact_values, redact
+from mesh.platform import perms, pipe_pump, proc as plat_proc
+from mesh.platform.fs import atomic_replace, open_regular_nofollow
+from mesh.platform.paths import is_reparse_stat
 
 DEFAULT_LOG_CAP_BYTES = 50 * 1024 * 1024
 ACTIVITY_TOUCH_INTERVAL_S = 1.0
@@ -49,37 +50,18 @@ PIPE_DRAIN_GRACE_S = 5.0
 
 
 def _open_regular_nofollow(path: str, flags: int, mode: int = 0o600, label: str = "file") -> int:
-    """Open a regular file without following symlinks or blocking on FIFOs."""
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    nonblock = getattr(os, "O_NONBLOCK", 0)
-    fd = os.open(path, flags | nofollow | nonblock, mode)
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise OSError(errno.EINVAL, f"Refusing non-regular {label}", path)
-        if nonblock:
-            try:
-                import fcntl
-
-                fl = fcntl.fcntl(fd, fcntl.F_GETFL)
-                if fl & nonblock:
-                    fcntl.fcntl(fd, fcntl.F_SETFL, fl & ~nonblock)
-            except OSError:
-                pass
-        return fd
-    except BaseException:
-        os.close(fd)
-        raise
+    """Open a regular file without following symlinks, junctions, or blocking on FIFOs."""
+    return open_regular_nofollow(path, flags, mode, label=label)
 
 
 def atomic_write_json(path: str, obj: Dict[str, Any]) -> None:
-    """Write JSON atomically (mkstemp O_EXCL|O_NOFOLLOW + fsync + rename) with mode 0600."""
+    """Write JSON atomically (mkstemp O_EXCL|O_NOFOLLOW + fsync + rename) with private perms."""
     parent = os.path.dirname(os.path.abspath(path)) or "."
     base = os.path.basename(path)
     fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=f".{base}.tmp.", suffix=".json")
     try:
         try:
-            os.fchmod(fd, 0o600)
+            perms.fchmod_private(fd, 0o600)
             payload = (json.dumps(obj, sort_keys=True) + "\n").encode("utf-8")
             view = memoryview(payload)
             while view:
@@ -88,7 +70,7 @@ def atomic_write_json(path: str, obj: Dict[str, Any]) -> None:
             os.fsync(fd)
         finally:
             os.close(fd)
-        os.replace(tmp_path, path)
+        atomic_replace(tmp_path, path)
     except BaseException:
         try:
             os.unlink(tmp_path)
@@ -161,7 +143,7 @@ def _pump_stream(
     try:
         fd = _open_regular_nofollow(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600, label="log file")
         try:
-            os.fchmod(fd, 0o600)
+            perms.fchmod_private(fd, 0o600)
             log_file = os.fdopen(fd, "wb")
         except BaseException:
             os.close(fd)
@@ -209,7 +191,7 @@ def _pump_stream(
                     os.utime(activity_path, None, follow_symlinks=False)
                 else:
                     st_act = os.lstat(activity_path)
-                    if stat.S_ISREG(st_act.st_mode):
+                    if not is_reparse_stat(st_act) and stat.S_ISREG(st_act.st_mode):
                         os.utime(activity_path, None)
             except OSError:
                 pass
@@ -218,98 +200,374 @@ def _pump_stream(
             return  # drain only
         write(redactor.feed(decoder.decode(chunk)).encode("utf-8", "replace"))
 
-    def past_deadline() -> bool:
-        dl = drain_deadline[0] if drain_deadline else None
-        return dl is not None and time.monotonic() >= dl
-
-    sel = None
     try:
-        pipe_fd: Optional[int] = None
-        if hasattr(pipe, "fileno"):
-            try:
-                pipe_fd = pipe.fileno()
-            except (AttributeError, ValueError, io.UnsupportedOperation, OSError):
-                pipe_fd = None
+        if isinstance(pipe, pipe_pump.OverlappedPipeReader):
+            pipe_pump.pump_overlapped_stream_win(
+                pipe,
+                handle_chunk,
+                drain_wake_event=drain_wake_fd,
+                drain_deadline=drain_deadline,
+            )
+        else:
+            pipe_fd: Optional[int] = None
+            if hasattr(pipe, "fileno"):
+                try:
+                    pipe_fd = pipe.fileno()
+                except (AttributeError, ValueError, io.UnsupportedOperation, OSError):
+                    pipe_fd = None
 
-        if pipe_fd is not None and (drain_wake_fd is not None or drain_deadline is not None):
-            os.set_blocking(pipe_fd, False)
-            sel = selectors.PollSelector()
-            sel.register(pipe_fd, selectors.EVENT_READ, data="pipe")
-            wake_watched = False
-            if drain_wake_fd is not None:
-                sel.register(drain_wake_fd, selectors.EVENT_READ, data="wake")
-                wake_watched = True
-
-            eof = False
-            while not eof:
-                dl = drain_deadline[0] if drain_deadline else None
-                if dl is not None:
-                    if wake_watched:
-                        try:
-                            sel.unregister(drain_wake_fd)
-                        except (KeyError, ValueError):
-                            pass
-                        wake_watched = False
-                    remaining = dl - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    timeout: Optional[float] = remaining
-                else:
-                    timeout = None
-
-                events = sel.select(timeout)
-                if not events:
-                    break
-                pipe_ready = False
-                for key, _ in events:
-                    if key.data == "wake":
-                        if wake_watched:
-                            try:
-                                sel.unregister(drain_wake_fd)
-                            except (KeyError, ValueError):
-                                pass
-                            wake_watched = False
-                    elif key.data == "pipe":
-                        pipe_ready = True
-                if not pipe_ready:
-                    continue
+            if (
+                sys.platform != "win32"
+                and pipe_fd is not None
+                and (drain_wake_fd is not None or drain_deadline is not None)
+            ):
+                pipe_pump.pump_fd_stream_posix(
+                    pipe_fd,
+                    handle_chunk,
+                    drain_wake_fd=drain_wake_fd,
+                    drain_deadline=drain_deadline,
+                    chunk_size=READ_CHUNK_BYTES,
+                )
+            else:
                 while True:
-                    try:
-                        chunk = os.read(pipe_fd, READ_CHUNK_BYTES)
-                    except BlockingIOError:
-                        break
-                    except InterruptedError:
-                        continue
-                    except OSError:
-                        eof = True
-                        break
+                    chunk = pipe.read1(READ_CHUNK_BYTES) if hasattr(pipe, "read1") else os.read(pipe.fileno(), READ_CHUNK_BYTES)
                     if not chunk:
-                        eof = True
                         break
                     handle_chunk(chunk)
-                    if past_deadline():
-                        eof = True
-                        break
-        else:
-            while True:
-                chunk = pipe.read1(READ_CHUNK_BYTES) if hasattr(pipe, "read1") else os.read(pipe.fileno(), READ_CHUNK_BYTES)
-                if not chunk:
-                    break
-                handle_chunk(chunk)
 
         write(redactor.feed(decoder.decode(b"", final=True)).encode("utf-8", "replace"))
         write(redactor.flush().encode("utf-8", "replace"))
     finally:
-        if sel is not None:
-            try:
-                sel.close()
-            except OSError:
-                pass
         if log_file is not None:
             try:
                 log_file.close()
             except OSError:
                 pass
+
+
+def _resolve_win_run_identity(run_dir: str, spec: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve ``(home, run_id)`` for Windows Named Job Object / Stop Event wiring."""
+    real_run = os.path.realpath(run_dir)
+    parent = os.path.dirname(real_run)
+    parent_name = os.path.basename(parent)
+    inferred_home: Optional[str] = None
+    inferred_run_id: Optional[str] = None
+    if parent_name in ("runs", "merges") and os.path.basename(real_run):
+        inferred_home = os.path.dirname(parent)
+        inferred_run_id = os.path.basename(real_run)
+
+    run_id = spec.get("run_id") or os.environ.get("MESH_RUN_ID") or inferred_run_id
+    if not isinstance(run_id, str) or not run_id:
+        return None, None
+    home = spec.get("home") or os.environ.get("MESH_HOME") or inferred_home
+    if not isinstance(home, str) or not home:
+        return None, None
+    return home, run_id
+
+
+def _collect_job_members_at_exit(
+    run_job: Any,
+    *,
+    self_pid: Optional[int] = None,
+    query_pids_fn: Any = None,
+    get_stat_fn: Any = None,
+) -> List[Dict[str, int]]:
+    """Collect remaining live ``(pid, starttime)`` job members excluding ``runwrap`` itself."""
+    my_pid = os.getpid() if self_pid is None else int(self_pid)
+    q_fn = plat_proc.query_job_pids if query_pids_fn is None else query_pids_fn
+    s_fn = get_proc_stat if get_stat_fn is None else get_stat_fn
+    try:
+        pids = q_fn(run_job)
+    except OSError:
+        return []
+    members: List[Dict[str, int]] = []
+    for pid in sorted(set(int(p) for p in pids)):
+        if pid <= 0 or pid == my_pid:
+            continue
+        try:
+            info = s_fn(pid)
+        except OSError:
+            info = None
+        if info is not None and int(info.get("starttime") or 0) > 0:
+            members.append({"pid": pid, "starttime": int(info["starttime"])})
+    return members
+
+
+def _wait_child_win(
+    child: "subprocess.Popen[Any]",
+    stop_event: Any,
+    on_stop: Any,
+) -> int:
+    """Wait for *child* exit on Windows while watching *stop_event* for graceful term."""
+    if stop_event is None:
+        while child.poll() is None:
+            try:
+                return child.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                pass
+        return child.wait()
+
+    import ctypes
+    from ctypes import wintypes
+    from mesh.platform import _win32_ctypes as w32
+
+    dll_k32 = w32.get_kernel32()
+    proc_h = int(child._handle)
+    stop_h = int(stop_event.fileno())
+    stop_watched = True
+    while child.poll() is None:
+        if stop_watched:
+            arr = (wintypes.HANDLE * 2)(proc_h, stop_h)
+            rc = int(dll_k32.WaitForMultipleObjects(2, arr, False, 500))
+            if rc == w32.WAIT_OBJECT_0:
+                break
+            if rc == w32.WAIT_OBJECT_0 + 1:
+                on_stop()
+                stop_watched = False
+            elif rc == w32.WAIT_FAILED:
+                break
+        else:
+            try:
+                return child.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                pass
+    return child.wait()
+
+
+def _ensure_console_win(
+    *,
+    k32: Any = None,
+    user32: Any = None,
+) -> bool:
+    """Allocate a hidden console when ``runwrap`` has none so ``CTRL_BREAK_EVENT`` works.
+
+    Processes started detached without a console fail ``GenerateConsoleCtrlEvent``;
+    allocating a console before spawning the child (while preserving redirected stdio
+    handles and hiding any created window) lets the child share a console group.
+    """
+    from ctypes import wintypes
+    from mesh.platform import _win32_ctypes as w32
+
+    dll_k32 = k32 if k32 is not None else w32.get_kernel32()
+    buf = (wintypes.DWORD * 1)()
+    try:
+        count = int(dll_k32.GetConsoleProcessList(buf, 1))
+    except Exception:
+        return False
+    if count > 0:
+        return False
+
+    saved_std: List[Tuple[int, Any]] = []
+    for std_id in (w32.STD_INPUT_HANDLE, w32.STD_OUTPUT_HANDLE, w32.STD_ERROR_HANDLE):
+        try:
+            h = dll_k32.GetStdHandle(std_id)
+        except Exception:
+            h = None
+        if not w32.is_null_or_invalid_handle(h):
+            saved_std.append((std_id, h))
+
+    try:
+        if not dll_k32.AllocConsole():
+            return False
+    except Exception:
+        return False
+
+    for std_id, h in saved_std:
+        try:
+            dll_k32.SetStdHandle(std_id, h)
+        except Exception:
+            pass
+
+    try:
+        hwnd = dll_k32.GetConsoleWindow()
+        if hwnd:
+            dll_u32 = user32 if user32 is not None else w32.get_user32()
+            dll_u32.ShowWindow(hwnd, w32.SW_HIDE)
+    except Exception:
+        pass
+    return True
+
+
+def _run_win32(
+    run_dir: str,
+    spec: Dict[str, Any],
+    env: Dict[str, str],
+    exact_values: List[Tuple[str, str]],
+    activity_path: str,
+    combined_log: Optional[str],
+    stdin_spec: Any,
+    cap_bytes: int,
+) -> int:
+    """Windows runwrap lifecycle using Named Job retention, Stop Event, and Overlapped pipes."""
+    _ensure_console_win()
+    home, run_id = _resolve_win_run_identity(run_dir, spec)
+    run_job: Any = None
+    stop_event: Any = None
+    if home and run_id:
+        try:
+            run_job = plat_proc.open_run_job(home, run_id, terminate=False)
+        except (OSError, ValueError):
+            run_job = None
+        try:
+            stop_event = plat_proc.create_stop_event(home, run_id)
+        except (OSError, ValueError):
+            stop_event = None
+
+    try:
+        out_reader, out_w_fd = pipe_pump.create_pipe_pair()
+        err_reader = None
+        err_w_fd: Optional[int] = None
+        if not combined_log:
+            try:
+                err_reader, err_w_fd = pipe_pump.create_pipe_pair()
+            except BaseException:
+                try:
+                    os.close(out_w_fd)
+                except OSError:
+                    pass
+                out_reader.close()
+                raise
+
+        stdin_file = None
+        if stdin_spec and stdin_spec != "devnull":
+            stdin_file = open(stdin_spec, "rb")
+            child_stdin: Any = stdin_file
+        else:
+            child_stdin = subprocess.DEVNULL
+
+        child: Optional["subprocess.Popen[Any]"] = None
+        try:
+            try:
+                pipe_pump._verify_win_cmd_target_exists(spec["argv"][0])
+                spawn_args = pipe_pump.prepare_win_cmd_args(spec["argv"], env=env)
+                child = subprocess.Popen(
+                    spawn_args,
+                    cwd=spec.get("cwd") or None,
+                    stdin=child_stdin,
+                    stdout=out_w_fd,
+                    stderr=subprocess.STDOUT if combined_log else err_w_fd,
+                    env=env,
+                    close_fds=True,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                )
+            except (OSError, ValueError) as exc:
+                atomic_write_json(
+                    os.path.join(run_dir, "exit.json"),
+                    {"exit_code": 127, "signal": None, "ended_at": now_iso_utc(), "error": type(exc).__name__},
+                )
+            finally:
+                for wfd in (out_w_fd, err_w_fd):
+                    if wfd is not None:
+                        try:
+                            os.close(wfd)
+                        except OSError:
+                            pass
+                if stdin_file is not None:
+                    stdin_file.close()
+        except BaseException:
+            out_reader.close()
+            if err_reader is not None:
+                err_reader.close()
+            raise
+
+        if child is None:
+            out_reader.close()
+            if err_reader is not None:
+                err_reader.close()
+            return 0
+
+        stop_lock = threading.Lock()
+        stop_sent = False
+
+        def forward_stop() -> None:
+            nonlocal stop_sent
+            with stop_lock:
+                if stop_sent:
+                    return
+                stop_sent = True
+            try:
+                if child.poll() is None:
+                    child.send_signal(signal.CTRL_BREAK_EVENT)
+            except (ProcessLookupError, OSError, ValueError):
+                pass
+
+        def on_signal(signum: int, frame: Any) -> None:
+            _ = (signum, frame)
+            forward_stop()
+
+        for sig in (signal.SIGINT, getattr(signal, "SIGBREAK", None)):
+            if sig is None:
+                continue
+            try:
+                signal.signal(sig, on_signal)
+            except (ValueError, OSError):
+                pass
+
+        if combined_log:
+            streams = [(out_reader, combined_log)]
+        else:
+            streams = [(out_reader, "stdout.log"), (err_reader, "stderr.log")]
+        capture_errors: List[str] = []
+        wake_event = pipe_pump.create_wake_event()
+        drain_deadline: List[Optional[float]] = [None]
+        threads = [
+            threading.Thread(
+                target=_pump_stream,
+                args=(
+                    reader,
+                    os.path.join(run_dir, name),
+                    exact_values,
+                    activity_path,
+                    cap_bytes,
+                    capture_errors,
+                    wake_event,
+                    drain_deadline,
+                ),
+                daemon=True,
+            )
+            for reader, name in streams
+        ]
+        try:
+            for thread in threads:
+                thread.start()
+
+            returncode = _wait_child_win(child, stop_event, forward_stop)
+            drain_deadline[0] = time.monotonic() + PIPE_DRAIN_GRACE_S
+            try:
+                wake_event.set()
+            except OSError:
+                pass
+            join_deadline = drain_deadline[0] + 1.0
+            for thread in threads:
+                thread.join(max(0.0, join_deadline - time.monotonic()))
+        finally:
+            if not any(t.is_alive() for t in threads):
+                wake_event.close()
+            for (reader, _), thread in zip(streams, threads):
+                if reader is not None and not thread.is_alive():
+                    reader.close()
+
+        hung = [os.path.basename(name) for (_, name), thread in zip(streams, threads) if thread.is_alive()]
+        if hung:
+            capture_errors.append("output capture did not finish: " + ", ".join(hung))
+        exit_code: Optional[int] = returncode if returncode >= 0 else None
+        term_signal: Optional[int] = -returncode if returncode < 0 else None
+        exit_doc: Dict[str, Any] = {
+            "exit_code": exit_code,
+            "signal": term_signal,
+            "ended_at": now_iso_utc(),
+        }
+        if capture_errors:
+            exit_doc["capture_error"] = "; ".join(capture_errors)[:500]
+        if run_job is not None:
+            exit_doc["job_members_at_exit"] = _collect_job_members_at_exit(run_job)
+        atomic_write_json(os.path.join(run_dir, "exit.json"), exit_doc)
+        return 0
+    finally:
+        if stop_event is not None:
+            stop_event.close()
+        if run_job is not None:
+            run_job.close()
 
 
 def run(run_dir: str) -> int:
@@ -324,7 +582,10 @@ def run(run_dir: str) -> int:
     act_fd = _open_regular_nofollow(
         activity_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600, label="activity file"
     )
-    os.close(act_fd)
+    try:
+        perms.fchmod_private(act_fd, 0o600)
+    finally:
+        os.close(act_fd)
 
     try:
         stat_info = get_proc_stat(os.getpid())
@@ -352,6 +613,19 @@ def run(run_dir: str) -> int:
         combined_log = "test.log"
 
     stdin_spec = spec.get("stdin", "devnull")
+    cap_bytes = int(spec.get("log_cap_bytes") or DEFAULT_LOG_CAP_BYTES)
+    if sys.platform == "win32":
+        return _run_win32(
+            run_dir,
+            spec,
+            env,
+            exact_values,
+            activity_path,
+            combined_log,
+            stdin_spec,
+            cap_bytes,
+        )
+
     stdin_file = None
     if stdin_spec and stdin_spec != "devnull":
         stdin_file = open(stdin_spec, "rb")
@@ -393,7 +667,6 @@ def run(run_dir: str) -> int:
         except (ValueError, OSError):
             pass
 
-    cap_bytes = int(spec.get("log_cap_bytes") or DEFAULT_LOG_CAP_BYTES)
     if combined_log:
         streams = [(child.stdout, combined_log)]
     else:

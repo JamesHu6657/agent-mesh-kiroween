@@ -45,6 +45,7 @@ def _run_with_timeout(fn, timeout_s: float = 2.0):
     return result[0]
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX 0o000/0o500 dir chmod and POSIX symlink rmtree tests; Win32 READONLY/junction tests in test_platform_paths_fs.py")
 class TestP1_9PathsTraversalAndRmtree(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="mh-r3f-p19-")
@@ -167,6 +168,7 @@ class TestP1_9PathsTraversalAndRmtree(unittest.TestCase):
             self.assertEqual(cm_post.exception.errno, errno.EINVAL)
 
 
+@unittest.skipUnless(hasattr(os, "mkfifo") and sys.platform != "win32", "POSIX mkfifo and file-symlink nofollow checks in adapters and runwrap")
 class TestP1_10AdaptersAndRunwrap(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="mh-r3f-p110-")

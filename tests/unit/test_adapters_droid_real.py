@@ -19,6 +19,7 @@ from unittest import mock
 from mesh.adapters import droid as droid_mod
 from mesh.adapters.droid import DroidAdapter
 from mesh.adapters.kiro import KiroAdapter
+from mesh.platform.paths import temp_root
 from tests import tierlib
 from tests.unit.test_fixture_hashes import FIXTURE_HASHES
 
@@ -63,8 +64,8 @@ def caps_snapshot(adapter):
 
 class DroidParseBase(unittest.TestCase):
     def run_dir(self) -> str:
-        d = tempfile.mkdtemp(prefix="mh-droidparse-", dir="/tmp")
-        self.assertTrue(d.startswith("/tmp/mh-"), d)
+        d = tempfile.mkdtemp(prefix="mh-droidparse-", dir=temp_root())
+        self.assertTrue(d.startswith(os.path.join(temp_root(), "mh-")), d)
         self.addCleanup(shutil.rmtree, d, True)
         return d
 
@@ -216,13 +217,13 @@ class TestReevaluateCommittedDroidResults(unittest.TestCase):
             made.append(path)
             return path
 
-        with mock.patch.object(tempfile, "tempdir", "/tmp"), \
+        with mock.patch.object(tempfile, "tempdir", temp_root()), \
                 mock.patch.object(tempfile, "mkdtemp", side_effect=tracking_mkdtemp), \
                 mock.patch.object(subprocess, "Popen", side_effect=AssertionError("no process may start")):
             new = reevaluate.reevaluate_doc(doc, name, REAL_ROOT)
         self.assertTrue(made)
         for path in made:
-            self.assertTrue(path.startswith("/tmp/mh-"), path)
+            self.assertTrue(path.startswith(os.path.join(temp_root(), "mh-")), path)
         before = {c["id"]: c for c in doc["cases"]}
         after = {c["id"]: c for c in new["cases"]}
         self.assertEqual(set(after), set(before))

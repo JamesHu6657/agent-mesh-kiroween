@@ -53,6 +53,7 @@ import os
 import re
 import sqlite3
 import stat
+import sys
 from typing import Any, Dict, List, Optional
 
 from mesh.adapters import vendor_stream as vs
@@ -75,6 +76,8 @@ from mesh.adapters.base import (
     validate_run_request_tokens,
 )
 from mesh.adapters.project_layer import _root_chain, project_layer_paths
+from mesh.platform import fs as _plat_fs
+from mesh.platform import paths as _plat_paths
 
 DEVIN_VERSION = "3000.14.30821"
 FLAGS = ["--print", "--prompt-file", "--model", "--permission-mode", "--respect-workspace-trust"]
@@ -189,12 +192,13 @@ def _frontmatter_grants(text: str, truncated: bool = False) -> bool:
 def _read_head(path: str, limit: int) -> bytes:
     """Up to ``limit`` bytes of a regular file. build() runs on the scheduler's event loop
     and the file is task-controlled, so (like ``base.open_run_file_nofollow``) the open
-    neither follows a symlink nor blocks on a FIFO, and anything but a regular file raises."""
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-                 | getattr(os, "O_NOCTTY", 0))
+    neither follows a symlink/junction nor blocks on a FIFO, and anything but a regular file raises."""
+    fd = _plat_fs.open_regular_nofollow(
+        path,
+        os.O_RDONLY | getattr(os, "O_NOCTTY", 0),
+        label="skill file",
+    )
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise OSError(errno.EINVAL, "Refusing non-regular skill file", path)
         chunks: List[bytes] = []
         while limit > 0:
             chunk = os.read(fd, limit)
@@ -217,6 +221,21 @@ def _skill_grants(path: str) -> bool:
     return _frontmatter_grants(head[:SKILL_HEAD_BYTES].decode("utf-8", "replace"), len(head) > SKILL_HEAD_BYTES)
 
 
+def _win_walk_path(path: str) -> str:
+    if sys.platform != "win32" or not path or path.startswith(("\\\\?\\", "\\\\.\\")):
+        return path
+    absp = os.path.abspath(path)
+    if not absp.startswith("\\\\"):
+        return "\\\\?\\" + absp
+    return path
+
+
+def _strip_win_prefix(path: str) -> str:
+    if sys.platform == "win32" and path.startswith("\\\\?\\"):
+        return path[4:]
+    return path
+
+
 def _skill_grants_found(workspace: str) -> List[str]:
     found: List[str] = []
     budget = SKILL_SCAN_MAX_ENTRIES
@@ -225,20 +244,32 @@ def _skill_grants_found(workspace: str) -> List[str]:
             top = os.path.join(directory, sd, "skills")
             if not os.path.lexists(top):
                 continue
-            if os.path.realpath(os.path.join(directory, sd)) == os.path.realpath(os.path.expanduser("~/" + sd)):
+            if _plat_paths.same_path(os.path.join(directory, sd), os.path.expanduser("~/" + sd)):
                 continue  # the user's own folder is user config
-            if os.path.islink(top) or not os.path.isdir(top):
+            if _plat_paths.is_reparse_link(top) or not os.path.isdir(top):
                 found.append(top)
                 continue
-            for root, dirs, files in os.walk(top, onerror=lambda _e, t=top: found.append(t)):
+            walk_top = _win_walk_path(top)
+            for root, dirs, files in os.walk(walk_top, onerror=lambda _e, t=top: found.append(t)):
                 budget -= len(dirs) + len(files)
                 if budget < 0:
                     found.append(top)
                     return found
-                for name in dirs + files:
-                    path = os.path.join(root, name)
-                    # Devin follows symlinks here; the walk does not, so a link is refused.
-                    if os.path.islink(path) or (name.lower() == SKILL_FILE_NAME and _skill_grants(path)):
+                kept_dirs: List[str] = []
+                for name in dirs:
+                    raw_path = os.path.join(root, name)
+                    path = _strip_win_prefix(raw_path)
+                    # Devin follows symlinks/junctions here; prune reparse dirs on Windows too.
+                    if _plat_paths.is_reparse_link(path):
+                        found.append(path)
+                    else:
+                        if name.lower() == SKILL_FILE_NAME and _skill_grants(path):
+                            found.append(path)
+                        kept_dirs.append(name)
+                dirs[:] = kept_dirs
+                for name in files:
+                    path = _strip_win_prefix(os.path.join(root, name))
+                    if _plat_paths.is_reparse_link(path) or (name.lower() == SKILL_FILE_NAME and _skill_grants(path)):
                         found.append(path)
     return found
 
@@ -246,7 +277,7 @@ def _skill_grants_found(workspace: str) -> List[str]:
 def _legacy_dirs_found(workspace: str) -> List[str]:
     user_real = os.path.realpath(os.path.expanduser("~/" + LEGACY_DIR))
     found = [os.path.join(d, LEGACY_DIR) for d in _root_chain(workspace, ROOT_MARKERS)]
-    return [p for p in found if os.path.lexists(p) and os.path.realpath(p) != user_real]
+    return [p for p in found if os.path.lexists(p) and not _plat_paths.same_path(p, user_real)]
 
 
 def project_layer_found(workspace: str) -> List[str]:
@@ -278,7 +309,7 @@ def _refuse_project_layer(req: RunRequest) -> None:
     found = project_layer_found(req.workspace)
     if found:
         ws = os.path.realpath(req.workspace)
-        rels = sorted({os.path.relpath(p, ws) for p in found})
+        rels = sorted({os.path.relpath(p, ws).replace(os.sep, "/") for p in found})
         shown = [r if len(r) <= SHOWN_PATH_CHARS else r[:SHOWN_PATH_CHARS] + "..." for r in rels[:SHOWN_PATHS]]
         more = f" (+{len(rels) - len(shown)} more)" if len(rels) > len(shown) else ""
         raise AdapterUnsupported(
@@ -335,6 +366,7 @@ class DevinAdapter(Adapter):
     """Adapter for the Devin CLI (``devin``), local agent."""
 
     id = "devin"
+    supported_profiles = ("unrestricted",)
     #: Empty (treated like None by check_adapter_effort_values): effort is part of the model id,
     #: refused upstream as EFFORT_UNSUPPORTED via the reasoning_effort capability; build() is a last guard.
     supported_efforts = ()
@@ -342,6 +374,11 @@ class DevinAdapter(Adapter):
     binary_names = ["devin"]
     planned_version = DEVIN_VERSION
     verified_version = None  # no committed help fixture; probe() checks flags live
+    model_presets = {
+        "chips": ["swe-2-flash", "swe-2-flash-medium", "claude-fable-5-2-high"],
+        "default_allowed": [],
+        "note": "Devin CLI 当前处于 M5 暂停状态且仅支持 unrestricted，请确认后手动选择或输入模型 ID",
+    }
     liveness = "none"
     max_argv_prompt_bytes = 100_000  # the prompt goes in --prompt-file; kept for the shared limit
     launch_enabled = False

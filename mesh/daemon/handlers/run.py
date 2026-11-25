@@ -16,6 +16,7 @@ import shutil
 import signal
 import sqlite3
 import stat
+import sys
 from typing import Any, Deque, Dict, List, Mapping, Optional, Set, Tuple
 
 import mesh.constants as c
@@ -42,6 +43,10 @@ from mesh.core.workspaces import (
 )
 from mesh.daemon.handlers.base import Effect, HandlerContext, HandlerResult
 from mesh.errors import MeshError
+from mesh.platform import fs as _plat_fs
+from mesh.platform import paths as _plat_paths
+from mesh.platform import perms as _plat_perms
+from mesh.platform.proc import crash_self_now
 
 RUN_STATUSES = ("starting", "running", "exited", "killed", "lost", "spawn_failed")
 LOG_STREAMS = ("stdout", "stderr")
@@ -200,6 +205,8 @@ def _read_log_tail(path: str, tail: int) -> Dict[str, Any]:
             total += 1
             if bline.endswith(b"\n"):
                 bline = bline[:-1]
+            if sys.platform == "win32" and bline.endswith(b"\r"):
+                bline = bline[:-1]
             raw_window.append(bline)
     lines: List[str] = [
         _clip_over_line(bline) if len(bline) > _OVER_LINE_BYTES else bline.decode("utf-8", errors="replace")
@@ -294,7 +301,7 @@ def _resolve_task_log_target(ctx: HandlerContext) -> Tuple[str, Optional[sqlite3
 
 
 async def prepare_log_command(ctx: HandlerContext) -> None:
-    """Validate, authorize, and offload run/task log reading and redaction off the event loop."""
+    """Validate, authorize, and offload run/task log & activity reading off the event loop."""
     if ctx.cmd == "run.log":
         run, streams, tail = _resolve_run_log_target(ctx)
         run_info = dict(run)
@@ -329,20 +336,286 @@ async def prepare_log_command(ctx: HandlerContext) -> None:
             "tail": tail,
             "data": data,
         })
+        return
+    if ctx.cmd == "run.activity":
+        task_id, run, limit = _resolve_run_activity_target(ctx)
+        if run is None:
+            setattr(ctx, "_prepared_activity", {
+                "task_id": task_id,
+                "run_id": None,
+                "limit": limit,
+                "data": {
+                    "available": False,
+                    "run_id": None,
+                    "task_id": task_id,
+                    "status": None,
+                    "adapter": None,
+                    "source": "empty",
+                    "entries": [],
+                    "counts": {},
+                    "total_entries": 0,
+                    "lines_scanned": 0,
+                    "log_capped": False,
+                    "truncated": False,
+                },
+            })
+            return
+        run_info = dict(run)
+        data = await asyncio.to_thread(_extract_activity_for_run, run_info, limit)
+        setattr(ctx, "_prepared_activity", {
+            "task_id": task_id,
+            "run_id": run_info["id"],
+            "run_dir": run_info["run_dir"],
+            "limit": limit,
+            "data": data,
+        })
+        return
+
+
+def _activity_limit_arg(ctx: HandlerContext) -> int:
+    from mesh.adapters.activity import MAX_ACTIVITY_ENTRIES
+
+    raw = ctx.args.get("limit")
+    if raw is None:
+        return MAX_ACTIVITY_ENTRIES
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1 or raw > MAX_ACTIVITY_ENTRIES:
+        raise _usage(f"Parameter 'limit' must be an integer between 1 and {MAX_ACTIVITY_ENTRIES}", "limit")
+    return raw
+
+
+def _resolve_run_activity_target(ctx: HandlerContext) -> Tuple[Optional[str], Optional[sqlite3.Row], int]:
+    run_id = ctx.args.get("run_id")
+    task_id = ctx.args.get("task_id") or ctx.args.get("task")
+    limit = _activity_limit_arg(ctx)
+    if run_id is not None and (not isinstance(run_id, str) or not run_id.strip()):
+        raise _usage("Parameter 'run_id' must be a non-empty string", "run_id")
+    if task_id is not None and (not isinstance(task_id, str) or not task_id.strip()):
+        raise _usage("Parameter 'task_id' must be a non-empty string", "task_id")
+    if not run_id and not task_id:
+        raise _usage("Either 'run_id' or 'task_id' is required", "run_id")
+
+    if run_id:
+        run = _get_run(ctx.conn, run_id.strip())
+        _authz_run(ctx, "run.activity", run)
+        if task_id and run["task_id"] != task_id.strip():
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message=f"Run '{run_id}' does not belong to task '{task_id}'",
+                details={"run_id": run_id, "task_id": task_id},
+            )
+        return run["task_id"], run, limit
+
+    assert task_id is not None
+    tid = task_id.strip()
+    task = _get_task_row(ctx.conn, tid)
+    check_authz(
+        ctx.conn,
+        "run.activity",
+        ctx.principal,
+        ctx.actor_kind,
+        ctx.via,
+        project_id=task["project_id"],
+        task_id=tid,
+    )
+    run = ctx.conn.execute(
+        """SELECT r.*, p.name AS agent_name FROM runs r LEFT JOIN principals p ON r.agent_id = p.id
+           WHERE r.task_id = ? ORDER BY r.fence DESC, r.rowid DESC LIMIT 1;""",
+        (tid,),
+    ).fetchone()
+    return tid, run, limit
+
+
+def _extract_activity_for_run(run: Mapping[str, Any], limit: int) -> Dict[str, Any]:
+    from mesh.adapters.activity import extract_run_activity
+
+    res = extract_run_activity(run["run_dir"], adapter=run["adapter"], limit=limit)
+    res["run_id"] = run["id"]
+    res["task_id"] = run["task_id"]
+    res["project_id"] = run["project_id"]
+    res["status"] = run["status"]
+    return redact_value(res)
+
+
+def _diff_max_bytes_arg(ctx: HandlerContext) -> int:
+    from mesh.core.diffs import DEFAULT_MAX_DIFF_BYTES, MAX_DIFF_BYTES
+
+    raw = ctx.args.get("max_bytes")
+    if raw is None:
+        return DEFAULT_MAX_DIFF_BYTES
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1024 or raw > MAX_DIFF_BYTES:
+        raise _usage(f"Parameter 'max_bytes' must be an integer between 1024 and {MAX_DIFF_BYTES}", "max_bytes")
+    return raw
+
+
+def _bool_arg(ctx: HandlerContext, name: str, default: bool) -> bool:
+    raw = ctx.args.get(name)
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, int) and raw in (0, 1):
+        return bool(raw)
+    raise _usage(f"Parameter '{name}' must be a boolean", name)
+
+
+def _resolve_task_diff_plan(ctx: HandlerContext) -> Dict[str, Any]:
+    task_id = ctx.args.get("task_id") or ctx.args.get("task")
+    if not isinstance(task_id, str) or not task_id.strip():
+        raise _usage("Missing required parameter task_id", "task_id")
+    tid = task_id.strip()
+    max_bytes = _diff_max_bytes_arg(ctx)
+    include_untracked = _bool_arg(ctx, "include_untracked", True)
+    task = _get_task_row(ctx.conn, tid)
+    check_authz(
+        ctx.conn,
+        "task.diff",
+        ctx.principal,
+        ctx.actor_kind,
+        ctx.via,
+        project_id=task["project_id"],
+        task_id=tid,
+    )
+    prow = ctx.conn.execute(
+        "SELECT id, repo_path, integration_branch FROM projects WHERE id = ?;",
+        (task["project_id"],),
+    ).fetchone()
+    repo_path = prow["repo_path"] if prow is not None else None
+    integ_branch = prow["integration_branch"] if prow is not None else None
+    allowed_roots = _allowed_workspace_roots(ctx.conn, ctx.home)
+    match = _match_task_workspace_with_roots(
+        allowed_roots, task["project_id"], tid, task["workspace_path"]
+    )
+    ws_real = match[1] if match is not None else None
+    matched_root = match[2] if match is not None else None
+    integ_wt = _resolve_integ_wt_from_values(
+        allowed_roots, task["project_id"], repo_path, integ_branch, matched_root=matched_root
+    )
+    return {
+        "task_id": tid,
+        "project_id": task["project_id"],
+        "task_kind": task["kind"],
+        "workspace_path": task["workspace_path"],
+        "workspace_real": ws_real,
+        "branch": task["branch"],
+        "base_commit": task["base_commit"],
+        "repo_path": repo_path,
+        "integ_wt": integ_wt,
+        "max_bytes": max_bytes,
+        "include_untracked": include_untracked,
+    }
+
+
+def _resolve_project_diff_plan(ctx: HandlerContext) -> Dict[str, Any]:
+    project_id = ctx.args.get("project_id") or ctx.args.get("project")
+    scope_project = lead_run_token_scope(ctx.principal, ctx.via)
+    if not project_id and scope_project:
+        project_id = scope_project
+    if not isinstance(project_id, str) or not project_id.strip():
+        raise _usage("Missing required parameter project_id", "project_id")
+    pid = project_id.strip()
+    max_bytes = _diff_max_bytes_arg(ctx)
+    check_authz(
+        ctx.conn,
+        "project.diff",
+        ctx.principal,
+        ctx.actor_kind,
+        ctx.via,
+        project_id=pid,
+    )
+    prow = ctx.conn.execute(
+        "SELECT id, repo_path, base_branch, base_commit, integration_branch FROM projects WHERE id = ?;",
+        (pid,),
+    ).fetchone()
+    if prow is None:
+        raise _not_found("Project", pid)
+    allowed_roots = _allowed_workspace_roots(ctx.conn, ctx.home)
+    integ_wt = _resolve_integ_wt_from_values(
+        allowed_roots, pid, prow["repo_path"], prow["integration_branch"]
+    )
+    return {
+        "project_id": pid,
+        "repo_path": prow["repo_path"],
+        "base_branch": prow["base_branch"],
+        "base_commit": prow["base_commit"],
+        "integration_branch": prow["integration_branch"],
+        "integ_wt": integ_wt,
+        "max_bytes": max_bytes,
+    }
+
+
+async def prepare_diff_command(ctx: HandlerContext) -> None:
+    """Validate, authorize, and offload read-only git diff computation off the event loop."""
+    from mesh.core.diffs import compute_project_diff, compute_task_diff
+
+    if ctx.cmd == "task.diff":
+        plan = _resolve_task_diff_plan(ctx)
+        data = await asyncio.to_thread(compute_task_diff, **plan)
+        setattr(ctx, "_prepared_diff", {"cmd": "task.diff", "task_id": plan["task_id"], "data": data})
+        return
+    if ctx.cmd == "project.diff":
+        plan = _resolve_project_diff_plan(ctx)
+        data = await asyncio.to_thread(compute_project_diff, **plan)
+        setattr(ctx, "_prepared_diff", {"cmd": "project.diff", "project_id": plan["project_id"], "data": data})
+        return
 
 
 # --- run ----------------------------------------------------------------------
 def handle_run_list(ctx: HandlerContext) -> HandlerResult:
     task_id = ctx.args.get("task")
     status = ctx.args.get("status")
+    statuses = ctx.args.get("statuses")
+    raw_project = ctx.args.get("project")
+    raw_project_id = ctx.args.get("project_id")
+    raw_limit = ctx.args.get("limit")
+
+    if raw_project is not None and (not isinstance(raw_project, str) or not raw_project.strip()):
+        raise _usage("--project must be a non-empty string", "project")
+    if raw_project_id is not None and (not isinstance(raw_project_id, str) or not raw_project_id.strip()):
+        raise _usage("project_id must be a non-empty string", "project_id")
+    if raw_project and raw_project_id and raw_project != raw_project_id:
+        raise _usage("Conflicting 'project' and 'project_id' arguments", "project")
+    project_filter = raw_project or raw_project_id
+
     if status is not None and status not in RUN_STATUSES:
         raise _usage(f"--status must be one of: {', '.join(RUN_STATUSES)}", "status")
+    status_list: List[str] = []
+    if statuses is not None:
+        if not isinstance(statuses, list) or not statuses:
+            raise _usage("Field 'statuses' must be a non-empty list of run statuses", "statuses")
+        for st in statuses:
+            if not isinstance(st, str) or st not in RUN_STATUSES:
+                raise _usage(f"Each entry in 'statuses' must be one of: {', '.join(RUN_STATUSES)}", "statuses")
+            if st not in status_list:
+                status_list.append(st)
+    if status is not None:
+        if status_list and status not in status_list:
+            status_list = []
+        elif not status_list:
+            status_list = [status]
+
+    limit: Optional[int] = None
+    if raw_limit is not None:
+        if isinstance(raw_limit, bool) or not isinstance(raw_limit, int) or raw_limit < 1 or raw_limit > 500:
+            raise _usage("Field 'limit' must be an integer between 1 and 500", "limit")
+        limit = raw_limit
+
     if task_id:
         task = _get_task_row(ctx.conn, task_id)
         check_authz(ctx.conn, "run.list", ctx.principal, ctx.actor_kind, ctx.via,
                     project_id=task["project_id"], task_id=task_id)
+        if project_filter and task["project_id"] != project_filter:
+            check_authz(ctx.conn, "run.list", ctx.principal, ctx.actor_kind, ctx.via,
+                        project_id=project_filter)
+            return HandlerResult(data={"runs": []})
+    elif project_filter:
+        check_authz(ctx.conn, "run.list", ctx.principal, ctx.actor_kind, ctx.via,
+                    project_id=project_filter)
     else:
         check_authz(ctx.conn, "run.list", ctx.principal, ctx.actor_kind, ctx.via)
+
+    if status is not None and statuses is not None and not status_list:
+        return HandlerResult(data={"runs": []})
 
     query = """SELECT r.*, p.name AS agent_name FROM runs r
                LEFT JOIN principals p ON r.agent_id = p.id WHERE 1=1"""
@@ -350,24 +623,51 @@ def handle_run_list(ctx: HandlerContext) -> HandlerResult:
     scope_project = lead_run_token_scope(ctx.principal, ctx.via)
     if scope_project is not None:
         # Review m2-r9 finding 1(a): a lead run token lists only its own project's runs.
+        if project_filter and project_filter != scope_project:
+            return HandlerResult(data={"runs": []})
         query += " AND r.project_id = ?"
         params.append(scope_project)
+    elif project_filter:
+        query += " AND r.project_id = ?"
+        params.append(project_filter)
     if task_id:
         query += " AND r.task_id = ?"
         params.append(task_id)
-    if status:
-        query += " AND r.status = ?"
-        params.append(status)
-    query += " ORDER BY COALESCE(r.started_at, '') ASC, r.rowid ASC;"
-    rows = ctx.conn.execute(query, params).fetchall()
+    if status_list:
+        if len(status_list) == 1:
+            query += " AND r.status = ?"
+            params.append(status_list[0])
+        else:
+            ph = ",".join("?" for _ in status_list)
+            query += f" AND r.status IN ({ph})"
+            params.extend(status_list)
 
-    if scope_project is None and not _is_unrestricted_reader(ctx):
-        agent_id = ctx.principal.get("id")
-        rows = [
-            r for r in rows
-            if (r["task_id"] and can_principal_read_task(ctx.conn, agent_id, r["task_id"]))
-            or (not r["task_id"] and can_principal_read_project(ctx.conn, agent_id, r["project_id"]))
-        ]
+    unrestricted = scope_project is not None or _is_unrestricted_reader(ctx)
+    if limit is not None:
+        query += " ORDER BY COALESCE(r.started_at, '') DESC, r.rowid DESC"
+        if unrestricted:
+            query += " LIMIT ?"
+            params.append(limit)
+        query += ";"
+        rows = list(ctx.conn.execute(query, params).fetchall())
+        if not unrestricted:
+            agent_id = ctx.principal.get("id")
+            rows = [
+                r for r in rows
+                if (r["task_id"] and can_principal_read_task(ctx.conn, agent_id, r["task_id"]))
+                or (not r["task_id"] and can_principal_read_project(ctx.conn, agent_id, r["project_id"]))
+            ][:limit]
+        rows.reverse()
+    else:
+        query += " ORDER BY COALESCE(r.started_at, '') ASC, r.rowid ASC;"
+        rows = list(ctx.conn.execute(query, params).fetchall())
+        if not unrestricted:
+            agent_id = ctx.principal.get("id")
+            rows = [
+                r for r in rows
+                if (r["task_id"] and can_principal_read_task(ctx.conn, agent_id, r["task_id"]))
+                or (not r["task_id"] and can_principal_read_project(ctx.conn, agent_id, r["project_id"]))
+            ]
     return HandlerResult(data=redact_value({"runs": [_format_run(r) for r in rows]}))
 
 
@@ -412,13 +712,76 @@ def handle_run_log(ctx: HandlerContext) -> HandlerResult:
     return HandlerResult(data=data if data is not None else _run_logs(run, streams, tail))
 
 
-# --- task log -----------------------------------------------------------------
+# --- task log / run activity / git diffs --------------------------------------
 def handle_task_log(ctx: HandlerContext) -> HandlerResult:
     task_id, run, streams, tail = _resolve_task_log_target(ctx)
     if run is None:
         return HandlerResult(data={"task_id": task_id, "run_id": None, "status": None, "streams": {}})
     data = _prepared_log_match(ctx, "task.log", run, streams, tail, task_id=task_id)
     return HandlerResult(data=data if data is not None else _run_logs(run, streams, tail))
+
+
+def handle_run_activity(ctx: HandlerContext) -> HandlerResult:
+    task_id, run, limit = _resolve_run_activity_target(ctx)
+    if run is None:
+        return HandlerResult(
+            data={
+                "available": False,
+                "run_id": None,
+                "task_id": task_id,
+                "status": None,
+                "adapter": None,
+                "source": "empty",
+                "entries": [],
+                "counts": {},
+                "total_entries": 0,
+                "lines_scanned": 0,
+                "log_capped": False,
+                "truncated": False,
+            }
+        )
+    prep = getattr(ctx, "_prepared_activity", None)
+    if (
+        isinstance(prep, dict)
+        and prep.get("run_id") == run["id"]
+        and prep.get("run_dir") == run["run_dir"]
+        and prep.get("limit") == limit
+        and isinstance(prep.get("data"), dict)
+    ):
+        data = dict(prep["data"])
+        data["status"] = run["status"]
+        return HandlerResult(data=data)
+    return HandlerResult(data=_extract_activity_for_run(run, limit))
+
+
+def handle_task_diff(ctx: HandlerContext) -> HandlerResult:
+    from mesh.core.diffs import compute_task_diff
+
+    plan = _resolve_task_diff_plan(ctx)
+    prep = getattr(ctx, "_prepared_diff", None)
+    if (
+        isinstance(prep, dict)
+        and prep.get("cmd") == "task.diff"
+        and prep.get("task_id") == plan["task_id"]
+        and isinstance(prep.get("data"), dict)
+    ):
+        return HandlerResult(data=prep["data"])
+    return HandlerResult(data=compute_task_diff(**plan))
+
+
+def handle_project_diff(ctx: HandlerContext) -> HandlerResult:
+    from mesh.core.diffs import compute_project_diff
+
+    plan = _resolve_project_diff_plan(ctx)
+    prep = getattr(ctx, "_prepared_diff", None)
+    if (
+        isinstance(prep, dict)
+        and prep.get("cmd") == "project.diff"
+        and prep.get("project_id") == plan["project_id"]
+        and isinstance(prep.get("data"), dict)
+    ):
+        return HandlerResult(data=prep["data"])
+    return HandlerResult(data=compute_project_diff(**plan))
 
 
 # --- workspace ----------------------------------------------------------------
@@ -437,7 +800,7 @@ def _task_workspace_entry(
             )
             if match is not None:
                 _stripped, real_path, _matched_root = match
-                exists = os.path.isdir(real_path) and not os.path.islink(_stripped)
+                exists = os.path.isdir(real_path) and not _plat_paths.is_reparse_link(_stripped)
         else:
             trusted = resolve_trusted_path(path)
             exists = trusted is not None and os.path.isdir(trusted)
@@ -537,7 +900,7 @@ def handle_workspace_show(ctx: HandlerContext) -> HandlerResult:
                 continue
             dirnames[:] = sorted(
                 d for d in dirnames
-                if d != ".git" and not os.path.islink(os.path.join(dirpath, d))
+                if d != ".git" and not _plat_paths.is_reparse_link(os.path.join(dirpath, d))
             )
             for name in sorted(filenames):
                 files.append(os.path.relpath(os.path.join(dirpath, name), base))
@@ -581,7 +944,9 @@ def _commits_beyond_base(
 
     if not base_commit:
         return None
-    ws_clean = workspace.rstrip(os.sep) if isinstance(workspace, str) else ""
+    ws_clean = _plat_paths.strip_trailing_seps(workspace) if isinstance(workspace, str) else ""
+    if _plat_paths.is_fs_root(ws_clean):
+        ws_clean = ""
     counts: List[int] = []
     if branch and integ_wt and os.path.isdir(integ_wt):
         ref = f"refs/heads/{branch}"
@@ -642,9 +1007,14 @@ def _verify_workspace_ancestors_not_symlinked(
         or not matched_root
     ):
         return None
-    stripped_clean = stripped.rstrip(os.sep)
-    matched_root_clean = matched_root.rstrip(os.sep)
-    if not stripped_clean or not matched_root_clean:
+    stripped_clean = _plat_paths.strip_trailing_seps(stripped)
+    matched_root_clean = _plat_paths.strip_trailing_seps(matched_root)
+    if (
+        not stripped_clean
+        or not matched_root_clean
+        or _plat_paths.is_fs_root(stripped_clean)
+        or _plat_paths.is_fs_root(matched_root_clean)
+    ):
         return None
     leaf = os.path.basename(stripped_clean)
     if leaf != task_id and not (
@@ -656,7 +1026,7 @@ def _verify_workspace_ancestors_not_symlinked(
     if stripped_real is None or cand_real is None:
         return None
     expected = os.path.join(cand_real, project_id, "tasks", leaf)
-    return stripped_real if stripped_real == expected else None
+    return stripped_real if _plat_paths.same_path(stripped_real, expected) else None
 
 
 def _match_task_workspace_with_roots(
@@ -667,8 +1037,8 @@ def _match_task_workspace_with_roots(
 ) -> Optional[Tuple[str, str, str]]:
     if not isinstance(path, str) or not path.strip():
         return None
-    stripped = path.rstrip(os.sep)
-    if not stripped:
+    stripped = _plat_paths.strip_trailing_seps(path)
+    if not stripped or _plat_paths.is_fs_root(stripped):
         return None
     for cand_root in roots:
         real = _verify_workspace_ancestors_not_symlinked(stripped, cand_root, project_id, task_id)
@@ -849,7 +1219,9 @@ def _already_pruned(
     """
     from mesh.core.gitops import run_git
 
-    wp = (task["workspace_path"] or "").rstrip(os.sep)
+    wp = _plat_paths.strip_trailing_seps(task["workspace_path"] or "")
+    if _plat_paths.is_fs_root(wp):
+        wp = ""
     if wp and os.path.lexists(wp):
         return False
     branch = task["branch"]
@@ -887,7 +1259,7 @@ def _remove_worktree_and_branch_with_roots(
     if match is None:
         return "outside_workspaces_root"
     stripped, real_path, _matched_root = match
-    if os.path.islink(stripped):
+    if _plat_paths.is_reparse_link(stripped):
         return "outside_workspaces_root"
     from mesh.core.repos import is_registered_worktree
 
@@ -973,7 +1345,7 @@ def _maybe_ws_crash(home: str, point: str, testing_mode: Optional[bool] = None) 
     from mesh.daemon import supervisor
 
     supervisor._log_meshd(home, f"MESH_TEST_CRASH_AT={point}: killing meshd")
-    os.kill(os.getpid(), signal.SIGKILL)
+    crash_self_now()
 
 
 def _write_ws_prune_checkpoint(path: Optional[str], doc: Mapping[str, Any]) -> None:
@@ -989,10 +1361,14 @@ def _write_ws_prune_checkpoint(path: Optional[str], doc: Mapping[str, Any]) -> N
             written = 0
             while written < len(view):
                 written += os.write(fd, view[written:])
+            if sys.platform != "win32" and hasattr(os, "fchmod"):
+                _plat_perms.fchmod_private(fd, 0o600)
             os.fsync(fd)
         finally:
             os.close(fd)
-        os.replace(tmp, path)
+        if sys.platform == "win32" or not hasattr(os, "fchmod"):
+            _plat_perms.set_private_file_acl(tmp, 0o600)
+        _plat_fs.atomic_replace(tmp, path)
     except Exception:
         try:
             if os.path.lexists(tmp):
@@ -1006,8 +1382,7 @@ def _read_ws_prune_checkpoint(path: Optional[str]) -> Optional[Dict[str, Any]]:
     if not path:
         return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = json.loads(_plat_fs.read_bytes_shared(path).decode("utf-8"))
         return data if isinstance(data, dict) else None
     except (OSError, ValueError):
         return None
@@ -1232,7 +1607,9 @@ def plan_workspace_prune(ctx: HandlerContext) -> Dict[str, Any]:
     }
     for task_row in _prune_candidates(ctx, project_id):
         task = dict(task_row)
-        wp = (task["workspace_path"] or "").rstrip(os.sep)
+        wp = _plat_paths.strip_trailing_seps(task["workspace_path"] or "")
+        if _plat_paths.is_fs_root(wp):
+            wp = ""
         if not task["branch"] and (not wp or not os.path.lexists(wp)):
             continue
         if task["id"] in pruned_ids and (not wp or not os.path.lexists(wp)):
@@ -1845,13 +2222,13 @@ def _validate_delete_target_ancestors(
     """Validate ``tasks`` dir exists without symlinks and ancestors resolve under ``matched_root``."""
     if not isinstance(stripped, str) or not stripped.strip():
         return None
-    tasks_dir = os.path.dirname(stripped.rstrip(os.sep))
-    if os.path.islink(tasks_dir) or not os.path.isdir(tasks_dir):
+    tasks_dir = os.path.dirname(_plat_paths.strip_trailing_seps(stripped))
+    if _plat_paths.is_reparse_link(tasks_dir) or not os.path.isdir(tasks_dir):
         return None
     verified_real = _verify_workspace_ancestors_not_symlinked(
         stripped, matched_root, project_id, task_id
     )
-    if verified_real is None or verified_real != real:
+    if verified_real is None or not _plat_paths.same_path(verified_real, real):
         return None
     return verified_real
 
@@ -1904,13 +2281,20 @@ def _delete_workspace_dir_impl(
             message=f"Workspace path of task '{task_id}' is outside the workspaces root",
             details={"task_id": task_id, "path": stripped, "reason": "outside_workspaces_root"},
         )
-    root_real = os.path.realpath(matched_root.rstrip(os.sep))
+    root_real = os.path.realpath(_plat_paths.strip_trailing_seps(matched_root))
     make_owned_ancestors_writable(verified_real, root_real)
+    if sys.platform == "win32":
+        # Windows SeChangeNotifyPrivilege allows lstat/deletes under a D:P parent dir;
+        # require readable/writable parent dir DACL before writing marker or running rmtree.
+        parent_dir = os.path.dirname(verified_real)
+        os.listdir(parent_dir)
+        if os.name == "nt" and not _plat_perms._win_dir_has_owner_rw_acl(parent_dir):
+            raise PermissionError(errno.EACCES, "Parent directory is inaccessible", parent_dir)
     try:
         st = os.lstat(verified_real)
     except FileNotFoundError:
         return False
-    if not _stat.S_ISDIR(st.st_mode):
+    if _plat_paths.is_reparse_stat(st) or not _stat.S_ISDIR(st.st_mode):
         raise MeshError(
             code=c.INVALID_ARGUMENT,
             exit_code=c.EXIT_USAGE,
@@ -2074,7 +2458,7 @@ def _validate_workspace_delete(
         except OSError:
             st_target = None
             if not ctx.dry_run:  # a dry run never changes permissions; the real run re-checks
-                make_owned_ancestors_writable(real, os.path.realpath(matched_root.rstrip(os.sep)))
+                make_owned_ancestors_writable(real, os.path.realpath(_plat_paths.strip_trailing_seps(matched_root)))
             try:
                 st_target = os.lstat(real) if not ctx.dry_run else None
             except FileNotFoundError:
@@ -2086,7 +2470,9 @@ def _validate_workspace_delete(
                     message=f"Workspace path of task '{task_id}' cannot be inspected",
                     details={"task_id": task_id, "path": path, "reason": "unreadable", "errno": exc.errno},
                 )
-        if st_target is not None and not stat.S_ISDIR(st_target.st_mode):
+        if st_target is not None and (
+            _plat_paths.is_reparse_stat(st_target) or not stat.S_ISDIR(st_target.st_mode)
+        ):
             raise MeshError(
                 code=c.INVALID_ARGUMENT,
                 exit_code=c.EXIT_USAGE,
@@ -2291,7 +2677,7 @@ async def run_workspace_delete(server: Any, ctx: HandlerContext) -> HandlerResul
                 is not None
             )
             check_paths = [
-                p.rstrip(os.sep)
+                _plat_paths.strip_trailing_seps(p)
                 for p in (real, stripped, path)
                 if isinstance(p, str) and p.strip()
             ]
@@ -2559,11 +2945,13 @@ def handle_workspace_delete(ctx: HandlerContext) -> HandlerResult:
 def handle_run_release(ctx: HandlerContext) -> HandlerResult:
     """`mesh run release <run-id> --force-seen-unusable` (r4c, N18 operator path).
 
-    Only for a task run held because its seen state (``seen.json``) is unusable: the
-    run closes as ``lost``, its lease is released and its task takes the usual
-    lost-run transition. No process is signalled. The ordinary rules stay: nothing
-    is ever killed by pgid alone and a hold is never released on a timeout; this is
-    the explicit operator decision. User only (never an agent or a run token).
+    Only for a task run or launch-mode lead turn held because its seen state
+    (``seen.json`` / ``adopt_pending``) is unusable: the run closes as ``lost``,
+    its lease is released, and its task takes the usual lost-run transition (or a
+    lead turn returns its carried outbox wake messages to ``pending`` with backoff).
+    No process is signalled. The ordinary rules stay: nothing is ever killed by pgid
+    alone and a hold is never released on a timeout; this is the explicit operator
+    decision. User only (never an agent or a run token).
     """
     if not (ctx.actor_kind == "user" and ctx.via == "direct"):
         raise MeshError(
@@ -2794,5 +3182,9 @@ def _release_merge_held(ctx: HandlerContext, run: Any) -> HandlerResult:
                 params={"task_id": task_id, "lease_key": key, "run_id": run_id},
             )
         )
+    if sys.platform == "win32":
+        from mesh.daemon import supervisor
+
+        supervisor.close_run_job(run_id)
     return HandlerResult(data={"run_id": run_id, "released": True, "status": "lost", "lease": key,
                                "lease_released": released, "task_id": task_id})

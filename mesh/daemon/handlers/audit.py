@@ -14,8 +14,15 @@ from mesh.core.approvals import (
     verify_approval_event_history,
     verify_stored_op_json,
 )
-from mesh.core.canonical import canonical_json
+from mesh.core.canonical import canonical_json, hash_canonical
 from mesh.core.events import compute_user_event_mac, verify_event_chain
+from mesh.core.grants import (
+    DEFAULT_PERMISSION_MODE,
+    PERMISSION_MODES,
+    build_grant_scope_key,
+    compute_user_grant_mac,
+    compute_user_grant_revoke_mac,
+)
 from mesh.core.invariants import check_i4_status_events
 from mesh.core.paths import resolve_home
 from mesh.core.redact import redact, redact_value
@@ -51,10 +58,16 @@ def _json_values_equal(a: Any, b: Any) -> bool:
         return type(a) is type(b) and a == b
 
 
-def _effective_approval_policy(adict: Dict[str, Any], effective_settings: Dict[str, Any]) -> Tuple[str, str]:
-    """Effective policy at a historical seq across row category and compound gates."""
+def _effective_approval_policy(
+    adict: Dict[str, Any],
+    effective_settings: Dict[str, Any],
+    *,
+    project_plan_gate: Optional[str] = None,
+    project_perm_mode: Optional[str] = None,
+) -> Tuple[str, str]:
+    """Effective policy at a historical seq across row category, supervised step gate, and compound gates."""
     def _policy_for_cat(cat: str) -> str:
-        if cat == "config":
+        if cat in ("config", "plan_dispatch", "step_dispatch"):
             return "direct_only"
         val = effective_settings.get(f"approval.policy.{cat}")
         if isinstance(val, str) and val in ("direct_only", "direct_or_relayed", "not_required"):
@@ -64,6 +77,13 @@ def _effective_approval_policy(adict: Dict[str, Any], effective_settings: Dict[s
     categories: List[str] = [adict["category"]]
     op_type = adict.get("op_type")
     op_json = adict.get("op_json")
+    if (
+        op_type == "task.assign"
+        and project_plan_gate == "require_approval"
+        and project_perm_mode == "supervised"
+        and "step_dispatch" not in categories
+    ):
+        categories.append("step_dispatch")
     if op_type in ("task.reassign", "task.retry", "task.reject") and op_json:
         stored = _parse_json_dict(op_json)
         if stored is not None:
@@ -179,9 +199,25 @@ def handle_audit_verify(ctx: HandlerContext) -> HandlerResult:
     revoked_agent_tokens: Dict[str, bool] = {}
     created_projects: Set[str] = set()
     project_lead_at_seq: Dict[str, str] = {}
+    project_plan_gate_at_seq: Dict[str, str] = {}
+    project_perm_mode_at_seq: Dict[str, str] = {}
+    project_lead_changed_max_seq: Dict[str, int] = {}
+    project_cancelled_max_seq: Dict[str, int] = {}
+    grant_created_ev: Dict[str, Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = {}
+    grant_revoked_ev: Dict[str, Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = {}
+    grant_used_evs: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = []
     created_tasks: Set[str] = set()
     started_runs: Set[str] = set()
     latest_decided_by_apr: Dict[str, Dict[str, Any]] = {}
+    chat_events_by_seq: Dict[int, Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = {}
+    chat_edited_by_msg: Dict[str, Tuple[int, str, Optional[str]]] = {}
+    chat_cancelled_by_msg: Dict[str, Tuple[int, Optional[str], Optional[List[str]]]] = {}
+    chat_msg_decided_apr: Dict[str, str] = {}
+    plan_created_ev: Dict[str, Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = {}
+    plan_status_at_seq: Dict[str, str] = {}
+    dispatched_plan_tasks: Dict[str, Set[str]] = {}
+    task_expected_plan: Dict[str, str] = {}
+    task_expected_step: Dict[str, Tuple[str, Optional[str]]] = {}
 
     by_approval_events: Dict[str, List[Dict[str, Any]]] = {}
     consumed: Dict[str, List[Dict[str, Any]]] = {}
@@ -255,20 +291,210 @@ def handle_audit_verify(ctx: HandlerContext) -> HandlerResult:
         elif etype == "project.created" and row_dict.get("project_id"):
             pid = row_dict["project_id"]
             created_projects.add(pid)
+            if payload_obj and isinstance(payload_obj.get("plan_gate_mode"), str) and payload_obj["plan_gate_mode"] in ("off", "require_approval"):
+                project_plan_gate_at_seq[pid] = payload_obj["plan_gate_mode"]
+            else:
+                project_plan_gate_at_seq[pid] = "off"
+            if payload_obj and isinstance(payload_obj.get("permission_mode"), str) and payload_obj["permission_mode"] in PERMISSION_MODES:
+                project_perm_mode_at_seq[pid] = payload_obj["permission_mode"]
+            else:
+                project_perm_mode_at_seq[pid] = DEFAULT_PERMISSION_MODE
             if payload_obj and isinstance(payload_obj.get("lead"), str):
                 lid = agent_id_by_name.get(payload_obj["lead"])
                 if lid:
                     project_lead_at_seq[pid] = lid
+        elif etype == "project.permission_mode_changed" and row_dict.get("project_id"):
+            pid = row_dict["project_id"]
+            if row_dict.get("actor_kind") != "user" or row_dict.get("via") != "direct":
+                _flag_event(seq, f"Event {event_id} (seq {seq}) project.permission_mode_changed requires direct user")
+            elif payload_obj and isinstance(payload_obj.get("to_mode"), str) and payload_obj["to_mode"] in PERMISSION_MODES:
+                project_perm_mode_at_seq[pid] = payload_obj["to_mode"]
+            else:
+                _flag_event(seq, f"Event {event_id} (seq {seq}) project.permission_mode_changed has invalid to_mode")
+        elif etype == "policy.auto_allowed":
+            pid = row_dict.get("project_id") or (payload_obj.get("project_id") if payload_obj else None)
+            if not isinstance(pid, str) or not pid or project_perm_mode_at_seq.get(pid) != "auto":
+                _flag_event(
+                    seq,
+                    f"Event {event_id} (seq {seq}) policy.auto_allowed occurred while project '{pid}' "
+                    f"signed permission_mode was '{project_perm_mode_at_seq.get(pid)}', not 'auto'",
+                )
+        elif etype == "grant.created":
+            if row_dict.get("actor_kind") != "user" or row_dict.get("via") != "direct":
+                _flag_event(seq, f"Event {event_id} (seq {seq}) grant.created requires direct user")
+            gid = payload_obj.get("grant_id") if payload_obj else None
+            if not isinstance(gid, str) or not gid:
+                _flag_event(seq, f"Event {event_id} (seq {seq}) grant.created missing grant_id")
+            else:
+                grant_created_ev[gid] = (row_dict, payload_obj)
+        elif etype == "grant.revoked":
+            if row_dict.get("actor_kind") != "user" or row_dict.get("via") != "direct":
+                _flag_event(seq, f"Event {event_id} (seq {seq}) grant.revoked requires direct user")
+            gid = payload_obj.get("grant_id") if payload_obj else None
+            if not isinstance(gid, str) or not gid:
+                _flag_event(seq, f"Event {event_id} (seq {seq}) grant.revoked missing grant_id")
+            else:
+                grant_revoked_ev[gid] = (row_dict, payload_obj)
+        elif etype == "grant.used":
+            grant_used_evs.append((row_dict, payload_obj))
         elif etype == "project.lead_changed" and row_dict.get("project_id"):
             pid = row_dict["project_id"]
+            project_lead_changed_max_seq[pid] = seq
             if payload_obj and isinstance(payload_obj.get("new_lead"), str):
                 lid = agent_id_by_name.get(payload_obj["new_lead"])
                 if lid:
                     project_lead_at_seq[pid] = lid
+        elif etype == "project.cancelled" and row_dict.get("project_id"):
+            project_cancelled_max_seq[row_dict["project_id"]] = seq
         elif etype in ("task.created", "task.assigned") and row_dict.get("task_id") and row_dict.get("from_state") is None:
             created_tasks.add(row_dict["task_id"])
+            t_plan_id = payload_obj.get("plan_id") if payload_obj else None
+            if isinstance(t_plan_id, str) and t_plan_id:
+                task_expected_step[row_dict["task_id"]] = (
+                    t_plan_id,
+                    payload_obj.get("plan_step_key"),
+                )
+            elif row_dict.get("actor_kind") != "user":
+                pid_t = row_dict.get("project_id")
+                if (
+                    isinstance(pid_t, str)
+                    and project_plan_gate_at_seq.get(pid_t) == "require_approval"
+                    and project_perm_mode_at_seq.get(pid_t, DEFAULT_PERMISSION_MODE) in ("supervised", "plan")
+                ):
+                    _flag_event(
+                        seq,
+                        f"Event {event_id} (seq {seq}) non-user {etype} without plan_id occurred while project '{pid_t}' "
+                        f"was plan-locked (plan_gate_mode='require_approval', permission_mode='{project_perm_mode_at_seq.get(pid_t, DEFAULT_PERMISSION_MODE)}')",
+                    )
         elif etype in ("task.started", "lead.turn_started", "task.merging") and row_dict.get("run_id"):
             started_runs.add(row_dict["run_id"])
+        elif etype == "chat.message":
+            chat_events_by_seq[seq] = (row_dict, payload_obj)
+        elif etype == "chat.edited":
+            if row_dict.get("actor_kind") != "user" or row_dict.get("via") != "direct":
+                _flag_event(seq, f"Event {event_id} (seq {seq}) chat.edited requires direct user")
+            elif (
+                payload_obj
+                and isinstance(payload_obj.get("message_id"), str)
+                and payload_obj["message_id"]
+                and isinstance(payload_obj.get("body"), str)
+            ):
+                chat_edited_by_msg[payload_obj["message_id"]] = (
+                    seq,
+                    payload_obj["body"],
+                    row_dict.get("project_id"),
+                )
+            else:
+                _flag_event(seq, f"Event {event_id} (seq {seq}) chat.edited has invalid payload")
+        elif etype == "chat.cancelled":
+            if row_dict.get("actor_kind") != "user" or row_dict.get("via") != "direct":
+                _flag_event(seq, f"Event {event_id} (seq {seq}) chat.cancelled requires direct user")
+            elif payload_obj and isinstance(payload_obj.get("message_id"), str) and payload_obj["message_id"]:
+                cmid = payload_obj["message_id"]
+                raw_oids = payload_obj.get("outbox_ids")
+                if raw_oids is not None and (
+                    not isinstance(raw_oids, list) or not all(isinstance(x, str) and x for x in raw_oids)
+                ):
+                    _flag_event(seq, f"Event {event_id} (seq {seq}) chat.cancelled has invalid outbox_ids")
+                elif cmid in chat_cancelled_by_msg:
+                    _flag_event(seq, f"Event {event_id} (seq {seq}) duplicate chat.cancelled for message '{cmid}'")
+                else:
+                    chat_cancelled_by_msg[cmid] = (seq, row_dict.get("project_id"), raw_oids)
+            else:
+                _flag_event(seq, f"Event {event_id} (seq {seq}) chat.cancelled has invalid payload")
+        elif etype == "lead.interrupted":
+            if row_dict.get("actor_kind") != "user" or row_dict.get("via") != "direct":
+                _flag_event(seq, f"Event {event_id} (seq {seq}) {etype} requires direct user")
+        elif etype in ("plan.proposed", "plan.revised") and payload_obj:
+            pl_id = payload_obj.get("plan_id")
+            if isinstance(pl_id, str) and pl_id:
+                plan_created_ev[pl_id] = (row_dict, payload_obj)
+                plan_status_at_seq[pl_id] = str(payload_obj.get("status") or "proposed")
+            pid_p = row_dict.get("project_id") or payload_obj.get("project_id")
+            if (payload_obj.get("auto_approved") is True or not payload_obj.get("approval_id")) and (
+                not isinstance(pid_p, str) or project_perm_mode_at_seq.get(pid_p) != "auto"
+            ):
+                _flag_event(
+                    seq,
+                    f"Event {event_id} (seq {seq}) auto-approved {etype} occurred while project '{pid_p}' "
+                    f"signed permission_mode was '{project_perm_mode_at_seq.get(pid_p)}', not 'auto'",
+                )
+            sup_ids = payload_obj.get("supersedes_plan_ids")
+            if isinstance(sup_ids, list):
+                for sid in sup_ids:
+                    if isinstance(sid, str) and sid:
+                        plan_status_at_seq[sid] = "superseded"
+        elif etype == "plan.approved" and payload_obj:
+            pl_id = payload_obj.get("plan_id")
+            if isinstance(pl_id, str) and pl_id:
+                plan_status_at_seq[pl_id] = str(payload_obj.get("to_status") or "approved_pending_dispatch")
+        elif etype == "plan.rejected" and payload_obj:
+            pl_id = payload_obj.get("plan_id")
+            if isinstance(pl_id, str) and pl_id:
+                plan_status_at_seq[pl_id] = str(payload_obj.get("to_status") or "rejected")
+        elif etype == "plan.cancelled" and payload_obj:
+            pl_id = payload_obj.get("plan_id")
+            if isinstance(pl_id, str) and pl_id:
+                plan_status_at_seq[pl_id] = str(payload_obj.get("to_status") or "cancelled")
+        elif etype == "plan.interpretation_noted" and payload_obj:
+            pl_id = payload_obj.get("plan_id")
+            if isinstance(pl_id, str) and pl_id and isinstance(payload_obj.get("status"), str):
+                plan_status_at_seq[pl_id] = payload_obj["status"]
+        elif etype == "plan.dispatched":
+            if payload_obj is None:
+                _flag_event(seq, f"Event {event_id} (seq {seq}) plan.dispatched has invalid payload")
+            else:
+                pl_id = payload_obj.get("plan_id")
+                if isinstance(pl_id, str) and pl_id:
+                    plan_status_at_seq[pl_id] = "dispatched"
+                    tids = payload_obj.get("task_ids")
+                    if isinstance(tids, list):
+                        tset = dispatched_plan_tasks.setdefault(pl_id, set())
+                        for tid in tids:
+                            if isinstance(tid, str) and tid:
+                                tset.add(tid)
+                                task_expected_plan[tid] = pl_id
+                pid_d = row_dict.get("project_id") or payload_obj.get("project_id")
+                auto_disp = bool(payload_obj.get("auto_dispatched"))
+                disp_aid = row_dict.get("approval_id") or payload_obj.get("approval_id")
+                if auto_disp or not isinstance(disp_aid, str) or not disp_aid:
+                    if not isinstance(pid_d, str) or project_perm_mode_at_seq.get(pid_d) != "auto":
+                        _flag_event(
+                            seq,
+                            f"Event {event_id} (seq {seq}) auto plan.dispatched occurred while project '{pid_d}' "
+                            f"signed permission_mode was '{project_perm_mode_at_seq.get(pid_d)}', not 'auto'",
+                        )
+                else:
+                    adict_d = apr_by_id.get(disp_aid)
+                    dec_d = latest_decided_by_apr.get(disp_aid)
+                    dec_d_pay = _parse_json_dict(dec_d.get("payload_json")) if dec_d else None
+                    cons_d = consumed.get(disp_aid, [])
+                    if adict_d is None or adict_d.get("category") != "plan_dispatch" or adict_d.get("op_type") != "plan.dispatch":
+                        _flag_event(
+                            seq,
+                            f"Event {event_id} (seq {seq}) plan.dispatched references invalid non-plan_dispatch approval '{disp_aid}'",
+                        )
+                    elif adict_d.get("project_id") != pid_d:
+                        _flag_event(
+                            seq,
+                            f"Event {event_id} (seq {seq}) plan.dispatched approval '{disp_aid}' project_id mismatch",
+                        )
+                    elif (
+                        dec_d is None
+                        or dec_d.get("via") != "direct"
+                        or dec_d.get("actor_kind") != "user"
+                        or not dec_d_pay
+                        or dec_d_pay.get("decision") != "approved"
+                    ):
+                        _flag_event(
+                            seq,
+                            f"Event {event_id} (seq {seq}) plan.dispatched approval '{disp_aid}' was not direct-user approved prior to dispatch",
+                        )
+                    elif not cons_d:
+                        _flag_event(
+                            seq,
+                            f"Event {event_id} (seq {seq}) plan.dispatched approval '{disp_aid}' was not consumed prior to dispatch",
+                        )
 
         aid_ev = row_dict.get("approval_id")
         if aid_ev:
@@ -281,6 +507,17 @@ def handle_audit_verify(ctx: HandlerContext) -> HandlerResult:
 
             if etype == "approval.decided":
                 latest_decided_by_apr[aid_ev] = row_dict
+                if payload_obj and isinstance(payload_obj.get("chat_message_id"), str) and payload_obj["chat_message_id"]:
+                    cmid = payload_obj["chat_message_id"]
+                    prev_aid = chat_msg_decided_apr.get(cmid)
+                    if prev_aid is not None and prev_aid != aid_ev:
+                        _flag_approval(
+                            aid_ev,
+                            f"Approval {aid_ev}: chat_message_id '{cmid}' reused across approvals '{prev_aid}' and '{aid_ev}'",
+                            seq,
+                        )
+                    else:
+                        chat_msg_decided_apr[cmid] = aid_ev
                 adict_ev = apr_by_id.get(aid_ev)
                 ev_via = row_dict.get("via")
                 ev_actor = row_dict.get("actor_id")
@@ -293,7 +530,13 @@ def handle_audit_verify(ctx: HandlerContext) -> HandlerResult:
                         seq,
                     )
                 elif adict_ev is not None and ev_via in ("relayed", "delegated"):
-                    blocking_cat, eff_policy = _effective_approval_policy(adict_ev, effective_settings)
+                    pid_pol = adict_ev.get("project_id")
+                    blocking_cat, eff_policy = _effective_approval_policy(
+                        adict_ev,
+                        effective_settings,
+                        project_plan_gate=project_plan_gate_at_seq.get(pid_pol) if pid_pol else None,
+                        project_perm_mode=project_perm_mode_at_seq.get(pid_pol) if pid_pol else None,
+                    )
                     if eff_policy == "direct_only":
                         _flag_approval(
                             aid_ev,
@@ -355,7 +598,13 @@ def handle_audit_verify(ctx: HandlerContext) -> HandlerResult:
                         "workspace.prune",
                         "project.deliver",
                     ):
-                        blocking_cat, eff_policy = _effective_approval_policy(adict_ev, effective_settings)
+                        pid_pol = adict_ev.get("project_id")
+                        blocking_cat, eff_policy = _effective_approval_policy(
+                            adict_ev,
+                            effective_settings,
+                            project_plan_gate=project_plan_gate_at_seq.get(pid_pol) if pid_pol else None,
+                            project_perm_mode=project_perm_mode_at_seq.get(pid_pol) if pid_pol else None,
+                        )
                         if eff_policy == "direct_only":
                             _flag_approval(
                                 aid_ev,
@@ -665,9 +914,32 @@ def handle_audit_verify(ctx: HandlerContext) -> HandlerResult:
                 if not isinstance(rid, str) or not rid or rid not in started_runs:
                     _flag_state(f"credential:{cid}", f"Run token '{cid}' has no matching task.started or lead.turn_started event")
 
-        for prow in ctx.conn.execute("SELECT id FROM projects ORDER BY id ASC;").fetchall():
+        pcols = {r["name"] for r in ctx.conn.execute("PRAGMA table_info(projects);").fetchall()}
+        proj_select = ["id"]
+        if "plan_gate_mode" in pcols:
+            proj_select.append("plan_gate_mode")
+        if "permission_mode" in pcols:
+            proj_select.append("permission_mode")
+        for prow in ctx.conn.execute(f"SELECT {', '.join(proj_select)} FROM projects ORDER BY id ASC;").fetchall():
             if prow["id"] not in created_projects:
                 _flag_state(f"project:{prow['id']}", f"Project '{prow['id']}' has no project.created event")
+            else:
+                if "plan_gate_mode" in pcols:
+                    exp_pgm = project_plan_gate_at_seq.get(prow["id"], "off")
+                    actual_pgm = prow["plan_gate_mode"] or "off"
+                    if actual_pgm != exp_pgm:
+                        _flag_state(
+                            f"project_plan_gate:{prow['id']}",
+                            f"Project '{prow['id']}' plan_gate_mode '{actual_pgm}' differs from event history '{exp_pgm}'",
+                        )
+                if "permission_mode" in pcols:
+                    exp_pmode = project_perm_mode_at_seq.get(prow["id"], DEFAULT_PERMISSION_MODE)
+                    actual_pmode = prow["permission_mode"] or DEFAULT_PERMISSION_MODE
+                    if actual_pmode != exp_pmode:
+                        _flag_state(
+                            f"project_mode:{prow['id']}",
+                            f"Project '{prow['id']}' permission_mode '{actual_pmode}' differs from event history '{exp_pmode}'",
+                        )
 
         for trow in ctx.conn.execute("SELECT id FROM tasks ORDER BY id ASC;").fetchall():
             if trow["id"] not in created_tasks:
@@ -680,6 +952,331 @@ def handle_audit_verify(ctx: HandlerContext) -> HandlerResult:
         for viol in check_i4_status_events(ctx.conn):
             subj = viol.details.get("project_id") or viol.details.get("task_id") or "i4"
             _flag_state(f"i4:{subj}", viol.message)
+
+    # 2d. Verify Chat-First v2 tables (`chat_messages`, `plans`, and `tasks.plan_id`/`plan_step_key`) (P2-4)
+    has_chat_tbl = ctx.conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chat_messages';"
+    ).fetchone() is not None
+    if has_chat_tbl:
+        chat_rows = ctx.conn.execute("SELECT * FROM chat_messages ORDER BY event_seq ASC;").fetchall()
+        outbox_chat_rows = ctx.conn.execute(
+            "SELECT id, project_id, event_seq, channel, status, last_error FROM outbox "
+            "WHERE channel IN ('lead_wake', 'inbox');"
+        ).fetchall()
+        outbox_by_key: Dict[Tuple[Optional[str], int], List[Dict[str, Any]]] = {}
+        outbox_by_id: Dict[str, Dict[str, Any]] = {}
+        for ob_row in outbox_chat_rows:
+            ob_d = dict(ob_row)
+            outbox_by_id[ob_d["id"]] = ob_d
+            outbox_by_key.setdefault((ob_d["project_id"], ob_d["event_seq"]), []).append(ob_d)
+
+        seen_chat_seqs: Set[int] = set()
+        seen_chat_ids: Set[str] = set()
+        for crow in chat_rows:
+            cid = crow["id"]
+            cseq = crow["event_seq"]
+            seen_chat_seqs.add(cseq)
+            seen_chat_ids.add(cid)
+            ev_pair = chat_events_by_seq.get(cseq)
+            if ev_pair is None:
+                _flag_state(f"chat:{cid}", f"Chat message '{cid}' (event_seq {cseq}) has no matching chat.message event")
+                continue
+            cev, cpay = ev_pair
+            if cpay is None:
+                _flag_state(f"chat:{cid}", f"Chat message '{cid}' chat.message event at seq {cseq} has invalid payload")
+                continue
+            if cpay.get("message_id") != cid:
+                _flag_state(f"chat:{cid}", f"Chat message '{cid}' id differs from chat.message event '{cpay.get('message_id')}'")
+            if cpay.get("role") != crow["role"]:
+                _flag_state(f"chat:{cid}", f"Chat message '{cid}' role '{crow['role']}' differs from event '{cpay.get('role')}'")
+            if cpay.get("kind") != crow["kind"]:
+                _flag_state(f"chat:{cid}", f"Chat message '{cid}' kind '{crow['kind']}' differs from event '{cpay.get('kind')}'")
+            if cev.get("via") != crow["via"]:
+                _flag_state(f"chat:{cid}", f"Chat message '{cid}' via '{crow['via']}' differs from event '{cev.get('via')}'")
+            if cev.get("actor_id") != crow["actor_id"] or cev.get("actor_kind") != crow["actor_kind"]:
+                _flag_state(f"chat:{cid}", f"Chat message '{cid}' actor differs from chat.message event")
+            if cev.get("project_id") != crow["project_id"]:
+                _flag_state(f"chat:{cid}", f"Chat message '{cid}' project_id '{crow['project_id']}' differs from event '{cev.get('project_id')}'")
+            is_mutable_user_text = (
+                crow["role"] == "user"
+                and crow["kind"] == "text"
+                and crow["via"] == "direct"
+                and not crow["approval_id"]
+                and not crow["plan_id"]
+                and not crow["task_id"]
+                and not crow["consumed_by_approval_id"]
+            )
+            expected_body = cpay.get("body")
+            edit_info = chat_edited_by_msg.get(cid)
+            if edit_info is not None:
+                edit_seq, edit_body, edit_pid = edit_info
+                if not is_mutable_user_text or edit_seq <= cseq or edit_pid != crow["project_id"]:
+                    _flag_state(
+                        f"chat:{cid}",
+                        f"Chat message '{cid}' cannot be modified by chat.edited event (ineligible or out-of-order)",
+                    )
+                else:
+                    expected_body = edit_body
+            if expected_body != crow["body"]:
+                _flag_state(f"chat:{cid}", f"Chat message '{cid}' body differs from chat.message event (tampered)")
+
+            cmeta = _parse_json_dict(crow["meta_json"]) or {}
+            is_queued_cancelled = bool(cmeta.get("queued_cancelled"))
+            cancel_info = chat_cancelled_by_msg.get(cid)
+            msg_outbox = outbox_by_key.get((crow["project_id"], cseq), [])
+            if cancel_info is not None:
+                cancel_seq, cancel_pid, cancel_ob_ids = cancel_info
+                if not is_mutable_user_text or cancel_seq <= cseq or cancel_pid != crow["project_id"]:
+                    _flag_state(
+                        f"chat:{cid}",
+                        f"Chat message '{cid}' cannot be cancelled by chat.cancelled event (ineligible or out-of-order)",
+                    )
+                if edit_info is not None and edit_info[0] >= cancel_seq:
+                    _flag_state(
+                        f"chat:{cid}",
+                        f"Chat message '{cid}' has chat.edited event at seq {edit_info[0]} after chat.cancelled at seq {cancel_seq}",
+                    )
+                if not is_queued_cancelled:
+                    _flag_state(
+                        f"chat:{cid}",
+                        f"Chat message '{cid}' has chat.cancelled event but meta_json.queued_cancelled is not true",
+                    )
+                for ob in msg_outbox:
+                    if ob["status"] != "superseded":
+                        _flag_state(
+                            f"chat:{cid}",
+                            f"Chat message '{cid}' has chat.cancelled event but outbox row '{ob['id']}' has status '{ob['status']}'",
+                        )
+                if cancel_ob_ids is not None:
+                    for oid in cancel_ob_ids:
+                        ob = outbox_by_id.get(oid)
+                        if ob is None or ob["project_id"] != crow["project_id"] or ob["event_seq"] != cseq:
+                            _flag_state(
+                                f"chat:{cid}",
+                                f"Chat message '{cid}' chat.cancelled references missing or mismatched outbox row '{oid}'",
+                            )
+                        elif ob["status"] != "superseded":
+                            _flag_state(
+                                f"chat:{cid}",
+                                f"Chat message '{cid}' chat.cancelled outbox row '{oid}' is '{ob['status']}', expected 'superseded'",
+                            )
+            else:
+                if is_queued_cancelled:
+                    _flag_state(
+                        f"chat:{cid}",
+                        f"Chat message '{cid}' has meta_json.queued_cancelled=true without a chat.cancelled event",
+                    )
+                lead_changed_after = project_lead_changed_max_seq.get(crow["project_id"], -1) > cseq
+                proj_cancelled_after = project_cancelled_max_seq.get(crow["project_id"], -1) > cseq
+                for ob in msg_outbox:
+                    if ob["status"] == "superseded":
+                        allowed_by_proj = lead_changed_after or (ob["channel"] == "lead_wake" and proj_cancelled_after)
+                        if ob.get("last_error") == "cancelled_by_user" or not allowed_by_proj:
+                            _flag_state(
+                                f"chat:{cid}",
+                                f"Outbox row '{ob['id']}' for chat message '{cid}' is 'superseded' without a matching chat.cancelled event",
+                            )
+
+            exp_consumed_apr = chat_msg_decided_apr.get(cid)
+            if crow["consumed_by_approval_id"] != exp_consumed_apr:
+                _flag_state(
+                    f"chat:{cid}",
+                    f"Chat message '{cid}' consumed_by_approval_id ({crow['consumed_by_approval_id']!r}) "
+                    f"differs from approval.decided event history ({exp_consumed_apr!r})",
+                )
+        for cseq, (_, cpay) in sorted(chat_events_by_seq.items()):
+            if cseq not in seen_chat_seqs:
+                mid = (cpay or {}).get("message_id") or f"seq_{cseq}"
+                _flag_state(f"chat:{mid}", f"chat.message event at seq {cseq} ('{mid}') is missing from chat_messages table")
+        for mid, (eseq, _, _) in sorted(chat_edited_by_msg.items()):
+            if mid not in seen_chat_ids:
+                _flag_state(f"chat:{mid}", f"chat.edited event at seq {eseq} references nonexistent chat message '{mid}'")
+        for mid, (c_seq, _, _) in sorted(chat_cancelled_by_msg.items()):
+            if mid not in seen_chat_ids:
+                _flag_state(f"chat:{mid}", f"chat.cancelled event at seq {c_seq} references nonexistent chat message '{mid}'")
+
+    has_plans_tbl = ctx.conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'plans';"
+    ).fetchone() is not None
+    if has_plans_tbl:
+        plan_rows = ctx.conn.execute("SELECT * FROM plans ORDER BY id ASC;").fetchall()
+        seen_plan_ids: Set[str] = set()
+        for plrow in plan_rows:
+            plid = plrow["id"]
+            seen_plan_ids.add(plid)
+            ev_pair = plan_created_ev.get(plid)
+            if ev_pair is None:
+                _flag_state(f"plan:{plid}", f"Plan '{plid}' has no plan.proposed/plan.revised event")
+            else:
+                pev, ppay = ev_pair
+                if ppay is None:
+                    _flag_state(f"plan:{plid}", f"Plan '{plid}' creation event has invalid payload")
+                else:
+                    if ppay.get("plan_hash") != plrow["plan_hash"]:
+                        _flag_state(
+                            f"plan:{plid}",
+                            f"Plan '{plid}' plan_hash '{plrow['plan_hash']}' differs from creation event '{ppay.get('plan_hash')}'",
+                        )
+                    if pev.get("project_id") != plrow["project_id"] or ppay.get("version") != plrow["version"]:
+                        _flag_state(f"plan:{plid}", f"Plan '{plid}' project_id/version differs from creation event")
+                    if ppay.get("approval_id") != plrow["approval_id"]:
+                        _flag_state(f"plan:{plid}", f"Plan '{plid}' approval_id differs from creation event")
+            # Recompute canonical plan hash from stored (title, summary, steps_json)
+            try:
+                stored_steps = json.loads(plrow["steps_json"] or "[]")
+                if not isinstance(stored_steps, list):
+                    raise ValueError("steps_json is not a list")
+                recomputed_plan_hash = "sha256:" + hash_canonical({
+                    "v": 1,
+                    "title": plrow["title"],
+                    "summary": plrow["summary"],
+                    "steps": stored_steps,
+                })
+                if recomputed_plan_hash != plrow["plan_hash"]:
+                    _flag_state(
+                        f"plan:{plid}",
+                        f"Plan '{plid}' recomputed plan_hash '{recomputed_plan_hash}' differs from stored '{plrow['plan_hash']}' (tampered)",
+                    )
+            except Exception as exc:
+                _flag_state(f"plan:{plid}", f"Plan '{plid}' steps_json invalid or unhashable: {exc}")
+            exp_status = plan_status_at_seq.get(plid)
+            if exp_status is not None and plrow["status"] != exp_status:
+                _flag_state(
+                    f"plan:{plid}",
+                    f"Plan '{plid}' status '{plrow['status']}' differs from last plan.* event state '{exp_status}'",
+                )
+        for plid in sorted(set(plan_created_ev.keys()) - seen_plan_ids):
+            _flag_state(f"plan:{plid}", f"Plan '{plid}' referenced in plan.* events is missing from plans table")
+
+        # Cross-check tasks.plan_id / tasks.plan_step_key against plan.dispatched.task_ids and task creation events
+        tcols = {r["name"] for r in ctx.conn.execute("PRAGMA table_info(tasks);").fetchall()}
+        if "plan_id" in tcols and "plan_step_key" in tcols:
+            t_rows = ctx.conn.execute("SELECT id, plan_id, plan_step_key FROM tasks ORDER BY id ASC;").fetchall()
+            tasks_by_id_plan = {r["id"]: (r["plan_id"], r["plan_step_key"]) for r in t_rows}
+            for tid, (t_plid, t_skey) in tasks_by_id_plan.items():
+                exp_plid = task_expected_plan.get(tid)
+                if t_plid != exp_plid:
+                    _flag_state(
+                        f"task_plan:{tid}",
+                        f"Task '{tid}' plan_id ({t_plid!r}) differs from plan.dispatched event history ({exp_plid!r})",
+                    )
+                if tid in task_expected_step:
+                    exp_pair = task_expected_step[tid]
+                    if (t_plid, t_skey) != exp_pair:
+                        _flag_state(
+                            f"task_plan:{tid}",
+                            f"Task '{tid}' (plan_id, plan_step_key)={(t_plid, t_skey)!r} differs from task creation event {exp_pair!r}",
+                        )
+            for plid, tids in sorted(dispatched_plan_tasks.items()):
+                for tid in sorted(tids):
+                    if tid not in tasks_by_id_plan or tasks_by_id_plan[tid][0] != plid:
+                        _flag_state(
+                            f"plan_tasks:{plid}:{tid}",
+                            f"Task '{tid}' listed in plan.dispatched for '{plid}' is missing or has mismatched plan_id",
+                        )
+
+    # 2e. Verify standing_grants table, user_mac signatures, and grant.used history
+    has_grants_tbl = ctx.conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'standing_grants';"
+    ).fetchone() is not None
+    if has_grants_tbl:
+        grant_rows = ctx.conn.execute("SELECT * FROM standing_grants ORDER BY id ASC;").fetchall()
+        grants_by_id: Dict[str, Dict[str, Any]] = {}
+        for grow in grant_rows:
+            gdict = dict(grow)
+            gid = gdict["id"]
+            grants_by_id[gid] = gdict
+            # Scope key integrity
+            try:
+                exp_scope_key = build_grant_scope_key(
+                    gdict["category"],
+                    gdict["project_id"],
+                    scope_agent_id=gdict["scope_agent_id"],
+                    scope_profile=gdict["scope_profile"],
+                    scope_config_key=gdict["scope_config_key"],
+                )
+            except Exception as exc:
+                exp_scope_key = None
+                _flag_state(f"grant:{gid}", f"Standing grant '{gid}' has invalid scope fields: {exc}")
+            if exp_scope_key is not None and gdict["scope_key"] != exp_scope_key:
+                _flag_state(
+                    f"grant:{gid}",
+                    f"Standing grant '{gid}' scope_key '{gdict['scope_key']}' differs from recomputed '{exp_scope_key}' (tampered)",
+                )
+            # Creation MAC & event chain match
+            if gdict["created_via"] != "direct" or not gdict["user_mac"]:
+                _flag_state(f"grant:{gid}", f"Standing grant '{gid}' missing direct created_via or user_mac")
+            else:
+                exp_gmac = compute_user_grant_mac(
+                    ctx.k_user,
+                    gid,
+                    gdict["project_id"],
+                    gdict["category"],
+                    gdict["scope_key"],
+                    gdict["source_approval_id"],
+                    gdict["created_at"],
+                )
+                if gdict["user_mac"] != exp_gmac:
+                    _flag_state(f"grant:{gid}", f"Standing grant '{gid}' user_mac signature mismatch")
+            cev_pair = grant_created_ev.get(gid)
+            if cev_pair is None:
+                _flag_state(f"grant:{gid}", f"Standing grant '{gid}' has no grant.created event")
+            else:
+                cev, cpay = cev_pair
+                if cpay is None or (
+                    cpay.get("project_id") != gdict["project_id"]
+                    or cpay.get("category") != gdict["category"]
+                    or cpay.get("scope_agent_id") != gdict["scope_agent_id"]
+                    or cpay.get("scope_profile") != gdict["scope_profile"]
+                    or cpay.get("scope_config_key") != gdict["scope_config_key"]
+                    or cpay.get("scope_key") != gdict["scope_key"]
+                    or cpay.get("source_approval_id") != gdict["source_approval_id"]
+                    or cev.get("actor_id") != gdict["created_by"]
+                ):
+                    _flag_state(f"grant:{gid}", f"Standing grant '{gid}' differs from its grant.created event (tampered)")
+            # Revocation MAC & event chain match
+            rev_pair = grant_revoked_ev.get(gid)
+            if gdict["revoked_at"] is not None:
+                if rev_pair is None:
+                    _flag_state(f"grant:{gid}", f"Revoked standing grant '{gid}' has no grant.revoked event")
+                else:
+                    rev_ev, rev_pay = rev_pair
+                    if rev_pay is None or rev_pay.get("revoked_at") != gdict["revoked_at"] or rev_ev.get("actor_id") != gdict["revoked_by"]:
+                        _flag_state(f"grant:{gid}", f"Standing grant '{gid}' revocation differs from grant.revoked event")
+                if not gdict["revoked_user_mac"]:
+                    _flag_state(f"grant:{gid}", f"Revoked standing grant '{gid}' is missing revoked_user_mac")
+                else:
+                    exp_rmac = compute_user_grant_revoke_mac(ctx.k_user, gid, gdict["revoked_at"])
+                    if gdict["revoked_user_mac"] != exp_rmac:
+                        _flag_state(f"grant:{gid}", f"Standing grant '{gid}' revoked_user_mac signature mismatch")
+            elif rev_pair is not None:
+                _flag_state(f"grant:{gid}", f"Standing grant '{gid}' has a grant.revoked event but is still active in standing_grants")
+
+        for gid in sorted(set(grant_created_ev.keys()) - set(grants_by_id.keys())):
+            _flag_state(f"grant:{gid}", f"Standing grant '{gid}' from grant.created event is missing from standing_grants table")
+
+        for uev, upay in grant_used_evs:
+            useq = uev["seq"]
+            if upay is None or not isinstance(upay.get("grant_id"), str):
+                _flag_event(useq, f"Event {uev['id']} (seq {useq}) grant.used has invalid payload")
+                continue
+            ugid = upay["grant_id"]
+            gdict = grants_by_id.get(ugid)
+            cev_pair = grant_created_ev.get(ugid)
+            if gdict is None or cev_pair is None:
+                _flag_event(useq, f"Event {uev['id']} (seq {useq}) grant.used references unknown grant '{ugid}'")
+                continue
+            if useq <= cev_pair[0]["seq"]:
+                _flag_event(useq, f"Event {uev['id']} (seq {useq}) grant.used predates grant.created for '{ugid}'")
+            rev_pair = grant_revoked_ev.get(ugid)
+            if rev_pair is not None and useq >= rev_pair[0]["seq"]:
+                _flag_event(useq, f"Event {uev['id']} (seq {useq}) grant.used occurred after grant.revoked for '{ugid}'")
+            if (
+                upay.get("category") != gdict["category"]
+                or upay.get("scope_key") != gdict["scope_key"]
+                or upay.get("project_id") != gdict["project_id"]
+            ):
+                _flag_event(useq, f"Event {uev['id']} (seq {useq}) grant.used scope does not match grant '{ugid}'")
 
     relayed_summary = [
         {"relayed_by": r_by, "credential_id": c_id, "count": count}

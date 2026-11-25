@@ -145,7 +145,7 @@ class TestAuth(unittest.TestCase):
         mock_reader = MagicMock()
 
         # Mock get_peer_credentials to return a different UID than current process
-        diff_uid = os.getuid() + 999
+        diff_uid = (os.getuid() if hasattr(os, "getuid") else 0) + 999
         with patch("mesh.daemon.server.get_peer_credentials", return_value=(12345, diff_uid, diff_uid)):
             import asyncio
             asyncio.run(server.handle_client(mock_reader, mock_writer))

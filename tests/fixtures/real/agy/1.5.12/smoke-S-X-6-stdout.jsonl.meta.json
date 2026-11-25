@@ -1,0 +1,17 @@
+{
+  "captured_at_utc": "2026-11-19T14:09:11Z",
+  "command": [
+    "agy",
+    "--print",
+    "Count from 1 to 2000, one number per line, with no other text.",
+    "--output-format",
+    "stream-json",
+    "--model",
+    "gemini-3.8-flash-low",
+    "--mode",
+    "plan",
+    "--print-timeout",
+    "180s"
+  ],
+  "sha256": "53ebbdf3403de44dbc4ac1c7279c05bab43f20d51211e90cddd800cc61b25dbf"
+}

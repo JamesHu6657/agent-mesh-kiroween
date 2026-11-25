@@ -11,7 +11,7 @@ import mesh.constants as c
 from tests.helpers import MeshHarness
 from tests.integration.test_execution_launch_fences import get_proc_environ, run_cli_as
 from tests.integration.test_tasks import create_agent
-from tests.stubs import create_test_stubs
+from tests.stubs import create_test_stubs, stub_path
 
 
 class TestBatch7G1(unittest.TestCase):
@@ -35,7 +35,7 @@ class TestBatch7G1(unittest.TestCase):
                 "task", "create",
                 "--project", prj_id,
                 "--title", "Launch fail user",
-                "--spec", f'FAKE {{"wait_release": {{"path": "{gate}"}}}}',
+                "--spec", 'FAKE ' + json.dumps({"wait_release": {"path": gate}}),
                 "--assignee", "fx",
                 token=tok_lead,
             )
@@ -446,7 +446,7 @@ class TestBatch7G1(unittest.TestCase):
         off_path_dir = tempfile.mkdtemp(prefix="mh-b7-offpath-")
         self.addCleanup(shutil.rmtree, off_path_dir, True)
         create_test_stubs(off_path_dir)
-        droid_bin = os.path.join(off_path_dir, "droid")
+        droid_bin = stub_path(off_path_dir, "droid")
 
         # Empty PATH dir so default `droid` is NOT on PATH
         empty_stubs = tempfile.mkdtemp(prefix="mh-b7-empty-")
@@ -458,7 +458,7 @@ class TestBatch7G1(unittest.TestCase):
             env = h.get_env()
             clean_parts = [
                 p for p in env.get("PATH", "").split(os.pathsep)
-                if p and not os.path.exists(os.path.join(p, "droid"))
+                if p and not os.path.exists(stub_path(p, "droid")) and not os.path.exists(os.path.join(p, "droid"))
             ]
             h.start_daemon(extra_env={"PATH": os.pathsep.join(clean_parts)})
 

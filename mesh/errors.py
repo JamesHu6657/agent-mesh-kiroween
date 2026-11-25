@@ -14,6 +14,7 @@ class MeshError(Exception):
         message: str = "",
         details: Optional[Dict[str, Any]] = None,
         data: Optional[Dict[str, Any]] = None,
+        commit_tx: bool = False,
     ):
         super().__init__(message)
         self.code = code
@@ -21,6 +22,7 @@ class MeshError(Exception):
         self.message = message
         self.details = details if details is not None else {}
         self.data = data
+        self.commit_tx = bool(commit_tx)
 
     def to_dict(self) -> Dict[str, Any]:
         from mesh.core.redact import redact, redact_value

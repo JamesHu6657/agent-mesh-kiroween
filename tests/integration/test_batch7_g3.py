@@ -5,6 +5,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -15,7 +16,8 @@ import mesh.constants as c
 from mesh.core.auth import generate_run_token
 from mesh.core.clock import now_iso_utc
 from mesh.core.ids import new_id
-from tests.helpers import MeshHarness
+from mesh.platform import ipc as plat_ipc, perms as plat_perms, pipe_pump
+from tests.helpers import MeshHarness, cli_popen_argv
 from tests.integration.test_lead_actions import _fake_goal
 from tests.integration.test_lead_turns import LeadTurnCase, create_agent
 from tests.stubs import create_test_stubs
@@ -129,17 +131,20 @@ class TestBatch7G3DaemonFlows(unittest.TestCase):
         os.makedirs(os.path.dirname(ws_tok), mode=0o700, exist_ok=True)
         with open(ws_tok, "w", encoding="utf-8") as f:
             f.write(tok_w + "\n")
-        os.chmod(ws_tok, 0o600)
+        plat_perms.set_private_file_acl(ws_tok)
 
         fake_user_home = os.path.join(self.h.fixtures_dir, "empty_user_home")
         os.makedirs(fake_user_home, mode=0o700, exist_ok=True)
+        plat_perms.set_private_dir_acl(fake_user_home)
         env = self.h.get_env()
         env.pop("MESH_HOME", None)
         env["HOME"] = fake_user_home
-        env["MESH_SOCKET"] = os.path.join(self.h.home, "run", "mesh.sock")
+        env["USERPROFILE"] = fake_user_home
+        env["MESH_SOCKET"] = plat_ipc.daemon_endpoint_path(self.h.home)
 
+        cmd = pipe_pump.prepare_win_cmd_args([self.h.bin_mesh, "--token-file", ws_tok, "whoami"], env=env)
         proc = subprocess.run(
-            [self.h.bin_mesh, "--token-file", ws_tok, "whoami"],
+            cmd,
             env=env,
             capture_output=True,
             text=True,
@@ -151,14 +156,13 @@ class TestBatch7G3DaemonFlows(unittest.TestCase):
 
     def test_f6_f7_auth_failed_wakes_tail_and_superseded_inbox_wait(self) -> None:
         # 1. auth.failed wakes a streaming event tail before timeout.
+        cmd_tail, env_tail = cli_popen_argv(
+            self.h, "--user", "--passphrase-file", self.h.passphrase_file,
+            "event", "tail", "--since", "0", "--timeout", "10s",
+        )
         tail_proc = subprocess.Popen(
-            [
-                self.h.bin_mesh,
-                "--home", self.h.home,
-                "--user", "--passphrase-file", self.h.passphrase_file,
-                "event", "tail", "--since", "0", "--timeout", "10s",
-            ],
-            env=self.h.get_env(),
+            cmd_tail,
+            env=env_tail,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -168,7 +172,7 @@ class TestBatch7G3DaemonFlows(unittest.TestCase):
             bad_pw = os.path.join(self.h.fixtures_dir, "bad.pw")
             with open(bad_pw, "w", encoding="utf-8") as f:
                 f.write("definitely-wrong-passphrase-123\n")
-            os.chmod(bad_pw, 0o600)
+            plat_perms.set_private_file_acl(bad_pw)
             rc_bad, _ = self.h.cli("--user", "--passphrase-file", bad_pw, "whoami")
             self.assertEqual(rc_bad, c.EXIT_UNAUTHENTICATED)
 
@@ -283,19 +287,18 @@ class TestBatch7G3CredentialInRunAndWake(LeadTurnCase):
         ext_tok = os.path.join(self.stubs_dir, "grok.tok")
         with open(ext_tok, "w", encoding="utf-8") as f:
             f.write(self.tok_grok + "\n")
-        os.chmod(ext_tok, 0o600)
+        plat_perms.set_private_file_acl(ext_tok)
 
         prj_id = self._create_project(_fake_goal({"lead_actions": {"actions": []}}))
         self._wait_turn_closed(prj_id, count=1)
 
+        cmd_tail, env_tail = cli_popen_argv(
+            self.harness, "--user", "--passphrase-file", self.harness.passphrase_file,
+            "event", "tail", "--since", "0", "--timeout", "15s",
+        )
         tail_proc = subprocess.Popen(
-            [
-                self.harness.bin_mesh,
-                "--home", self.harness.home,
-                "--user", "--passphrase-file", self.harness.passphrase_file,
-                "event", "tail", "--since", "0", "--timeout", "15s",
-            ],
-            env=self.harness.get_env(),
+            cmd_tail,
+            env=env_tail,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

@@ -30,12 +30,14 @@ DEFAULT_POLICIES = {
     "deploy": "direct_or_relayed",
     "delete_external": "direct_or_relayed",
     "external_other": "direct_or_relayed",
+    "plan_dispatch": "direct_only",
+    "step_dispatch": "direct_only",
 }
 
 
 def get_approval_policy(conn: sqlite3.Connection, category: str) -> str:
     """Retrieve effective approval policy for a category."""
-    if category == "config":
+    if category in ("config", "plan_dispatch", "step_dispatch"):
         return "direct_only"
     key = f"approval.policy.{category}"
     cur = conn.execute("SELECT value_json FROM settings WHERE key = ?;", (key,))
@@ -61,6 +63,21 @@ def get_row_approval_policy(
                 categories.append(cat)
     op_type = row["op_type"] if "op_type" in row.keys() else None
     op_json = row["op_json"] if "op_json" in row.keys() else None
+    project_id = row["project_id"] if "project_id" in row.keys() else None
+    if op_type == "task.assign" and project_id and "step_dispatch" not in categories:
+        try:
+            prow = conn.execute(
+                "SELECT plan_gate_mode, permission_mode FROM projects WHERE id = ?;",
+                (project_id,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            prow = None
+        if (
+            prow is not None
+            and prow["plan_gate_mode"] == "require_approval"
+            and prow["permission_mode"] == "supervised"
+        ):
+            categories.append("step_dispatch")
     if op_type in ("task.reassign", "task.retry", "task.reject") and op_json:
         try:
             stored = json.loads(op_json)
@@ -369,11 +386,11 @@ def verify_approval_event_history(events: List[Any]) -> Tuple[Optional[Dict[str,
                 except (TypeError, ValueError):
                     prev_payload = {}
                 prev_chan = "relayed" if dec_ev["via"] == "delegated" else dec_ev["via"]
+                prev_dec = prev_payload.get("decision") if isinstance(prev_payload, dict) else None
                 if not (
-                    isinstance(prev_payload, dict)
-                    and prev_payload.get("decision") == "approved"
+                    prev_dec in ("approved", "rejected")
                     and prev_chan == "relayed"
-                    and payload.get("decision") == "approved"
+                    and payload.get("decision") == prev_dec
                     and ev["via"] == "direct"
                 ):
                     return dec_ev, terminal, "conflicting multiple approval.decided events"
@@ -433,6 +450,160 @@ def verify_row_for_consume(conn: sqlite3.Connection, row: Any) -> None:
         raise bad("decision_event_mismatch", "the decision does not match its approval.decided event")
 
 
+def sync_plan_on_approval_terminal(
+    conn: sqlite3.Connection,
+    approval_id: str,
+    reason: str,
+    *,
+    actor_id: str = "system",
+    actor_kind: str = "system",
+    via: str = "system",
+    request_id: Optional[str] = None,
+    k_user: Optional[bytes] = None,
+    to_status: str = "cancelled",
+) -> List[str]:
+    """Keep `plans` synchronized whenever a `plan_dispatch` approval expires or is cancelled (P2-3)."""
+    has_plans = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'plans';"
+    ).fetchone()
+    if not has_plans:
+        return []
+    rows = conn.execute(
+        "SELECT id, project_id, version, status FROM plans "
+        "WHERE approval_id = ? AND status IN ('proposed', 'approved_pending_dispatch');",
+        (approval_id,),
+    ).fetchall()
+    if not rows:
+        return []
+    now = now_iso_utc()
+    updated_ids: List[str] = []
+    clean_reason = redact(reason) if isinstance(reason, str) else "approval_terminal"
+    for prow in rows:
+        conn.execute(
+            "UPDATE plans SET status = ?, updated_at = ? WHERE id = ?;",
+            (to_status, now, prow["id"]),
+        )
+        record_event(
+            conn=conn,
+            type_="plan.cancelled",
+            actor_id=actor_id,
+            actor_kind=actor_kind,
+            via=via,
+            project_id=prow["project_id"],
+            approval_id=approval_id,
+            reason=clean_reason,
+            payload={
+                "plan_id": prow["id"],
+                "version": prow["version"],
+                "from_status": prow["status"],
+                "to_status": to_status,
+                "reason": clean_reason,
+            },
+            request_id=request_id,
+            k_user=k_user,
+        )
+        updated_ids.append(prow["id"])
+    return updated_ids
+
+
+def _emit_project_approval_card(
+    conn: sqlite3.Connection,
+    *,
+    apr_id: str,
+    op_hash: str,
+    project_id: Optional[str],
+    task_id: Optional[str],
+    category: str,
+    op: str,
+    summary: str,
+    request_id: Optional[str],
+) -> Optional[str]:
+    """Write a system inline approval card chat message for every project-scoped non-plan approval."""
+    if not project_id or category == "plan_dispatch":
+        return None
+    has_chat = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chat_messages';"
+    ).fetchone()
+    if not has_chat:
+        return None
+    has_sys = conn.execute(
+        "SELECT 1 FROM principals WHERE id = 'principal_system';"
+    ).fetchone()
+    if not has_sys:
+        return None
+    has_proj = conn.execute(
+        "SELECT 1 FROM projects WHERE id = ?;",
+        (project_id,),
+    ).fetchone()
+    if not has_proj:
+        return None
+
+    card_id = generate_id("cmsg")
+    now = now_iso_utc()
+    if op.startswith("external."):
+        card_body = redact(f"外部请求确认 [{category}]：{summary}。请使用卡片按钮（允许 / 拒绝）决定。")
+        card_kind = "escalation_card" if category == "permission_escalation" else "approval_card"
+    elif category == "permission_escalation":
+        card_body = redact(f"需要提权确认：{summary}。请使用卡片按钮（允许 / 始终允许 / 拒绝）决定。")
+        card_kind = "escalation_card"
+    elif category == "config":
+        card_body = redact(f"需要配置变更确认：{summary}。配置写入仅限用户直接确认，请使用卡片按钮（允许 / 拒绝）决定。")
+        card_kind = "escalation_card"
+    elif category == "step_dispatch":
+        card_body = redact(f"准备运行步骤：{summary}。请使用卡片按钮（允许 / 始终允许 / 拒绝）决定。")
+        card_kind = "approval_card"
+    elif category == "retry_over_limit":
+        card_body = redact(f"任务已达重试上限：{summary}。请使用卡片按钮（允许 / 始终允许 / 拒绝）决定。")
+        card_kind = "approval_card"
+    else:
+        card_body = redact(f"需要确认 [{category}]：{summary}。请使用卡片按钮决定。")
+        card_kind = "approval_card"
+
+    card_ev = record_event(
+        conn=conn,
+        type_="chat.message",
+        actor_id="principal_system",
+        actor_kind="system",
+        via="system",
+        project_id=project_id,
+        task_id=task_id,
+        approval_id=apr_id,
+        payload={
+            "message_id": card_id,
+            "project_id": project_id,
+            "role": "system",
+            "kind": card_kind,
+            "task_id": task_id,
+            "approval_id": apr_id,
+            "category": category,
+            "op": op,
+            "op_hash": op_hash,
+            "body": card_body,
+        },
+        request_id=request_id,
+    )
+    conn.execute(
+        """INSERT INTO chat_messages (
+            id, project_id, event_seq, role, kind, actor_id, actor_kind, via,
+            run_id, plan_id, approval_id, task_id, body, meta_json,
+            consumed_by_approval_id, created_at
+        ) VALUES (?, ?, ?, 'system', ?, 'principal_system', 'system', 'system',
+                  NULL, NULL, ?, ?, ?, ?, NULL, ?);""",
+        (
+            card_id,
+            project_id,
+            card_ev["seq"],
+            card_kind,
+            apr_id,
+            task_id,
+            card_body,
+            json.dumps({"category": category, "op": op, "op_hash": op_hash}, sort_keys=True),
+            now,
+        ),
+    )
+    return card_id
+
+
 def create_or_get_pending_approval(
     conn: sqlite3.Connection,
     category: str,
@@ -450,6 +621,7 @@ def create_or_get_pending_approval(
     request_id: Optional[str] = None,
     k_user: Optional[bytes] = None,
     testing_mode: Optional[bool] = None,
+    emit_chat_card: bool = True,
 ) -> Dict[str, Any]:
     """Create a pending approval row or return existing open approval with matching op_hash."""
     op_doc, op_hash = compute_op_hash(
@@ -498,6 +670,14 @@ def create_or_get_pending_approval(
                 payload={"approval_id": row["id"], "category": row["category"], "op": old["op_type"],
                          "requested_by": old["requested_by"], "expires_at": row["expires_at"],
                          "status": "expired", "expired_on": "new_request"},
+            )
+            sync_plan_on_approval_terminal(
+                conn,
+                row["id"],
+                "approval_expired",
+                actor_id="system",
+                actor_kind="system",
+                via="system",
             )
             row = None
     if row:
@@ -578,6 +758,19 @@ def create_or_get_pending_approval(
         k_user=k_user,
     )
 
+    if emit_chat_card:
+        _emit_project_approval_card(
+            conn,
+            apr_id=apr_id,
+            op_hash=op_hash,
+            project_id=project_id,
+            task_id=task_id,
+            category=category,
+            op=op,
+            summary=summary,
+            request_id=request_id,
+        )
+
     return {
         "approval_id": apr_id,
         "op_hash": op_hash,
@@ -616,7 +809,11 @@ def check_and_consume_approval(
             details={"approval_id": approval_id},
         )
 
-    # Recompute op_hash from incoming parameters using expected gate category and CALLER as requested_by (plan §7.4 step 4)
+    # Recompute op_hash from incoming parameters using expected gate category and CALLER as requested_by (plan §7.4 step 4).
+    # Note on lead-change asymmetry: single-use approvals bind `requested_by`, so changing a project's lead
+    # between approval creation and consume invalidates the unconsumed single-use approval (the new lead must
+    # re-propose/re-request), whereas project-scoped standing grants (`permission_escalation`, `retry_over_limit`)
+    # bind the project/target agent/profile and survive lead changes until revoked via `grant.revoke`.
     _, computed_hash = compute_op_hash(
         op=op,
         requested_by=caller_id,
@@ -778,7 +975,8 @@ def ensure_delegated_decider_current(conn, row):
 
 
 def cancel_open_approvals(conn, rows, actor_id, actor_kind, via, reason,
-                          request_id=None, relayed_by=None, k_user=None):
+                          request_id=None, relayed_by=None, k_user=None,
+                          *, sync_plan: bool = True):
     """Withdraw unconsumed decisions atomically with one hash-chained event per row.
 
     Port note (private repo): an approval pinned by an in-progress workspace reservation is
@@ -798,9 +996,119 @@ def cancel_open_approvals(conn, rows, actor_id, actor_kind, via, reason,
         if not changed:
             continue
         cancelled.append(row["id"])
+        row_task_id = row["task_id"] if "task_id" in row.keys() else None
         record_event(conn=conn, type_="approval.cancelled", actor_id=actor_id,
                      actor_kind=actor_kind, via=via, relayed_by=relayed_by,
-                     project_id=row["project_id"], approval_id=row["id"],
+                     project_id=row["project_id"], task_id=row_task_id, approval_id=row["id"],
                      payload={"approval_id": row["id"], "reason": reason, "from_status": row["status"]},
                      request_id=request_id, k_user=k_user)
+        if sync_plan:
+            sync_plan_on_approval_terminal(
+                conn,
+                row["id"],
+                reason or "approval_cancelled",
+                actor_id=actor_id,
+                actor_kind=actor_kind,
+                via=via,
+                request_id=request_id,
+                k_user=k_user,
+            )
     return cancelled
+
+
+def cancel_pending_step_dispatch_approvals(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    from_mode: str,
+    to_mode: str,
+    actor_id: str,
+    actor_kind: str,
+    via: str,
+    request_id: Optional[str] = None,
+    k_user: Optional[bytes] = None,
+) -> List[str]:
+    """Audited sweep-cancel of pending `step_dispatch` cards when leaving `supervised` mode.
+
+    Permission-mode changes are forward-only:
+    - Switching away from `supervised` (`supervised` -> `plan` or `auto`) sweep-cancels
+      obsolete pending `step_dispatch` approvals (each emitting a signed `approval.cancelled`
+      event) so they do not linger unconsumable; pending `permission_escalation` cards are
+      preserved because escalation is never auto-allowed by mode.
+    - Switching into `auto` (`supervised`/`plan` -> `auto`) additionally sweep-cancels
+      obsolete pending `plan_dispatch` cards via ``cancel_pending_plan_dispatch_approvals``
+      without cancelling the proposed plan itself.
+    - Switching into `supervised` (`plan`/`auto` -> `supervised`) does NOT retroactively
+      re-gate tasks already materialized in `assigned` or later states.
+    """
+    if from_mode != "supervised" or to_mode == "supervised":
+        return []
+    rows = conn.execute(
+        """SELECT id, project_id, task_id, status
+           FROM approvals
+           WHERE project_id = ?
+             AND category = 'step_dispatch'
+             AND status = 'pending'
+             AND consumed_at IS NULL
+           ORDER BY requested_at ASC, id ASC;""",
+        (project_id,),
+    ).fetchall()
+    if not rows:
+        return []
+    return cancel_open_approvals(
+        conn,
+        rows,
+        actor_id=actor_id,
+        actor_kind=actor_kind,
+        via=via,
+        reason=f"permission_mode_changed:{from_mode}->{to_mode}",
+        request_id=request_id,
+        k_user=k_user,
+    )
+
+
+def cancel_pending_plan_dispatch_approvals(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    from_mode: str,
+    to_mode: str,
+    actor_id: str,
+    actor_kind: str,
+    via: str,
+    request_id: Optional[str] = None,
+    k_user: Optional[bytes] = None,
+) -> List[str]:
+    """Audited sweep-cancel of pending `plan_dispatch` cards when entering `auto` mode.
+
+    Because `auto` mode ungates plan dispatch, any lingering `pending` `plan_dispatch` card
+    is obsolete and is sweep-cancelled with a signed `approval.cancelled` event while
+    preserving the `proposed` plan itself (`sync_plan=False`) so the lead can dispatch it
+    directly under `auto` mode (`policy.auto_allowed`). Already-`approved` `plan_dispatch`
+    approvals are preserved so user-approved plans can still consume them.
+    """
+    if to_mode != "auto" or from_mode == "auto":
+        return []
+    rows = conn.execute(
+        """SELECT id, project_id, task_id, status
+           FROM approvals
+           WHERE project_id = ?
+             AND category = 'plan_dispatch'
+             AND status = 'pending'
+             AND consumed_at IS NULL
+           ORDER BY requested_at ASC, id ASC;""",
+        (project_id,),
+    ).fetchall()
+    if not rows:
+        return []
+    return cancel_open_approvals(
+        conn,
+        rows,
+        actor_id=actor_id,
+        actor_kind=actor_kind,
+        via=via,
+        reason=f"permission_mode_changed:{from_mode}->{to_mode}",
+        request_id=request_id,
+        k_user=k_user,
+        sync_plan=False,
+    )

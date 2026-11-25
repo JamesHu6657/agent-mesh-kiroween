@@ -15,6 +15,7 @@ import errno
 import io
 import os
 import re
+import sys
 import unittest
 from typing import Iterator, List, Optional
 from unittest import mock
@@ -104,6 +105,7 @@ class TestSiblingScanCap(unittest.TestCase):
         self.assertLessEqual(len(probes), 63)
         self.assertGreater(len(probes), 0)
 
+    @unittest.skipUnless(sys.platform != "win32", "POSIX /proc/<pid>/environ gVisor sibling fallback")
     def test_get_proc_environ_propagates_cap_eio(self):
         """ACC: N18, A8 - get_proc_environ on a leader-zombie (state Z, 2 threads, empty leader
         environ) whose capped sibling scan finds nothing raises EIO, which run_targets and

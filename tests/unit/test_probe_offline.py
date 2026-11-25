@@ -8,45 +8,53 @@ variable is written to os.environ.
 import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 
 from mesh.adapters.droid import DroidAdapter
 from mesh.adapters import helpdiff
+from mesh.platform.paths import temp_root
 from tests import tierlib
 from tests.probe import test_probe as tier
-from tests.stubs import FIXTURES_ROOT, create_test_stubs, make_executable
+from tests.stubs import FIXTURES_ROOT, _write_python_stub, create_test_stubs, stub_path
 
 DROID_FX = os.path.join(FIXTURES_ROOT, "droid", "1.3.0")
 
 
 def _write_droid_stub(path: str, version: str, help_text: str, exec_help_text: str) -> str:
-    with open(path + ".help", "w", encoding="utf-8") as f:
+    with open(path + ".help", "w", encoding="utf-8", newline="\n") as f:
         f.write(help_text)
-    with open(path + ".exec-help", "w", encoding="utf-8") as f:
+    with open(path + ".exec-help", "w", encoding="utf-8", newline="\n") as f:
         f.write(exec_help_text)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"""#!/usr/bin/env python3
+    return _write_python_stub(
+        os.path.dirname(path),
+        os.path.basename(path),
+        f"""#!/usr/bin/env python3
 import sys
 args = sys.argv[1:]
 if args == ["--version"]:
     print("droid {version}")
 elif args == ["--help"]:
-    sys.stdout.write(open({path + '.help'!r}, encoding="utf-8").read())
+    with open({path + '.help'!r}, "rb") as fp:
+        sys.stdout.buffer.write(fp.read())
+    sys.stdout.buffer.flush()
 elif args == ["exec", "--help"]:
-    sys.stdout.write(open({path + '.exec-help'!r}, encoding="utf-8").read())
+    with open({path + '.exec-help'!r}, "rb") as fp:
+        sys.stdout.buffer.write(fp.read())
+    sys.stdout.buffer.flush()
 else:
     sys.exit(99)
-""")
-    make_executable(path)
-    return path
+""",
+    )
 
 
 class ProbeOfflineTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.mkdtemp(prefix="mh-probe-off-")
+        self.tmp = tempfile.mkdtemp(prefix="mh-probe-off-", dir=temp_root())
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        self.assertTrue(self.tmp.startswith("/tmp/mh-"))
+        self.mh_prefix = os.path.join(temp_root(), "mh-")
+        self.assertTrue(self.tmp.startswith(self.mh_prefix))
         self.capture = os.path.join(self.tmp, "capture")
         with open(os.path.join(DROID_FX, "help.txt"), encoding="utf-8") as f:
             self.help = f.read()
@@ -54,7 +62,7 @@ class ProbeOfflineTest(unittest.TestCase):
             self.exec_help = f.read()
 
     def probe(self, stub: str):
-        self.assertTrue(stub.startswith("/tmp/mh-") and os.path.isabs(stub), stub)
+        self.assertTrue(stub.startswith(self.mh_prefix) and os.path.isabs(stub), stub)
         p = DroidAdapter().probe(binary_path=stub)
         self.assertEqual(p.binary_path, stub)
         return p
@@ -63,7 +71,7 @@ class ProbeOfflineTest(unittest.TestCase):
         """ACC: N10, N22 - a stub printing the committed 1.3.0 help: shas match, empty diff, no missing flag, nothing captured."""
         stubs = create_test_stubs(os.path.join(self.tmp, "stubs"), tripwire_file=os.path.join(self.tmp, "trip.log"),
                                   droid_version="1.3.0")
-        stub = os.path.join(stubs, "droid")
+        stub = stub_path(stubs, "droid")
         p = self.probe(stub)
         self.assertEqual(p.version, "1.3.0")
         self.assertIsNone(p.flag_diff)
@@ -135,14 +143,14 @@ class ProbeOfflineTest(unittest.TestCase):
         self.assertIn("--log-group-id", str(cm.exception))
 
     def test_shim_free_daemon_records_the_probe_row(self) -> None:
-        """ACC: N10, N22 - the tier's daemon path offline: a use_shims=False harness (no tests/shims on PATH, no MESH_TESTING) probes a /tmp/mh-* stub through the real CLI and records droid 9.9.0 in adapter_probes."""
+        """ACC: N10, N22 - the tier's daemon path offline: a use_shims=False harness (no tests/shims on PATH, no MESH_TESTING) probes a temp stub through the real CLI and records droid 9.9.0 in adapter_probes."""
         from tests.helpers import MeshHarness
 
         stub = _write_droid_stub(os.path.join(self.tmp, "droid"), "9.9.0", self.help, self.exec_help)
         # Tripwire stubs first on PATH so no real vendor binary can be reached (Kiro r1 minor 2).
         trip = os.path.join(self.tmp, "daemon-trip.log")
         guard = create_test_stubs(os.path.join(self.tmp, "guard"), tripwire_file=trip)
-        self.assertTrue(guard.startswith("/tmp/mh-") and trip.startswith("/tmp/mh-"))
+        self.assertTrue(guard.startswith(self.mh_prefix) and trip.startswith(self.mh_prefix))
         h = MeshHarness(init_db=True, start_daemon=False, use_shims=False, extra_path=guard)
         try:
             env = h.get_env()

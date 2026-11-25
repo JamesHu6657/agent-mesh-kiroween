@@ -11,8 +11,11 @@ import unittest
 
 import mesh.constants as c
 from tests.gitfixture import GitFixture, GitMeshHarness
+from tests.helpers import EXPECTED_CRASH_RETURNCODE, restore_accessible_for_test, set_inaccessible_for_test
 from tests.integration.test_execution_launch import create_agent as create_exec_agent
 from tests.stubs import create_test_stubs
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 class TestBatch7PR45R2Integration(unittest.TestCase):
@@ -101,7 +104,7 @@ class TestBatch7PR45R2Integration(unittest.TestCase):
             token=self.tok_lead1,
         )
         self.assertNotEqual(rc_c1, 0, resp_c1)
-        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), -signal.SIGKILL)
+        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), EXPECTED_CRASH_RETURNCODE)
         self.assertTrue(os.path.isdir(ws1))
 
         self.harness.restart_daemon()
@@ -141,7 +144,7 @@ class TestBatch7PR45R2Integration(unittest.TestCase):
             token=self.tok_lead1,
         )
         self.assertNotEqual(rc_c2, 0, resp_c2)
-        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), -signal.SIGKILL)
+        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), EXPECTED_CRASH_RETURNCODE)
         self.assertFalse(os.path.exists(ws2))
 
         self.harness.restart_daemon()
@@ -181,7 +184,7 @@ class TestBatch7PR45R2Integration(unittest.TestCase):
             token=self.tok_lead1,
         )
         self.assertNotEqual(rc_cr1, 0, resp_cr1)
-        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), -signal.SIGKILL)
+        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), EXPECTED_CRASH_RETURNCODE)
         self.assertTrue(os.path.isdir(ws1))
 
         self.harness.restart_daemon()
@@ -217,7 +220,7 @@ class TestBatch7PR45R2Integration(unittest.TestCase):
             token=self.tok_lead1,
         )
         self.assertNotEqual(rc_cr2, 0, resp_cr2)
-        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), -signal.SIGKILL)
+        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), EXPECTED_CRASH_RETURNCODE)
         self.assertFalse(os.path.exists(ws2))
 
         self.harness.restart_daemon()
@@ -246,12 +249,14 @@ class TestBatch7PR45R2Integration(unittest.TestCase):
         dirty_script = os.path.join(self.stubs_dir, "dirty_tracked.py")
         with open(dirty_script, "w", encoding="utf-8") as f:
             f.write(
-                "import os\n"
+                "import os, sys\n"
+                f"sys.path.insert(0, {_REPO_ROOT!r})\n"
+                "from tests.helpers import set_inaccessible_for_test\n"
                 "with open('calc.py', 'w') as fp:\n"
                 "    fp.write('corrupted = True\\n')\n"
                 "os.makedirs('top000', mode=0o700, exist_ok=True)\n"
                 "open('top000/f', 'w').write('x')\n"
-                "os.chmod('top000', 0o000)\n"
+                "set_inaccessible_for_test('top000')\n"
                 "os.makedirs('empty_leftover', mode=0o700, exist_ok=True)\n"
             )
         _, prj1 = self._create_repo_project("P12Tracked", test_command=json.dumps([sys.executable, dirty_script]))
@@ -273,10 +278,12 @@ class TestBatch7PR45R2Integration(unittest.TestCase):
         ro_script = os.path.join(self.stubs_dir, "mk_000_empty.py")
         with open(ro_script, "w", encoding="utf-8") as f:
             f.write(
-                "import os\n"
+                "import os, sys\n"
+                f"sys.path.insert(0, {_REPO_ROOT!r})\n"
+                "from tests.helpers import set_inaccessible_for_test\n"
                 "os.makedirs('top000', mode=0o700, exist_ok=True)\n"
                 "open('top000/f', 'w').write('x')\n"
-                "os.chmod('top000', 0o000)\n"
+                "set_inaccessible_for_test('top000')\n"
                 "os.makedirs('empty_leftover', mode=0o700, exist_ok=True)\n"
             )
         _, prj2 = self._create_repo_project("P12Zero", test_command=json.dumps([sys.executable, ro_script]))

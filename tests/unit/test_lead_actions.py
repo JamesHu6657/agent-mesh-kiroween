@@ -55,7 +55,7 @@ class TestLeadActions(unittest.TestCase):
         self.assertEqual(oversized.actions, [])
 
     def test_allowed_cmds_are_exactly_the_plan_list(self):
-        """The allowed list is the 15 cmds of plan §12.4 plus `task.close`. ACC: L2"""
+        """The allowed list is the 15 cmds of plan §12.4 plus `task.close` and Chat-First chat/plan cmds. ACC: L2"""
         self.assertEqual(
             ALLOWED_ACTION_CMDS,
             [
@@ -75,9 +75,13 @@ class TestLeadActions(unittest.TestCase):
                 "project.complete",
                 "project.deliver",
                 "approval.request",
+                "chat.reply",
+                "plan.propose",
+                "plan.dispatch",
+                "plan.cancel",
             ],
         )
-        self.assertEqual(len(ALLOWED_ACTION_CMDS), 16)
+        self.assertEqual(len(ALLOWED_ACTION_CMDS), 20)
         self.assertEqual(MAX_ACTIONS, 50)
 
     def test_optional_approval_key(self):

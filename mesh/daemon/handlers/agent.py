@@ -429,8 +429,13 @@ def handle_agent_create(ctx: HandlerContext) -> HandlerResult:
     # AGY model effort encoding rule (D17, §14.4)
     check_agy_model_effort_conflict(adapter_name, default_model, default_effort)
 
-    # Permission profiles
-    default_profile = _validate_default_profile(ctx.args.get("default_profile", "edit"))
+    # Permission profiles: when omitted, pick the adapter's first supported safe profile
+    # (never elevated/unrestricted; falls back to "edit" when none is safe, e.g. devin).
+    if "default_profile" in ctx.args:
+        raw_default_profile = ctx.args["default_profile"]
+    else:
+        raw_default_profile = adapter.default_safe_profile() or "edit"
+    default_profile = _validate_default_profile(raw_default_profile)
     max_unapproved_profile = _validate_max_unapproved_profile(ctx.args.get("max_unapproved_profile", "dev"))
 
     raw_can_lead = ctx.args.get("can_lead")

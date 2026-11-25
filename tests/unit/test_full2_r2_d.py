@@ -25,6 +25,7 @@ from mesh.core.clock import now_iso_utc
 from mesh.core.db import init_db, transaction
 from mesh.core.proc import get_proc_stat
 from mesh.daemon import merge, supervisor, terminate
+from mesh.platform import proc as plat_proc
 from tests.gitfixture import GitFixture
 
 MESH_PROC_LOCK = "shared"
@@ -41,9 +42,7 @@ def _wait_until(pred, timeout: float = 10.0, step: float = 0.02) -> bool:
 
 def _kill_proc(pid: int, starttime: int) -> None:
     try:
-        info = get_proc_stat(pid)
-        if info is not None and int(info["starttime"]) == int(starttime):
-            os.kill(pid, signal.SIGKILL)
+        plat_proc.kill_if_same(pid, int(starttime))
     except OSError:
         pass
 
@@ -232,6 +231,12 @@ class TestP1_6LeftoversFinalizationGit(unittest.TestCase):
         out = merge.run_merge_pipeline(plan)
         self.assertEqual(out["outcome"], "merged", out)
 
+    @staticmethod
+    def _sleep_past_poll() -> None:
+        deadline = time.monotonic() + terminate.POLL_S + (0.05 if sys.platform == "win32" else 0.02)
+        while time.monotonic() < deadline:
+            time.sleep(max(0.005, deadline - time.monotonic()))
+
     def test_p1_6_leftovers_defers_finalization_until_git_ready_and_renews_lease(self) -> None:
         wpid, wst = self._seed_running_code_task(kind="code", exit_code=0)
         old_hb = now_iso_utc(time.time() - 30)
@@ -258,14 +263,19 @@ class TestP1_6LeftoversFinalizationGit(unittest.TestCase):
 
         try:
             with mock.patch.object(supervisor, "submission_git_info", gated_collect):
-                # Advance two empty scans so terminate.step(t) returns "done".
+                # Advance empty scans until terminate.step(t) returns "done" and starts background git collection.
                 self.assertIsNone(supervisor._advance(self.conn, self.home, run, t, testing_mode=True))
-                time.sleep(terminate.POLL_S + 0.02)
+                self._sleep_past_poll()
 
                 # First "done" starts background git collection and must defer without forgetting t or dropping lease.
-                res = supervisor._advance(self.conn, self.home, run, t, testing_mode=True)
-                self.assertIsNone(res)
-                self.assertTrue(entered.wait(timeout=5.0))
+                start_deadline = time.monotonic() + (15.0 if sys.platform == "win32" else 5.0)
+                while time.monotonic() < start_deadline:
+                    res = supervisor._advance(self.conn, self.home, run, t, testing_mode=True)
+                    self.assertIsNone(res)
+                    if entered.wait(timeout=0.05):
+                        break
+                    time.sleep(terminate.POLL_S / 2 + 0.02)
+                self.assertTrue(entered.is_set())
                 self.assertIs(terminate.get(self.run_id), t)
 
                 lease_mid = self.conn.execute(
@@ -288,7 +298,8 @@ class TestP1_6LeftoversFinalizationGit(unittest.TestCase):
 
                 # Subsequent scans reach "done" and finalize auto-submit with deliverable.git.
                 final_res = None
-                deadline = time.monotonic() + 5.0
+                # Win32 Toolhelp+PEB scans under parallel load can exceed 5s across two POLL_S cycles.
+                deadline = time.monotonic() + (15.0 if sys.platform == "win32" else 5.0)
                 while time.monotonic() < deadline:
                     final_res = supervisor._advance(self.conn, self.home, run, t, testing_mode=True)
                     if final_res is not None:
@@ -310,8 +321,14 @@ class TestP1_6LeftoversFinalizationGit(unittest.TestCase):
         run = self.conn.execute("SELECT * FROM runs WHERE id = ?;", (self.run_id,)).fetchone()
         with mock.patch.object(supervisor, "_submit_git_state", side_effect=AssertionError("should not collect git")):
             self.assertIsNone(supervisor._advance(self.conn, self.home, run, t, testing_mode=True))
-            time.sleep(terminate.POLL_S + 0.02)
-            res = supervisor._advance(self.conn, self.home, run, t, testing_mode=True)
+            self._sleep_past_poll()
+            res = None
+            deadline = time.monotonic() + (15.0 if sys.platform == "win32" else 5.0)
+            while time.monotonic() < deadline:
+                res = supervisor._advance(self.conn, self.home, run, t, testing_mode=True)
+                if res is not None:
+                    break
+                time.sleep(terminate.POLL_S / 2 + 0.02)
         self.assertEqual(res, "exit_nonzero")
         self.assertIsNone(terminate.get(self.run_id))
 

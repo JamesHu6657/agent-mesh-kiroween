@@ -11,6 +11,7 @@ import unittest
 from typing import Any, Dict, List, Optional
 
 import mesh.constants as c
+from mesh.platform import perms as plat_perms
 from tests.helpers import MeshHarness
 from tests.stubs import create_test_stubs
 
@@ -62,7 +63,7 @@ def create_agent(
     tok_path = os.path.join(tok_dir, f"{name}.tok")
     with open(tok_path, "w", encoding="utf-8") as f:
         f.write(token)
-    os.chmod(tok_path, 0o600)
+    plat_perms.set_private_file_acl(tok_path)
 
     return token
 

@@ -12,11 +12,13 @@ P3  `task retry` with a model the assignee does not allow is a validation error,
     INTERNAL_ERROR."""
 
 import json
+import socket
 import threading
 import time
 import unittest
 
 import mesh.constants as c
+from mesh.platform import ipc as plat_ipc
 from tests.integration import test_merge as tm
 from tests.integration.test_tasks import create_agent
 
@@ -183,10 +185,7 @@ class TestConnectionLimits(_Base):
                                                "MESH_TEST_MAX_CONNECTIONS": "4"})
 
     def _sock(self):
-        import os
-        import socket
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.connect(os.path.join(self.harness.home, "run", "mesh.sock"))
+        s = plat_ipc.connect_endpoint(plat_ipc.daemon_endpoint_path(self.harness.home), timeout=10)
         s.settimeout(10)
         return s
 
@@ -279,10 +278,7 @@ class TestOversizeDrainDeadline(_Base):
     """PR #40 r1: a slow oversized sender cannot hold a connection past the deadline."""
 
     def test_slow_oversized_sender_closed(self) -> None:
-        import os
-        import socket
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.connect(os.path.join(self.harness.home, "run", "mesh.sock"))
+        s = plat_ipc.connect_endpoint(plat_ipc.daemon_endpoint_path(self.harness.home), timeout=5)
         s.settimeout(5)
         try:
             s.sendall(b"x" * (1024 * 1024 + 8192))

@@ -22,6 +22,7 @@ from typing import List
 from mesh.adapters import evidence
 from mesh.core.clock import now_iso_utc
 from tests.helpers import MeshHarness
+from tests.stubs import _write_python_stub
 
 MODEL = "claude-haiku-5.5"
 STUB = """#!{python}
@@ -53,11 +54,7 @@ class QueuedHeldKiroTaskTest(unittest.TestCase):
                                     "--lead", "lead1", token=self.tok_plain)
         self.assertEqual(rc, 0, resp)
         self.project_id = resp["data"]["id"]
-        binary = os.path.join(self.tmp, "bin", "kiro-cli")
-        os.makedirs(os.path.dirname(binary))
-        with open(binary, "w", encoding="utf-8") as f:
-            f.write(STUB.format(python=sys.executable))
-        os.chmod(binary, 0o755)
+        binary = _write_python_stub(os.path.join(self.tmp, "bin"), "kiro-cli", STUB.format(python=sys.executable))
         self.kiro_id = self._agent("kx", ["--adapter", "kiro", "--delivery", "launch", "--binary", binary,
                                           "--allowed-model", MODEL, "--default-model", MODEL])[0]
 

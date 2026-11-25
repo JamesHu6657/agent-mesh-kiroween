@@ -11,8 +11,11 @@ import unittest
 
 import mesh.constants as c
 from tests.gitfixture import GitFixture, GitMeshHarness
+from tests.helpers import EXPECTED_CRASH_RETURNCODE, restore_accessible_for_test, set_inaccessible_for_test
 from tests.integration.test_execution_launch import create_agent as create_exec_agent
 from tests.stubs import create_test_stubs
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 class TestBatch7PR45R3Integration(unittest.TestCase):
@@ -185,7 +188,7 @@ class TestBatch7PR45R3Integration(unittest.TestCase):
         self.harness.restart_daemon(extra_env={"MESH_TEST_CRASH_AT": "after_merge_commit"})
         rc_cr, _ = self.harness.cli("task", "merge", tsk_b, token=self.tok_lead1)
         self.assertNotEqual(rc_cr, 0)
-        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), -signal.SIGKILL)
+        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), EXPECTED_CRASH_RETURNCODE)
         self.harness.restart_daemon()
         self.assertTrue(os.path.isdir(os.path.join(integ_b, "vendor_sub")))
         self.assertTrue(self.fixture.is_clean(integ_b))
@@ -211,7 +214,7 @@ class TestBatch7PR45R3Integration(unittest.TestCase):
         self.harness.restart_daemon(extra_env={"MESH_TEST_CRASH_AT": "after_merge_abort"})
         rc_cr, _ = self.harness.cli("task", "merge", tsk1, token=self.tok_lead1)
         self.assertNotEqual(rc_cr, 0)
-        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), -signal.SIGKILL)
+        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), EXPECTED_CRASH_RETURNCODE)
 
         self.assertFalse(self.fixture.has_merge_head(integ))
         with open(os.path.join(integ, "calc.py"), encoding="utf-8") as f:
@@ -239,7 +242,9 @@ class TestBatch7PR45R3Integration(unittest.TestCase):
         ready_flag = os.path.join(self.stubs_dir, "mid_test_ready.flag")
         with open(script, "w", encoding="utf-8") as f:
             f.write(
-                "import os, time\n"
+                "import os, sys, time\n"
+                f"sys.path.insert(0, {_REPO_ROOT!r})\n"
+                "from tests.helpers import set_inaccessible_for_test\n"
                 "with open('calc.py', 'w') as fp:\n"
                 "    fp.write('# mid-test calc dirty\\n')\n"
                 "with open('artifact.tmp', 'w') as fp:\n"
@@ -247,7 +252,7 @@ class TestBatch7PR45R3Integration(unittest.TestCase):
                 "os.makedirs('top000', mode=0o700, exist_ok=True)\n"
                 "with open('top000/f', 'w') as fp:\n"
                 "    fp.write('1')\n"
-                "os.chmod('top000', 0o000)\n"
+                "set_inaccessible_for_test('top000')\n"
                 f"open({ready_flag!r}, 'w').write('ready')\n"
                 "time.sleep(30)\n"
             )
@@ -255,7 +260,7 @@ class TestBatch7PR45R3Integration(unittest.TestCase):
         import time
 
         top000_path = os.path.join(integ, "top000")
-        self.addCleanup(lambda: os.path.isdir(top000_path) and os.chmod(top000_path, 0o700))
+        self.addCleanup(lambda: os.path.isdir(top000_path) and restore_accessible_for_test(top000_path))
 
         merge_res = []
         t = threading.Thread(
@@ -274,7 +279,7 @@ class TestBatch7PR45R3Integration(unittest.TestCase):
 
         # Boot 1 recovery runs decide_recovery -> _abort_and_verify and crashes right after git merge --abort.
         self.harness.start_daemon(extra_env={"MESH_TEST_CRASH_AT": "after_merge_abort"}, wait_ready=False)
-        self.assertEqual(self.harness.wait_daemon_exit(timeout=20.0), -signal.SIGKILL)
+        self.assertEqual(self.harness.wait_daemon_exit(timeout=20.0), EXPECTED_CRASH_RETURNCODE)
         self.assertFalse(self.fixture.has_merge_head(integ))
         self.assertTrue(os.path.exists(os.path.join(integ, "artifact.tmp")))
         self.assertTrue(os.path.exists(top000_path))
@@ -347,7 +352,7 @@ class TestBatch7PR45R3Integration(unittest.TestCase):
         self.harness.restart_daemon(extra_env={"MESH_TEST_CRASH_AT": "before_ws_prune_delete"})
         rc_cb, _ = self.harness.cli("workspace", "prune", "--project", prj, "--idempotency-key", "k-before-del", token=self.tok_lead1)
         self.assertNotEqual(rc_cb, 0)
-        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), -signal.SIGKILL)
+        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), EXPECTED_CRASH_RETURNCODE)
         self.assertTrue(os.path.isdir(ws_m1))
         self.harness.restart_daemon()
         with contextlib.closing(self.harness.db()) as conn:
@@ -359,7 +364,7 @@ class TestBatch7PR45R3Integration(unittest.TestCase):
         self.harness.restart_daemon(extra_env={"MESH_TEST_CRASH_AT": "after_ws_prune_worktree_remove"})
         rc_cw, _ = self.harness.cli("workspace", "prune", "--project", prj, "--idempotency-key", "k-wt-rm", token=self.tok_lead1)
         self.assertNotEqual(rc_cw, 0)
-        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), -signal.SIGKILL)
+        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), EXPECTED_CRASH_RETURNCODE)
         self.assertFalse(os.path.exists(ws_m1))
         self.assertIn(f"mesh/{prj}/{tsk_m1}", self.fixture.branches(repo, "mesh/*"))
         self.harness.restart_daemon()
@@ -381,7 +386,7 @@ class TestBatch7PR45R3Integration(unittest.TestCase):
         self.harness.restart_daemon(extra_env={"MESH_TEST_CRASH_AT": "after_ws_prune_delete"})
         rc_cd, _ = self.harness.cli("workspace", "prune", "--project", prj, "--idempotency-key", "k-mid-del", token=self.tok_lead1)
         self.assertNotEqual(rc_cd, 0)
-        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), -signal.SIGKILL)
+        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), EXPECTED_CRASH_RETURNCODE)
         self.assertFalse(os.path.exists(ws_m2))
         self.assertTrue(os.path.isdir(ws_m3))
 
@@ -404,7 +409,7 @@ class TestBatch7PR45R3Integration(unittest.TestCase):
         self.harness.restart_daemon(extra_env={"MESH_TEST_CRASH_AT": "after_ws_prune_last_delete"})
         rc_cl, _ = self.harness.cli("workspace", "prune", "--project", prj, "--idempotency-key", "k-last-del", token=self.tok_lead1)
         self.assertNotEqual(rc_cl, 0)
-        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), -signal.SIGKILL)
+        self.assertEqual(self.harness.wait_daemon_exit(timeout=30.0), EXPECTED_CRASH_RETURNCODE)
         self.assertFalse(os.path.exists(ws_m4))
 
         self.harness.restart_daemon()

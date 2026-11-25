@@ -3,6 +3,7 @@
 Each test runs the real script (in a throwaway git repo or with stubs); no network, no real
 coder, reviewer or gitleaks is involved."""
 
+import sys
 import os
 import shutil
 import signal
@@ -52,6 +53,7 @@ class RepoCase(unittest.TestCase):
                               env=dict(os.environ, **(env or {})), timeout=timeout)
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash + scripts/coord/coder-guard.sh atomic lock test")
 class TestCoderGuardAtomic(RepoCase):
     def test_d1_two_dispatches_one_admitted(self):
         home = self.tmp
@@ -72,6 +74,7 @@ class TestCoderGuardAtomic(RepoCase):
             subprocess.run(["pkill", "-f", "droid exec -f p-linear-d1"])
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash + scripts/coord/push-review.sh / sync-github.sh + /bin/sh fake gitleaks test")
 class TestPushHelpersScanWhatTheyPush(RepoCase):
     def setUp(self):
         super().setUp()
@@ -115,6 +118,7 @@ class TestPushHelpersScanWhatTheyPush(RepoCase):
         self.assertNotEqual(git(self.repo, "rev-parse", "main").stdout.strip(), scanned)  # the race happened
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash + scripts/coord/merge.sh test")
 class TestMergeScript(RepoCase):
     def setUp(self):
         super().setUp()
@@ -157,6 +161,7 @@ class TestMergeScript(RepoCase):
             self.assertEqual(f.read(), "resolved by hand\n")
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash + scripts/coord/kiro-plan.sh + /bin/sh + POSIX symlink test")
 class TestKiroRunner(RepoCase):
     def fake_kiro(self, rc):
         home = os.path.join(self.tmp, "home")
@@ -185,6 +190,7 @@ class TestKiroRunner(RepoCase):
         self.assertTrue(os.path.exists(out))
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash + .kiro/hooks/scripts/secret-scan.sh + /bin/sh gitleaks stub test")
 class TestSecretScanQuotedNames(RepoCase):
     def test_d8_non_ascii_name_is_scanned(self):
         gl = os.path.join(self.tmp, "bin", "gitleaks")
@@ -201,7 +207,7 @@ class TestAcceptanceCheck(unittest.TestCase):
         with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as f:
             f.write(text)
         self.addCleanup(os.unlink, f.name)
-        return subprocess.run(["python3", os.path.join(HOOKS, "acceptance-check.py"), f.name],
+        return subprocess.run([sys.executable, os.path.join(HOOKS, "acceptance-check.py"), f.name],
                               capture_output=True, text=True, timeout=120)
 
     def test_d9_formatted_ids_are_checked(self):
@@ -217,6 +223,7 @@ class TestAcceptanceCheck(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout)
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash + scripts/coord/wait-pid.sh test")
 class TestWaitPid(unittest.TestCase):
     def test_d11_zero_is_refused(self):
         r = subprocess.run(["bash", os.path.join(COORD, "wait-pid.sh"), str(os.getpid()), "0"],
@@ -229,7 +236,7 @@ class TestViewKiroLive(RepoCase):
         log = os.path.join(self.repo, "logs", "raw", "kiro-coord-2026.jsonl")
         line = '{"data": {"update": {"sessionUpdate": "tool_call", "title": "LINEAR-D13-TOOL"}}}\n'
         write(log, line[:20])
-        p = subprocess.Popen(["python3", os.path.join(self.repo, "scripts", "coord", "view-kiro-live.py")],
+        p = subprocess.Popen([sys.executable, os.path.join(self.repo, "scripts", "coord", "view-kiro-live.py")],
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         try:
             time.sleep(2.5)
@@ -250,6 +257,7 @@ STUB2 = STUB.replace("""  "inbox wait")
 """, 1)
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash + scripts/coord/inbox-worker.sh + /bin/sh stub test")
 class TestInboxWorker(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

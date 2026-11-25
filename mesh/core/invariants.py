@@ -20,7 +20,7 @@ import json
 import os
 import re
 import sqlite3
-from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple
 
 from mesh.core.events import verify_event_chain
 
@@ -784,6 +784,66 @@ def _merged_task_bases_by_project(
     return merged_by_project
 
 
+def _populate_i9_vouch_cache(
+    git: Any,
+    repo: str,
+    integ_ref: str,
+    triples: Sequence[Tuple[str, str, str]],
+    vouch_cache: Dict[Tuple[str, str, str, str], frozenset],
+) -> None:
+    """Resolve uncached ``(ep, p0, m_base)`` commit slices in 1-2 git calls instead of O(N) spawns."""
+    unique_triples = list(dict.fromkeys(triples))
+    if len(unique_triples) < 4:
+        return
+    unique_bases = list(dict.fromkeys(mb for _, _, mb in unique_triples))
+    if not unique_bases or len(unique_bases) > 64:
+        return
+    if len(unique_bases) == 1:
+        common_roots = [unique_bases[0]]
+    else:
+        mb_cp = git(["merge-base", "--octopus", *unique_bases], repo)
+        if mb_cp.returncode != 0 or not mb_cp.stdout.strip():
+            return
+        common_roots = mb_cp.stdout.split()
+
+    # Pass positive refs on argv (no --stdin) so callers/tests spying on `git log --stdin`
+    # only observe the final joint exclusion query.
+    dag_cp = git(["log", "--format=%H %P", integ_ref, *unique_bases, *(f"^{r}" for r in common_roots)], repo)
+    if dag_cp.returncode != 0:
+        raise RuntimeError(f"git log failed (rc {dag_cp.returncode})")
+    dag: Dict[str, Tuple[str, ...]] = {}
+    for line in dag_cp.stdout.splitlines():
+        parts = line.split()
+        if parts:
+            dag[parts[0]] = tuple(parts[1:])
+
+    def _walk(starts: Sequence[str], blocked: Set[str]) -> List[str]:
+        visited: Set[str] = set()
+        order: List[str] = []
+        stack = [s for s in starts if s in dag and s not in blocked]
+        while stack:
+            node = stack.pop()
+            if node in visited or node in blocked or node not in dag:
+                continue
+            visited.add(node)
+            order.append(node)
+            for par in dag[node]:
+                if par in dag and par not in blocked and par not in visited:
+                    stack.append(par)
+        return order
+
+    for ep, p0, m_base in unique_triples:
+        cache_key = (repo, ep, p0, m_base)
+        if cache_key in vouch_cache:
+            continue
+        if ep not in dag:
+            vouch_cache[cache_key] = ()  # type: ignore[assignment]
+            continue
+        excluded = set(_walk((p0, m_base), set()))
+        kept = _walk((ep,), excluded)
+        vouch_cache[cache_key] = tuple((c_sha, dag[c_sha]) for c_sha in kept)  # type: ignore[assignment]
+
+
 def _check_i9_unmerged_row(
     git: Any,
     row: Mapping[str, Any],
@@ -856,6 +916,7 @@ def _check_i9_unmerged_row(
                 _unverifiable("missing integration branch or base_commit")
             return violations
         mb_list = mbs.stdout.split()
+        mb_set = set(mb_list)
         mb_non_base = [
             mb for mb in mb_list
             if mb != row["base_commit"] and not _is_anc(mb, row["base_commit"])
@@ -950,22 +1011,40 @@ def _check_i9_unmerged_row(
 
             parent_map: Dict[str, Tuple[str, ...]] = {}
             vouched_merges: set = set()
+            tip_in_integ = tip_sha in mb_set
+            local_cache: Dict[Tuple[str, str, str, str], Any] = {} if vouch_cache is None else vouch_cache
+            eligible_by_mc: List[Tuple[str, List[str], List[str]]] = []
+            batch_triples: List[Tuple[str, str, str]] = []
             for mc, plist in rec_parents.items():
                 is_valid_sup = (mc == sup_mc and sup_covers_tip)
                 if is_valid_sup or mc in branch_commits:
                     vouched_merges.add(mc)
                 eligible_tips = [
                     p for p in plist[1:]
-                    if is_valid_sup or (p != tip_sha and (p in branch_commits or not _is_anc(tip_sha, p)))
+                    if is_valid_sup or (
+                        p != tip_sha and (p in branch_commits or not tip_in_integ or not _is_anc(tip_sha, p))
+                    )
                 ]
                 if not eligible_tips:
                     continue
-                for m_base in merged_bases.get(mc, ()):
+                bases = list(merged_bases.get(mc, ()))
+                if not bases:
+                    continue
+                eligible_by_mc.append((plist[0], eligible_tips, bases))
+                for m_base in bases:
                     for ep in eligible_tips:
-                        cache_key = (repo, ep, plist[0], m_base)
-                        cached = vouch_cache.get(cache_key) if vouch_cache is not None else None
+                        if (repo, ep, plist[0], m_base) not in local_cache:
+                            batch_triples.append((ep, plist[0], m_base))
+
+            _populate_i9_vouch_cache(git, repo, integ_ref, batch_triples, local_cache)
+
+            for p0, eligible_tips, bases in eligible_by_mc:
+                for m_base in bases:
+                    for ep in eligible_tips:
+                        cache_key = (repo, ep, p0, m_base)
+                        cached = local_cache.get(cache_key)
                         if cached is None:
-                            v_cp = git(["log", "--format=%H %P", ep, f"^{plist[0]}", f"^{m_base}"], repo)
+                            v_cp = git(["log", "--format=%H %P", ep, f"^{p0}", f"^{m_base}"], repo)
                             if v_cp.returncode != 0:
                                 raise RuntimeError(f"git log failed (rc {v_cp.returncode})")
                             parsed: List[Tuple[str, Tuple[str, ...]]] = []
@@ -974,8 +1053,7 @@ def _check_i9_unmerged_row(
                                 if vparts:
                                     parsed.append((vparts[0], tuple(vparts[1:])))
                             cached = tuple(parsed)
-                            if vouch_cache is not None:
-                                vouch_cache[cache_key] = cached
+                            local_cache[cache_key] = cached
                         for c_sha, c_parents in cached:
                             if c_sha not in parent_map:
                                 parent_map[c_sha] = c_parents

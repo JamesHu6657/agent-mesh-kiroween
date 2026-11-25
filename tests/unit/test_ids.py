@@ -12,7 +12,8 @@ class TestIDs(unittest.TestCase):
         """Verify all 14 expected prefixes are accepted and generated."""
         expected_prefixes = {
             "prj", "tsk", "run", "apr", "agt", "usr", "cred",
-            "evt", "msg", "req", "boot", "lead", "mrg", "crit"
+            "evt", "msg", "req", "boot", "lead", "mrg", "crit",
+            "pln", "cmsg", "grt",
         }
         self.assertEqual(PREFIXES, expected_prefixes)
 

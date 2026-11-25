@@ -12,9 +12,10 @@ import unittest
 import mesh.constants as c
 from mesh.adapters import evidence, smoke_schema
 from mesh.core.invariants import check_invariants
+from mesh.platform import ipc as plat_ipc, perms as plat_perms
 from tests import tierlib
 from tests.helpers import MeshHarness
-from tests.stubs import create_test_stubs
+from tests.stubs import _write_python_stub, create_test_stubs
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -45,9 +46,8 @@ sys.exit(99)
 
 
 def _raw_socket_call(sock_path: str, payload: dict) -> dict:
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+    with plat_ipc.connect_endpoint(sock_path, timeout=10.0) as s:
         s.settimeout(10.0)
-        s.connect(sock_path)
         s.sendall((json.dumps(payload) + "\n").encode("utf-8"))
         buf = b""
         while b"\n" not in buf:
@@ -64,13 +64,13 @@ class TestBatch7Pr46R1Integration(unittest.TestCase):
         self.addCleanup(self.harness.teardown)
         self.tok_dir = tempfile.mkdtemp(prefix="mh-pr46-tok-")
         self.addCleanup(shutil.rmtree, self.tok_dir, True)
-        os.chmod(self.tok_dir, 0o700)
+        plat_perms.set_private_dir_acl(self.tok_dir)
 
     def test_f1_keyed_onboard_and_token_issue_refuse_existing_out_before_db_writes(self) -> None:
         existing = os.path.join(self.tok_dir, "existing.tok")
         with open(existing, "w", encoding="utf-8") as f:
             f.write("PREEXISTING_TOKEN\n")
-        os.chmod(existing, 0o600)
+        plat_perms.set_private_file_acl(existing)
 
         # 1. Fresh keyed onboard without --force must exit 2 and leave DB clean
         for attempt in (1, 2):
@@ -145,7 +145,7 @@ class TestBatch7Pr46R1Integration(unittest.TestCase):
             conn.close()
 
         # 3. Direct daemon protocol checks for replay_only envelope rules
-        sock = os.path.join(self.harness.home, "run", "mesh.sock")
+        sock = plat_ipc.daemon_endpoint_path(self.harness.home)
         auth = {"type": "user", "passphrase": self.harness.passphrase}
         for bad_req in (
             {"v": 1, "cmd": "agent.create", "auth": auth, "args": {"name": "s1", "adapter": "none", "delivery": "inbox"}, "replay_only": True},
@@ -308,18 +308,18 @@ class TestBatch7Pr46R1VendorIntegration(unittest.TestCase):
         self.assertEqual(rc, 0, tok_r)
         tok_lead = tok_r["data"]["token"]
 
-        kiro_bin = os.path.join(self.tmp, "bin-kiro", "kiro-cli")
-        os.makedirs(os.path.dirname(kiro_bin))
-        with open(kiro_bin, "w", encoding="utf-8") as f:
-            f.write(_KIRO_DENIED_EXIT1_STUB.format(
+        kiro_bin = _write_python_stub(
+            os.path.join(self.tmp, "bin-kiro"),
+            "kiro-cli",
+            _KIRO_DENIED_EXIT1_STUB.format(
                 python=sys.executable,
                 help=os.path.join(REAL_KIRO, "help.txt"),
                 chat_help=os.path.join(REAL_KIRO, "chat-help.txt"),
                 models=os.path.join(REAL_KIRO, "list-models.json"),
                 fake_sk=fake_sk,
                 fake_mesh=fake_mesh,
-            ))
-        os.chmod(kiro_bin, 0o755)
+            ),
+        )
         time.sleep(0.05)
 
         rc_p, resp_p = self.harness.cli("adapter", "probe", "kiro", "--binary", kiro_bin, user=True)
@@ -335,9 +335,10 @@ class TestBatch7Pr46R1VendorIntegration(unittest.TestCase):
         )
         self.assertEqual(rc_prj, 0, resp_prj)
         pid = resp_prj["data"]["id"]
+        kiro_profile = "edit" if sys.platform == "win32" else "readonly"
         rc_tsk, resp_tsk = self.harness.cli(
             "task", "create", "--project", pid, "--title", "TF5", "--spec", "say hi",
-            "--assignee", "kiro_w", "--profile", "readonly", token=tok_lead,
+            "--assignee", "kiro_w", "--profile", kiro_profile, token=tok_lead,
         )
         self.assertEqual(rc_tsk, 0, resp_tsk)
         tid = resp_tsk["data"]["id"]

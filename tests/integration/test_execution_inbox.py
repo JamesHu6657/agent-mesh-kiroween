@@ -15,7 +15,9 @@ import unittest
 from typing import Any, Dict, List, Optional
 
 import mesh.constants as c
-from tests.helpers import MeshHarness, assert_h5, serial
+from mesh.platform import perms as plat_perms
+from mesh.platform.paths import strip_trailing_seps
+from tests.helpers import MeshHarness, assert_h5, assert_private_mode, serial
 from tests.stubs import create_test_stubs
 
 
@@ -66,7 +68,7 @@ def create_agent(
     tok_path = os.path.join(tok_dir, f"{name}.token")
     with open(tok_path, "w", encoding="utf-8") as f:
         f.write(token)
-    os.chmod(tok_path, 0o600)
+    plat_perms.set_private_file_acl(tok_path)
     return token
 
 
@@ -225,14 +227,12 @@ class TestExecutionInbox(unittest.TestCase):
         fence = resp_st["data"]["fence"]
         ws_path = resp_st["data"]["workspace"]
 
-        # Verify workspace and run dirs exist with 0700 permissions
+        # Verify workspace and run dirs exist with 0700 permissions (or private ACL on Win32)
         self.assertTrue(os.path.isdir(ws_path))
-        ws_mode = stat.S_IMODE(os.stat(ws_path).st_mode)
-        self.assertEqual(ws_mode, 0o700)
+        assert_private_mode(self, ws_path, is_dir=True, posix_mode=0o700)
         run_dir = os.path.join(self.harness.home, "runs", run_id)
         self.assertTrue(os.path.isdir(run_dir))
-        run_mode = stat.S_IMODE(os.stat(run_dir).st_mode)
-        self.assertEqual(run_mode, 0o700)
+        assert_private_mode(self, run_dir, is_dir=True, posix_mode=0o700)
 
         # 2. Heartbeat extends expires_at. Let the lease age a little first so the extension
         # is observable (expires_at only moves on heartbeat).
@@ -1404,7 +1404,7 @@ class TestExecutionInbox(unittest.TestCase):
         rc_sh1, resp_sh1 = self.harness.cli("task", "show", t1, token=self.tok_lead1)
         self.assertEqual(rc_sh1, 0)
         ws_t1_attempt2 = resp_sh1["data"]["workspace_path"]
-        self.assertTrue(ws_t1_attempt2.rstrip("/").endswith(f"tasks/{t1}.a2"))
+        self.assertTrue(strip_trailing_seps(ws_t1_attempt2).endswith(os.path.join("tasks", f"{t1}.a2")))
         # Old dir still exists on disk
         self.assertTrue(os.path.isdir(ws_t1_attempt1))
 
@@ -1422,7 +1422,11 @@ class TestExecutionInbox(unittest.TestCase):
         retried_t1 = resp_ev1["data"]["items"]
         self.assertEqual(len(retried_t1), 1)
         self.assertEqual(retried_t1[0]["payload"].get("workspace"), "fresh")
-        self.assertTrue(retried_t1[0]["payload"].get("workspace_path", "").rstrip("/").endswith(f"tasks/{t1}.a2"))
+        self.assertTrue(
+            strip_trailing_seps(retried_t1[0]["payload"].get("workspace_path", "")).endswith(
+                os.path.join("tasks", f"{t1}.a2")
+            )
+        )
 
         rc_ev2, resp_ev2 = self.harness.cli("event", "list", "--task", t2, "--type", "task.retried", token=self.tok_lead1)
         self.assertEqual(rc_ev2, 0)

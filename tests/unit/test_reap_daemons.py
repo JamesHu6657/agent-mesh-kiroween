@@ -1,12 +1,10 @@
 """Registry policy fixtures and pidfd tests, isolated from host/suite processes."""
 import contextlib
 import errno
-import fcntl
 import io
 import json
 import os
 from pathlib import Path
-import select
 import signal
 import subprocess
 import sys
@@ -15,6 +13,14 @@ import time
 import unittest
 from unittest import mock
 
+if sys.platform != "win32":
+    import fcntl
+    import select
+else:
+    fcntl = None  # type: ignore[assignment]
+    select = None  # type: ignore[assignment]
+
+from mesh.platform import paths as plat_paths
 from scripts.coord import reap_daemons as reap
 from tests.helpers import MeshHarness
 
@@ -23,7 +29,8 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class TestPolicy(unittest.TestCase):
     def setUp(self):
-        self.record = {"pid": 123, "starttime": 456, "home": "/tmp/mh-fixture",
+        self._home_fixture = os.path.join(plat_paths.temp_root(), "mh-fixture")
+        self.record = {"pid": 123, "starttime": 456, "home": self._home_fixture,
                        "suite_id": "fixture"}
         self.current = reap.parse_stat("123 (name with ) spaces) S " + "0 " * 18 + "456 0")
 
@@ -57,15 +64,25 @@ class TestPolicy(unittest.TestCase):
             self.assertFalse(reap.adhoc_alive(record, owner))
 
     def test_malformed_record_fields(self):
+        tmp = plat_paths.temp_root()
+        outside_home = (
+            "/var/tmp/mh-a"
+            if sys.platform != "win32"
+            else os.path.join(os.path.dirname(tmp), "var", "mh-a")
+        )
         for update in ({"pid": True}, {"pid": 1}, {"starttime": "456"},
-                       {"home": "/tmp/mh-a/../../var/mh-b"},
-                       {"home": "/tmp/mh-a/nested"}, {"home": "/var/tmp/mh-a"},
-                       {"home": "/tmp/mh-"}, {"suite_id": "../escape"},
+                       {"home": os.path.join(tmp, "mh-a", "..", "..", "var", "mh-b")},
+                       {"home": os.path.join(tmp, "mh-a", "nested")}, {"home": outside_home},
+                       {"home": os.path.join(tmp, "mh-")}, {"suite_id": "../escape"},
                        {"suite_id": "adhoc-123"}, {"suite_id": ""}):
             with self.subTest(update=update), self.assertRaises(ValueError):
                 reap.validate_record(dict(self.record, **update))
 
 
+@unittest.skipUnless(
+    sys.platform.startswith("linux"),
+    "Linux pidfd/proc/fcntl/dash reap_daemons suite; Win32 tested in test_phase7b_win_port.py",
+)
 class RegistryFixture(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="mesh-reap-registry-")
@@ -144,6 +161,10 @@ class RegistryFixture(unittest.TestCase):
         return output.getvalue()
 
 
+@unittest.skipUnless(
+    sys.platform.startswith("linux"),
+    "Linux pidfd/proc/fcntl/dash reap_daemons suite; Win32 tested in test_phase7b_win_port.py",
+)
 class TestRegistry(RegistryFixture):
     def test_atomic_registration_permissions_and_removal(self):
         child = self.child()
@@ -452,6 +473,10 @@ class TestRegistry(RegistryFixture):
             self.assertEqual(result.returncode, status, result.stderr)
 
 
+@unittest.skipUnless(
+    sys.platform.startswith("linux"),
+    "Linux pidfd/proc/fcntl/dash reap_daemons suite; Win32 tested in test_phase7b_win_port.py",
+)
 class TestGenerationsAndEdges(RegistryFixture):
     """Item 2/3 regressions; inherits the isolated registry fixture only."""
 
@@ -584,6 +609,10 @@ class TestGenerationsAndEdges(RegistryFixture):
         self.assertTrue(fresh.exists())
 
 
+@unittest.skipUnless(
+    sys.platform.startswith("linux"),
+    "Linux pidfd/proc/fcntl/dash reap_daemons suite; Win32 tested in test_phase7b_win_port.py",
+)
 class TestHarnessPidFileFallback(RegistryFixture):
     """Linear MAJOR: the meshd.pid fallback only signals our exact daemon via pidfd."""
 
@@ -666,6 +695,10 @@ class TestHarnessPidFileFallback(RegistryFixture):
 
 
 
+@unittest.skipUnless(
+    sys.platform.startswith("linux"),
+    "Linux pidfd/proc/fcntl/dash reap_daemons suite; Win32 tested in test_phase7b_win_port.py",
+)
 class TestPidFileDaemonWithoutIdentity(RegistryFixture):
     """r7d3 F1 / r7d4: daemons from ``mesh daemon start`` (no Popen identity) are
     stopped via pidfd only if they run for exactly this (absolute) home and carry

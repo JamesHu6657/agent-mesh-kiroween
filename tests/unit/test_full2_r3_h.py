@@ -9,6 +9,7 @@ import shutil
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -30,7 +31,9 @@ from mesh.daemon.handlers import inbox as inbox_handlers
 from mesh.daemon.handlers import task as task_handlers
 from mesh.daemon.handlers.base import HandlerContext
 from mesh.errors import MeshError
+from mesh.platform import perms as plat_perms
 from tests.gitfixture import GitFixture
+from tests.helpers import restore_accessible_for_test, set_world_readable_for_test
 
 
 PASS = "correct-horse-battery-staple"
@@ -368,11 +371,13 @@ class TestP2_11BoundaryAndClientHardening(unittest.TestCase):
 
             with self.assertRaises(OSError):
                 workspaces.ensure_workspace_dir(sym_ws)
-            self.assertEqual(stat.S_IMODE(os.stat(victim).st_mode), 0o755)
+            if sys.platform != "win32":
+                self.assertEqual(stat.S_IMODE(os.stat(victim).st_mode), 0o755)
 
             with self.assertRaises(OSError):
                 workspaces.ensure_run_dir(sym_ws)
-            self.assertEqual(stat.S_IMODE(os.stat(victim).st_mode), 0o755)
+            if sys.platform != "win32":
+                self.assertEqual(stat.S_IMODE(os.stat(victim).st_mode), 0o755)
 
     def test_first_start_reattaches_orphaned_branch_when_db_branch_is_none(self) -> None:
         fixture = GitFixture()
@@ -435,7 +440,7 @@ class TestP2_11BoundaryAndClientHardening(unittest.TestCase):
             big = os.path.join(tmp, "big.pp")
             with open(big, "w", encoding="utf-8") as f:
                 f.write("a" * (mesh_passphrase.MAX_PASSPHRASE_BYTES + 100))
-            os.chmod(big, 0o600)
+            plat_perms.set_private_file_acl(big)
             with self.assertRaises(MeshError) as cm_f:
                 mesh_passphrase.read_passphrase(SimpleNamespace(passphrase_fd=None, passphrase_file=big), env={})
             self.assertEqual((cm_f.exception.code, cm_f.exception.exit_code), (c.INVALID_ARGUMENT, c.EXIT_USAGE))
@@ -452,9 +457,14 @@ class TestP2_11BoundaryAndClientHardening(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="mh-r3h-tok-") as tmp:
             home = os.path.join(tmp, "home")
             os.makedirs(home, mode=0o700)
+            plat_perms.set_private_dir_acl(home)
             world_dir = os.path.join(tmp, "world")
             os.makedirs(world_dir, mode=0o777)
-            os.chmod(world_dir, 0o777)
+            if sys.platform == "win32":
+                plat_perms.grant_everyone_write_for_test(world_dir)
+                self.addCleanup(lambda: os.path.isdir(world_dir) and restore_accessible_for_test(world_dir))
+            else:
+                os.chmod(world_dir, 0o777)
             planned_nonexistent = os.path.join(world_dir, "sub", "nested", "lead.token")
             with self.assertRaises(MeshError) as cm:
                 setup_cli._check_token_destination(home, planned_nonexistent)
@@ -462,9 +472,10 @@ class TestP2_11BoundaryAndClientHardening(unittest.TestCase):
 
             priv_dir = os.path.join(tmp, "priv")
             os.makedirs(priv_dir, mode=0o700)
-            os.chmod(priv_dir, 0o700)
+            plat_perms.set_private_dir_acl(priv_dir)
             setup_cli._check_token_destination(home, os.path.join(priv_dir, "sub", "lead.token"))
 
+    @unittest.skipIf(sys.platform == "win32", "AF_UNIX socket length/socket.socket mocks are POSIX-only")
     def test_client_checks_socket_len_handles_oserror_and_closes_fds(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mh-r3h-cli-") as tmp:
             long_home = os.path.join(tmp, "x" * 120)
@@ -551,6 +562,7 @@ class TestP2_11BoundaryAndClientHardening(unittest.TestCase):
             finally:
                 conn.close()
 
+    @unittest.skipIf(sys.platform == "win32", "scripts/inbox-worker-example.sh requires POSIX bash")
     def test_inbox_worker_script_dash_summary_and_non_offer_wait_rounds(self) -> None:
         script = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
                               "scripts", "inbox-worker-example.sh")

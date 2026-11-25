@@ -14,6 +14,7 @@ import unittest
 from typing import Any, Dict, List, Optional
 
 import mesh.constants as c
+from mesh.platform import perms as plat_perms
 from tests.helpers import MeshHarness, serial
 from tests.stubs import create_test_stubs
 
@@ -79,7 +80,7 @@ def create_agent(
     tok_path = os.path.join(tok_dir, f"{name}.tok")
     with open(tok_path, "w", encoding="utf-8") as f:
         f.write(token)
-    os.chmod(tok_path, 0o600)
+    plat_perms.set_private_file_acl(tok_path)
 
     return token
 
@@ -781,12 +782,13 @@ class TestTasksIntegration(unittest.TestCase):
 
     def test_n4_adapter_launch_disabled(self) -> None:
         """ACC: N4, N23 - Launch agent on adapter agy; m task create … --assignee <it> [@lead1] -> rc 13 ADAPTER_UNSUPPORTED M3, details.reason no_smoke_evidence (no agy results file)."""
-        from mesh.adapters import evidence, smoke_schema
+        from mesh.adapters import evidence
 
         # Precondition (N23): no agy results file where this testing-mode daemon could look.
         self.assertNotIn(evidence.OVERRIDE_ENV, os.environ)
         self.assertIsNone(evidence.results_dir(True, {}))
-        self.assertIsNone(smoke_schema.load_latest(str(evidence.results_dir(False)), "agy"))
+        # The repository now holds agy results (2026-11-19 smoke), but a testing-mode daemon
+        # reads no results directory (asserted above), so agy still has no smoke evidence here.
         create_agent(
             self.harness,
             "ag_agy",

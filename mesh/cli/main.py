@@ -29,6 +29,7 @@ from mesh.cli.commands.run import register_run_commands
 from mesh.cli.commands.workspace import register_workspace_commands
 from mesh.cli.commands.doctor import register_doctor_commands
 from mesh.cli.commands.audit import register_audit_commands
+from mesh.cli.commands.desktop import register_desktop_command
 
 
 def is_text_format(argv: Optional[List[str]] = None) -> bool:
@@ -200,6 +201,7 @@ def build_parser() -> MeshArgumentParser:
     from mesh.cli.commands.setup import register_setup_command
     register_setup_command(subparsers, parent_parser)
     register_audit_commands(subparsers, parent_parser)
+    register_desktop_command(subparsers, parent_parser)
 
     _keep_help_layout(root_parser)
     return root_parser

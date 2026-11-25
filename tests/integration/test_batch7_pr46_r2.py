@@ -5,24 +5,25 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import sqlite3
 import unittest
 
 import mesh.constants as c
 from mesh.core.invariants import check_invariants
+from mesh.platform import ipc as plat_ipc, paths as plat_paths, perms as plat_perms, pipe_pump
 from scripts.coord import reap_daemons
 from tests.helpers import MeshHarness
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-BIN_MESH = os.path.join(REPO_ROOT, "bin", "mesh")
+BIN_MESH = os.path.join(REPO_ROOT, "bin", "mesh.cmd" if sys.platform == "win32" else "mesh")
 
 
 def _raw_socket_call(sock_path: str, payload: dict) -> dict:
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+    with plat_ipc.connect_endpoint(sock_path, timeout=10.0) as s:
         s.settimeout(10.0)
-        s.connect(sock_path)
         s.sendall((json.dumps(payload) + "\n").encode("utf-8"))
         buf = b""
         while b"\n" not in buf:
@@ -67,31 +68,36 @@ class TestBatch7Pr46R2SetupIntegration(unittest.TestCase):
     """P2 Finding #1 (`mesh setup --input -` lead_name null / bad token_dir): zero side effects."""
 
     def setUp(self) -> None:
-        self.tmp = tempfile.mkdtemp(prefix="mh-pr46r2-setup-", dir="/tmp")
+        self.tmp = tempfile.mkdtemp(prefix="mh-pr46r2-setup-", dir=plat_paths.temp_root())
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.home = os.path.join(self.tmp, "home")
         self.tok_dir = os.path.join(self.tmp, "tok")
         os.makedirs(self.tok_dir, mode=0o700)
+        plat_perms.set_private_dir_acl(self.tok_dir)
         self.pfile = os.path.join(self.tmp, "passphrase")
         with open(self.pfile, "w", encoding="utf-8") as f:
             f.write("test-setup-passphrase-16chars\n")
-        os.chmod(self.pfile, 0o600)
+        plat_perms.set_private_file_acl(self.pfile)
         self.env = {k: v for k, v in os.environ.items() if not k.startswith("MESH_")}
         self.env["MESH_TESTING"] = "1"
         self.env["MESH_PASSPHRASE_FILE"] = self.pfile
         self.addCleanup(self._cleanup_leaked_daemon)
 
     def _cleanup_leaked_daemon(self) -> None:
-        if os.path.exists(os.path.join(self.home, "run", "mesh.sock")):
+        if plat_ipc.probe_daemon_endpoint(self.home):
+            cmd = pipe_pump.prepare_win_cmd_args(
+                [BIN_MESH, "--home", self.home, "daemon", "stop", "--user"], env=self.env,
+            )
             subprocess.run(
-                [BIN_MESH, "--home", self.home, "daemon", "stop", "--user"],
+                cmd,
                 env=self.env, capture_output=True, text=True, timeout=15,
             )
             reap_daemons.kill_home_daemons(self.home)
 
     def _run_setup(self, *args: str, stdin_text: str = None):
+        cmd = pipe_pump.prepare_win_cmd_args([BIN_MESH, "--home", self.home, "setup", *args], env=self.env)
         proc = subprocess.run(
-            [BIN_MESH, "--home", self.home, "setup", *args],
+            cmd,
             env=self.env,
             input=stdin_text,
             capture_output=True,
@@ -106,7 +112,7 @@ class TestBatch7Pr46R2SetupIntegration(unittest.TestCase):
         self.assertEqual(rc, c.EXIT_USAGE, resp)
         self.assertEqual(resp["error"]["code"], c.INVALID_ARGUMENT)
         self.assertFalse(os.path.exists(os.path.join(self.home, "mesh.db")))
-        self.assertFalse(os.path.exists(os.path.join(self.home, "run", "mesh.sock")))
+        self.assertFalse(plat_ipc.probe_daemon_endpoint(self.home))
 
         rc_td, resp_td = self._run_setup("--token-dir", "")
         self.assertEqual(rc_td, c.EXIT_USAGE, resp_td)
@@ -134,8 +140,8 @@ class TestBatch7Pr46R2DaemonIntegration(unittest.TestCase):
         self.addCleanup(self.harness.teardown)
         self.tok_dir = tempfile.mkdtemp(prefix="mh-pr46r2-tok-")
         self.addCleanup(shutil.rmtree, self.tok_dir, True)
-        os.chmod(self.tok_dir, 0o700)
-        self.sock = os.path.join(self.harness.home, "run", "mesh.sock")
+        plat_perms.set_private_dir_acl(self.tok_dir)
+        self.sock = plat_ipc.daemon_endpoint_path(self.harness.home)
         self.user_auth = {"type": "user", "passphrase": self.harness.passphrase}
 
     def test_f1_task_and_project_wait_null_and_non_str_until_exit_usage(self) -> None:

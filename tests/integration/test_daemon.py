@@ -6,14 +6,26 @@ import os
 import shutil
 import signal
 import socket
+import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
 
 import mesh.constants as c
-from tests.helpers import MeshHarness, idle_bound, serial
+from mesh.core.paths import mesh_cli_argv
+from mesh.platform import ipc as plat_ipc, paths as plat_paths, perms as plat_perms, pipe_pump, proc as plat_proc
+from tests.helpers import (
+    MeshHarness,
+    _win_terminate_and_wait_pid,
+    assert_private_mode,
+    idle_bound,
+    restore_accessible_for_test,
+    serial,
+    set_world_readable_for_test,
+)
 
 
 class TestDaemonIntegration(unittest.TestCase):
@@ -47,12 +59,7 @@ class TestDaemonIntegration(unittest.TestCase):
         self.assertIn("mesh daemon start", down_resp["error"]["message"])
 
     def test_daemon_socket_and_no_tcp(self) -> None:
-        """ACC: C1 - Daemon opens Unix socket at $H/run/mesh.sock and no TCP ports."""
-        sock_path = os.path.join(self.harness.home, "run", "mesh.sock")
-        self.assertTrue(os.path.exists(sock_path))
-        st = os.stat(sock_path)
-        self.assertTrue(stat.S_ISSOCK(st.st_mode))
-
+        """ACC: C1 - Daemon opens Unix socket at $H/run/mesh.sock (or Win32 Named Pipe) and no TCP ports."""
         # Check PID file
         pid_path = os.path.join(self.harness.home, "run", "meshd.pid")
         self.assertTrue(os.path.exists(pid_path))
@@ -60,6 +67,38 @@ class TestDaemonIntegration(unittest.TestCase):
             pid = int(f.read().strip())
 
         self.assertEqual(pid, self.harness.meshd_pid(), "pid file must name this home's meshd")
+
+        if sys.platform == "win32":
+            self.assertTrue(plat_ipc.probe_daemon_endpoint(self.harness.home), "meshd Named Pipe must accept connections")
+            netstat = shutil.which("netstat")
+            self.assertIsNotNone(netstat, "netstat must be installed on Windows")
+            p_net = subprocess.run([netstat, "-ano"], capture_output=True, text=True, timeout=15)
+            self.assertEqual(p_net.returncode, 0, p_net.stderr)
+            pid_str = str(pid)
+            owned_parts = [
+                parts for ln in p_net.stdout.splitlines()
+                if (parts := ln.split()) and parts[0] in ("TCP", "UDP") and parts[-1] == pid_str
+            ]
+            # Python ProactorEventLoop.__init__ creates one loopback self-pipe TCP socketpair
+            # for signal.set_wakeup_fd on Windows; allow at most that single symmetric pair.
+            if (
+                len(owned_parts) == 2
+                and all(p[0] == "TCP" and len(p) >= 5 and p[3] == "ESTABLISHED" for p in owned_parts)
+                and owned_parts[0][1] == owned_parts[1][2]
+                and owned_parts[0][2] == owned_parts[1][1]
+                and all(
+                    addr.startswith(("127.0.0.1:", "[::1]:"))
+                    for addr in (owned_parts[0][1], owned_parts[0][2])
+                )
+            ):
+                owned_parts = []
+            self.assertEqual(owned_parts, [], f"meshd owns unexpected TCP/UDP socket(s): {owned_parts}")
+            return
+
+        sock_path = os.path.join(self.harness.home, "run", "mesh.sock")
+        self.assertTrue(os.path.exists(sock_path))
+        st = os.stat(sock_path)
+        self.assertTrue(stat.S_ISSOCK(st.st_mode))
 
         # 1) /proc: resolve every socket fd of meshd against /proc/net/{tcp,tcp6,udp,udp6,unix}.
         fd_dir = f"/proc/{pid}/fd"
@@ -118,50 +157,64 @@ class TestDaemonIntegration(unittest.TestCase):
         # Make sure the request log exists (it is written per request).
         rc, _ = self.harness.cli("status")
         self.assertEqual(rc, 0)
-        # Dirs 0700
+        # Dirs 0700 (or private owner ACL on Win32)
         for d in [home, os.path.join(home, "run"), os.path.join(home, "runs"), os.path.join(home, "workspaces")]:
             self.assertTrue(os.path.isdir(d), f"{d} must exist")
-            mode = stat.S_IMODE(os.stat(d).st_mode)
-            self.assertEqual(mode, 0o700, f"Dir {d} has mode {oct(mode)}, expected 0700")
+            assert_private_mode(self, d, is_dir=True, posix_mode=0o700)
 
-        # Files 0600
+        # Files 0600 (or private owner ACL + Named Pipe probe on Win32)
         db_path = os.path.join(home, "mesh.db")
-        sock_path = os.path.join(home, "run", "mesh.sock")
         log_path = os.path.join(home, "logs", "meshd.log")
-        self.assertTrue(stat.S_ISSOCK(os.stat(sock_path).st_mode))
-        for f in [db_path, sock_path, log_path]:
+        if sys.platform == "win32":
+            self.assertTrue(plat_ipc.probe_daemon_endpoint(home))
+            check_files = [db_path, log_path]
+        else:
+            sock_path = os.path.join(home, "run", "mesh.sock")
+            self.assertTrue(stat.S_ISSOCK(os.stat(sock_path).st_mode))
+            check_files = [db_path, sock_path, log_path]
+        for f in check_files:
             self.assertTrue(os.path.exists(f), f"{f} must exist")
-            mode = stat.S_IMODE(os.stat(f).st_mode)
-            self.assertEqual(mode, 0o600, f"File {f} has mode {oct(mode)}, expected 0600")
+            assert_private_mode(self, f, is_dir=False, posix_mode=0o600)
 
     def test_insecure_home_permissions(self) -> None:
-        """ACC: C4 - Stop meshd, chmod 755 $H, mesh daemon run -> rc 2 INSECURE_PERMISSIONS; doctor --fix-perms restores 0700."""
+        """ACC: C4 - Stop meshd, make $H world-readable, mesh daemon run -> rc 2 INSECURE_PERMISSIONS; doctor --fix-perms restores private perms."""
         self.harness.stop_daemon()
-        os.chmod(self.harness.home, 0o755)
+        if sys.platform == "win32":
+            set_world_readable_for_test(self.harness.home)
+        else:
+            os.chmod(self.harness.home, 0o755)
         try:
-            sock_path = os.path.join(self.harness.home, "run", "mesh.sock")
-            self.assertFalse(os.path.exists(sock_path), "socket must be gone after stop")
+            sock_path = plat_ipc.daemon_endpoint_path(self.harness.home)
+            if sys.platform == "win32":
+                self.assertFalse(plat_ipc.probe_daemon_endpoint(self.harness.home), "pipe must be gone after stop")
+            else:
+                self.assertFalse(os.path.exists(sock_path), "socket must be gone after stop")
             rc, resp = self.harness.cli("daemon", "run")
             self.assertEqual(rc, c.EXIT_USAGE)
             self.assertFalse(resp["ok"])
             self.assertEqual(resp["error"]["code"], c.INSECURE_PERMISSIONS)
-            self.assertFalse(os.path.lexists(sock_path), "rejected start must not create the socket")
+            if sys.platform == "win32":
+                self.assertFalse(plat_ipc.probe_daemon_endpoint(self.harness.home), "rejected start must not open pipe")
+            else:
+                self.assertFalse(os.path.lexists(sock_path), "rejected start must not create the socket")
 
             # Now run doctor --fix-perms
             rc_fix, resp_fix = self.harness.cli("doctor", "--fix-perms")
             self.assertEqual(rc_fix, 0)
             self.assertTrue(resp_fix["ok"])
 
-            # Verify mode is 0700
-            mode = stat.S_IMODE(os.stat(self.harness.home).st_mode)
-            self.assertEqual(mode, 0o700)
+            # Verify mode is 0700 (or private DACL on Win32)
+            assert_private_mode(self, self.harness.home, is_dir=True, posix_mode=0o700)
 
             # Start daemon again -> succeeds
             self.harness.start_daemon()
             rc_status, resp_status = self.harness.cli("status")
             self.assertEqual(rc_status, 0)
         finally:
-            os.chmod(self.harness.home, 0o700)
+            if sys.platform == "win32":
+                restore_accessible_for_test(self.harness.home)
+            else:
+                os.chmod(self.harness.home, 0o700)
 
     def test_install_path_check_in_workspace(self) -> None:
         """ACC: C14 - Copy install to $H/workspaces/inst/, verify daemon run and doctor fail with INSTALL_PATH_INSECURE."""
@@ -172,17 +225,22 @@ class TestDaemonIntegration(unittest.TestCase):
         # Copy bin/ and mesh/ to $H/workspaces/inst/
         shutil.copytree(os.path.join(repo_root, "bin"), os.path.join(inst_dir, "bin"))
         shutil.copytree(os.path.join(repo_root, "mesh"), os.path.join(inst_dir, "mesh"))
-        # Ensure bin/mesh is executable
-        os.chmod(os.path.join(inst_dir, "bin", "mesh"), 0o755)
-
-        inst_mesh = os.path.join(inst_dir, "bin", "mesh")
+        if sys.platform == "win32":
+            inst_mesh = os.path.join(inst_dir, "bin", "mesh.cmd")
+        else:
+            os.chmod(os.path.join(inst_dir, "bin", "mesh"), 0o755)
+            inst_mesh = os.path.join(inst_dir, "bin", "mesh")
         env = dict(self.harness.get_env())
 
         # Test daemon run
-        sock_path = os.path.join(self.harness.home, "run", "mesh.sock")
-        self.assertFalse(os.path.lexists(sock_path), "socket must be gone after stop")
-        proc = subprocess.run([inst_mesh, "--home", self.harness.home, "daemon", "run"], capture_output=True, text=True, env=env)
-        self.assertEqual(proc.returncode, c.EXIT_USAGE)
+        sock_path = plat_ipc.daemon_endpoint_path(self.harness.home)
+        if sys.platform == "win32":
+            self.assertFalse(plat_ipc.probe_daemon_endpoint(self.harness.home), "pipe must be gone after stop")
+        else:
+            self.assertFalse(os.path.lexists(sock_path), "socket must be gone after stop")
+        run_cmd = pipe_pump.prepare_win_cmd_args([inst_mesh, "--home", self.harness.home, "daemon", "run"], env=env)
+        proc = subprocess.run(run_cmd, capture_output=True, text=True, env=env)
+        self.assertEqual(proc.returncode, c.EXIT_USAGE, proc.stdout + proc.stderr)
         envelope = json.loads(proc.stdout)
         self.assertEqual(envelope["error"]["code"], c.INSTALL_PATH_INSECURE)
         self.assertEqual(envelope["error"]["details"]["install_root"], os.path.realpath(inst_dir))
@@ -190,16 +248,23 @@ class TestDaemonIntegration(unittest.TestCase):
             envelope["error"]["details"]["conflict"],
             os.path.realpath(os.path.join(self.harness.home, "workspaces")),
         )
-        self.assertFalse(os.path.lexists(sock_path), "INSTALL_PATH_INSECURE start must not create the socket")
+        if sys.platform == "win32":
+            self.assertFalse(plat_ipc.probe_daemon_endpoint(self.harness.home), "INSTALL_PATH_INSECURE must not open pipe")
+        else:
+            self.assertFalse(os.path.lexists(sock_path), "INSTALL_PATH_INSECURE start must not create the socket")
 
         # Test doctor
-        proc_doc = subprocess.run([inst_mesh, "--home", self.harness.home, "doctor"], capture_output=True, text=True, env=env)
-        self.assertEqual(proc_doc.returncode, c.EXIT_USAGE)
+        doc_cmd = pipe_pump.prepare_win_cmd_args([inst_mesh, "--home", self.harness.home, "doctor"], env=env)
+        proc_doc = subprocess.run(doc_cmd, capture_output=True, text=True, env=env)
+        self.assertEqual(proc_doc.returncode, c.EXIT_USAGE, proc_doc.stdout + proc_doc.stderr)
         envelope_doc = json.loads(proc_doc.stdout)
         self.assertEqual(envelope_doc["error"]["code"], c.INSTALL_PATH_INSECURE)
         self.assertEqual(envelope_doc["error"]["details"]["install_root"], os.path.realpath(inst_dir))
         self.assertIn("conflict", envelope_doc["error"]["details"])
-        self.assertFalse(os.path.lexists(sock_path))
+        if sys.platform == "win32":
+            self.assertFalse(plat_ipc.probe_daemon_endpoint(self.harness.home))
+        else:
+            self.assertFalse(os.path.lexists(sock_path))
 
     def test_daemon_already_running(self) -> None:
         """ACC: C5 - Start second daemon on the same home -> rc 1 DAEMON_ALREADY_RUNNING."""
@@ -217,7 +282,10 @@ class TestDaemonIntegration(unittest.TestCase):
         self.assertEqual(rc_s, 0, resp_s)
         self.assertEqual(resp_s["data"]["status"], "running")
         self.assertEqual(self.harness.meshd_pid(), pid_before, "meshd pid must be unchanged")
-        os.kill(pid_before, 0)
+        if sys.platform == "win32":
+            self.assertTrue(plat_proc.is_tgid_alive(pid_before))
+        else:
+            os.kill(pid_before, 0)
 
     def test_audit_log_never_contains_auth(self) -> None:
         """ACC: C11 - grep -c '"auth"' $H/logs/meshd.log after requests must be 0."""
@@ -376,10 +444,14 @@ class TestDaemonIntegration(unittest.TestCase):
         f = os.path.join(self.harness.fixtures_dir, "f.tok")
         with open(f, "w", encoding="utf-8") as fh:
             fh.write(token)
-        os.chmod(f, 0o600)
+        plat_perms.set_private_file_acl(f)
         rc_ok, resp_ok = self.harness.cli("whoami", "--token-file", f)
         self.assertEqual(rc_ok, 0, resp_ok)  # control: the same file works at 0600
-        os.chmod(f, 0o644)
+        if sys.platform == "win32":
+            set_world_readable_for_test(f)
+            self.addCleanup(lambda: os.path.exists(f) and restore_accessible_for_test(f))
+        else:
+            os.chmod(f, 0o644)
         rc, resp = self.harness.cli("whoami", "--token-file", f)
         self.assertEqual(rc, c.EXIT_UNAUTHENTICATED, resp)
         self.assertFalse(resp["ok"])
@@ -398,14 +470,14 @@ class TestDaemonIntegration(unittest.TestCase):
         orig = os.path.join(self.harness.fixtures_dir, "grok.tok")
         with open(orig, "w", encoding="utf-8") as fh:
             fh.write(token)
-        os.chmod(orig, 0o600)
+        plat_perms.set_private_file_acl(orig)
         rc_ok, resp_ok = self.harness.cli("whoami", "--token-file", orig)
         self.assertEqual(rc_ok, 0, resp_ok)  # control: grok's own token file works
         g = os.path.join(self.harness.home, "workspaces", "g.tok")
         shutil.copyfile(orig, g)
-        os.chmod(g, 0o600)
+        plat_perms.set_private_file_acl(g)
         try:
-            self.assertEqual(stat.S_IMODE(os.stat(g).st_mode), 0o600)
+            assert_private_mode(self, g, is_dir=False, posix_mode=0o600)
             rc, resp = self.harness.cli("whoami", "--token-file", g)
             self.assertEqual(rc, c.EXIT_UNAUTHENTICATED, resp)
             self.assertFalse(resp["ok"])
@@ -426,21 +498,30 @@ class TestDaemonIntegration(unittest.TestCase):
         rc_cfg, _ = self.harness.cli("config", "set", "auth.lockout_window_s", "30", user=True)
         self.assertEqual(rc_cfg, 0)
 
-        # Create a bad passphrase file
-        bad_pass_file = os.path.join(self.harness.home, ".bad_pass")
-        with open(bad_pass_file, "w") as f:
-            f.write("wrong-password-123456")
-        os.chmod(bad_pass_file, 0o600)
-
-        bad_fd = os.open(bad_pass_file, os.O_RDONLY)
-        try:
-            # 5 failures with wrong passphrase
+        if sys.platform == "win32":
+            # Windows test CLI skips pass_fds on non-inheritable FDs; feed the wrong passphrase on fd 0.
             for i in range(5):
-                rc, resp = self.harness.cli("whoami", "--user", "--passphrase-fd", str(bad_fd))
+                rc, resp = self.harness.cli(
+                    "whoami", "--user", "--passphrase-fd", "0", stdin="wrong-password-123456\n"
+                )
                 self.assertEqual(rc, c.EXIT_UNAUTHENTICATED, f"Attempt {i+1} got rc {rc}: {resp}")
                 self.assertEqual(resp["error"]["code"], c.PASSPHRASE_INVALID)
-        finally:
-            os.close(bad_fd)
+        else:
+            # Create a bad passphrase file
+            bad_pass_file = os.path.join(self.harness.home, ".bad_pass")
+            with open(bad_pass_file, "w") as f:
+                f.write("wrong-password-123456")
+            os.chmod(bad_pass_file, 0o600)
+
+            bad_fd = os.open(bad_pass_file, os.O_RDONLY)
+            try:
+                # 5 failures with wrong passphrase
+                for i in range(5):
+                    rc, resp = self.harness.cli("whoami", "--user", "--passphrase-fd", str(bad_fd))
+                    self.assertEqual(rc, c.EXIT_UNAUTHENTICATED, f"Attempt {i+1} got rc {rc}: {resp}")
+                    self.assertEqual(resp["error"]["code"], c.PASSPHRASE_INVALID)
+            finally:
+                os.close(bad_fd)
 
         # 6th attempt with correct passphrase during lockout window -> LOCKED_OUT
         rc, resp = self.harness.cli("whoami", user=True)
@@ -482,12 +563,18 @@ class TestDaemonIntegration(unittest.TestCase):
         self.assertEqual(rc, c.EXIT_USAGE)
         self.assertEqual(resp["error"]["code"], c.PASSPHRASE_SOURCE_REJECTED)
 
-        # No fd, no file, no env and no tty -> NO_TTY exit 3 (G17: setsid -w ... </dev/null)
+        # No fd, no file, no env and no tty -> NO_TTY exit 3 (G17: setsid -w / DETACHED_PROCESS ... </dev/null)
         def run(extra_env=None, *extra):
-            cmd = ["setsid", "-w", self.harness.bin_mesh, "--home", self.harness.home, "whoami", "--user", *extra]
             env = {k: v for k, v in self.harness.get_env().items() if not k.startswith("MESH_PASSPHRASE")}
             env.update(extra_env or {})
-            proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env)
+            run_kw = {"stdin": subprocess.DEVNULL, "capture_output": True, "text": True, "env": env}
+            if sys.platform == "win32":
+                self.harness._with_direct_pythonpath(env)
+                cmd = mesh_cli_argv("--home", self.harness.home, "whoami", "--user", *extra)
+                run_kw["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                cmd = ["setsid", "-w", self.harness.bin_mesh, "--home", self.harness.home, "whoami", "--user", *extra]
+            proc = subprocess.run(cmd, **run_kw)
             return proc.returncode, json.loads(proc.stdout)
 
         rc, resp = run()
@@ -504,7 +591,11 @@ class TestDaemonIntegration(unittest.TestCase):
         loose = os.path.join(self.harness.fixtures_dir, "loose-pass")
         with open(loose, "w", encoding="utf-8") as f:
             f.write(self.harness.passphrase)
-        os.chmod(loose, 0o644)
+        if sys.platform == "win32":
+            set_world_readable_for_test(loose)
+            self.addCleanup(lambda: os.path.exists(loose) and restore_accessible_for_test(loose))
+        else:
+            os.chmod(loose, 0o644)
         rc, resp = run(None, "--passphrase-file", loose)
         self.assertEqual((rc, resp["error"]["code"]), (c.EXIT_USAGE, c.INSECURE_PERMISSIONS))
 
@@ -590,10 +681,14 @@ class TestDaemonIntegration(unittest.TestCase):
             self.assertEqual(after[0], before[0], "mesh.db was recreated (inode changed)")
             self.assertEqual(after[3], before[3], "mesh.db content changed")
             self.assertEqual(after[1:3], before[1:3], "mesh.db size/mtime changed")
-            self.assertFalse(os.path.exists(os.path.join(self.harness.home, "run", "mesh.sock")))
+            if sys.platform == "win32":
+                self.assertFalse(plat_ipc.probe_daemon_endpoint(self.harness.home))
+            else:
+                self.assertFalse(os.path.exists(os.path.join(self.harness.home, "run", "mesh.sock")))
         finally:
+            from mesh.core.schema import CURRENT_SCHEMA_VERSION
             conn = sqlite3.connect(db_path)
-            conn.execute("UPDATE meta SET value = '1' WHERE key = 'schema_version';")
+            conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version';", (str(CURRENT_SCHEMA_VERSION),))
             conn.commit()
             conn.close()
 
@@ -601,28 +696,44 @@ class TestDaemonIntegration(unittest.TestCase):
         """F1 regression: daemon start --user reads fd once, status poll doesn't fail auth, auth.failed count is 0."""
         fresh = MeshHarness(init_db=True, start_daemon=False)
         try:
-            p_file = os.path.join(fresh.home, ".pass_test")
-            with open(p_file, "w") as f:
-                f.write(fresh.passphrase)
-            os.chmod(p_file, 0o600)
-            fd = os.open(p_file, os.O_RDONLY)
-            try:
-                # Real CLI invocation: bin/mesh --home <fresh.home> --user --passphrase-fd <fd> daemon start
-                cmd = [fresh.bin_mesh, "--home", fresh.home, "--user", "--passphrase-fd", str(fd), "daemon", "start"]
+            if sys.platform == "win32":
+                env = fresh._with_direct_pythonpath(fresh.get_env())
+                cmd = mesh_cli_argv("--home", fresh.home, "--user", "--passphrase-fd", "0", "daemon", "start")
                 proc = subprocess.run(
                     cmd,
-                    pass_fds=(fd,),
+                    input=fresh.passphrase,
                     capture_output=True,
                     text=True,
-                    env=fresh.get_env(),
+                    env=env,
                     timeout=10,
                 )
                 self.assertEqual(proc.returncode, 0, f"daemon start failed: {proc.stdout} {proc.stderr}")
                 data = json.loads(proc.stdout)
                 self.assertTrue(data.get("ok"))
                 self.assertEqual(data.get("data", {}).get("status"), "started")
-            finally:
-                os.close(fd)
+            else:
+                p_file = os.path.join(fresh.home, ".pass_test")
+                with open(p_file, "w") as f:
+                    f.write(fresh.passphrase)
+                os.chmod(p_file, 0o600)
+                fd = os.open(p_file, os.O_RDONLY)
+                try:
+                    # Real CLI invocation: bin/mesh --home <fresh.home> --user --passphrase-fd <fd> daemon start
+                    cmd = [fresh.bin_mesh, "--home", fresh.home, "--user", "--passphrase-fd", str(fd), "daemon", "start"]
+                    proc = subprocess.run(
+                        cmd,
+                        pass_fds=(fd,),
+                        capture_output=True,
+                        text=True,
+                        env=fresh.get_env(),
+                        timeout=10,
+                    )
+                    self.assertEqual(proc.returncode, 0, f"daemon start failed: {proc.stdout} {proc.stderr}")
+                    data = json.loads(proc.stdout)
+                    self.assertTrue(data.get("ok"))
+                    self.assertEqual(data.get("data", {}).get("status"), "started")
+                finally:
+                    os.close(fd)
 
             # Check whoami --user succeeds with rc 0
             rc_who, resp_who = fresh.cli("whoami", user=True)
@@ -650,18 +761,36 @@ class TestDaemonIntegration(unittest.TestCase):
             self.assertTrue(fresh.wait_for(lambda: os.path.exists(pid_file), timeout=10.0))
             with open(pid_file, "r", encoding="utf-8") as f:
                 pid = int(f.read().strip())
-            self.assertTrue(os.path.exists(f"/proc/{pid}"))
+            if sys.platform == "win32":
+                self.assertTrue(plat_proc.is_tgid_alive(pid))
+            else:
+                self.assertTrue(os.path.exists(f"/proc/{pid}"))
             self.assertIsNone(fresh.daemon_proc)
             # r7d4: the detached daemon inherits the harness token (its credential).
-            with open(f"/proc/{pid}/environ", "rb") as f:
-                environ = f.read().split(b"\0")
-            self.assertIn(b"MESH_TEST_HARNESS_TOKEN=" + fresh._harness_token.encode(), environ)
+            if sys.platform == "win32":
+                proc_env = plat_proc.get_proc_environ(pid) or {}
+                self.assertEqual(proc_env.get("MESH_TEST_HARNESS_TOKEN"), fresh._harness_token)
+            else:
+                with open(f"/proc/{pid}/environ", "rb") as f:
+                    environ = f.read().split(b"\0")
+                self.assertIn(b"MESH_TEST_HARNESS_TOKEN=" + fresh._harness_token.encode(), environ)
             # Linear r7d5 MINOR: no explicit stop here; teardown alone must stop it.
         finally:
             fresh.teardown()
 
         def procs_for_home() -> list:
             found = []
+            if sys.platform == "win32":
+                for p in plat_proc.list_toolhelp_processes():
+                    try:
+                        if not plat_proc.is_tgid_alive(p):
+                            continue
+                        argv = plat_proc.get_proc_cmdline(p) or []
+                    except OSError:
+                        continue
+                    if any(plat_paths.norm_cmp_win(a) == plat_paths.norm_cmp_win(home) for a in argv):
+                        found.append(p)
+                return found
             want = home.encode()
             for entry in os.listdir("/proc"):
                 if not entry.isdigit():
@@ -698,40 +827,64 @@ class TestDaemonIntegration(unittest.TestCase):
             self.assertTrue(b.wait_for(lambda: os.path.exists(pid_file_b), timeout=10.0))
             with open(pid_file_b, "r", encoding="utf-8") as f:
                 pid = int(f.read().strip())
-            with open(f"/proc/{pid}/environ", "rb") as f:
-                environ = f.read().split(b"\0")
-            self.assertIn(b"MESH_HOME=" + a.home.encode(), environ)
-            self.assertIn(b"MESH_TEST_HARNESS_TOKEN=" + a._harness_token.encode(), environ)
-            with open(f"/proc/{pid}/cmdline", "rb") as f:
-                self.assertEqual(f.read().split(b"\0")[:9],
-                                 [b"python3", b"-P", b"-s", b"-m", b"mesh", b"--home",
-                                  b.home.encode(), b"daemon", b"run"])
+            if sys.platform == "win32":
+                proc_env = plat_proc.get_proc_environ(pid) or {}
+                self.assertEqual(
+                    plat_paths.norm_cmp_win(proc_env.get("MESH_HOME", "")),
+                    plat_paths.norm_cmp_win(a.home),
+                )
+                self.assertEqual(proc_env.get("MESH_TEST_HARNESS_TOKEN"), a._harness_token)
+                argv = plat_proc.get_proc_cmdline(pid) or []
+                self.assertGreaterEqual(len(argv), 9, argv)
+                self.assertTrue(os.path.basename(argv[0]).lower().startswith("python"), argv)
+                self.assertEqual(argv[1:6], ["-P", "-s", "-m", "mesh", "--home"])
+                self.assertEqual(plat_paths.norm_cmp_win(argv[6]), plat_paths.norm_cmp_win(b.home))
+                self.assertEqual(argv[7:9], ["daemon", "run"])
+            else:
+                with open(f"/proc/{pid}/environ", "rb") as f:
+                    environ = f.read().split(b"\0")
+                self.assertIn(b"MESH_HOME=" + a.home.encode(), environ)
+                self.assertIn(b"MESH_TEST_HARNESS_TOKEN=" + a._harness_token.encode(), environ)
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    self.assertEqual(f.read().split(b"\0")[:9],
+                                     [b"python3", b"-P", b"-s", b"-m", b"mesh", b"--home",
+                                      b.home.encode(), b"daemon", b"run"])
             os.makedirs(os.path.join(a.home, "run"), exist_ok=True)
             with open(os.path.join(a.home, "run", "meshd.pid"), "w", encoding="utf-8") as f:
                 f.write(f"{pid}\n")
             self.assertEqual(a.stop_pidfile_daemon(), "home_mismatch")
             a.stop_daemon()  # the whole teardown stop path refuses it too
             time.sleep(0.5)
-            with open(f"/proc/{pid}/stat", "r") as f:
-                self.assertNotIn(f.read().rsplit(")", 1)[1].split()[0], ("Z", "X"))
+            if sys.platform == "win32":
+                self.assertTrue(plat_proc.is_tgid_alive(pid))
+            else:
+                with open(f"/proc/{pid}/stat", "r") as f:
+                    self.assertNotIn(f.read().rsplit(")", 1)[1].split()[0], ("Z", "X"))
             rc, resp = b.cli("daemon", "status", user=True)
             self.assertEqual(rc, 0, f"daemon B stopped answering: {resp}")
             self.assertEqual(resp.get("data", {}).get("pid"), pid, resp)
             rc, resp = b.cli("daemon", "stop", user=True)
             self.assertEqual(rc, 0, f"daemon stop failed: {resp}")
-            self.assertTrue(b.wait_for(lambda: not os.path.exists(f"/proc/{pid}")
-                                       or open(f"/proc/{pid}/stat").read()
-                                       .rsplit(")", 1)[1].split()[0] in ("Z", "X"),
-                                       timeout=10.0))
+            if sys.platform == "win32":
+                self.assertTrue(b.wait_for(lambda: not plat_proc.is_tgid_alive(pid), timeout=10.0))
+            else:
+                self.assertTrue(b.wait_for(lambda: not os.path.exists(f"/proc/{pid}")
+                                           or open(f"/proc/{pid}/stat").read()
+                                           .rsplit(")", 1)[1].split()[0] in ("Z", "X"),
+                                           timeout=10.0))
             pid = None
         finally:
             if pid is not None:  # failure path: B carries A's token, stop it directly
-                with contextlib.suppress(ProcessLookupError):
-                    fd = os.pidfd_open(pid)
-                    try:
-                        signal.pidfd_send_signal(fd, signal.SIGKILL)
-                    finally:
-                        os.close(fd)
+                if sys.platform == "win32":
+                    with contextlib.suppress(OSError):
+                        _win_terminate_and_wait_pid(pid, timeout_s=10.0)
+                else:
+                    with contextlib.suppress(ProcessLookupError):
+                        fd = os.pidfd_open(pid)
+                        try:
+                            signal.pidfd_send_signal(fd, signal.SIGKILL)
+                        finally:
+                            os.close(fd)
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(os.path.join(a.home, "run", "meshd.pid"))
             a.teardown()
@@ -741,28 +894,44 @@ class TestDaemonIntegration(unittest.TestCase):
         """F1 regression: empty passphrase rejected client-side without hitting daemon."""
         fresh = MeshHarness(init_db=True, start_daemon=True)
         try:
-            empty_file = os.path.join(fresh.home, ".empty_pass")
-            with open(empty_file, "w") as f:
-                f.write("")
-            os.chmod(empty_file, 0o600)
-
-            fd = os.open(empty_file, os.O_RDONLY)
-            try:
-                cmd = [fresh.bin_mesh, "--home", fresh.home, "--user", "--passphrase-fd", str(fd), "whoami"]
+            if sys.platform == "win32":
+                env = fresh._with_direct_pythonpath(fresh.get_env())
+                cmd = mesh_cli_argv("--home", fresh.home, "--user", "--passphrase-fd", "0", "whoami")
                 proc = subprocess.run(
                     cmd,
-                    pass_fds=(fd,),
+                    input="",
                     capture_output=True,
                     text=True,
-                    env=fresh.get_env(),
+                    env=env,
                     timeout=5,
                 )
                 self.assertIn(proc.returncode, (c.EXIT_USAGE, c.EXIT_UNAUTHENTICATED))
                 data = json.loads(proc.stdout)
                 self.assertFalse(data.get("ok"))
                 self.assertIn(data["error"]["code"], (c.PASSPHRASE_INVALID, c.INVALID_ARGUMENT))
-            finally:
-                os.close(fd)
+            else:
+                empty_file = os.path.join(fresh.home, ".empty_pass")
+                with open(empty_file, "w") as f:
+                    f.write("")
+                os.chmod(empty_file, 0o600)
+
+                fd = os.open(empty_file, os.O_RDONLY)
+                try:
+                    cmd = [fresh.bin_mesh, "--home", fresh.home, "--user", "--passphrase-fd", str(fd), "whoami"]
+                    proc = subprocess.run(
+                        cmd,
+                        pass_fds=(fd,),
+                        capture_output=True,
+                        text=True,
+                        env=fresh.get_env(),
+                        timeout=5,
+                    )
+                    self.assertIn(proc.returncode, (c.EXIT_USAGE, c.EXIT_UNAUTHENTICATED))
+                    data = json.loads(proc.stdout)
+                    self.assertFalse(data.get("ok"))
+                    self.assertIn(data["error"]["code"], (c.PASSPHRASE_INVALID, c.INVALID_ARGUMENT))
+                finally:
+                    os.close(fd)
 
             # Check no auth.failed was written
             db = fresh.db()
@@ -852,7 +1021,10 @@ class TestDaemonIntegration(unittest.TestCase):
             env = self.harness.get_env()
             env["PYTHONPATH"] = shadow_dir
 
-            cmd = [self.harness.bin_mesh, "--home", self.harness.home, "version"]
+            cmd = pipe_pump.prepare_win_cmd_args(
+                [self.harness.bin_mesh, "--home", self.harness.home, "version"],
+                env=env,
+            )
             proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=5)
             self.assertEqual(proc.returncode, 0, f"Shadow argparse was executed! stdout={proc.stdout}, stderr={proc.stderr}")
             self.assertFalse(os.path.exists(marker), "Shadow argparse was executed!")
@@ -882,10 +1054,9 @@ class TestDaemonIntegration(unittest.TestCase):
         self.assertEqual(rc_stat, 0)
         self.assertTrue(resp_stat["ok"])
 
-        # 2. Request exceeding 1 MiB (1.2 MiB) directly via socket
-        sock_path = os.path.join(self.harness.home, "run", "mesh.sock")
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.connect(sock_path)
+        # 2. Request exceeding 1 MiB (1.2 MiB) directly via IPC endpoint
+        endpoint = plat_ipc.daemon_endpoint_path(self.harness.home)
+        s = plat_ipc.connect_endpoint(endpoint)
         oversized = "y" * (1200 * 1024)
         req = json.dumps({"v": 1, "cmd": "status", "auth": {"type": "none"}, "args": {"big": oversized}}) + "\n"
         s.sendall(req.encode("utf-8"))
@@ -910,11 +1081,10 @@ class TestDaemonIntegration(unittest.TestCase):
 
     def test_f7b_unknown_command_classification(self) -> None:
         """F7(b) regression: unknown daemon commands return rc 2 INVALID_ARGUMENT; planned verbs return NOT_IMPLEMENTED_IN_M1."""
-        sock_path = os.path.join(self.harness.home, "run", "mesh.sock")
+        endpoint = plat_ipc.daemon_endpoint_path(self.harness.home)
 
         def send_raw(cmd_name: str) -> dict:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.connect(sock_path)
+            s = plat_ipc.connect_endpoint(endpoint)
             req = json.dumps({
                 "v": 1,
                 "cmd": cmd_name,
@@ -1008,8 +1178,9 @@ class TestDaemonIntegration(unittest.TestCase):
         self.assertEqual(mt_before, mt_after)
 
         # Restore version so teardown invariant check passes
+        from mesh.core.schema import CURRENT_SCHEMA_VERSION
         conn = sqlite3.connect(db_path)
-        conn.execute("UPDATE meta SET value = '1' WHERE key = 'schema_version';")
+        conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version';", (str(CURRENT_SCHEMA_VERSION),))
         conn.commit()
         conn.close()
 
@@ -1028,8 +1199,9 @@ class TestDaemonIntegration(unittest.TestCase):
             conn.close()
 
             # Attempting to run daemon should fail with INSTALL_PATH_INSECURE (rc 2)
-            cmd = [fresh.bin_mesh, "--home", fresh.home, "daemon", "run"]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=5, env=fresh.get_env())
+            env_f7 = fresh.get_env()
+            cmd = pipe_pump.prepare_win_cmd_args([fresh.bin_mesh, "--home", fresh.home, "daemon", "run"], env=env_f7)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=5, env=env_f7)
             self.assertEqual(proc.returncode, c.EXIT_USAGE)
             data = json.loads(proc.stdout)
             self.assertEqual(data["error"]["code"], c.INSTALL_PATH_INSECURE)

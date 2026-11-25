@@ -10,6 +10,8 @@ from typing import Any, Dict, Optional, Tuple
 import mesh.constants as c
 from mesh.errors import MeshError
 from mesh.core.paths import check_token_file_secure
+from mesh.platform import ipc
+from mesh.platform.paths import is_fs_root, norm_cmp
 
 
 #: Set by the CLI when --home was given on the command line (blind review P2): then
@@ -18,7 +20,7 @@ EXPLICIT_HOME = False
 
 
 class MeshClient:
-    """Client connecting to meshd over the local Unix socket."""
+    """Client connecting to meshd over the local Unix socket or Windows named pipe."""
 
     def __init__(self, home: str, timeout: float = 30.0):
         self.home = os.path.realpath(home)
@@ -26,30 +28,71 @@ class MeshClient:
         # It applies only when neither --home nor MESH_HOME chose a home.
         default_home = os.path.realpath(os.path.expanduser("~/.agent-mesh"))
         mesh_socket = os.environ.get("MESH_SOCKET")
+        self._pipe_home_pending = False
+        self._socket_explicit = False
         if (mesh_socket and not os.environ.get("MESH_HOME") and not EXPLICIT_HOME
-                and self.home == default_home):
+                and norm_cmp(self.home) == norm_cmp(default_home)):
             self.socket_path = mesh_socket
-            sock_real = os.path.realpath(mesh_socket)
-            sock_dir = os.path.dirname(sock_real)
-            if os.path.basename(sock_real) == "mesh.sock" and os.path.basename(sock_dir) == "run":
-                derived_home = os.path.dirname(sock_dir)
-                if derived_home and derived_home != os.sep:
-                    self.home = derived_home
+            self._socket_explicit = True
+            if ipc.is_win_pipe_path(mesh_socket):
+                self._pipe_home_pending = True
+            else:
+                sock_real = os.path.realpath(mesh_socket)
+                sock_dir = os.path.dirname(sock_real)
+                if os.path.basename(sock_real) == "mesh.sock" and os.path.basename(sock_dir) == "run":
+                    derived_home = os.path.dirname(sock_dir)
+                    if derived_home and not is_fs_root(derived_home):
+                        self.home = derived_home
         else:
-            self.socket_path = os.path.join(self.home, "run", "mesh.sock")
+            self.socket_path = ipc.daemon_endpoint_path(self.home)
         self.timeout = timeout
 
-    def _connect_socket(self, timeout: Optional[float]) -> socket.socket:
-        from mesh.core.paths import check_socket_path_length
+    def _resolve_win_pipe_home(self) -> None:
+        if not getattr(self, "_pipe_home_pending", False):
+            return
+        self._pipe_home_pending = False
+        resp = self.send_request({"v": 1, "cmd": "daemon.status", "auth": {"type": "none"}})
+        if not isinstance(resp, dict) or not resp.get("ok"):
+            return
+        reported = (resp.get("data") or {}).get("home")
+        if not isinstance(reported, str) or not reported.strip():
+            return
+        if norm_cmp(ipc.daemon_endpoint_path_win(reported)) != norm_cmp(self.socket_path):
+            raise MeshError(
+                code=c.TOKEN_FILE_INSECURE,
+                exit_code=c.EXIT_UNAUTHENTICATED,
+                message="Refusing token file: daemon reported home does not match MESH_SOCKET pipe",
+                details={"socket": self.socket_path, "reported_home": reported},
+            )
+        self.home = os.path.realpath(reported)
 
-        check_socket_path_length(self.socket_path)
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    def _connect_socket(self, timeout: Optional[float]) -> Any:
+        if sys.platform != "win32":
+            from mesh.core.paths import check_socket_path_length
+
+            check_socket_path_length(self.socket_path)
+        else:
+            if not getattr(self, "_socket_explicit", False):
+                try:
+                    self.socket_path = ipc.daemon_endpoint_path(self.home)
+                except OSError as exc:
+                    raise MeshError(
+                        code=c.DAEMON_UNAVAILABLE,
+                        exit_code=c.EXIT_DAEMON_UNAVAILABLE,
+                        message=f"Daemon unavailable at {self.socket_path}: {exc}. Hint: mesh daemon start",
+                    ) from exc
+            if not ipc.is_win_pipe_path(self.socket_path):
+                raise MeshError(
+                    code=c.DAEMON_UNAVAILABLE,
+                    exit_code=c.EXIT_DAEMON_UNAVAILABLE,
+                    message=(
+                        f"Daemon unavailable at {self.socket_path}: "
+                        "invalid Windows named pipe endpoint. Hint: mesh daemon start"
+                    ),
+                )
         try:
-            sock.settimeout(timeout)
-            sock.connect(self.socket_path)
-            return sock
+            return ipc.connect_endpoint(self.socket_path, timeout=timeout)
         except OSError as exc:
-            sock.close()
             raise MeshError(
                 code=c.DAEMON_UNAVAILABLE,
                 exit_code=c.EXIT_DAEMON_UNAVAILABLE,
@@ -139,6 +182,8 @@ class MeshClient:
             return {"type": "user", "passphrase": passphrase}
 
         if token_file:
+            if getattr(self, "_pipe_home_pending", False):
+                self._resolve_win_pipe_home()
             # Linear round 4 P2: also refuse tokens inside the configured workspaces.root
             # and registered repositories, not only the default locations.
             from mesh.core.paths import read_token_file_secure

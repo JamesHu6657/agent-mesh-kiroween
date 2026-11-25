@@ -6,6 +6,7 @@ output (2026-11-19, see docs/adapters-devin.md) with personal fields replaced; s
 live in temp dirs. No real devin runs, no network, no login. Expected values are literals.
 """
 
+import sys
 import json
 import os
 import shutil
@@ -17,6 +18,7 @@ from mesh.adapters.base import AdapterUnsupported, EffortNotAllowed, ProfileUnsu
 from mesh.adapters.devin import DevinAdapter
 from mesh.adapters.registry import get_adapter
 from mesh.core.prompts import parse_deliverable, prompt_strategy
+from tests.helpers import restore_accessible_for_test, rmtree_deep, set_inaccessible_for_test
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SYNTH = os.path.join(ROOT, "tests", "fixtures", "synthetic", "devin")
@@ -46,7 +48,10 @@ HELP = """Usage: devin [OPTIONS] [PATH]... [-- <PROMPT>...] [COMMAND]
 class _Tmp(unittest.TestCase):
     def tmpdir(self):
         d = tempfile.mkdtemp(prefix="mh-devin-")
-        self.addCleanup(shutil.rmtree, d, True)
+        if sys.platform == "win32":
+            self.addCleanup(rmtree_deep, d)
+        else:
+            self.addCleanup(shutil.rmtree, d, True)
         return d
 
     def req(self, profile="unrestricted", model="swe-2-flash-medium", effort=None, options=None, ws=None):
@@ -80,6 +85,25 @@ class _Tmp(unittest.TestCase):
         for name, text in (("help.txt", help_text), ("auth.txt", synth(auth))):
             with open(os.path.join(d, name), "w", encoding="utf-8") as f:
                 f.write(text)
+        if sys.platform == "win32":
+            py_path = os.path.join(d, "devin_stub.py")
+            with open(py_path, "w", encoding="utf-8") as f:
+                f.write(
+                    "import os, sys\n"
+                    f"d = {d!r}\n"
+                    "a = sys.argv[1:]\n"
+                    "if a[:1] == ['--version']:\n"
+                    f"    print({version!r}); sys.exit({version_rc})\n"
+                    "if a[:1] == ['--help']:\n"
+                    "    sys.stdout.write(open(os.path.join(d, 'help.txt'), encoding='utf-8').read()); sys.exit(0)\n"
+                    "if a[:1] == ['auth']:\n"
+                    "    sys.stdout.write(open(os.path.join(d, 'auth.txt'), encoding='utf-8').read()); sys.exit(0)\n"
+                    "sys.exit(2)\n"
+                )
+            path = os.path.join(d, "devin.cmd")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f'@echo off\r\n"{sys.executable}" -P -s "{py_path}" %*\r\n')
+            return path
         path = os.path.join(d, "devin")
         with open(path, "w", encoding="utf-8") as f:
             f.write("#!/bin/sh\n"
@@ -313,7 +337,7 @@ class TestDevinProjectLayer(_Tmp):
                         with self.assertRaises(AdapterUnsupported) as cm:
                             self.guard(profile, ws)
                         self.assertEqual(cm.exception.details.get("reason"), "devin_project_layer_present")
-                        self.assertIn(rel, cm.exception.message)
+                        self.assertIn(rel.replace(os.sep, "/"), cm.exception.message)
                 DevinAdapter().build(self.req(profile="unrestricted", ws=ws))
 
     SKILL_DIRS = (".devin", ".cognition", ".agents", ".claude", ".cursor", ".codex", ".kiro", ".github", ".windsurf",
@@ -335,7 +359,7 @@ class TestDevinProjectLayer(_Tmp):
             if rel.endswith("SKILL.md"):
                 with open(os.path.join(home, rel), "w") as f:
                     f.write(grant)
-            with self.subTest(rel=rel), mock.patch.dict(os.environ, {"HOME": home}):
+            with self.subTest(rel=rel), mock.patch.dict(os.environ, {"HOME": home, "USERPROFILE": home}):
                 for profile in BELOW:
                     self.guard(profile, home)
             with self.subTest(rel=rel, home="elsewhere"):
@@ -343,7 +367,7 @@ class TestDevinProjectLayer(_Tmp):
                     self.guard(ws=home)
         for rel in (".mcp.json", "opencode.json"):
             home = self._ws_with(rel)
-            with self.subTest(rel=rel), mock.patch.dict(os.environ, {"HOME": home}):
+            with self.subTest(rel=rel), mock.patch.dict(os.environ, {"HOME": home, "USERPROFILE": home}):
                 with self.assertRaises(AdapterUnsupported):
                     self.guard(ws=home)
 
@@ -353,8 +377,9 @@ class TestDevinProjectLayer(_Tmp):
         ws = self._ws_with("AGENTS.md")
         for i in range(40):
             d = os.path.join(ws, ".devin", "skills", f"{i:02d}-" + "n" * 240)
-            os.makedirs(d)
-            with open(os.path.join(d, "SKILL.md"), "w") as f:
+            fs_d = "\\\\?\\" + os.path.abspath(d) if sys.platform == "win32" else d
+            os.makedirs(fs_d)
+            with open(os.path.join(fs_d, "SKILL.md"), "w") as f:
                 f.write("---\nallowed-tools: [exec]\n---\n")
         with self.assertRaises(AdapterUnsupported) as cm:
             self.guard(ws=ws)
@@ -530,6 +555,7 @@ class TestDevinProjectLayer(_Tmp):
             with self.subTest(rel=rel):
                 self._refused(self._ws_with(rel))
 
+    @unittest.skipUnless(sys.platform != "win32", "POSIX symlink/file-symlink skill tree check requires POSIX symlinks")
     def test_any_symlink_in_a_skills_tree_is_refused(self):
         # Devin follows symlinks in skills/ (real CLI: a symlinked skill directory is loaded
         # with its grants); os.walk does not, so Mesh cannot vouch for the target.
@@ -586,10 +612,17 @@ class TestDevinProjectLayer(_Tmp):
         with self.assertRaises(AdapterUnsupported):
             self.guard(ws=ws)
         ws = self._skill(".devin/skills/a/SKILL.md", "---\nname: a\n---\n")
-        os.chmod(os.path.join(ws, ".devin/skills/a/SKILL.md"), 0)
-        if os.geteuid() != 0:
+        skill_file = os.path.join(ws, ".devin/skills/a/SKILL.md")
+        if sys.platform == "win32":
+            set_inaccessible_for_test(skill_file)
+            self.addCleanup(restore_accessible_for_test, skill_file)
             with self.assertRaises(AdapterUnsupported):
                 self.guard(ws=ws)
+        else:
+            os.chmod(skill_file, 0)
+            if os.geteuid() != 0:
+                with self.assertRaises(AdapterUnsupported):
+                    self.guard(ws=ws)
         ws = self._skill(".devin/skills/a/SKILL.md", "---\nname: a\n---\n")
         with mock.patch.object(dv, "SKILL_SCAN_MAX_ENTRIES", 1):
             with self.assertRaises(AdapterUnsupported):
@@ -617,6 +650,7 @@ class TestDevinProjectLayer(_Tmp):
         self.assertFalse(blocked, "blocked on a FIFO (would hang the meshd event loop)")
         return out
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX os.mkfifo / O_NONBLOCK FIFO test")
     def test_fifo_skill_file_is_refused_without_blocking(self):
         # Review r2 P2-1: build() runs on the scheduler's event loop; a plain open() of a
         # task-controlled FIFO blocked it, and read as empty (no grant) once a writer came.
@@ -630,6 +664,7 @@ class TestDevinProjectLayer(_Tmp):
                 self.assertIsInstance(out.get("error"), AdapterUnsupported)
                 self.assertEqual(out["error"].details.get("reason"), "devin_project_layer_present")
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX os.mkfifo / /dev/null non-regular skill test")
     def test_skill_file_read_does_not_follow_symlinks_or_non_regular_files(self):
         from mesh.adapters import devin as dv
 
@@ -809,18 +844,22 @@ class TestDevinAuthAndProbe(_Tmp):
         other = os.path.join(root, "bin")
         os.makedirs(shims)
         os.makedirs(other)
+        fname = "devin.cmd" if sys.platform == "win32" else "devin"
+        content = "@echo off\r\nexit /b 99\r\n" if sys.platform == "win32" else "#!/bin/sh\nexit 99\n"
         for d in (shims, other):
-            with open(os.path.join(d, "devin"), "w") as f:
-                f.write("#!/bin/sh\nexit 99\n")
-            os.chmod(os.path.join(d, "devin"), 0o755)
+            with open(os.path.join(d, fname), "w", encoding="utf-8") as f:
+                f.write(content)
+            if sys.platform != "win32":
+                os.chmod(os.path.join(d, fname), 0o755)
         with mock.patch.dict(os.environ, {"PATH": shims + os.pathsep + other}):
             self.assertIsNone(DevinAdapter().resolve_binary())
             self.assertEqual(DevinAdapter().probe().status, "not_installed")
         with mock.patch.dict(os.environ, {"PATH": other}):
-            self.assertEqual(DevinAdapter().resolve_binary(), os.path.join(other, "devin"))
+            self.assertEqual(DevinAdapter().resolve_binary(), os.path.join(other, fname))
 
     def test_repo_shim_exists(self):
         self.assertTrue(os.path.isfile(os.path.join(ROOT, "tests", "shims", "devin")))
+        self.assertTrue(os.path.isfile(os.path.join(ROOT, "tests", "shims", "devin.cmd")))
 
     def test_list_models_is_user_supplied(self):
         self.assertIsNone(DevinAdapter().list_models(self.stub()))

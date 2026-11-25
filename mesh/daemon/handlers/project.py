@@ -68,14 +68,33 @@ def _lead_dir_effect(ctx: HandlerContext, project_id: str, agent_id: str) -> Non
     ctx.effects.append(Effect("create_lead_dir", params))
 
 
-def _check_lead_launch(ctx: HandlerContext, adapter_id: str) -> None:
+def _check_lead_launch(
+    ctx: HandlerContext,
+    adapter_id: str,
+    binary_path: Optional[str] = None,
+    options_json: Optional[str] = None,
+) -> Optional[str]:
     """A launch-mode lead must pass the lead-turn launch gate (rc 13, AG step 4)."""
     from mesh.adapters.registry import get_adapter
     from mesh.daemon.lead_turns import lead_launch_check
 
-    # C-5: no binary_path here on purpose (only the adapter id is known at this point); vendor
-    # leads are refused before the evidence gate, and non-vendor kinds ignore the binary.
-    lead_launch_check(ctx.conn, get_adapter(adapter_id, testing_mode=ctx.testing_mode), ctx.testing_mode)
+    try:
+        options = json.loads(options_json or "{}")
+    except (ValueError, TypeError):
+        options = {}
+    if not isinstance(options, dict):
+        options = {}
+    adapter = get_adapter(adapter_id, testing_mode=ctx.testing_mode, options=options)
+    return lead_launch_check(ctx.conn, adapter, ctx.testing_mode, binary_path=binary_path)
+
+
+def _lead_evidence_warning_message(adapter_id: str, warning: Optional[str]) -> Optional[str]:
+    if not warning:
+        return None
+    return (
+        f"Lead adapter '{adapter_id}' allowed in warn mode without valid smoke evidence "
+        f"({warning}); run `mesh adapter show {adapter_id}` for details"
+    )
 
 
 def _prepare_repo_project(ctx: HandlerContext) -> Optional[Dict[str, Any]]:
@@ -233,9 +252,80 @@ def _handle_intake_submit(ctx: HandlerContext) -> HandlerResult:
         )
     goal = goal.strip()
 
+    # Resolve plan_gate_mode (Chat-First Batch 1 + P2-5):
+    # - Direct user: explicit arg -> project.default_plan_gate -> 'off'.
+    # - Non-user caller: CANNOT explicitly set plan_gate_mode='off'; if the caller
+    #   currently leads any active `require_approval` project, force `require_approval`
+    #   so an inbox lead with `intake` cannot spawn an ungated sibling project.
+    raw_pgm = ctx.args.get("plan_gate_mode")
+    if raw_pgm is not None:
+        if not isinstance(raw_pgm, str) or raw_pgm not in ("off", "require_approval"):
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message="Field 'plan_gate_mode' must be 'off' or 'require_approval'",
+                details={"param": "plan_gate_mode", "expected": ["off", "require_approval"], "got": raw_pgm},
+            )
+        if ctx.actor_kind != "user" and raw_pgm == "off":
+            raise MeshError(
+                code=c.CAPABILITY_MISSING,
+                exit_code=c.EXIT_FORBIDDEN,
+                message="Non-user callers cannot disable plan_gate_mode ('off')",
+                details={"param": "plan_gate_mode", "actor_kind": ctx.actor_kind},
+            )
+        plan_gate_mode = raw_pgm
+    else:
+        pgm_row = ctx.conn.execute(
+            "SELECT value_json FROM settings WHERE key = 'project.default_plan_gate';"
+        ).fetchone()
+        plan_gate_mode = "off"
+        if pgm_row and pgm_row["value_json"]:
+            try:
+                parsed_pgm = json.loads(pgm_row["value_json"])
+                if parsed_pgm in ("off", "require_approval"):
+                    plan_gate_mode = parsed_pgm
+            except Exception:
+                plan_gate_mode = "off"
+
+    if ctx.actor_kind != "user" and plan_gate_mode != "require_approval":
+        leads_gated = ctx.conn.execute(
+            """SELECT 1 FROM lead_assignments la
+               JOIN projects p ON p.id = la.project_id
+               WHERE la.agent_id = ? AND la.ended_at IS NULL
+                 AND p.status = 'active' AND p.plan_gate_mode = 'require_approval'
+               LIMIT 1;""",
+            (ctx.principal["id"],),
+        ).fetchone()
+        if leads_gated is not None:
+            plan_gate_mode = "require_approval"
+
+    # Resolve per-project permission_mode: 'supervised' | 'plan' (DEFAULT) | 'auto'.
+    # Non-user callers can never set permission_mode='auto'.
+    raw_pmode = ctx.args.get("permission_mode")
+    if raw_pmode is not None:
+        if not isinstance(raw_pmode, str) or raw_pmode not in ("supervised", "plan", "auto"):
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message="Field 'permission_mode' must be 'supervised', 'plan', or 'auto'",
+                details={"param": "permission_mode", "expected": ["supervised", "plan", "auto"], "got": raw_pmode},
+            )
+        if ctx.actor_kind != "user" and raw_pmode == "auto":
+            raise MeshError(
+                code=c.CAPABILITY_MISSING,
+                exit_code=c.EXIT_FORBIDDEN,
+                message="Non-user callers cannot set permission_mode='auto'",
+                details={"param": "permission_mode", "actor_kind": ctx.actor_kind},
+            )
+        permission_mode = raw_pmode
+    else:
+        permission_mode = "plan"
+
     criteria = ctx.args.get("criterion") or ctx.args.get("criteria") or []
     if isinstance(criteria, str):
         criteria = [criteria]
+    if not criteria and plan_gate_mode == "require_approval":
+        criteria = ["完成用户对话目标并经 Lead 验收"]
     if not isinstance(criteria, list) or not criteria or any(
         not isinstance(cr, str) or not cr.strip() for cr in criteria
     ):
@@ -266,7 +356,8 @@ def _handle_intake_submit(ctx: HandlerContext) -> HandlerResult:
         )
 
     cur = ctx.conn.execute(
-        """SELECT a.id, a.can_lead, a.delivery, a.adapter, p.disabled_at, p.name
+        """SELECT a.id, a.can_lead, a.delivery, a.adapter, a.binary_path, a.adapter_options_json,
+                  p.disabled_at, p.name
            FROM agents a
            JOIN principals p ON a.id = p.id
            WHERE p.name = ?;""",
@@ -294,11 +385,31 @@ def _handle_intake_submit(ctx: HandlerContext) -> HandlerResult:
             message=f"Agent '{lead_name}' is disabled",
             details={"agent": lead_name, "reason": "disabled"},
         )
+    warnings: List[str] = []
     if arow["delivery"] == "launch":
-        _check_lead_launch(ctx, arow["adapter"])
+        ev_warning = _check_lead_launch(
+            ctx, arow["adapter"], binary_path=arow["binary_path"], options_json=arow["adapter_options_json"]
+        )
+        msg = _lead_evidence_warning_message(arow["adapter"], ev_warning)
+        if msg:
+            warnings.append(msg)
 
     lead_id = arow["id"]
     lead_delivery = arow["delivery"]
+
+    # P3-5: A non-user agent with `intake` cannot bypass plan_gate_mode by creating an
+    # ungated sibling project assigned to a lead that currently leads an active gated project.
+    if ctx.actor_kind != "user" and plan_gate_mode != "require_approval":
+        lead_leads_gated = ctx.conn.execute(
+            """SELECT 1 FROM lead_assignments la
+               JOIN projects p ON p.id = la.project_id
+               WHERE la.agent_id = ? AND la.ended_at IS NULL
+                 AND p.status = 'active' AND p.plan_gate_mode = 'require_approval'
+               LIMIT 1;""",
+            (lead_id,),
+        ).fetchone()
+        if lead_leads_gated is not None:
+            plan_gate_mode = "require_approval"
 
     prj_id = generate_id("prj")
     origin_id = ctx.principal["id"]
@@ -321,8 +432,9 @@ def _handle_intake_submit(ctx: HandlerContext) -> HandlerResult:
         """INSERT INTO projects (
             id, name, goal, status, origin_principal_id, origin_ref,
             created_by, created_via, version, created_at, updated_at,
-            repo_path, base_branch, integration_branch, base_commit, test_command_json
-        ) VALUES (?, ?, ?, 'active', ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?);""",
+            repo_path, base_branch, integration_branch, base_commit, test_command_json,
+            plan_gate_mode, permission_mode
+        ) VALUES (?, ?, ?, 'active', ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?);""",
         (
             prj_id,
             title,
@@ -338,6 +450,8 @@ def _handle_intake_submit(ctx: HandlerContext) -> HandlerResult:
             repo_cols["integration_branch"],
             repo_cols["base_commit"],
             repo_cols["test_command_json"],
+            plan_gate_mode,
+            permission_mode,
         ),
     )
 
@@ -408,6 +522,8 @@ def _handle_intake_submit(ctx: HandlerContext) -> HandlerResult:
             "name": title,
             "goal": goal,
             "lead": lead_name,
+            "plan_gate_mode": plan_gate_mode,
+            "permission_mode": permission_mode,
             "criteria": criteria_records,
             "criteria_count": len(criteria_records),
             "origin_ref": ctx.args.get("origin_ref"),
@@ -433,6 +549,8 @@ def _handle_intake_submit(ctx: HandlerContext) -> HandlerResult:
         "goal": goal,
         "status": "active",
         "lead": lead_name,
+        "plan_gate_mode": plan_gate_mode,
+        "permission_mode": permission_mode,
         "created_via": created_via,
         "origin": ctx.principal["name"],
         "criteria": criteria_records,
@@ -440,7 +558,7 @@ def _handle_intake_submit(ctx: HandlerContext) -> HandlerResult:
     }
     if repo_info is not None:
         data.update(_repo_view(repo_cols))
-    return HandlerResult(data=data)
+    return HandlerResult(data=data, warnings=warnings)
 
 
 def _repo_view(cols: Any) -> Dict[str, Any]:
@@ -520,7 +638,7 @@ def handle_project_list(ctx: HandlerContext) -> HandlerResult:
     check_authz(ctx.conn, "project.list", ctx.principal, ctx.actor_kind, ctx.via)
     status_filter = ctx.args.get("status")
     query = """
-        SELECT pr.id, pr.name, pr.goal, pr.status, pr.created_via,
+        SELECT pr.id, pr.name, pr.goal, pr.status, pr.plan_gate_mode, pr.permission_mode, pr.created_via,
                pr.created_at, pr.updated_at, pr.completed_at, pr.origin_ref,
                op.name as origin, lp.name as lead
         FROM projects pr
@@ -562,7 +680,7 @@ def handle_project_show(ctx: HandlerContext) -> HandlerResult:
     project_id = _require_authorized_project_id(ctx, "project.show")
 
     cur = ctx.conn.execute(
-        """SELECT pr.id, pr.name, pr.goal, pr.status, pr.created_via,
+        """SELECT pr.id, pr.name, pr.goal, pr.status, pr.plan_gate_mode, pr.permission_mode, pr.created_via,
                   pr.created_at, pr.updated_at, pr.completed_at, pr.origin_ref,
                   op.name as origin, lp.name as lead,
                   pr.repo_path, pr.base_branch, pr.integration_branch, pr.base_commit,
@@ -656,7 +774,8 @@ def handle_project_set_lead(ctx: HandlerContext) -> HandlerResult:
 
     # 3. New lead agent validation
     acur = ctx.conn.execute(
-        """SELECT a.id, a.can_lead, a.delivery, a.adapter, p.disabled_at, p.name
+        """SELECT a.id, a.can_lead, a.delivery, a.adapter, a.binary_path, a.adapter_options_json,
+                  p.disabled_at, p.name
            FROM agents a
            JOIN principals p ON a.id = p.id
            WHERE p.name = ?;""",
@@ -684,8 +803,14 @@ def handle_project_set_lead(ctx: HandlerContext) -> HandlerResult:
             message=f"Agent '{new_lead_name}' is disabled",
             details={"agent": new_lead_name, "reason": "disabled"},
         )
+    warnings: List[str] = []
     if arow["delivery"] == "launch":
-        _check_lead_launch(ctx, arow["adapter"])
+        ev_warning = _check_lead_launch(
+            ctx, arow["adapter"], binary_path=arow["binary_path"], options_json=arow["adapter_options_json"]
+        )
+        msg = _lead_evidence_warning_message(arow["adapter"], ev_warning)
+        if msg:
+            warnings.append(msg)
 
     new_lead_id = arow["id"]
     new_lead_delivery = arow["delivery"]
@@ -718,7 +843,8 @@ def handle_project_set_lead(ctx: HandlerContext) -> HandlerResult:
                 "new_lead": new_lead_name,
                 "assignment_id": old_lead["assignment_id"],
                 "unchanged": True,
-            }
+            },
+            warnings=warnings,
         )
 
     # 6. Approval gate after target validation and unchanged noop check
@@ -988,7 +1114,8 @@ def handle_project_set_lead(ctx: HandlerContext) -> HandlerResult:
             "new_lead": new_lead_name,
             "assignment_id": new_asg_id,
             "cancelled_approvals": cancelled_approvals,
-        }
+        },
+        warnings=warnings,
     )
 
 
@@ -1816,6 +1943,154 @@ def handle_project_update(ctx: HandlerContext) -> HandlerResult:
     return HandlerResult(data={"id": project_id, "goal": updated_goal})
 
 
+def handle_project_set_permission_mode(ctx: HandlerContext) -> HandlerResult:
+    """Set a project's per-project permission mode ('supervised' | 'plan' | 'auto'). Direct user only.
+
+    Mode transitions are forward-only:
+    - Switching away from 'supervised' ('supervised' -> 'plan' or 'auto') sweep-cancels
+      obsolete pending 'step_dispatch' cards with audited 'approval.cancelled' events
+      (pending 'permission_escalation' cards are preserved).
+    - Switching into 'supervised' does not retroactively re-gate tasks already materialized
+      in 'assigned' or later states.
+    """
+    raw_pid = ctx.args.get("project_id") if ctx.args.get("project_id") is not None else ctx.args.get("project")
+    if not isinstance(raw_pid, str) or not raw_pid.strip():
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="project_id is required",
+            details={"param": "project_id"},
+        )
+    project_id = raw_pid.strip()
+    check_authz(ctx.conn, "project.set_permission_mode", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id)
+
+    if ctx.actor_kind != "user" or ctx.via != "direct":
+        raise MeshError(
+            code=c.CAPABILITY_MISSING,
+            exit_code=c.EXIT_FORBIDDEN,
+            message="Command 'project.set_permission_mode' requires direct user authentication",
+            details={"cmd": "project.set_permission_mode", "required": "user_direct"},
+        )
+    if not ctx.k_user:
+        raise MeshError(
+            code=c.PASSPHRASE_REQUIRED,
+            exit_code=c.EXIT_UNAUTHENTICATED,
+            message="Command 'project.set_permission_mode' requires direct user passphrase",
+        )
+
+    raw_mode = ctx.args.get("permission_mode") if "permission_mode" in ctx.args else ctx.args.get("mode")
+    if not isinstance(raw_mode, str) or raw_mode not in ("supervised", "plan", "auto"):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Field 'permission_mode' must be 'supervised', 'plan', or 'auto'",
+            details={"param": "permission_mode", "expected": ["supervised", "plan", "auto"], "got": raw_mode},
+        )
+    raw_reason = ctx.args.get("reason")
+    if raw_reason is not None and (not isinstance(raw_reason, str) or len(raw_reason) > 4000):
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="Field 'reason' must be a string up to 4000 characters",
+            details={"param": "reason"},
+        )
+    clean_reason = redact(raw_reason.strip()) if isinstance(raw_reason, str) and raw_reason.strip() else None
+
+    row = ctx.conn.execute(
+        "SELECT id, status, plan_gate_mode, permission_mode FROM projects WHERE id = ?;",
+        (project_id,),
+    ).fetchone()
+    if row is None:
+        raise MeshError(
+            code=c.NOT_FOUND,
+            exit_code=c.EXIT_NOT_FOUND,
+            message=f"Project '{project_id}' not found",
+            details={"project_id": project_id},
+        )
+    if row["status"] in ("completed", "cancelled"):
+        raise MeshError(
+            code=c.PROJECT_NOT_ACTIVE,
+            exit_code=c.EXIT_CONFLICT,
+            message=f"Project '{project_id}' is terminal ({row['status']})",
+            details={"project_id": project_id, "status": row["status"]},
+        )
+
+    old_mode = row["permission_mode"] if "permission_mode" in row.keys() and row["permission_mode"] else "plan"
+    now = now_iso_utc()
+    cancelled_step_approvals: List[str] = []
+    cancelled_plan_approvals: List[str] = []
+    events_emitted: List[str] = []
+    if old_mode != raw_mode:
+        ctx.conn.execute(
+            "UPDATE projects SET permission_mode = ?, updated_at = ?, version = version + 1 WHERE id = ?;",
+            (raw_mode, now, project_id),
+        )
+        payload = {
+            "project_id": project_id,
+            "from_mode": old_mode,
+            "to_mode": raw_mode,
+        }
+        if clean_reason:
+            payload["reason"] = clean_reason
+        record_event(
+            conn=ctx.conn,
+            type_="project.permission_mode_changed",
+            actor_id=ctx.principal["id"],
+            actor_kind=ctx.actor_kind,
+            via=ctx.via,
+            credential_id=ctx.credential_id,
+            project_id=project_id,
+            reason=clean_reason,
+            payload=payload,
+            request_id=ctx.request_id,
+            k_user=ctx.k_user,
+        )
+        events_emitted.append("project.permission_mode_changed")
+        from mesh.core.approvals import (
+            cancel_pending_plan_dispatch_approvals,
+            cancel_pending_step_dispatch_approvals,
+        )
+
+        cancelled_step_approvals = cancel_pending_step_dispatch_approvals(
+            ctx.conn,
+            project_id,
+            from_mode=old_mode,
+            to_mode=raw_mode,
+            actor_id=ctx.principal["id"],
+            actor_kind=ctx.actor_kind,
+            via=ctx.via,
+            request_id=ctx.request_id,
+            k_user=ctx.k_user,
+        )
+        cancelled_plan_approvals = cancel_pending_plan_dispatch_approvals(
+            ctx.conn,
+            project_id,
+            from_mode=old_mode,
+            to_mode=raw_mode,
+            actor_id=ctx.principal["id"],
+            actor_kind=ctx.actor_kind,
+            via=ctx.via,
+            request_id=ctx.request_id,
+            k_user=ctx.k_user,
+        )
+        if cancelled_step_approvals or cancelled_plan_approvals:
+            events_emitted.append("approval.cancelled")
+
+    return HandlerResult(
+        data={
+            "id": project_id,
+            "project_id": project_id,
+            "plan_gate_mode": row["plan_gate_mode"],
+            "permission_mode": raw_mode,
+            "previous_permission_mode": old_mode,
+            "changed": old_mode != raw_mode,
+            "cancelled_step_approvals": cancelled_step_approvals,
+            "cancelled_plan_approvals": cancelled_plan_approvals,
+        },
+        events=events_emitted,
+    )
+
+
 def handle_project_complete(ctx: HandlerContext) -> HandlerResult:
     """Mark a project completed with criteria verification per plan §6.1 P4."""
     project_id = _require_authorized_project_id(ctx, "project.complete")
@@ -2079,7 +2354,7 @@ async def handle_project_wait(server: Any, ctx: HandlerContext, reader: Any = No
     project_id = _require_authorized_project_id(ctx, "project.wait")
 
     cur = ctx.conn.execute(
-        """SELECT pr.id, pr.name, pr.goal, pr.status, pr.created_via,
+        """SELECT pr.id, pr.name, pr.goal, pr.status, pr.plan_gate_mode, pr.permission_mode, pr.created_via,
                   pr.created_at, pr.updated_at, pr.completed_at, pr.origin_ref,
                   op.name as origin, lp.name as lead,
                   pr.repo_path, pr.base_branch, pr.integration_branch, pr.base_commit,
@@ -2163,7 +2438,7 @@ async def handle_project_wait(server: Any, ctx: HandlerContext, reader: Any = No
             # Blind review P2: re-check credential and access on every pass of the wait.
             _recheck_wait_authz(ctx, "project.wait", project_id=project_id)
             cur = ctx.conn.execute(
-                """SELECT pr.id, pr.name, pr.goal, pr.status, pr.created_via,
+                """SELECT pr.id, pr.name, pr.goal, pr.status, pr.plan_gate_mode, pr.permission_mode, pr.created_via,
                           pr.created_at, pr.updated_at, pr.completed_at, pr.origin_ref,
                           op.name as origin, lp.name as lead,
                           pr.repo_path, pr.base_branch, pr.integration_branch, pr.base_commit,

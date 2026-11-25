@@ -8,6 +8,8 @@ import json
 from datetime import datetime, timezone
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -17,6 +19,7 @@ import mesh.constants as c
 from mesh.core.db import init_db
 from mesh.daemon import merge
 from mesh.errors import MeshError
+from mesh.platform.paths import temp_root
 from tests.gitfixture import GitFixture
 
 # merge.run_test_step scans real /proc for leftovers: hold host-wide /proc lock shared (tests/run_tier.py).
@@ -96,7 +99,7 @@ class MergeDbCase(unittest.TestCase):
     mesh_proc_lock = "shared"
 
     def setUp(self) -> None:
-        self.tmp = tempfile.mkdtemp(prefix="mh-mu-")
+        self.tmp = tempfile.mkdtemp(prefix="mh-mu-", dir=temp_root())
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.conn = init_db(os.path.join(self.tmp, "mesh.db"))
         self.addCleanup(self.conn.close)
@@ -197,13 +200,23 @@ class ReviewR5bR6MinorsTest(MergeDbCase):
 
     def test_leftovers_kill_failed_is_not_a_pass(self) -> None:
         """ACC: K7 - a passing command whose leftover survives termination (terminate.step patched to kill_failed) does not pass."""
-        tmp = tempfile.mkdtemp(prefix="mh-mk-")
+        tmp = tempfile.mkdtemp(prefix="mh-mk-", dir=temp_root())
         self.addCleanup(shutil.rmtree, tmp, True)
         cwd = os.path.join(tmp, "integ")
         os.makedirs(cwd)
         run_id = f"run_mk{os.getpid()}x{NOW[-6:-1].replace(':', '')}"
+        if sys.platform == "win32":
+            test_argv = [
+                sys.executable,
+                "-c",
+                "import subprocess, sys; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], "
+                "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, "
+                "creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS)",
+            ]
+        else:
+            test_argv = ["sh", "-c", "setsid sleep 30 >/dev/null 2>&1 & exit 0"]
         plan = {"run_id": run_id, "run_dir": os.path.join(tmp, "merges", "mrg_k"), "integration": cwd,
-                "test_argv": ["sh", "-c", "setsid sleep 30 >/dev/null 2>&1 & exit 0"], "test_timeout_s": 30,
+                "test_argv": test_argv, "test_timeout_s": 30,
                 "kill_grace_s": 1}
 
         def cleanup() -> None:
@@ -214,6 +227,10 @@ class ReviewR5bR6MinorsTest(MergeDbCase):
                 import time as _t
                 _t.sleep(0.05)
             merge.terminate.forget(run_id)
+            if sys.platform == "win32":
+                from mesh.daemon import supervisor as _sup
+
+                _sup.close_run_job(run_id)
 
         self.addCleanup(cleanup)
         with mock.patch.object(merge.terminate, "step", return_value="kill_failed"):
@@ -249,7 +266,7 @@ class ReviewR5bR6MinorsTest(MergeDbCase):
 
     def test_log_tail_byte_cap(self) -> None:
         """ACC: K7 (details) - one 300 KiB line: tail <= 16 KiB, lines <= 1 KiB, truncated flag set."""
-        tmp = tempfile.mkdtemp(prefix="mh-lt-")
+        tmp = tempfile.mkdtemp(prefix="mh-lt-", dir=temp_root())
         self.addCleanup(shutil.rmtree, tmp, True)
         path = os.path.join(tmp, "test.log")
         with open(path, "w", encoding="utf-8") as f:
@@ -497,7 +514,7 @@ class PipelineTagShadowTest(TaskBranchCase):
     def test_k10_tag_named_like_the_task_branch(self) -> None:
         """ACC: K10, K5 - a tag named like the task branch (at main) does not turn the merge into a no-op; the branch tip is merged."""
         self.fixture.git(self.repo, "tag", self.BRANCH, self.base)
-        run_dir = tempfile.mkdtemp(prefix="mh-mrg-")  # the pipeline writes merge_intent.json there (P1-3)
+        run_dir = tempfile.mkdtemp(prefix="mh-mrg-", dir=temp_root())  # the pipeline writes merge_intent.json there (P1-3)
         self.addCleanup(shutil.rmtree, run_dir, True)
         plan = {"task_id": self.TASK, "title": "t", "integration": self.repo, "worktree": self.repo,
                 "branch": self.BRANCH, "pre_head": None, "run_dir": run_dir, "merge_id": "mrg_t",

@@ -14,12 +14,16 @@ import json
 import os
 import signal
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 import unittest
 from typing import Any, Dict, List
 
 from mesh.core.proc import get_proc_environ, get_proc_stat
+from mesh.platform import proc as plat_proc
+from tests.helpers import EXPECTED_CRASH_RETURNCODE, _win_terminate_and_wait_pid
 from tests.integration.test_execution_acc_run2 import Run2AccBase
 
 
@@ -31,6 +35,19 @@ def _alive(pid: int) -> bool:
 def _carriers(run_id: str) -> List[int]:
     """Live pids whose environ carries MESH_RUN_ID=<run_id>."""
     out = []
+    if sys.platform == "win32":
+        try:
+            pids = sorted(plat_proc.list_toolhelp_processes())
+        except OSError:
+            pids = []
+        for pid in pids:
+            try:
+                env = get_proc_environ(pid)
+            except OSError:
+                continue
+            if env and env.get("MESH_RUN_ID") == run_id and _alive(pid):
+                out.append(pid)
+        return out
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
             continue
@@ -96,13 +113,58 @@ class RecoveryBase(Run2AccBase):
     def recovered(self) -> List[Dict[str, Any]]:
         return [json.loads(e["payload_json"]) for e in self.events("daemon.recovered")]
 
+    @staticmethod
+    def _kill_pid(pid: int) -> None:
+        if sys.platform == "win32":
+            _win_terminate_and_wait_pid(int(pid))
+        else:
+            os.kill(int(pid), signal.SIGKILL)
+
+    def _run_group_members(self, run: Any) -> List[int]:
+        if sys.platform != "win32":
+            return _group_members(run["pgid"])
+        found = set(_carriers(run["id"]))
+        try:
+            job = plat_proc.open_run_job(self.harness.home, run["id"], terminate=False)
+        except OSError:
+            job = None
+        if job is not None:
+            try:
+                for pid in plat_proc.query_job_pids(job):
+                    if _alive(pid):
+                        found.add(int(pid))
+            finally:
+                job.close()
+        return sorted(found)
+
+    def _kill_run_group_pids(self, run: Any) -> None:
+        if sys.platform != "win32":
+            os.killpg(run["pgid"], signal.SIGKILL)
+            return
+        targets = set(self._run_group_members(run))
+        if run["wrapper_pid"]:
+            targets.add(int(run["wrapper_pid"]))
+        try:
+            job = plat_proc.open_run_job(self.harness.home, run["id"], terminate=True)
+        except OSError:
+            job = None
+        if job is not None:
+            try:
+                targets.update(plat_proc.query_job_pids(job))
+                plat_proc.terminate_job(job, exit_code=137)
+            finally:
+                job.close()
+        for pid in sorted(targets):
+            if _alive(pid):
+                _win_terminate_and_wait_pid(pid)
+
 
 class TestRecoveryLaunch(RecoveryBase):
     def test_i1_i11_adopt_after_kill9(self) -> None:
         """ACC: I1, I11 (R1, R10) - kill -9 meshd during a record_pid + sleep 8 run; restart:
         run.adopted, the lease holder is the new boot id, the run finishes, 1 pid, task submitted."""
         pids = os.path.join(self.harness.fixtures_dir, "acc-pids")
-        spec = 'FAKE {"steps":[{"record_pid":{"path":"%s"}},{"sleep":{"seconds":8}},{"succeed":{}}]}' % pids
+        spec = "FAKE " + json.dumps({"steps": [{"record_pid": {"path": pids}}, {"sleep": {"seconds": 8}}, {"succeed": {}}]})
         task_id = self.create_task(spec)
         run = self.wait_running_run(task_id)
         self.assertTrue(self.harness.wait_for(lambda: len(self.pid_lines(pids)) == 1, timeout=20))
@@ -149,8 +211,8 @@ class TestRecoveryLaunch(RecoveryBase):
         self.wait_wrapper_started(run)
         try:
             self.harness.kill9_daemon()
-            os.killpg(run["pgid"], signal.SIGKILL)
-            self.assertTrue(self.harness.wait_for(lambda: not _group_members(run["pgid"]), timeout=10))
+            self._kill_run_group_pids(run)
+            self.assertTrue(self.harness.wait_for(lambda: not self._run_group_members(run), timeout=10))
             self.assertEqual(_carriers(run["id"]), [])
             self.harness.restart_daemon()
 
@@ -203,7 +265,7 @@ class TestRecoveryLaunch(RecoveryBase):
             self.assertEqual((row["status"], row["end_reason"]), ("killed", "timeout"))
             failure = json.loads(self.q1("SELECT failure_json FROM tasks WHERE id = ?;", (task_id,))["failure_json"])
             self.assertEqual(failure["reason"], "timeout")
-            self.assertEqual(_group_members(run["pgid"]), [])
+            self.assertEqual(self._run_group_members(run), [])
             self.assertEqual(_carriers(run["id"]), [])
             self.assertEqual(self.recovered()[-1]["runs_adopted_past_deadline"], 1)
             self.assertEqual(len(self.lead1_task_failed_msgs(task_id)), 1)
@@ -257,10 +319,10 @@ class TestRecoveryLaunch(RecoveryBase):
         self.assertEqual(self.status(task_b), "cancelling")
         try:
             self.harness.kill9_daemon()
-            os.kill(run_a["wrapper_pid"], signal.SIGKILL)
-            os.killpg(run_b["pgid"], signal.SIGKILL)
+            self._kill_pid(run_a["wrapper_pid"])
+            self._kill_run_group_pids(run_b)
             self.assertTrue(self.harness.wait_for(lambda: not _alive(run_a["wrapper_pid"]), timeout=10))
-            self.assertTrue(self.harness.wait_for(lambda: not _group_members(run_b["pgid"]), timeout=10))
+            self.assertTrue(self.harness.wait_for(lambda: not self._run_group_members(run_b), timeout=10))
             survivors = _carriers(run_a["id"])
             self.assertTrue(survivors, "the fake child must outlive its wrapper")
             msg = self.q1("SELECT id, attempts FROM outbox WHERE status = 'pending' ORDER BY rowid LIMIT 1;")
@@ -319,7 +381,7 @@ class TestRecoveryCrashHooks(RecoveryBase):
         task_id = self.create_task(spec)
         self.assertEqual(self.status(task_id), "queued")
         self.harness.release_launch_starts()
-        self.assertEqual(self.harness.wait_daemon_exit(timeout=30), -signal.SIGKILL)
+        self.assertEqual(self.harness.wait_daemon_exit(timeout=30), EXPECTED_CRASH_RETURNCODE)
         return task_id
 
     def test_i7_crash_after_tx_a(self) -> None:
@@ -350,8 +412,9 @@ class TestRecoveryCrashHooks(RecoveryBase):
         exactly one run for the task."""
         pids = os.path.join(self.harness.fixtures_dir, "acc-pids")
         gate = self.gate("i10")
-        spec = ('FAKE {"steps":[{"record_pid":{"path":"%s"}},{"wait_release":{"path":"%s"}},{"succeed":{}}]}'
-                % (pids, gate))
+        spec = "FAKE " + json.dumps(
+            {"steps": [{"record_pid": {"path": pids}}, {"wait_release": {"path": gate}}, {"succeed": {}}]}
+        )
         task_id = self.create_task_and_crash("after_popen", spec)
         try:
             runs = self.runs_of(task_id)
@@ -566,12 +629,12 @@ class TestRecoveryBranches(RecoveryBase):
             conn.close()
 
     def kill_run_group(self, run: Any) -> None:
-        os.killpg(run["pgid"], signal.SIGKILL)
-        self.assertTrue(self.harness.wait_for(lambda: not _group_members(run["pgid"]), timeout=10))
+        self._kill_run_group_pids(run)
+        self.assertTrue(self.harness.wait_for(lambda: not self._run_group_members(run), timeout=10))
         self.assertEqual(_carriers(run["id"]), [])
 
     def side_proc(self, env_run_id: str = None, term_file: str = None):
-        """A process outside any run (own session); optionally carrying MESH_RUN_ID. With
+        """A process outside any run (own session/process group); optionally carrying MESH_RUN_ID. With
         term_file it records SIGTERM's arrival and exits 1 s later."""
         script = ("import signal,sys,time\n"
                   "f=sys.argv[1]\n"
@@ -588,15 +651,20 @@ class TestRecoveryBranches(RecoveryBase):
         env = {k: v for k, v in os.environ.items() if k != "MESH_RUN_ID"}
         if env_run_id:
             env["MESH_RUN_ID"] = env_run_id
-        import subprocess
-        import sys
-        proc = subprocess.Popen([sys.executable, "-c", script, term_file or ""], stdout=subprocess.PIPE,
-                                start_new_session=True, env=env)
+        popen_kw: Dict[str, Any] = {"stdout": subprocess.PIPE, "env": env}
+        if sys.platform == "win32":
+            popen_kw["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kw["start_new_session"] = True
+        proc = subprocess.Popen([sys.executable, "-c", script, term_file or ""], **popen_kw)
         proc.stdout.readline()
 
         def _cleanup() -> None:
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                if sys.platform == "win32":
+                    _win_terminate_and_wait_pid(proc.pid)
+                else:
+                    os.killpg(proc.pid, signal.SIGKILL)
             except OSError:
                 pass
             proc.wait()
@@ -622,7 +690,7 @@ class TestRecoveryBranches(RecoveryBase):
         # status read below saw "running". This test covers the "exited while down" branch,
         # whose precondition is an empty group: wait for it before restarting.
         self.assertTrue(self.harness.wait_for(
-            lambda: not _group_members(run["pgid"]) and not _carriers(run["id"]), timeout=10),
+            lambda: not self._run_group_members(run) and not _carriers(run["id"]), timeout=10),
             "run group still occupied")
         self.harness.restart_daemon()
         self.assertEqual(self.status(task_id), "submitted")
@@ -652,19 +720,40 @@ class TestRecoveryBranches(RecoveryBase):
             os.unlink(os.path.join(run["run_dir"], "wrapper.json"))
             term_file = os.path.join(self.harness.fixtures_dir, "nowrap-term")
             carrier = self.side_proc(env_run_id=run["id"], term_file=term_file)
-            self.harness.restart_daemon()
-            self.assertEqual(self.recovered()[-1]["runs_terminating"], 1)
-            self.wait_status(task_id, "failed", timeout=30)
-            self.assertTrue(self.harness.wait_for(lambda: not _alive(carrier.pid), timeout=10))
+            last_alive = [time.time()]
+            stop_watch = threading.Event()
+            watch_thread = None
+            if sys.platform == "win32":
+                def _watch_carrier() -> None:
+                    while not stop_watch.is_set() and _alive(carrier.pid):
+                        last_alive[0] = time.time()
+                        time.sleep(0.05)
+
+                watch_thread = threading.Thread(target=_watch_carrier, daemon=True)
+                watch_thread.start()
+            try:
+                self.harness.restart_daemon()
+                self.assertEqual(self.recovered()[-1]["runs_terminating"], 1)
+                self.wait_status(task_id, "failed", timeout=30)
+                self.assertTrue(self.harness.wait_for(lambda: not _alive(carrier.pid), timeout=10))
+            finally:
+                stop_watch.set()
+                if watch_thread is not None:
+                    watch_thread.join(timeout=1.0)
             row = self.q1("SELECT status, end_reason, ended_at FROM runs WHERE id = ?;", (run["id"],))
             self.assertEqual((row["status"], row["end_reason"]), ("spawn_failed", "lost_before_spawn"))
             failure = json.loads(self.q1("SELECT failure_json FROM tasks WHERE id = ?;", (task_id,))["failure_json"])
             self.assertEqual(failure["reason"], "lost_before_spawn")
-            # The carrier got SIGTERM and lived 1 s more; the run closed only after it was gone.
-            stamps = [float(x) for x in self.pid_lines(term_file)]
-            self.assertEqual(len(stamps), 2, stamps)
             from mesh.core.clock import parse_utc
-            self.assertGreaterEqual(parse_utc(row["ended_at"]).timestamp() + 0.05, stamps[1])
+            if sys.platform == "win32":
+                # Without a shared console or Local\mesh-stop-* event on Windows, a test-spawned
+                # detached carrier is terminated after kill.grace_s; confirm close followed exit.
+                self.assertGreaterEqual(parse_utc(row["ended_at"]).timestamp() + 0.05, last_alive[0])
+            else:
+                # The carrier got SIGTERM and lived 1 s more; the run closed only after it was gone.
+                stamps = [float(x) for x in self.pid_lines(term_file)]
+                self.assertEqual(len(stamps), 2, stamps)
+                self.assertGreaterEqual(parse_utc(row["ended_at"]).timestamp() + 0.05, stamps[1])
             self.assertEqual(len(self.runs_of(task_id)), 1)  # never respawned
             self.assertEqual(self.events("run.adopted", task_id), [])
             self.doctor_ok()

@@ -188,6 +188,8 @@ def _format_task(
     return {
         "id": row["id"],
         "project_id": row["project_id"],
+        "plan_id": row["plan_id"] if "plan_id" in row.keys() else None,
+        "plan_step_key": row["plan_step_key"] if "plan_step_key" in row.keys() else None,
         "title": row["title"],
         "spec": row["spec"],
         "kind": row["kind"],
@@ -276,8 +278,10 @@ def _reassigned_profile_override(
 
     ag = conn.execute(
         """SELECT a.adapter, a.delivery FROM agents a JOIN principals p ON a.id = p.id
-           WHERE a.id = ? OR p.name = ?;""",
-        (to_agent, to_agent),
+           WHERE a.id = ? OR p.name = ?
+           ORDER BY CASE WHEN a.id = ? THEN 0 ELSE 1 END, a.id ASC
+           LIMIT 1;""",
+        (to_agent, to_agent, to_agent),
     ).fetchone()
     if ag is not None and ag["delivery"] == "launch":
         try:
@@ -531,6 +535,24 @@ def _check_spec_prompt_length(
         raise PromptTooLong(prompt_bytes, PROMPT_LIMIT_BYTES, adapter_id, profile)
 
 
+def _project_gate_modes(conn: sqlite3.Connection, project_id: str) -> Tuple[str, str]:
+    """Return `(plan_gate_mode, permission_mode)` for `project_id`."""
+    prow = conn.execute(
+        "SELECT plan_gate_mode, permission_mode FROM projects WHERE id = ?;",
+        (project_id,),
+    ).fetchone()
+    if prow is None:
+        return "off", "plan"
+    pgm = prow["plan_gate_mode"] if "plan_gate_mode" in prow.keys() and prow["plan_gate_mode"] else "off"
+    pmode = prow["permission_mode"] if "permission_mode" in prow.keys() and prow["permission_mode"] else "plan"
+    return pgm, pmode
+
+
+def _is_plan_locked(plan_gate_mode: str, permission_mode: str) -> bool:
+    """True when the project enforces plan approval & immutability ('plan' or 'supervised' mode)."""
+    return plan_gate_mode == "require_approval" and permission_mode in ("supervised", "plan")
+
+
 def _require_task_approval(
     conn: sqlite3.Connection,
     ctx: HandlerContext,
@@ -546,32 +568,165 @@ def _require_task_approval(
     retry_message: str = "",
     perm_message: str = "",
     compound_message: str = "",
+    need_step: bool = False,
+    step_summary: str = "",
+    step_message: str = "",
+    agent_id: Optional[str] = None,
+    resolved_profile: Optional[str] = None,
 ) -> None:
-    """Create or consume a single/compound approval for a task mutation (§7.4)."""
-    if not (need_retry or need_perm):
+    """Create or consume a single/compound approval for a task mutation (§7.4).
+
+    Standing grant & mode rules:
+    - ``retry_over_limit``: auto-allowed in ``auto`` permission mode, or by a project-scoped
+      ``retry_over_limit`` standing grant.
+    - ``permission_escalation``: NEVER auto-approved by mode alone; ONLY by an explicit
+      approval or an exact-scope ``(project_id, agent_id, exact_profile)`` standing grant.
+    - ``step_dispatch``: required for every step in ``supervised`` mode.
+    """
+    if not (need_retry or need_perm or need_step):
         return
     if ctx.actor_kind == "user" or ctx.via == "direct":
         return
 
-    gate_params = dict(params)
-    if need_retry and need_perm:
-        category = "retry_over_limit"
-        extra_categories = ["permission_escalation"]
-        gate_params["gates"] = ["permission_escalation", "retry_over_limit"]
-        summary = compound_summary
-        message = compound_message
-    elif need_retry:
-        category = "retry_over_limit"
-        extra_categories = []
-        summary = retry_summary
-        message = retry_message
-    else:
-        category = "permission_escalation"
-        extra_categories = []
-        summary = perm_summary
-        message = perm_message
+    from mesh.core.canonical import compute_op_hash
+    from mesh.core.grants import (
+        find_matching_standing_grant,
+        record_grant_used,
+        resolve_agent_row_for_grant,
+    )
+
+    raw_need_retry = need_retry
+    raw_need_perm = need_perm
+    raw_need_step = need_step
+
+    auto_retry_allowed = False
+    retry_grant: Optional[Dict[str, Any]] = None
+    perm_grant: Optional[Dict[str, Any]] = None
+
+    eff_need_retry = raw_need_retry
+    eff_need_perm = raw_need_perm
+
+    if eff_need_retry:
+        pgm, pmode = _project_gate_modes(conn, project_id)
+        if pmode == "auto":
+            eff_need_retry = False
+            auto_retry_allowed = True
+        else:
+            retry_grant = find_matching_standing_grant(
+                conn, project_id=project_id, category="retry_over_limit"
+            )
+            if retry_grant is not None:
+                eff_need_retry = False
+
+    if eff_need_perm:
+        eff_profile = resolved_profile or params.get("profile")
+        eff_agent_id = agent_id
+        if not eff_agent_id:
+            ident = params.get("to") or params.get("assignee")
+            arow = resolve_agent_row_for_grant(conn, ident, task_id)
+            if arow is not None:
+                eff_agent_id = arow["id"]
+        if eff_agent_id and isinstance(eff_profile, str):
+            perm_grant = find_matching_standing_grant(
+                conn,
+                project_id=project_id,
+                category="permission_escalation",
+                agent_id=eff_agent_id,
+                profile=eff_profile,
+            )
+            if perm_grant is not None:
+                eff_need_perm = False
+
+    def _select_gate(
+        n_retry: bool,
+        n_perm: bool,
+        n_step: bool,
+    ) -> Tuple[str, List[str], Dict[str, Any], str, str]:
+        g_params = dict(params)
+        if n_retry and n_perm:
+            cat = "retry_over_limit"
+            extras = ["permission_escalation"]
+            g_params["gates"] = ["permission_escalation", "retry_over_limit"]
+            summ = compound_summary
+            msg = compound_message
+        elif n_retry:
+            cat = "retry_over_limit"
+            extras = []
+            summ = retry_summary
+            msg = retry_message
+        elif n_perm:
+            cat = "permission_escalation"
+            extras = []
+            summ = perm_summary
+            msg = perm_message
+        else:
+            cat = "step_dispatch"
+            extras = []
+            summ = step_summary
+            msg = step_message
+        # P3-1: supervised step gate is pinned to direct_only even when folded into an
+        # escalation (or compound) approval.
+        if n_step and cat != "step_dispatch" and "step_dispatch" not in extras:
+            extras.append("step_dispatch")
+        return cat, extras, g_params, summ, msg
+
+    def _audit_grants_and_auto() -> None:
+        if ctx.dry_run:
+            return
+        if auto_retry_allowed:
+            record_event(
+                conn=conn,
+                type_="policy.auto_allowed",
+                actor_id=ctx.principal["id"],
+                actor_kind=ctx.actor_kind,
+                via=ctx.via,
+                credential_id=ctx.credential_id,
+                project_id=project_id,
+                task_id=task_id,
+                payload={
+                    "category": "retry_over_limit",
+                    "op": op,
+                    "permission_mode": "auto",
+                },
+                request_id=ctx.request_id,
+                k_user=ctx.k_user,
+            )
+        if retry_grant is not None:
+            record_grant_used(
+                conn,
+                grant=retry_grant,
+                op=op,
+                actor_id=ctx.principal["id"],
+                actor_kind=ctx.actor_kind,
+                via=ctx.via,
+                project_id=project_id,
+                task_id=task_id,
+                credential_id=ctx.credential_id,
+                request_id=ctx.request_id,
+                k_user=ctx.k_user,
+            )
+        if perm_grant is not None:
+            record_grant_used(
+                conn,
+                grant=perm_grant,
+                op=op,
+                actor_id=ctx.principal["id"],
+                actor_kind=ctx.actor_kind,
+                via=ctx.via,
+                project_id=project_id,
+                task_id=task_id,
+                credential_id=ctx.credential_id,
+                request_id=ctx.request_id,
+                k_user=ctx.k_user,
+            )
 
     if not ctx.approval:
+        if not (eff_need_retry or eff_need_perm or raw_need_step):
+            _audit_grants_and_auto()
+            return
+        category, _, gate_params, summary, message = _select_gate(
+            eff_need_retry, eff_need_perm, raw_need_step
+        )
         apr_info = create_or_get_pending_approval(
             conn=conn,
             category=category,
@@ -596,21 +751,70 @@ def _require_task_approval(
             details=apr_info,
         )
 
+    # P3-2: When ctx.approval is supplied, evaluate the raw (ungranted) gate first when the
+    # supplied approval matches the raw gate's hash (or when standing grants/auto would have
+    # cleared every gate), so clicking 'always_allow' on an escalation card cleanly consumes
+    # the user's explicit approval instead of stranding it with OP_HASH_MISMATCH.
+    raw_cat, raw_extras, raw_params, _, _ = _select_gate(
+        raw_need_retry, raw_need_perm, raw_need_step
+    )
+    use_raw_gate = False
+    if not (eff_need_retry or eff_need_perm or raw_need_step):
+        use_raw_gate = True
+    else:
+        eff_cat, eff_extras, eff_params, _, _ = _select_gate(
+            eff_need_retry, eff_need_perm, raw_need_step
+        )
+        if (raw_cat, raw_params) != (eff_cat, eff_params):
+            _, raw_hash = compute_op_hash(
+                op=op,
+                requested_by=ctx.principal["id"],
+                params=raw_params,
+                project_id=project_id,
+                target_id=task_id,
+                category=raw_cat,
+            )
+            apr_row = conn.execute(
+                "SELECT op_hash FROM approvals WHERE id = ?;",
+                (ctx.approval,),
+            ).fetchone()
+            if apr_row is not None and apr_row["op_hash"] == raw_hash:
+                use_raw_gate = True
+
+    if use_raw_gate:
+        check_and_consume_approval(
+            conn=conn,
+            approval_id=ctx.approval,
+            op=op,
+            category=raw_cat,
+            caller_id=ctx.principal["id"],
+            params=raw_params,
+            project_id=project_id,
+            target_id=task_id,
+            request_id=ctx.request_id,
+            extra_categories=raw_extras,
+            actor_kind=ctx.actor_kind,
+            via=ctx.via,
+            k_user=ctx.k_user,
+        )
+        return
+
     check_and_consume_approval(
         conn=conn,
         approval_id=ctx.approval,
         op=op,
-        category=category,
+        category=eff_cat,
         caller_id=ctx.principal["id"],
-        params=gate_params,
+        params=eff_params,
         project_id=project_id,
         target_id=task_id,
         request_id=ctx.request_id,
-        extra_categories=extra_categories,
+        extra_categories=eff_extras,
         actor_kind=ctx.actor_kind,
         via=ctx.via,
         k_user=ctx.k_user,
     )
+    _audit_grants_and_auto()
 
 
 def _validate_assignment_guards(
@@ -638,8 +842,10 @@ def _validate_assignment_guards(
         """SELECT a.*, p.name, p.disabled_at
            FROM agents a
            JOIN principals p ON a.id = p.id
-           WHERE a.id = ? OR p.name = ?;""",
-        (assignee_ident, assignee_ident),
+           WHERE a.id = ? OR p.name = ?
+           ORDER BY CASE WHEN a.id = ? THEN 0 ELSE 1 END, a.id ASC
+           LIMIT 1;""",
+        (assignee_ident, assignee_ident, assignee_ident),
     )
     agent = cur.fetchone()
     if not agent:
@@ -790,6 +996,22 @@ def handle_task_create(ctx: HandlerContext) -> HandlerResult:
         )
 
     check_authz(ctx.conn, "task.create", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id)
+
+    # Hard pre-dispatch gate (Chat-First): in 'plan' or 'supervised' mode (plan_gate_mode='require_approval'),
+    # non-user actors (leads) cannot bypass plan.propose + plan.dispatch via raw task.create.
+    # In 'auto' mode (or legacy plan_gate_mode='off'), lead may create tasks directly (permission_escalation still gated).
+    plan_gate_mode = project["plan_gate_mode"] if "plan_gate_mode" in project.keys() else "off"
+    permission_mode = project["permission_mode"] if "permission_mode" in project.keys() and project["permission_mode"] else "plan"
+    if _is_plan_locked(plan_gate_mode, permission_mode) and ctx.actor_kind != "user":
+        raise MeshError(
+            code=c.PLAN_APPROVAL_REQUIRED,
+            exit_code=c.EXIT_APPROVAL_REQUIRED,
+            message=(
+                f"Project '{project_id}' is in '{permission_mode}' permission mode; "
+                "lead must propose a plan (plan.propose) and dispatch after user approval (plan.dispatch)"
+            ),
+            details={"project_id": project_id, "plan_gate_mode": plan_gate_mode, "permission_mode": permission_mode},
+        )
 
     title = _require_str_param(ctx.args.get("title"), "title", "Parameter --title must be non-empty", strip=True)
     spec = _require_str_param(ctx.args.get("spec"), "spec", "Parameter --spec must be non-empty", strip=True)
@@ -1041,6 +1263,119 @@ def handle_task_create(ctx: HandlerContext) -> HandlerResult:
     )
 
 
+def _get_approved_plan_step_for_non_user(
+    conn: sqlite3.Connection,
+    ctx: HandlerContext,
+    project_id: str,
+    task: sqlite3.Row,
+    action_label: str,
+) -> Optional[Dict[str, Any]]:
+    """Enforce plan immutability for non-user actors on `require_approval` projects (P1-2).
+
+    Returns the matched plan step dict when `plan_gate_mode == 'require_approval'`
+    and `ctx.actor_kind != 'user'`, or `None` when no plan lock applies.
+    """
+    if ctx.actor_kind == "user":
+        return None
+    pgm, pmode = _project_gate_modes(conn, project_id)
+    if not _is_plan_locked(pgm, pmode):
+        return None
+    t_plan_id = task["plan_id"] if "plan_id" in task.keys() else None
+    t_step_key = task["plan_step_key"] if "plan_step_key" in task.keys() else None
+    if not t_plan_id or not t_step_key:
+        raise MeshError(
+            code=c.PLAN_APPROVAL_REQUIRED,
+            exit_code=c.EXIT_APPROVAL_REQUIRED,
+            message=(
+                f"Project '{project_id}' requires an approved plan before {action_label}; "
+                f"task '{task['id']}' is not linked to an approved plan"
+            ),
+            details={"project_id": project_id, "task_id": task["id"], "action": action_label},
+        )
+    pl_row = conn.execute("SELECT status, steps_json FROM plans WHERE id = ?;", (t_plan_id,)).fetchone()
+    if pl_row is None or pl_row["status"] != "dispatched":
+        raise MeshError(
+            code=c.PLAN_APPROVAL_REQUIRED,
+            exit_code=c.EXIT_APPROVAL_REQUIRED,
+            message=f"Plan '{t_plan_id}' is not dispatched; cannot {action_label} task '{task['id']}'",
+            details={"project_id": project_id, "task_id": task["id"], "plan_id": t_plan_id},
+        )
+    try:
+        pl_steps = json.loads(pl_row["steps_json"] or "[]")
+    except (TypeError, ValueError):
+        pl_steps = []
+    matched_step = next((s for s in pl_steps if isinstance(s, dict) and s.get("key") == t_step_key), None)
+    if matched_step is None:
+        raise MeshError(
+            code=c.PLAN_APPROVAL_REQUIRED,
+            exit_code=c.EXIT_APPROVAL_REQUIRED,
+            message=f"Task '{task['id']}' step '{t_step_key}' not found in approved plan '{t_plan_id}'",
+            details={"project_id": project_id, "task_id": task["id"], "plan_id": t_plan_id},
+        )
+    return matched_step
+
+
+def _assert_matches_plan_step(
+    plan_id: str,
+    task_id: str,
+    matched_step: Dict[str, Any],
+    *,
+    assignee_name: Optional[str] = None,
+    assignee_id: Optional[str] = None,
+    profile: Optional[str] = None,
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
+    check_assignee: bool = True,
+    check_profile: bool = True,
+    check_model: bool = True,
+    check_effort: bool = True,
+) -> None:
+    """Verify resolved task execution parameters still match the approved immutable plan step (P1-2)."""
+    if check_assignee:
+        exp_name = matched_step.get("assignee")
+        exp_id = matched_step.get("assignee_agent_id")
+        if assignee_name != exp_name and assignee_id != exp_id:
+            raise MeshError(
+                code=c.PLAN_APPROVAL_REQUIRED,
+                exit_code=c.EXIT_APPROVAL_REQUIRED,
+                message=(
+                    f"Cannot change assignee of plan task '{task_id}' to '{assignee_name or assignee_id}'; "
+                    f"approved plan '{plan_id}' specifies assignee '{exp_name}'. Propose a revised plan instead."
+                ),
+                details={"plan_id": plan_id, "task_id": task_id, "expected_assignee": exp_name, "got": assignee_name or assignee_id},
+            )
+    if check_profile and profile != matched_step.get("profile"):
+        raise MeshError(
+            code=c.PLAN_APPROVAL_REQUIRED,
+            exit_code=c.EXIT_APPROVAL_REQUIRED,
+            message=(
+                f"Cannot change profile of plan task '{task_id}' to '{profile}'; "
+                f"approved plan '{plan_id}' specifies profile '{matched_step.get('profile')}'. Propose a revised plan instead."
+            ),
+            details={"plan_id": plan_id, "task_id": task_id, "expected_profile": matched_step.get("profile"), "got": profile},
+        )
+    if check_model and model != matched_step.get("model"):
+        raise MeshError(
+            code=c.PLAN_APPROVAL_REQUIRED,
+            exit_code=c.EXIT_APPROVAL_REQUIRED,
+            message=(
+                f"Cannot change model of plan task '{task_id}' to '{model}'; "
+                f"approved plan '{plan_id}' specifies model '{matched_step.get('model')}'. Propose a revised plan instead."
+            ),
+            details={"plan_id": plan_id, "task_id": task_id, "expected_model": matched_step.get("model"), "got": model},
+        )
+    if check_effort and effort != matched_step.get("effort"):
+        raise MeshError(
+            code=c.PLAN_APPROVAL_REQUIRED,
+            exit_code=c.EXIT_APPROVAL_REQUIRED,
+            message=(
+                f"Cannot change effort of plan task '{task_id}' to '{effort}'; "
+                f"approved plan '{plan_id}' specifies effort '{matched_step.get('effort')}'. Propose a revised plan instead."
+            ),
+            details={"plan_id": plan_id, "task_id": task_id, "expected_effort": matched_step.get("effort"), "got": effort},
+        )
+
+
 def handle_task_assign(ctx: HandlerContext) -> HandlerResult:
     """Assign an unassigned task to an agent per plan §6.2 (T3)."""
     task_id = _require_str_param(ctx.args.get("task_id"), "task_id", "Missing required parameter task_id")
@@ -1054,6 +1389,87 @@ def handle_task_assign(ctx: HandlerContext) -> HandlerResult:
     project_id = task["project_id"]
 
     check_authz(ctx.conn, "task.assign", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id, task_id=task_id)
+
+    # Hard pre-dispatch gate (Chat-First): in 'plan' or 'supervised' mode,
+    # a non-user lead may only assign a task materialized from a dispatched plan
+    # (e.g. an escalated step or supervised step) with its exact approved params.
+    pgm_assign, pmode_assign = _project_gate_modes(ctx.conn, project_id)
+    if _is_plan_locked(pgm_assign, pmode_assign) and ctx.actor_kind != "user":
+        t_plan_id = task["plan_id"] if "plan_id" in task.keys() else None
+        t_step_key = task["plan_step_key"] if "plan_step_key" in task.keys() else None
+        if not t_plan_id or not t_step_key:
+            raise MeshError(
+                code=c.PLAN_APPROVAL_REQUIRED,
+                exit_code=c.EXIT_APPROVAL_REQUIRED,
+                message=(
+                    f"Project '{project_id}' requires an approved plan before assigning tasks; "
+                    f"task '{task_id}' is not linked to an approved plan"
+                ),
+                details={"project_id": project_id, "task_id": task_id},
+            )
+        pl_row = ctx.conn.execute("SELECT status, steps_json FROM plans WHERE id = ?;", (t_plan_id,)).fetchone()
+        if pl_row is None or pl_row["status"] != "dispatched":
+            raise MeshError(
+                code=c.PLAN_APPROVAL_REQUIRED,
+                exit_code=c.EXIT_APPROVAL_REQUIRED,
+                message=f"Plan '{t_plan_id}' is not dispatched; cannot assign task '{task_id}'",
+                details={"project_id": project_id, "task_id": task_id, "plan_id": t_plan_id},
+            )
+        try:
+            pl_steps = json.loads(pl_row["steps_json"] or "[]")
+        except (TypeError, ValueError):
+            pl_steps = []
+        matched_step = next((s for s in pl_steps if isinstance(s, dict) and s.get("key") == t_step_key), None)
+        if matched_step is None:
+            raise MeshError(
+                code=c.PLAN_APPROVAL_REQUIRED,
+                exit_code=c.EXIT_APPROVAL_REQUIRED,
+                message=f"Task '{task_id}' step '{t_step_key}' not found in approved plan '{t_plan_id}'",
+                details={"project_id": project_id, "task_id": task_id, "plan_id": t_plan_id},
+            )
+        if to_agent not in (matched_step.get("assignee"), matched_step.get("assignee_agent_id")):
+            raise MeshError(
+                code=c.PLAN_APPROVAL_REQUIRED,
+                exit_code=c.EXIT_APPROVAL_REQUIRED,
+                message=(
+                    f"Cannot assign task '{task_id}' to '{to_agent}'; approved plan '{t_plan_id}' "
+                    f"specifies assignee '{matched_step.get('assignee')}'"
+                ),
+                details={"plan_id": t_plan_id, "expected_assignee": matched_step.get("assignee"), "got": to_agent},
+            )
+        req_prof = ctx.args.get("profile")
+        if req_prof is not None and req_prof != matched_step.get("profile"):
+            raise MeshError(
+                code=c.PLAN_APPROVAL_REQUIRED,
+                exit_code=c.EXIT_APPROVAL_REQUIRED,
+                message=(
+                    f"Cannot override profile to '{req_prof}'; approved plan '{t_plan_id}' "
+                    f"specifies profile '{matched_step.get('profile')}'"
+                ),
+                details={"plan_id": t_plan_id, "expected_profile": matched_step.get("profile"), "got": req_prof},
+            )
+        req_model = ctx.args.get("model")
+        if req_model is not None and req_model != matched_step.get("model"):
+            raise MeshError(
+                code=c.PLAN_APPROVAL_REQUIRED,
+                exit_code=c.EXIT_APPROVAL_REQUIRED,
+                message=(
+                    f"Cannot override model to '{req_model}'; approved plan '{t_plan_id}' "
+                    f"specifies model '{matched_step.get('model')}'"
+                ),
+                details={"plan_id": t_plan_id, "expected_model": matched_step.get("model"), "got": req_model},
+            )
+        req_effort = ctx.args.get("effort")
+        if req_effort is not None and req_effort != matched_step.get("effort"):
+            raise MeshError(
+                code=c.PLAN_APPROVAL_REQUIRED,
+                exit_code=c.EXIT_APPROVAL_REQUIRED,
+                message=(
+                    f"Cannot override effort to '{req_effort}'; approved plan '{t_plan_id}' "
+                    f"specifies effort '{matched_step.get('effort')}'"
+                ),
+                details={"plan_id": t_plan_id, "expected_effort": matched_step.get("effort"), "got": req_effort},
+            )
 
     # Check transition: T3 is from created to assigned. Blind review P1: only T3; a
     # failed/escalated/rework/merge_failed task goes back through `task retry` (attempt cap,
@@ -1092,7 +1508,43 @@ def handle_task_assign(ctx: HandlerContext) -> HandlerResult:
             "attempt": task["attempt"] + 1,
             "max_attempts": task["max_attempts"],
         },
+        check_approval=False,
     )
+
+    max_unapproved = agent_row["max_unapproved_profile"] or "dev"
+    need_perm = PROFILE_RANKS.get(profile, 0) > PROFILE_RANKS.get(max_unapproved, 2)
+    # Forward-only permission-mode semantics: leaving 'supervised' sweep-cancels pending
+    # step_dispatch cards so subsequent task.assign runs ungated; entering 'supervised'
+    # gates future assignments without retroactively re-gating already-'assigned' tasks.
+    need_step = (
+        pgm_assign == "require_approval"
+        and pmode_assign == "supervised"
+        and ctx.actor_kind != "user"
+    )
+    if need_perm or need_step:
+        _require_task_approval(
+            conn=ctx.conn,
+            ctx=ctx,
+            op="task.assign",
+            project_id=project_id,
+            task_id=task_id,
+            params={
+                "task_id": task_id,
+                "to": agent_row["name"],
+                "profile": profile,
+                "model": model,
+                "effort": effort,
+            },
+            need_retry=False,
+            need_perm=need_perm,
+            need_step=need_step,
+            perm_summary=f"Permission escalation to '{profile}' for task '{task['title']}' on agent '{agent_row['name']}'",
+            perm_message=f"Profile '{profile}' requires user approval (category: permission_escalation)",
+            step_summary=f"Run step '{task['plan_step_key'] or task_id}' ({task['title']}) on agent '{agent_row['name']}' (profile: '{profile}')",
+            step_message=f"Supervised mode requires user approval before running step '{task['title']}' (category: step_dispatch)",
+            agent_id=agent_row["id"],
+            resolved_profile=profile,
+        )
 
     now = now_iso_utc()
     ctx.conn.execute(
@@ -1278,6 +1730,21 @@ def handle_task_cancel(ctx: HandlerContext) -> HandlerResult:
     project_id = task["project_id"]
 
     check_authz(ctx.conn, "task.cancel", ctx.principal, ctx.actor_kind, ctx.via, project_id=project_id, task_id=task_id)
+
+    # P1-2: On 'plan'/'supervised' projects, a non-user lead may NOT silently cancel/drop approved plan steps alone.
+    # Only the direct user may cancel a plan task directly (or the lead can ask the user in chat / propose a revised plan).
+    if ctx.actor_kind != "user":
+        pgm_cancel, pmode_cancel = _project_gate_modes(ctx.conn, project_id)
+        if _is_plan_locked(pgm_cancel, pmode_cancel):
+            raise MeshError(
+                code=c.PLAN_APPROVAL_REQUIRED,
+                exit_code=c.EXIT_APPROVAL_REQUIRED,
+                message=(
+                    f"Project '{project_id}' is in '{pmode_cancel}' permission mode; "
+                    f"a lead cannot cancel approved plan task '{task_id}' alone without direct user action"
+                ),
+                details={"project_id": project_id, "task_id": task_id, "plan_id": task["plan_id"]},
+            )
 
     # Check if task is terminal (e.g. accepted general task, merged, cancelled)
     if is_task_terminal(task["status"], task["kind"]):
@@ -2089,6 +2556,21 @@ def handle_task_reassign(ctx: HandlerContext) -> HandlerResult:
         check_approval=False,
     )
 
+    # P1-2: On require_approval projects, non-user task.reassign MUST keep the approved plan step's
+    # assignee, profile, model, and effort (preventing post-dispatch plan rewrites).
+    matched_step = _get_approved_plan_step_for_non_user(ctx.conn, ctx, project_id, task, "reassigning tasks")
+    if matched_step is not None:
+        _assert_matches_plan_step(
+            task["plan_id"],
+            task_id,
+            matched_step,
+            assignee_name=agent_row["name"],
+            assignee_id=agent_row["id"],
+            profile=profile,
+            model=model,
+            effort=effort,
+        )
+
     # Evaluate both retry_over_limit and permission_escalation together in a single gate check
     need_retry = task["status"] in ("failed", "escalated") and task["attempt"] >= task["max_attempts"]
     max_unapproved = agent_row["max_unapproved_profile"] or "dev"
@@ -2314,6 +2796,20 @@ def handle_task_retry(ctx: HandlerContext) -> HandlerResult:
             testing_mode=ctx.testing_mode,
             check_resolved_model=will_gate_approval,
             check_effort_before_stale_model=True,
+        )
+
+    # P1-2: On require_approval projects, non-user task.retry cannot override profile/model/effort
+    # beyond the approved plan step.
+    matched_step = _get_approved_plan_step_for_non_user(ctx.conn, ctx, project_id, task, "retrying tasks")
+    if matched_step is not None:
+        _assert_matches_plan_step(
+            task["plan_id"],
+            task_id,
+            matched_step,
+            profile=resolved_profile,
+            model=resolved_model,
+            effort=resolved_effort,
+            check_assignee=False,
         )
 
     # Fresh workspace calculation after an inbox lease expiry (§6.2 T19); defer DB writes

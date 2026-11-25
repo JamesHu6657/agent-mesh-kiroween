@@ -19,6 +19,7 @@ def set_up(env):
     return case
 
 
+@unittest.skipUnless(sys.platform != "win32", 'Smoke harness (tests/smoke/harness.py) is POSIX/Linux-only')
 class TestE2EGate(unittest.TestCase):
     def setUp(self):
         self.addCleanup(setattr, test_e2e, "_RUNS_USED", test_e2e._RUNS_USED)
@@ -63,6 +64,7 @@ def set_up_kiro(env, method="test_n13_readonly"):
     return case
 
 
+@unittest.skipUnless(sys.platform != "win32", 'Smoke harness (tests/smoke/harness.py) is POSIX/Linux-only')
 class TestKiroE2EGate(unittest.TestCase):
     def setUp(self):
         self.addCleanup(setattr, test_e2e, "_RUNS_USED", test_e2e._RUNS_USED)

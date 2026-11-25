@@ -119,7 +119,12 @@ class BlockedRecoveryTest(tm.MergeDbCase):
         self.fixture.git(self.repo, "worktree", "add", "-b", "mesh/prj_1/integration", integ, current)
         self.conn.execute("UPDATE projects SET repo_path = ? WHERE id = 'prj_1';", (self.repo,))
         self.assertFalse(merge._verify_integration_worktree(self.repo, self.repo, ws_root))
-        with open(os.path.join(integ, ".git"), "w", encoding="utf-8") as f:
+        dot_git = os.path.join(integ, ".git")
+        if os.path.exists(dot_git):
+            # git worktree add marks .git hidden on Windows; open("w") fails with EACCES unless unlinked.
+            os.chmod(dot_git, 0o600)
+            os.unlink(dot_git)
+        with open(dot_git, "w", encoding="utf-8") as f:
             f.write(f"gitdir: {os.path.join(self.repo, '.git')}\n")
         counts = {}
         with mock.patch.object(merge.terminate, "run_targets", return_value={}):

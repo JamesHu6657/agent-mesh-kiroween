@@ -26,6 +26,7 @@ from mesh.cli.help import HELP_TOPICS, TOP_HELP_EPILOG
 from mesh.cli.main import build_parser, main
 from mesh.cli.render import render_text
 from mesh.errors import MeshError
+from mesh.platform import pipe_pump
 from tests.helpers import MeshHarness
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -64,7 +65,8 @@ class TestVersionFlag(unittest.TestCase):
         self.assertEqual(out, f"mesh {mesh.__version__}\n")
 
     def test_version_flag_real_binary(self) -> None:
-        p = subprocess.run([os.path.join(REPO, "bin", "mesh"), "--version"], capture_output=True, text=True,
+        mesh_bin = os.path.join(REPO, "bin", "mesh.cmd" if sys.platform == "win32" else "mesh")
+        p = subprocess.run(pipe_pump.prepare_win_cmd_args([mesh_bin, "--version"]), capture_output=True, text=True,
                            timeout=30)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(json.loads(p.stdout)["data"]["version"], mesh.__version__)
@@ -299,6 +301,7 @@ class TestTokenOutChecks(unittest.TestCase):
         os.mkdir(os.path.join(self.base, "repo", ".git"))
         self._refused(os.path.join(self.base, "repo", "x.token"), "git work tree")
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX 0o777/0o1777 sticky directory bits do not exist on NTFS")
     def test_group_or_world_writable_dir_refused(self) -> None:
         d = os.path.join(self.base, "shared")
         os.mkdir(d)

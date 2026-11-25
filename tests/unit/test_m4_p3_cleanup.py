@@ -30,13 +30,15 @@ VENDORS = ("droid", "agy", "kiro", "vibe", "hermes", "openclaw")
 
 
 class TestPositionalPrompt(unittest.TestCase):
-    def _last_arg(self, adapter, text: str, profile: str) -> str:
+    def _prompt_arg(self, adapter, text: str, profile: str) -> str:
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "prompt.md")
             with open(path, "w", encoding="utf-8") as f:
                 f.write(text)
             req = RunRequest(prompt_path=path, workspace="/ws/t", model="m", effort=None, profile=profile)
-            return adapter.build(req).argv[-1]
+            argv = adapter.build(req).argv
+            # kiro: the last positional item; agy: the item directly after --print.
+            return argv[argv.index("--print") + 1] if adapter.id == "agy" else argv[-1]
 
     def test_helper(self):
         self.assertEqual(positional_prompt("-rf x"), "\n-rf x")
@@ -45,13 +47,13 @@ class TestPositionalPrompt(unittest.TestCase):
         self.assertEqual(positional_prompt(""), "")
 
     def test_kiro_and_agy_leading_dash_prompt_is_not_a_flag(self):
-        """ACC: N6 - the last argv item never starts with "-"; normal prompts are unchanged."""
+        """ACC: N6 - the prompt argv item never starts with "-"; normal prompts are unchanged."""
         for adapter in (KiroAdapter(), AgyAdapter()):
             with self.subTest(adapter=adapter.id):
-                last = self._last_arg(adapter, "--trust-all-tools do it", "readonly")
+                last = self._prompt_arg(adapter, "--trust-all-tools do it", "readonly")
                 self.assertEqual(last, "\n--trust-all-tools do it")
                 self.assertFalse(last.startswith("-"))
-                self.assertEqual(self._last_arg(adapter, "# Agent Mesh task t", "readonly"),
+                self.assertEqual(self._prompt_arg(adapter, "# Agent Mesh task t", "readonly"),
                                  "# Agent Mesh task t")
 
 

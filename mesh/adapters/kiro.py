@@ -38,6 +38,7 @@ class KiroAdapter(Adapter):
 
     id = "kiro"
     kind = "vendor"
+    supported_profiles = ("readonly", "edit", "unrestricted")
     binary_names = ["kiro-cli"]
     planned_version = "3.1.0"
     verified_version = "3.1.0"

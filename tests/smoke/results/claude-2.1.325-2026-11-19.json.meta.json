@@ -1,0 +1,10 @@
+{
+  "captured_at_utc": "2026-11-19T13:37:10Z",
+  "command": [
+    "python3",
+    "-m",
+    "tests.smoke.harness",
+    "claude"
+  ],
+  "sha256": "8cc3ba86f31e419cdf3167a90826b0403454ec46cb9d30eefd53dbe6e471722d"
+}

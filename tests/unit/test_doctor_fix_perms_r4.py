@@ -13,6 +13,7 @@ The chmod cases need a non-root uid (root ignores file modes) and are skipped as
 
 import os
 import stat
+import sys
 import unittest
 
 import mesh.constants as c
@@ -20,13 +21,14 @@ from mesh.core.paths import resolve_home
 from mesh.errors import MeshError
 from tests.unit.test_home_resolution_r3 import _CwdCase, _prod_env
 
-_IS_ROOT = os.getuid() == 0
+_IS_ROOT = os.getuid() == 0 if sys.platform != "win32" else False
 
 
 def _mode(path: str) -> int:
     return stat.S_IMODE(os.lstat(path).st_mode)
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), 'Linux O_PATH/lstat/mode-bit fix-perms tests')
 @unittest.skipIf(_IS_ROOT, "root ignores file modes; needs a non-root uid")
 class TestFixPermsRepairsFirst(_CwdCase):
     def _init(self, name: str) -> str:
@@ -128,11 +130,21 @@ class TestFixPermsRepairsFirst(_CwdCase):
         self.assertFalse(os.path.exists(home))
 
 
+def _rel_fs_root(base: str) -> str:
+    """Relative path from *base* to its own filesystem/drive root (avoids cross-drive relpath ValueError on Windows)."""
+    drive = os.path.splitdrive(os.path.abspath(base))[0]
+    root = (drive + os.sep) if drive else "/"
+    try:
+        return os.path.relpath(root, base)
+    except ValueError:
+        return root
+
+
 class TestEmptyAndRootHome(_CwdCase):
     BAD = ["", " ", "\t", "/", "//", "/.", "/tmp/.."]
 
     def test_resolve_home_refuses(self) -> None:
-        for home in self.BAD + [os.path.relpath("/", self.base)]:
+        for home in self.BAD + [_rel_fs_root(self.base)]:
             with self.subTest(home=home):
                 with self.assertRaises(MeshError) as ctx:
                     old = os.getcwd()
@@ -145,7 +157,7 @@ class TestEmptyAndRootHome(_CwdCase):
                 self.assertEqual(ctx.exception.exit_code, c.EXIT_USAGE)
 
     def test_cli_refuses_empty_and_root_home(self) -> None:
-        up = os.path.relpath("/", self.base)
+        up = _rel_fs_root(self.base)
         for home in self.BAD + [up]:
             for args, user in ((("init",), True), (("doctor",), False),
                                (("doctor", "--fix-perms"), False)):

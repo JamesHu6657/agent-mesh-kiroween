@@ -10,12 +10,15 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
 from typing import Any, Dict, List, Optional, Tuple
 
 import mesh.constants as c
+from mesh.core.proc import get_proc_stat
+from tests.helpers import assert_private_mode
 from tests.integration import test_merge as tm
 from tests.integration.test_lead_actions import LeadActionCase, _fake_goal
 from tests.integration.test_lead_turns import create_agent
@@ -48,7 +51,7 @@ class MergeGateCase(unittest.TestCase):
     doctor_ok = tm.TestMerge.doctor_ok
 
     def gate_command(self, gate: str) -> str:
-        return json.dumps(["python3", "-c", GATE_SCRIPT, gate])
+        return json.dumps([sys.executable, "-c", GATE_SCRIPT, gate])
 
     def gate_path(self, name: str = "gate") -> str:
         d = tempfile.mkdtemp(prefix="mh-gate-")
@@ -221,7 +224,7 @@ class TestP26SerialLeadMerges(LeadActionCase):
         assert self.fixture is not None
         tok_ibx = create_agent(self.harness, "ibx", adapter="none", delivery="inbox")
         repo = self.fixture.make_k0("SER")
-        slow = json.dumps(["python3", "-c", "import time; time.sleep(1.5)"])  # holds the merge lease
+        slow = json.dumps([sys.executable, "-c", "import time; time.sleep(1.5)"])  # holds the merge lease
         gate = os.path.join(self.harness.fixtures_dir, "serial-merges")
         # Hold launch starts across setup so every initial wake coalesces into one lead turn
         # with the action goal; otherwise an earlier turn or a `task.merged` wake re-runs
@@ -360,11 +363,14 @@ class TestP28ForceMergeHeld(MergeGateCase):
 
     def test_refused_while_wrapper_alive(self) -> None:
         prj, tsk, run_id = self.held_merge()
-        proc = subprocess.Popen(["sleep", "300"], start_new_session=True)
+        popen_kw: Dict[str, Any] = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32" else {"start_new_session": True}
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"], **popen_kw)
         self.addCleanup(proc.wait)
         self.addCleanup(proc.kill)
-        with open(f"/proc/{proc.pid}/stat", "rb") as f:
-            starttime = int(f.read().rsplit(b")", 1)[1].split()[19])
+        info = get_proc_stat(proc.pid)
+        self.assertIsNotNone(info)
+        assert info is not None
+        starttime = int(info["starttime"])
         self.write_db("UPDATE runs SET wrapper_pid = ?, pgid = ?, proc_starttime = ? WHERE id = ?;",
                       (proc.pid, proc.pid, starttime, run_id))
         rc, resp = self.release(run_id, "--force-merge-held")
@@ -384,7 +390,8 @@ class TestP28ForceMergeHeld(MergeGateCase):
     def test_reused_pid_is_not_the_wrapper(self) -> None:
         prj, tsk, run_id = self.held_merge()
         # a live pid with a different starttime than the recorded one: another process now
-        other = subprocess.Popen(["sleep", "300"], start_new_session=True)
+        popen_kw: Dict[str, Any] = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32" else {"start_new_session": True}
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"], **popen_kw)
         self.addCleanup(other.wait)
         self.addCleanup(other.kill)
         self.write_db("UPDATE runs SET wrapper_pid = ?, pgid = ?, proc_starttime = 1 WHERE id = ?;",
@@ -428,7 +435,7 @@ class TestP25NoopMergeRunsTests(MergeGateCase):
     merge_commit is the commit that really merged it, not the tip."""
 
     def test_zero_commit_task_with_failing_tests_is_not_merged(self) -> None:
-        repo, prj = self.make_project("N1", test_command='["false"]')
+        repo, prj = self.make_project("N1", test_command=json.dumps([sys.executable, "-c", "import sys; sys.exit(1)"]))
         self.repo = repo
         self.remote_before = self.fixture.remote_refs(repo)
         tsk, _ = self.accepted_task(prj, "Nothing", None)  # submitted without a commit
@@ -448,7 +455,7 @@ class TestP25NoopMergeRunsTests(MergeGateCase):
         self.doctor_ok()
 
     def test_noop_merge_runs_passing_tests_and_records_the_merging_commit(self) -> None:
-        repo, prj = self.make_project("N2", test_command='["true"]')
+        repo, prj = self.make_project("N2", test_command=json.dumps([sys.executable, "-c", "pass"]))
         self.repo = repo
         self.remote_before = self.fixture.remote_refs(repo)
         tsk, _ = self.accepted_task(prj, "Feature", "f.txt", "f\n")
@@ -478,7 +485,7 @@ class TestP25NoopMergeRunsTests(MergeGateCase):
         self.doctor_ok()  # I9: merge_commit is an ancestor of integration
 
     def test_zero_commit_task_after_other_merges_records_its_tip_not_a_later_merge(self) -> None:
-        repo, prj = self.make_project("N3", test_command='["true"]')
+        repo, prj = self.make_project("N3", test_command=json.dumps([sys.executable, "-c", "pass"]))
         self.repo = repo
         self.remote_before = self.fixture.remote_refs(repo)
         tsk_z, _ = self.accepted_task(prj, "Nothing", None)  # its tip is the base it started from
@@ -532,7 +539,7 @@ class TestP13IntentAndRecoveryByParents(MergeGateCase):
         self.assertEqual(self.q("SELECT status FROM tasks WHERE id = ?;", (tsk,))[0]["status"], "merging")
 
     def crashed_project(self, name: str) -> Tuple[str, str, str, str, str]:
-        repo, prj = self.make_project(name, test_command='["python3","-c","pass"]')
+        repo, prj = self.make_project(name, test_command=json.dumps([sys.executable, "-c", "pass"]))
         self.repo = repo
         self.remote_before = self.fixture.remote_refs(repo)
         tsk, ws = self.accepted_task(prj, "Commit then crash", "crash.txt", "crash\n")
@@ -549,7 +556,7 @@ class TestP13IntentAndRecoveryByParents(MergeGateCase):
         with open(path, encoding="utf-8") as f:
             intent = json.load(f)
         self.assertEqual((intent["task_id"], intent["pre_head"], intent["tip"]), (tsk, pre_head, tip))
-        self.assertEqual(oct(os.stat(path).st_mode & 0o777), oct(0o600))
+        assert_private_mode(self, path, is_dir=False, posix_mode=0o600)
         self.doctor_ok()
 
     def test_genuine_crash_after_commit_is_reconciled_by_commit_ready(self) -> None:
@@ -644,7 +651,7 @@ class TestP12TestStepGitState(MergeGateCase):
     INTEGRATION_DIRTY and nothing unreviewed enters the merge commit."""
 
     def py_command(self, script: str) -> str:
-        return json.dumps(["python3", "-c", script])
+        return json.dumps([sys.executable, "-c", script])
 
     def project_with(self, name: str, script: str) -> Tuple[str, str]:
         repo, prj = self.make_project(name, test_command=self.py_command(script))

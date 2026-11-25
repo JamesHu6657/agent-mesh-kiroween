@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
@@ -171,7 +172,7 @@ class TestBatch7G4Git(unittest.TestCase):
                 "with open(os.path.join('reports', 'junit.xml'), 'w') as out: out.write('<xml/>\\n')\n"
                 f"sys.exit(1 if os.path.exists({fail_flag!r}) else 0)\n"
             )
-        _, prj = self._make_repo_project("G4F2", test_command=json.dumps(["python3", script]))
+        _, prj = self._make_repo_project("G4F2", test_command=json.dumps([sys.executable, script]))
         tsk_1, _ = self._start_commit_submit_accept(prj, "First", "a.txt", "a\n")
         tsk_2, _ = self._start_commit_submit_accept(prj, "Second", "b.txt", "b\n")
 
@@ -206,7 +207,7 @@ class TestBatch7G4Git(unittest.TestCase):
                 f"while not os.path.exists({release_flag!r}) and time.monotonic() < deadline:\n"
                 "    time.sleep(0.05)\n"
             )
-        repo, prj = self._make_repo_project("G4F5", test_command=json.dumps(["python3", slow_test]))
+        repo, prj = self._make_repo_project("G4F5", test_command=json.dumps([sys.executable, slow_test]))
 
         # Merge tsk_1 (fast: create & merge after allowing test to exit immediately)
         open(release_flag, "w").close()

@@ -2,9 +2,11 @@
 
 import json
 import os
+import re
 import sqlite3
 from typing import Any, Dict, List, Optional
 
+from mesh.adapters import vendor_stream as vs
 from mesh.adapters.base import positional_prompt
 from mesh.adapters.base import (
     Adapter,
@@ -35,6 +37,19 @@ AGY_ERROR_MARKER = "AGY_ERROR:"
 _USAGE_KEYS = ("input_tokens", "output_tokens", "thinking_tokens", "cache_read_tokens", "total_tokens")
 # Text-bearing keys tried on agent_response steps (none present in 1.5.3; forward-compatible)
 _STEP_TEXT_KEYS = ("text", "response", "content", "message")
+# agy versions with recorded evidence of how the prompt is passed (see AgyAdapter.build()):
+# 1.5.3 real captures; 1.5.12: the argument-rejection stderr of the first smoke attempt of
+# 2026-11-19 and the passing rerun with this argv (tests/smoke/results/agy-1.5.12-2026-11-19.json).
+PROMPT_ARGV_EVIDENCE_VERSIONS = ("1.5.3", "1.5.12")
+# agy 1.5.12 stderr when the argv item after --print is not the prompt (2026-11-19 smoke: rc
+# non-zero, no model call):
+#   Error: --print took "--output-format" as its prompt, so the intended prompt was left as an
+#   argument and ignored.
+# Group 1 is the flag agy names, group 2 what it consumed as the prompt. Only a line that
+# starts with agy's own "Error: " prefix counts: the same words inside other stderr text (a
+# quoted prompt, tool output, a log line) are not an argument rejection.
+_PROMPT_CONSUMED_RE = re.compile(
+    r"^[ \t]*Error: (--?[A-Za-z][A-Za-z0-9-]*) took (.{1,200}?) as its prompt", re.MULTILINE)
 
 
 class AgyAdapter(Adapter):
@@ -42,6 +57,7 @@ class AgyAdapter(Adapter):
 
     id = "agy"
     kind = "vendor"
+    supported_profiles = ("readonly", "edit", "unrestricted")
     binary_names = ["agy"]
     planned_version = "1.5.2"
     verified_version = "1.5.2"
@@ -83,27 +99,12 @@ class AgyAdapter(Adapter):
         if req.options.get("binary"):
             # Linear full review C9: run the path validation resolved (~, relative), not the raw string.
             binary = self.resolve_binary(binary) or os.path.abspath(os.path.expanduser(binary))
-        argv = [
-            binary,
-            "--print",
-            "--output-format",
-            "stream-json",
-            "--model",
-            req.model or "gemini-3.8-flash-high",
-        ]
-        if req.effort:
-            argv.extend(["--effort", req.effort])
-
-        argv.extend(self.profile_flags(req.profile))
-
-        if req.options.get("sandbox"):
-            argv.append("--sandbox")
-        if req.options.get("agent"):
-            argv.extend(["--agent", req.options["agent"]])
+        profile_flags = self.profile_flags(req.profile)
 
         # Prompt length check and fallback per §12.5, N16
         prompt_content = ""
         prompt_bytes = 0
+        add_dir: Optional[str] = None
         if os.path.exists(req.prompt_path):
             prompt_bytes = os.path.getsize(req.prompt_path)
             if prompt_bytes <= self.max_argv_prompt_bytes:
@@ -112,18 +113,58 @@ class AgyAdapter(Adapter):
 
         if prompt_bytes > self.max_argv_prompt_bytes:
             prompt_abs = os.path.abspath(req.prompt_path)
-            run_dir = os.path.dirname(prompt_abs)
-            argv.extend(["--add-dir", run_dir])
+            add_dir = os.path.dirname(prompt_abs)
             prompt_content = f"Read the file {prompt_abs} and follow the instructions in it exactly. It is your complete task."
+
+        # Where the prompt goes (fix/agy-1.5.12-print): it is its own argv item directly after
+        # --print, and every other flag comes after it:
+        #   agy --print <prompt> --output-format stream-json --model <m> ... --print-timeout <n>s
+        # Evidence for this one form on both recorded versions:
+        # * agy 1.5.12 (smoke of 2026-11-19): --print takes the NEXT argv item as the prompt.
+        #   The earlier form `--print --output-format stream-json ... <prompt last>` failed
+        #   before any model call: `--print took "--output-format" as its prompt`
+        #   (_PROMPT_CONSUMED_RE). The rerun with the form below passed S-X-1..S-X-4
+        #   (tests/smoke/results/agy-1.5.12-2026-11-19.json, captures in
+        #   tests/fixtures/real/agy/1.5.12/).
+        # * agy 1.5.3: the sidecar of every real capture (tests/fixtures/real/agy/1.5.3/
+        #   stream-*.meta.json) records `agy -p <prompt> --model <m> --output-format stream-json`
+        #   (-p is the help's alias of --print), and those runs printed stream-json, so 1.5.3
+        #   honoured the flags after the prompt. That shape reads the same whether 1.5.3 took
+        #   the prompt as the flag's value or as a positional argument.
+        # * --help cannot tell the versions apart: the 1.5.2, 1.5.3 and 1.5.12 help texts are
+        #   byte-identical (sha256 EXPECTED_HELP_HASHES["agy"]), so no probe sees this change.
+        # Not used: `--print=<prompt>`, which the 1.5.12 message suggests. Nothing recorded
+        # shows 1.5.3/1.5.4 accept it (if --print is a switch there, `=<text>` may be
+        # refused). The earlier trailing-prompt form has no recorded success on any version
+        # (the one agy smoke run that used it, on 1.5.12, failed).
+        # m4-p3-cleanup (Carbon r10 P3): the real help fixture documents no `--`, so a prompt
+        # that starts with "-" gets a leading newline instead; no parser reads it as a flag.
+        argv = [
+            binary,
+            "--print",
+            positional_prompt(prompt_content),
+            "--output-format",
+            "stream-json",
+            "--model",
+            req.model or "gemini-3.8-flash-high",
+        ]
+        if req.effort:
+            argv.extend(["--effort", req.effort])
+
+        argv.extend(profile_flags)
+
+        if req.options.get("sandbox"):
+            argv.append("--sandbox")
+        if req.options.get("agent"):
+            argv.extend(["--agent", req.options["agent"]])
+
+        if add_dir is not None:
+            argv.extend(["--add-dir", add_dir])
 
         if req.resume_session_id:
             argv.extend(["--conversation", req.resume_session_id])
 
-        # m4-p3-cleanup (Carbon r10 P3): the prompt is the last, positional argv item. Neither
-        # CLI's real help fixture documents `--`, so a prompt that starts with "-" gets a
-        # leading newline instead; the CLI then reads it as INPUT, never as a flag.
-        prompt_content = positional_prompt(prompt_content)
-        argv.extend(["--print-timeout", f"{req.timeout_s}s", prompt_content])
+        argv.extend(["--print-timeout", f"{req.timeout_s}s"])
 
         return CommandSpec(argv=argv, cwd=req.workspace, stdin="devnull")
 
@@ -281,14 +322,20 @@ class AgyAdapter(Adapter):
 
     @staticmethod
     def parse_stderr_error(stderr_text: Optional[str]) -> Optional[Dict[str, Any]]:
-        """The last ``AGY_ERROR: {json}`` line in agy stderr, or None; never raises.
+        """The last ``AGY_ERROR: {json}`` line in agy stderr, else a rejected argv, else None;
+        never raises.
 
         stream-step6-network-error-stderr.txt: a plain ``error: ...`` line, then
         ``AGY_ERROR: {"short_error":...,"status":...,"error_code":...,"code_kind":...,
         "retryable":...,"error_id":...}``. Returns ``short_error`` (str or None) and
         ``retryable`` (bool or None), plus ``status``/``error_code``/``code_kind`` when present.
+
+        Without such a line, the agy 1.5.12 message ``--print took "<item>" as its prompt``
+        (_PROMPT_CONSUMED_RE) returns ``{"reason": "cli_usage_error", "details": {...}}``, the
+        shape the codex/claude/devin adapters use for rejected arguments: agy refused the argv
+        before any model call, so the argv Mesh built no longer fits the installed agy.
         """
-        if not isinstance(stderr_text, str) or AGY_ERROR_MARKER not in stderr_text:
+        if not isinstance(stderr_text, str):
             return None
         found: Optional[Dict[str, Any]] = None
         for line in stderr_text.splitlines():
@@ -311,7 +358,7 @@ class AgyAdapter(Adapter):
                 if key in data:
                     out[key] = data[key]
             found = out
-        return found
+        return found if found is not None else _usage_error(stderr_text)
 
     def list_models(self, binary_path: Optional[str] = None) -> Optional[List[str]]:
         bin_path = self.resolve_binary(binary_path)
@@ -474,6 +521,24 @@ class AgyAdapter(Adapter):
         )
         record_adapter_probe(conn, self.id, probe, bin_path)
         return probe
+
+
+def _usage_error(stderr_text: str) -> Optional[Dict[str, Any]]:
+    """``cli_usage_error`` for the agy 1.5.12 "took ... as its prompt" stderr, else None."""
+    m = _PROMPT_CONSUMED_RE.search(stderr_text)
+    if m is None:
+        return None
+    return {
+        "reason": "cli_usage_error",
+        "details": {
+            "stderr": vs.bounded(stderr_text.strip()),
+            "flag": m.group(1),
+            "consumed_as_prompt": vs.bounded(m.group(2).strip("\"'")),
+            "note": "agy rejected its arguments: the item after the prompt flag was not the prompt. "
+                    "Mesh puts the prompt directly after --print (evidence: agy "
+                    + ", ".join(PROMPT_ARGV_EVIDENCE_VERSIONS) + "); check `agy --version`",
+        },
+    }
 
 
 def _is_count(value: Any) -> bool:

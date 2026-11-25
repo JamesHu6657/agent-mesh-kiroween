@@ -1,5 +1,6 @@
 """Regression tests for Group F findings (P1-8, P2-4, P2-6, P2-8)."""
 
+import sys
 import json
 import os
 import shutil
@@ -309,6 +310,14 @@ class TestP2_4DeliverHiddenIndexFlags(unittest.TestCase):
 
 
 class TestP2_6HomeSubdirAndLogfileSymlinks(unittest.TestCase):
+    @staticmethod
+    def _dir_link(src: str, dst: str) -> None:
+        if sys.platform == "win32":
+            import _winapi
+            _winapi.CreateJunction(src, dst)
+        else:
+            os.symlink(src, dst)
+
     def test_init_mesh_home_rejects_symlink_and_file_subdirs(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mh-p26-init-") as tmp:
             external = os.path.join(tmp, "external_victim")
@@ -319,15 +328,16 @@ class TestP2_6HomeSubdirAndLogfileSymlinks(unittest.TestCase):
                 with self.subTest(kind="symlink_dir", sub=sub):
                     home = os.path.join(tmp, f"home_sym_{sub}")
                     os.makedirs(home, mode=0o700)
-                    os.symlink(external, os.path.join(home, sub))
+                    self._dir_link(external, os.path.join(home, sub))
                     with mock.patch.dict(os.environ, {"MESH_TESTING": "1"}):
                         with self.assertRaises(MeshError) as cm:
                             init_mesh_home(home, PASS)
                     self.assertEqual(cm.exception.code, c.INSECURE_PERMISSIONS)
                     self.assertEqual(cm.exception.exit_code, c.EXIT_USAGE)
-                    self.assertEqual(stat.S_IMODE(os.stat(external).st_mode), 0o755)
+                    if sys.platform != "win32":
+                        self.assertEqual(stat.S_IMODE(os.stat(external).st_mode), 0o755)
 
-            # Regular file and dangling symlink at subdir must also raise INSECURE_PERMISSIONS (rc 2)
+            # Regular file and dangling symlink / junction at subdir must also raise INSECURE_PERMISSIONS (rc 2)
             home_file = os.path.join(tmp, "home_file")
             os.makedirs(home_file, mode=0o700)
             with open(os.path.join(home_file, "logs"), "w", encoding="utf-8") as f:
@@ -340,7 +350,10 @@ class TestP2_6HomeSubdirAndLogfileSymlinks(unittest.TestCase):
 
             home_dangle = os.path.join(tmp, "home_dangle")
             os.makedirs(home_dangle, mode=0o700)
-            os.symlink(os.path.join(tmp, "missing_target"), os.path.join(home_dangle, "logs"))
+            missing_target = os.path.join(tmp, "missing_target")
+            os.makedirs(missing_target, exist_ok=True)
+            self._dir_link(missing_target, os.path.join(home_dangle, "logs"))
+            os.rmdir(missing_target)
             with mock.patch.dict(os.environ, {"MESH_TESTING": "1"}):
                 with self.assertRaises(MeshError) as cm_d:
                     init_mesh_home(home_dangle, PASS)
@@ -352,18 +365,18 @@ class TestP2_6HomeSubdirAndLogfileSymlinks(unittest.TestCase):
             outside = os.path.join(tmp, "outside")
             os.makedirs(outside, mode=0o700)
 
-            # 1. Symlinked $home/logs
+            # 1. Symlinked / junctioned $home/logs
             h1 = os.path.join(tmp, "h1")
             os.makedirs(h1, mode=0o700)
-            os.symlink(outside, os.path.join(h1, "logs"))
+            self._dir_link(outside, os.path.join(h1, "logs"))
             logfile.append_line(h1, "should not escape logs symlink")
             self.assertFalse(os.path.exists(os.path.join(outside, "meshd.log")))
 
-            # 2. Symlinked $home
+            # 2. Symlinked / junctioned $home
             real_h = os.path.join(tmp, "real_h")
             os.makedirs(real_h, mode=0o700)
             sym_h = os.path.join(tmp, "sym_h")
-            os.symlink(real_h, sym_h)
+            self._dir_link(real_h, sym_h)
             logfile.append_line(sym_h, "should not follow home symlink")
             self.assertFalse(os.path.exists(os.path.join(real_h, "logs", "meshd.log")))
 

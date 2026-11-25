@@ -1,0 +1,42 @@
+{
+  "$schema": "https://raw.githubusercontent.com/ScoopInstaller/Scoop/master/schema.json",
+  "version": "1.0.0.dev0",
+  "description": "Local-first multi-agent orchestrator with chat-first desktop UI, inline approval cards, and cryptographic audit chain.",
+  "homepage": "https://github.com/JamesHu6657/agent-mesh-kiroween",
+  "license": "MIT",
+  "notes": [
+    "Launch the desktop client from Start Menu ('Agent Mesh') or run 'mesh --help' in your terminal.",
+    "Your data directory (%USERPROFILE%\\.agent-mesh) is preserved across upgrades and uninstalls.",
+    "Requires Microsoft Edge WebView2 Runtime (preinstalled on Windows 11)."
+  ],
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/JamesHu6657/agent-mesh-kiroween/releases/download/v1.0.0.dev0/AgentMesh-1.0.0.dev0-win-x64-portable.zip",
+      "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "extract_dir": "AgentMesh-1.0.0.dev0-win-x64-portable"
+    }
+  },
+  "bin": [
+    "mesh.exe"
+  ],
+  "shortcuts": [
+    [
+      "Agent Mesh.exe",
+      "Agent Mesh"
+    ]
+  ],
+  "checkver": {
+    "github": "https://github.com/JamesHu6657/agent-mesh-kiroween"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/JamesHu6657/agent-mesh-kiroween/releases/download/v$version/AgentMesh-$version-win-x64-portable.zip",
+        "extract_dir": "AgentMesh-$version-win-x64-portable"
+      }
+    },
+    "hash": {
+      "url": "https://github.com/JamesHu6657/agent-mesh-kiroween/releases/download/v$version/SHA256SUMS.txt"
+    }
+  }
+}

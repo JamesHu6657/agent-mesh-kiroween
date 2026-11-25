@@ -62,6 +62,12 @@ from mesh.core.paths import (
     make_owned_dirs_writable,
     rmtree_allow_readonly,
 )
+from mesh.platform import fs as _plat_fs
+from mesh.platform import paths as _plat_paths
+from mesh.platform import perms as _plat_perms
+from mesh.platform import proc as _plat_proc
+from mesh.platform.fs import fsync_dir
+from mesh.platform.proc import crash_self_now
 from mesh.core.proc import ScanResult, get_proc_stat, is_tgid_alive
 from mesh.core.ids import generate_id
 from mesh.core.redact import redact, redact_value
@@ -104,7 +110,8 @@ _ACTIVE_MERGE_RUNS: Set[str] = set()
 
 def is_merge_run_active(run_id: str) -> bool:
     """True while the merge pipeline of ``run_id`` still runs in this process."""
-    return run_id in _ACTIVE_MERGE_RUNS
+    with _ACTIVE_TEST_LOCK:
+        return run_id in _ACTIVE_MERGE_RUNS
 
 
 def merge_lease_key(project_id: str) -> str:
@@ -128,7 +135,7 @@ def merge_in_progress_for_repo(conn: sqlite3.Connection, repo_path: Optional[str
     for prj in conn.execute("SELECT id, repo_path FROM projects WHERE repo_path IS NOT NULL "
                             "AND repo_path != '' ORDER BY id;").fetchall():
         try:
-            if os.path.realpath(prj["repo_path"]) != target:
+            if not _plat_paths.same_path(prj["repo_path"], target):
                 continue
         except (OSError, ValueError):
             continue
@@ -404,6 +411,11 @@ _CE_SKIP_WORKTREE = 0x4000
 _CE_INTENT_TO_ADD = 0x2000
 
 
+def _unlink_nonregular(path: str) -> None:
+    """Unlink a file, POSIX symlink, or Windows symlink/NTFS directory junction."""
+    _plat_fs.unlink_nonregular(path)
+
+
 def _atomic_write_bytes(path: str, data: bytes, mode: int = 0o600) -> None:
     parent = os.path.dirname(path)
     if not parent or not os.path.isdir(parent):
@@ -414,7 +426,8 @@ def _atomic_write_bytes(path: str, data: bytes, mode: int = 0o600) -> None:
         written = 0
         while written < len(view):
             written += os.write(fd, view[written:])
-        os.chmod(tmp, mode)
+        if not (sys.platform == "win32" and (mode & 0o077) == 0):
+            os.chmod(tmp, mode)
     except BaseException:
         try:
             os.close(fd)
@@ -426,7 +439,9 @@ def _atomic_write_bytes(path: str, data: bytes, mode: int = 0o600) -> None:
             pass
         raise
     os.close(fd)
-    os.replace(tmp, path)
+    if sys.platform == "win32" and (mode & 0o077) == 0:
+        _plat_perms.set_private_file_acl(tmp, mode)
+    _plat_fs.atomic_replace(tmp, path)
 
 
 _INDEX_LINK_EXT = b"link"
@@ -644,12 +659,11 @@ def _parse_index_flags(
     """
     if not index_path or not os.path.lexists(index_path):
         return {}, False
-    if os.path.islink(index_path) or not os.path.isfile(index_path):
+    if _plat_paths.is_reparse_link(index_path) or not os.path.isfile(index_path):
         return None, False
     try:
         st_mode = (os.lstat(index_path).st_mode & 0o777) or 0o644
-        with open(index_path, "rb") as f:
-            data = f.read()
+        data = _plat_fs.read_bytes_shared(index_path)
     except OSError:
         return None, False
     scan = _scan_index_bytes(data, clear_hide_flags=clear_hide_flags)
@@ -727,11 +741,10 @@ def _split_index_flags(
             return None
     else:
         shared_path = os.path.join(os.path.dirname(index_path), "sharedindex." + shared_hex)
-        if os.path.islink(shared_path) or not os.path.isfile(shared_path):
+        if _plat_paths.is_reparse_link(shared_path) or not os.path.isfile(shared_path):
             return None
         try:
-            with open(shared_path, "rb") as f:
-                sdata = f.read()
+            sdata = _plat_fs.read_bytes_shared(shared_path)
         except OSError:
             return None
         sscan = _scan_index_bytes(sdata)
@@ -778,8 +791,8 @@ def _cleanup_stray_shared_indexes(integ: str) -> None:
             continue
         path = os.path.join(gitdir, name)
         try:
-            if os.path.islink(path) or os.path.isfile(path):
-                os.unlink(path)
+            if _plat_paths.is_reparse_link(path) or os.path.isfile(path):
+                _unlink_nonregular(path)
         except OSError:
             pass
 
@@ -791,8 +804,8 @@ def _clear_merge_state_files(integ: str) -> None:
         if not path:
             continue
         try:
-            if os.path.islink(path) or os.path.isfile(path):
-                os.unlink(path)
+            if _plat_paths.is_reparse_link(path) or os.path.isfile(path):
+                _unlink_nonregular(path)
         except OSError:
             pass
 
@@ -879,11 +892,10 @@ def _merge_head_matches_tip(cwd: str, expected_tip: str) -> bool:
     if not expected_tip:
         return False
     mh_path = _git_path(cwd, "MERGE_HEAD", "rev-parse MERGE_HEAD path")
-    if not mh_path or os.path.islink(mh_path) or not os.path.isfile(mh_path):
+    if not mh_path or _plat_paths.is_reparse_link(mh_path) or not os.path.isfile(mh_path):
         return False
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(mh_path, flags)
+        fd = _plat_fs.open_regular_nofollow(mh_path, os.O_RDONLY, label="MERGE_HEAD")
     except OSError:
         return False
     try:
@@ -997,32 +1009,43 @@ def _safe_unlink_untracked(
     protected_dirs: Optional[Set[str]] = None,
 ) -> None:
     """Remove a single untracked entry created inside ``integ`` without following symlinks."""
-    rel_clean = (rel or "").rstrip("/")
-    if not rel_clean or os.path.isabs(rel_clean):
-        return
-    parts = [p for p in rel_clean.split("/") if p]
+    if sys.platform == "win32":
+        import ntpath
+
+        rel_clean = (rel or "").rstrip("\\/")
+        if (
+            not rel_clean
+            or rel_clean.startswith(("/", "\\"))
+            or ntpath.isabs(rel_clean)
+            or ntpath.splitdrive(rel_clean)[0]
+        ):
+            return
+        parts = _plat_paths.split_path_segments(rel_clean)
+    else:
+        rel_clean = (rel or "").rstrip("/")
+        if not rel_clean or os.path.isabs(rel_clean):
+            return
+        parts = [p for p in rel_clean.split("/") if p]
     if not parts or any(p in (".", "..") for p in parts):
         return
     integ_real = os.path.realpath(integ)
     cur = integ
     for part in parts[:-1]:
         cur = os.path.join(cur, part)
-        if os.path.islink(cur):
+        if _plat_paths.is_reparse_link(cur):
             return
-        cur_real = os.path.realpath(cur)
-        if cur_real != integ_real and not cur_real.startswith(integ_real + os.sep):
+        if not _plat_paths.is_path_equal_or_parent(integ_real, cur):
             return
     target = os.path.join(cur, parts[-1])
-    parent_real = os.path.realpath(os.path.dirname(target))
-    if parent_real != integ_real and not parent_real.startswith(integ_real + os.sep):
+    if not _plat_paths.is_path_equal_or_parent(integ_real, os.path.dirname(target)):
         return
-    if os.path.islink(target) or os.path.isfile(target):
+    if _plat_paths.is_reparse_link(target) or os.path.isfile(target):
         try:
-            os.unlink(target)
+            _unlink_nonregular(target)
         except PermissionError:
             if not make_owned_ancestors_writable(target, integ_real):
                 raise
-            os.unlink(target)
+            _unlink_nonregular(target)
     elif os.path.isdir(target):
         try:
             rmtree_allow_readonly(target, boundary_real=integ_real)
@@ -1032,18 +1055,21 @@ def _safe_unlink_untracked(
             rmtree_allow_readonly(target, boundary_real=integ_real)
     elif os.path.lexists(target):
         try:
-            os.unlink(target)
+            _unlink_nonregular(target)
         except PermissionError:
             if not make_owned_ancestors_writable(target, integ_real):
                 raise
-            os.unlink(target)
+            _unlink_nonregular(target)
     else:
         return
     protected_norm = {p.strip("/") for p in (protected_dirs or ()) if p and p.strip("/")}
     parent = os.path.dirname(target)
-    while parent and parent != integ:
-        p_real = os.path.realpath(parent)
-        if p_real == integ_real or not p_real.startswith(integ_real + os.sep) or os.path.islink(parent):
+    while parent and not _plat_paths.same_path(parent, integ):
+        if (
+            _plat_paths.same_path(parent, integ_real)
+            or not _plat_paths.is_path_equal_or_parent(integ_real, parent)
+            or _plat_paths.is_reparse_link(parent)
+        ):
             break
         rel_parent = os.path.relpath(parent, integ).replace(os.sep, "/").strip("/")
         if rel_parent in protected_norm:
@@ -1134,8 +1160,7 @@ def _load_pre_merge_shared(run_dir: Optional[str]) -> Optional[bytes]:
     if not path or not os.path.isfile(path):
         return None
     try:
-        with open(path, "rb") as f:
-            return f.read()
+        return _plat_fs.read_bytes_shared(path)
     except OSError:
         return None
 
@@ -1150,8 +1175,7 @@ def _load_pre_merge_index(run_dir: Optional[str]) -> Optional[bytes]:
     if not path or not os.path.isfile(path):
         return None
     try:
-        with open(path, "rb") as f:
-            return f.read()
+        return _plat_fs.read_bytes_shared(path)
     except OSError:
         return None
 
@@ -1188,22 +1212,21 @@ def _save_commit_ready(
             view = memoryview(data)
             while view:
                 view = view[os.write(fd, view):]
-            os.fchmod(fd, 0o600)
+            if sys.platform != "win32" and hasattr(os, "fchmod"):
+                _plat_perms.fchmod_private(fd, 0o600)
             os.fsync(fd)
         finally:
             os.close(fd)
-        os.replace(tmp, path)
+        if sys.platform == "win32" or not hasattr(os, "fchmod"):
+            _plat_perms.set_private_file_acl(tmp, 0o600)
+        _plat_fs.atomic_replace(tmp, path)
     except BaseException:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
-    dfd = os.open(parent, os.O_RDONLY)
-    try:
-        os.fsync(dfd)
-    finally:
-        os.close(dfd)
+    fsync_dir(parent)
 
 
 def _load_commit_ready(run_dir: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -1237,7 +1260,9 @@ def _save_pre_untracked(run_dir: Optional[str], pre_untracked: Set[str]) -> None
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(sorted(pre_untracked), f)
-            os.replace(tmp, path)
+            if sys.platform == "win32":
+                _plat_perms.set_private_file_acl(tmp, 0o600)
+            _plat_fs.atomic_replace(tmp, path)
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -1253,8 +1278,7 @@ def _load_pre_untracked(run_dir: Optional[str]) -> Optional[Set[str]]:
     if not path or not os.path.isfile(path):
         return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = json.loads(_plat_fs.read_bytes_shared(path).decode("utf-8"))
         if isinstance(data, list) and all(isinstance(x, str) for x in data):
             return set(data)
     except (OSError, ValueError, TypeError):
@@ -1271,14 +1295,13 @@ def _snapshot_empty_dirs(integ: str) -> Set[str]:
         has_entries = bool(dirnames or filenames)
         dirnames[:] = sorted(
             d for d in dirnames
-            if d != ".git" and not os.path.islink(os.path.join(dirpath, d))
+            if d != ".git" and not _plat_paths.is_reparse_link(os.path.join(dirpath, d))
         )
-        if dirpath == integ or has_entries:
+        if _plat_paths.same_path(dirpath, integ) or has_entries:
             continue
-        if os.path.islink(dirpath):
+        if _plat_paths.is_reparse_link(dirpath):
             continue
-        cur_real = os.path.realpath(dirpath)
-        if cur_real.startswith(integ_real + os.sep):
+        if not _plat_paths.same_path(dirpath, integ_real) and _plat_paths.is_path_equal_or_parent(integ_real, dirpath):
             empty.add(os.path.relpath(dirpath, integ).replace(os.sep, "/"))
     return empty
 
@@ -1292,7 +1315,9 @@ def _save_pre_empty_dirs(run_dir: Optional[str], pre_empty_dirs: Set[str]) -> No
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(sorted(pre_empty_dirs), f)
-            os.replace(tmp, path)
+            if sys.platform == "win32":
+                _plat_perms.set_private_file_acl(tmp, 0o600)
+            _plat_fs.atomic_replace(tmp, path)
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -1308,8 +1333,7 @@ def _load_pre_empty_dirs(run_dir: Optional[str]) -> Optional[Set[str]]:
     if not path or not os.path.isfile(path):
         return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = json.loads(_plat_fs.read_bytes_shared(path).decode("utf-8"))
         if isinstance(data, list) and all(isinstance(x, str) for x in data):
             return set(data)
     except (OSError, ValueError, TypeError):
@@ -1425,10 +1449,9 @@ def _is_safe_gitlink_dir(integ: str, rel: str) -> bool:
     cur = integ
     for part in parts:
         cur = os.path.join(cur, part)
-        if os.path.islink(cur) or not os.path.isdir(cur):
+        if _plat_paths.is_reparse_link(cur) or not os.path.isdir(cur):
             return False
-        cur_real = os.path.realpath(cur)
-        if cur_real != integ_real and not cur_real.startswith(integ_real + os.sep):
+        if not _plat_paths.is_path_equal_or_parent(integ_real, cur):
             return False
     return True
 
@@ -1445,7 +1468,7 @@ def _tampered_gitlink_paths(integ: str, gitlinks: Set[str]) -> Set[str]:
         cur = integ
         for part in parts:
             cur = os.path.join(cur, part)
-            if os.path.islink(cur):
+            if _plat_paths.is_reparse_link(cur):
                 tampered.add(g)
                 break
             if os.path.lexists(cur) and not os.path.isdir(cur):
@@ -1535,12 +1558,12 @@ def _cleanup_inside_empty_gitlinks(integ: str, cleanable_gitlinks: Set[str]) -> 
         for name in entries:
             child = os.path.join(g_path, name)
             try:
-                if os.path.islink(child) or not os.path.isdir(child):
+                if _plat_paths.is_reparse_link(child) or not os.path.isdir(child):
                     try:
-                        os.unlink(child)
+                        _unlink_nonregular(child)
                     except PermissionError:
                         make_owned_ancestors_writable(child, integ_real)
-                        os.unlink(child)
+                        _unlink_nonregular(child)
                 else:
                     rmtree_allow_readonly(child, boundary_real=g_real)
             except OSError:
@@ -1600,23 +1623,23 @@ def _restore_index_bytes(
         # Put the linked shared index back first if the test expired/removed it,
         # so the restored index never points at a missing file.
         sh_path = os.path.join(os.path.dirname(idx_path), shared_name)
-        if not os.path.isfile(sh_path) or os.path.islink(sh_path):
+        if not os.path.isfile(sh_path) or _plat_paths.is_reparse_link(sh_path):
             if not isinstance(shared_bytes, (bytes, bytearray)):
                 return False
             try:
-                if os.path.islink(sh_path):
-                    os.unlink(sh_path)
+                if _plat_paths.is_reparse_link(sh_path):
+                    _unlink_nonregular(sh_path)
                 _atomic_write_bytes(sh_path, bytes(shared_bytes), mode=0o644)
             except OSError:
                 return False
     try:
         st_mode = (
             (os.lstat(idx_path).st_mode & 0o777)
-            if os.path.lexists(idx_path) and not os.path.islink(idx_path)
+            if os.path.lexists(idx_path) and not _plat_paths.is_reparse_link(idx_path)
             else 0o644
         )
-        if os.path.islink(idx_path):
-            os.unlink(idx_path)
+        if _plat_paths.is_reparse_link(idx_path):
+            _unlink_nonregular(idx_path)
         _atomic_write_bytes(idx_path, bytes(index_bytes), mode=st_mode or 0o644)
         return True
     except OSError:
@@ -1651,14 +1674,17 @@ def _restore_head_and_ref(
     if desired_raw and head_path:
         try:
             cur_raw = None
-            if os.path.lexists(head_path) and not os.path.islink(head_path) and os.path.isfile(head_path):
-                with open(head_path, "r", encoding="utf-8") as f:
-                    cur_raw = f.read()
+            if os.path.lexists(head_path) and not _plat_paths.is_reparse_link(head_path) and os.path.isfile(head_path):
+                if sys.platform == "win32":
+                    cur_raw = _plat_fs.read_bytes_shared(head_path).decode("utf-8")
+                else:
+                    with open(head_path, "r", encoding="utf-8") as f:
+                        cur_raw = f.read()
             if cur_raw != desired_raw:
-                if os.path.islink(head_path):
-                    os.unlink(head_path)
+                if _plat_paths.is_reparse_link(head_path):
+                    _unlink_nonregular(head_path)
                 _atomic_write_bytes(head_path, desired_raw.encode("utf-8"), mode=0o644)
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             return False
 
     try:
@@ -1722,17 +1748,16 @@ def _cleanup_empty_dirs(
         )
         kept_dirnames: List[str] = []
         for d in sorted(dirnames):
-            if d == ".git" or os.path.islink(os.path.join(dirpath, d)):
+            if d == ".git" or _plat_paths.is_reparse_link(os.path.join(dirpath, d)):
                 continue
             child_rel = f"{rel_cur}/{d}" if rel_cur else d
             if _is_under_gitlink(child_rel, gitlinks):
                 continue
             kept_dirnames.append(d)
         dirnames[:] = kept_dirnames
-        if dirpath == integ or os.path.islink(dirpath):
+        if _plat_paths.same_path(dirpath, integ) or _plat_paths.is_reparse_link(dirpath):
             continue
-        cur_real = os.path.realpath(dirpath)
-        if not cur_real.startswith(integ_real + os.sep):
+        if _plat_paths.same_path(dirpath, integ_real) or not _plat_paths.is_path_equal_or_parent(integ_real, dirpath):
             continue
         if _is_under_gitlink(rel_cur, gitlinks) or rel_cur in gitlink_ancs:
             continue
@@ -1865,6 +1890,49 @@ def _post_test_dirty_paths(
     return dirty
 
 
+def _unlink_new_reparse_ancestor(
+    integ: str,
+    integ_real: str,
+    rel: str,
+    pre_untracked: Set[str],
+    protected_dirs: Set[str],
+) -> bool:
+    """Handle a newly created junction/symlink reported via a nested child path.
+
+    On Windows ``git status -uall`` descends into NTFS junctions and reports
+    ``junction/child.txt``. Never traverse inside the link; unlink the new
+    junction itself (unless protected/pre-existing) so external targets stay safe.
+    Returns True if a reparse ancestor handled/blocked ``rel``.
+    """
+    parts = [p for p in (rel or "").replace("\\", "/").strip("/").split("/") if p]
+    if len(parts) < 2:
+        return False
+    cur = integ
+    for idx, part in enumerate(parts[:-1]):
+        if part in (".", "..", ".git"):
+            return True
+        cur = os.path.join(cur, part)
+        if _plat_paths.is_reparse_link(cur):
+            prefix = "/".join(parts[: idx + 1])
+            if (
+                prefix in protected_dirs
+                or prefix in pre_untracked
+                or any(p.startswith(prefix + "/") for p in pre_untracked)
+            ):
+                return True
+            if not _plat_paths.is_path_equal_or_parent(integ_real, os.path.dirname(cur)):
+                return True
+            try:
+                _unlink_nonregular(cur)
+            except PermissionError:
+                make_owned_ancestors_writable(cur, integ_real)
+                _unlink_nonregular(cur)
+            return True
+        if not os.path.isdir(cur):
+            return False
+    return False
+
+
 def _cleanup_new_untracked(
     integ: str,
     pre_untracked: Optional[Set[str]],
@@ -1877,10 +1945,11 @@ def _cleanup_new_untracked(
         return
     gitlinks = _gitlink_paths(integ, refs=protected_refs, include_index=include_index)
     cleanable_gl, exempt_gl = _cleanable_and_exempt_gitlinks(integ, gitlinks, pre_empty_dirs)
-    if os.path.isdir(integ):
+    integ_real = os.path.realpath(integ) if os.path.isdir(integ) else None
+    if integ_real is not None:
         make_owned_dirs_writable(
             integ,
-            boundary_real=os.path.realpath(integ),
+            boundary_real=integ_real,
             skip_names={".git"},
             skip_paths_real=_gitlink_skip_paths_real(integ, exempt_gl),
         )
@@ -1894,6 +1963,10 @@ def _cleanup_new_untracked(
         if rel in pre_untracked or _is_under_gitlink(rel, gitlinks):
             continue
         try:
+            if integ_real is not None and _unlink_new_reparse_ancestor(
+                integ, integ_real, rel, pre_untracked, protected_dirs
+            ):
+                continue
             _safe_unlink_untracked(integ, rel, protected_dirs=protected_dirs)
         except OSError:
             pass
@@ -1918,62 +1991,58 @@ def _restore_single_tracked_path(integ: str, integ_real: str, ref: Optional[str]
         cur = integ
         for part in parts[:-1]:
             cur = os.path.join(cur, part)
-            if os.path.islink(cur) or not os.path.isdir(cur):
+            if _plat_paths.is_reparse_link(cur) or not os.path.isdir(cur):
                 return
-            cur_real = os.path.realpath(cur)
-            if not cur_real.startswith(integ_real + os.sep):
+            if _plat_paths.same_path(cur, integ_real) or not _plat_paths.is_path_equal_or_parent(integ_real, cur):
                 return
         target = os.path.join(cur, parts[-1])
-        parent_real = os.path.realpath(os.path.dirname(target))
-        if parent_real != integ_real and not parent_real.startswith(integ_real + os.sep):
+        if not _plat_paths.is_path_equal_or_parent(integ_real, os.path.dirname(target)):
             return
         try:
             if os.path.lexists(target):
-                if os.path.islink(target) or not os.path.isdir(target):
-                    os.unlink(target)
+                if _plat_paths.is_reparse_link(target) or not os.path.isdir(target):
+                    _unlink_nonregular(target)
                 else:
                     rmtree_allow_readonly(target, boundary_real=integ_real)
         except PermissionError:
             make_owned_ancestors_writable(target, integ_real)
             if os.path.lexists(target):
-                if os.path.islink(target) or not os.path.isdir(target):
-                    os.unlink(target)
+                if _plat_paths.is_reparse_link(target) or not os.path.isdir(target):
+                    _unlink_nonregular(target)
                 else:
                     rmtree_allow_readonly(target, boundary_real=integ_real)
         return
     cur = integ
     for part in parts[:-1]:
         cur = os.path.join(cur, part)
-        if os.path.islink(cur):
-            os.unlink(cur)
+        if _plat_paths.is_reparse_link(cur):
+            _unlink_nonregular(cur)
         elif os.path.lexists(cur) and not os.path.isdir(cur):
-            os.unlink(cur)
+            _unlink_nonregular(cur)
         if not os.path.exists(cur):
             try:
                 os.makedirs(cur, mode=0o755, exist_ok=True)
             except PermissionError:
                 make_owned_ancestors_writable(cur, integ_real)
                 os.makedirs(cur, mode=0o755, exist_ok=True)
-        cur_real = os.path.realpath(cur)
-        if not cur_real.startswith(integ_real + os.sep):
+        if _plat_paths.same_path(cur, integ_real) or not _plat_paths.is_path_equal_or_parent(integ_real, cur):
             return
     target = os.path.join(cur, parts[-1])
-    parent_real = os.path.realpath(os.path.dirname(target))
-    if parent_real != integ_real and not parent_real.startswith(integ_real + os.sep):
+    if not _plat_paths.is_path_equal_or_parent(integ_real, os.path.dirname(target)):
         return
-    if old_mode == "160000" and not os.path.islink(target) and os.path.isdir(target):
+    if old_mode == "160000" and not _plat_paths.is_reparse_link(target) and os.path.isdir(target):
         return
     try:
         if os.path.lexists(target):
-            if os.path.islink(target) or not os.path.isdir(target):
-                os.unlink(target)
+            if _plat_paths.is_reparse_link(target) or not os.path.isdir(target):
+                _unlink_nonregular(target)
             else:
                 rmtree_allow_readonly(target, boundary_real=integ_real)
     except PermissionError:
         make_owned_ancestors_writable(target, integ_real)
         if os.path.lexists(target):
-            if os.path.islink(target) or not os.path.isdir(target):
-                os.unlink(target)
+            if _plat_paths.is_reparse_link(target) or not os.path.isdir(target):
+                _unlink_nonregular(target)
             else:
                 rmtree_allow_readonly(target, boundary_real=integ_real)
 
@@ -1986,10 +2055,43 @@ def _restore_single_tracked_path(integ: str, integ_real: str, ref: Optional[str]
         return
     data = blob_cp.stdout if isinstance(blob_cp.stdout, bytes) else (blob_cp.stdout or "").encode("utf-8")
     if old_mode == "120000":
-        os.symlink(data, target)
+        if sys.platform == "win32":
+            link_target = data.decode("utf-8", errors="surrogateescape")
+            resolved_target = (
+                link_target
+                if os.path.isabs(link_target)
+                else os.path.join(os.path.dirname(target), link_target)
+            )
+            target_is_dir = os.path.isdir(resolved_target)
+            try:
+                os.symlink(link_target, target, target_is_directory=target_is_dir)
+            except OSError as exc:
+                if getattr(exc, "winerror", None) == 1314:
+                    raise OSError(
+                        exc.errno or errno.EACCES,
+                        "Cannot restore tracked git symlink without Windows SeCreateSymbolicLinkPrivilege "
+                        "(WinError 1314; enable Developer Mode or grant SeCreateSymbolicLinkPrivilege)",
+                        target,
+                    ) from exc
+                raise
+        else:
+            os.symlink(data, target)
         return
     mode = 0o755 if old_mode == "100755" else 0o644
-    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), mode)
+    try:
+        fd = _plat_fs.open_regular_nofollow(
+            target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode, label="tracked worktree file"
+        )
+    except PermissionError:
+        make_owned_ancestors_writable(target, integ_real)
+        if os.path.lexists(target) and not _plat_paths.is_reparse_link(target):
+            try:
+                os.chmod(target, 0o600 if sys.platform == "win32" else mode)
+            except OSError:
+                pass
+        fd = _plat_fs.open_regular_nofollow(
+            target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode, label="tracked worktree file"
+        )
     try:
         view = memoryview(data)
         written = 0
@@ -2209,8 +2311,7 @@ def _test_env(run_id: str) -> Dict[str, str]:
 
 def _read_json(path: str) -> Optional[Dict[str, Any]]:
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = json.loads(_plat_fs.read_bytes_shared(path).decode("utf-8"))
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
@@ -2402,17 +2503,12 @@ def _terminate_test(run_id: str, pid: Optional[int], starttime: Optional[int], e
 
 
 def _exited_unreaped(proc: "subprocess.Popen[Any]") -> bool:
-    """True once ``proc`` has exited, without reaping it (``waitid`` with WNOWAIT).
+    """True once ``proc`` has exited, without reaping it (``waitid`` with WNOWAIT on POSIX;
+    ``WaitForSingleObject(proc._handle, 0) == WAIT_OBJECT_0`` without closing handle on Win32).
 
     An already-reaped child (``returncode`` set, or ECHILD) also counts as exited.
     """
-    if proc.returncode is not None:
-        return True
-    try:
-        res = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-    except ChildProcessError:
-        return True
-    return res is not None and res.si_pid == proc.pid
+    return _plat_proc.is_popen_exited_unreaped(proc)
 
 
 def _wait_exit_unreaped(proc: "subprocess.Popen[Any]", timeout_s: float) -> bool:
@@ -2429,15 +2525,90 @@ def _wait_exit_unreaped(proc: "subprocess.Popen[Any]", timeout_s: float) -> bool
         time.sleep(min(TEST_POLL_S, 0.05))
 
 
-def _kill_test_proc_direct(proc: "subprocess.Popen[Any]", grace_s: float,
-                           force_group_kill: bool = False) -> None:
+def _kill_test_proc_direct(
+    proc: "subprocess.Popen[Any]",
+    grace_s: float,
+    force_group_kill: bool = False,
+    *,
+    run_id: Optional[str] = None,
+    home: Optional[str] = None,
+    wrapper_starttime: Optional[int] = None,
+) -> None:
     """Carbon RO P1-1 (2C): directly terminate meshd's own unreaped ``merge_test`` Popen
     session/group when ``/proc`` failures keep :func:`_terminate_test` from enumerating it.
 
-    ``proc`` was started with ``start_new_session=True`` and has not been reaped yet
-    (``proc.returncode is None``), so ``pgid == proc.pid`` is kernel-reserved and cannot
-    have been reused by an unrelated process.
+    ``proc`` was started with ``start_new_session=True`` (or inside a Named Run Job on Win32)
+    and has not been reaped yet (``proc.returncode is None``), so ``pgid == proc.pid`` is
+    kernel-reserved on POSIX and handle-pinned / Job-bound on Windows.
     """
+    if sys.platform == "win32":
+        from mesh.daemon import supervisor as _sup
+
+        pid = int(getattr(proc, "pid", 0) or 0)
+        if getattr(proc, "returncode", None) is not None or pid <= 1 or pid == os.getpid():
+            return
+        eff_wst = wrapper_starttime
+        if eff_wst is None and not _exited_unreaped(proc):
+            try:
+                info = get_proc_stat(pid)
+                if info is not None and int(info.get("starttime") or 0) > 0:
+                    eff_wst = int(info["starttime"])
+            except OSError:
+                eff_wst = None
+        job = getattr(proc, "_mesh_job", None)
+        should_close = False
+        if job is None and run_id:
+            try:
+                job, should_close = _sup.resolve_run_job(run_id, home=home, terminate=True)
+            except OSError:
+                job, should_close = None, False
+        try:
+            if not _exited_unreaped(proc):
+                signalled = False
+                if eff_wst:
+                    try:
+                        signalled = _plat_proc.signal_if_same(
+                            pid,
+                            int(eff_wst),
+                            _plat_proc.SIGTERM,
+                            run_id=run_id,
+                            home=home,
+                        )
+                    except OSError:
+                        signalled = False
+                elif run_id and home:
+                    try:
+                        signalled = _plat_proc.signal_run_stop_event(home, run_id)
+                    except OSError:
+                        signalled = False
+                if signalled and _wait_exit_unreaped(proc, max(0.0, grace_s)) and not force_group_kill:
+                    return
+            elif not force_group_kill:
+                return
+            if job is not None:
+                try:
+                    _plat_proc.terminate_job(job, 137)
+                except OSError:
+                    pass
+            if eff_wst:
+                try:
+                    _plat_proc.kill_if_same(pid, int(eff_wst))
+                except OSError:
+                    pass
+            if not _exited_unreaped(proc):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            _wait_exit_unreaped(proc, terminate.KILL_WAIT_S)
+        finally:
+            if should_close and job is not None:
+                try:
+                    job.close()
+                except Exception:
+                    pass
+        return
+
     if proc.returncode is not None or proc.pid <= 2 or proc.pid == os.getpgrp():
         return
     if not _exited_unreaped(proc):
@@ -2471,6 +2642,7 @@ def _kill_test_proc_direct(proc: "subprocess.Popen[Any]", grace_s: float,
 #: binding (session / parent walk, `classify_peer_run_session`) did not see the test
 #: command at all and a child that dropped MESH_RUN_ID passed as outside any run.
 _ACTIVE_TEST_WRAPPERS: Dict[str, int] = {}
+_ACTIVE_TEST_JOB_RUNS: Set[str] = set()
 _ACTIVE_TEST_LOCK = threading.Lock()
 
 
@@ -2479,12 +2651,24 @@ def in_memory_active_test_runs() -> Dict[str, int]:
         return dict(_ACTIVE_TEST_WRAPPERS)
 
 
+def in_memory_active_job_runs() -> Set[str]:
+    """Return merge run_ids currently owning or about to own a Win32 Job handle."""
+    with _ACTIVE_TEST_LOCK:
+        return set(_ACTIVE_MERGE_RUNS) | set(_ACTIVE_TEST_JOB_RUNS)
+
+
 def run_test_step(plan: Mapping[str, Any]) -> Dict[str, Any]:
+    win_job_tracked = sys.platform == "win32"
+    if win_job_tracked:
+        with _ACTIVE_TEST_LOCK:
+            _ACTIVE_TEST_JOB_RUNS.add(plan["run_id"])
     try:
         return _run_test_step(plan)
     finally:
         with _ACTIVE_TEST_LOCK:
             _ACTIVE_TEST_WRAPPERS.pop(plan["run_id"], None)
+            if win_job_tracked:
+                _ACTIVE_TEST_JOB_RUNS.discard(plan["run_id"])
 
 
 def _run_test_step(plan: Mapping[str, Any]) -> Dict[str, Any]:
@@ -2500,7 +2684,10 @@ def _run_test_step(plan: Mapping[str, Any]) -> Dict[str, Any]:
     """
     run_id = plan["run_id"]
     run_dir = plan["run_dir"]
+    home = os.path.dirname(os.path.dirname(_plat_paths.strip_trailing_seps(run_dir)))
     os.makedirs(run_dir, mode=0o700, exist_ok=True)
+    if sys.platform == "win32":
+        _plat_perms.set_private_dir_acl(run_dir, 0o700)
     log_path = os.path.join(run_dir, TEST_LOG_NAME)
     exit_path = os.path.join(run_dir, "exit.json")
     spec = {
@@ -2512,24 +2699,40 @@ def _run_test_step(plan: Mapping[str, Any]) -> Dict[str, Any]:
         "combined_log": TEST_LOG_NAME,
         "restore_pythonpath": True,
     }
+    if sys.platform == "win32":
+        spec["home"] = home
+        spec["run_id"] = run_id
     tmp = os.path.join(run_dir, "spec.json.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         os.write(fd, (json.dumps(spec, sort_keys=True) + "\n").encode("utf-8"))
+        if sys.platform != "win32" and hasattr(os, "fchmod"):
+            _plat_perms.fchmod_private(fd, 0o600)
         os.fsync(fd)
     finally:
         os.close(fd)
-    os.replace(tmp, os.path.join(run_dir, "spec.json"))
+    if sys.platform == "win32" or not hasattr(os, "fchmod"):
+        _plat_perms.set_private_file_acl(tmp, 0o600)
+    _plat_fs.atomic_replace(tmp, os.path.join(run_dir, "spec.json"))
 
     timeout_s = float(plan["test_timeout_s"])
     started = time.monotonic()
     registration_error: Optional[str] = None
+    run_job: Optional[Any] = None
+    popen_extra: Dict[str, Any] = {}
+    if sys.platform == "win32":
+        from mesh.daemon import supervisor as _sup
+
+        run_job = _plat_proc.create_run_job(home, run_id, kill_on_close=False)
+        _sup.register_run_job(run_id, run_job, home=home)
+        popen_extra["job"] = run_job
     try:
         proc = children.popen_registered(
             "merge_test",
             [sys.executable, "-P", "-s", "-m", "mesh.runwrap", run_dir],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             cwd=plan["integration"], env=_test_env(run_id), start_new_session=True, close_fds=True,
+            **popen_extra,
         )
     except children.SpawnedThenFailed as exc:
         # Round 10 (Linear P1-4): Popen succeeded but registration failed. The wrapper is
@@ -2539,6 +2742,12 @@ def _run_test_step(plan: Mapping[str, Any]) -> Dict[str, Any]:
         proc = exc.proc
         children.hold(proc.pid)
         registration_error = f"{type(exc.exc).__name__}: {exc.exc}" if getattr(exc, "exc", None) else str(exc)
+    except BaseException:
+        if sys.platform == "win32":
+            from mesh.daemon import supervisor as _sup
+
+            _sup.close_run_job(run_id)
+        raise
     with _ACTIVE_TEST_LOCK:
         _ACTIVE_TEST_WRAPPERS[run_id] = proc.pid
     try:
@@ -2555,6 +2764,10 @@ def _run_test_step(plan: Mapping[str, Any]) -> Dict[str, Any]:
                 starttime = int(w["starttime"])
                 break
             time.sleep(0.02)
+    if sys.platform == "win32":
+        from mesh.daemon import supervisor as _sup
+
+        _sup.register_run_job(run_id, run_job, pgid=proc.pid, wrapper_starttime=starttime, home=home)
     out: Dict[str, Any] = {"log_path": log_path, "timeout": False, "timeout_s": int(timeout_s),
                            "wrapper": {"pid": proc.pid, "starttime": starttime}}
     if registration_error:
@@ -2576,7 +2789,12 @@ def _run_test_step(plan: Mapping[str, Any]) -> Dict[str, Any]:
                     out["leftover_scan_uncertain"] = True
                 if not _exited_unreaped(proc) or out["termination"].get("scan_uncertain"):
                     _kill_test_proc_direct(
-                        proc, grace, force_group_kill=bool(out["termination"].get("scan_uncertain"))
+                        proc,
+                        grace,
+                        force_group_kill=bool(out["termination"].get("scan_uncertain")),
+                        run_id=run_id,
+                        home=home,
+                        wrapper_starttime=starttime,
                     )
                 exit_info = _read_json(exit_path)
                 break
@@ -2588,7 +2806,14 @@ def _run_test_step(plan: Mapping[str, Any]) -> Dict[str, Any]:
         # without MESH_RUN_ID (e.g. env={} with stdio on /dev/null).
         if not _wait_exit_unreaped(proc, WRAPPER_EXIT_WAIT_S):
             if out["timeout"]:
-                _kill_test_proc_direct(proc, 0.0, force_group_kill=True)
+                _kill_test_proc_direct(
+                    proc,
+                    0.0,
+                    force_group_kill=True,
+                    run_id=run_id,
+                    home=home,
+                    wrapper_starttime=starttime,
+                )
             if not _exited_unreaped(proc):
                 out["wrapper_alive"] = True
         if not out["timeout"]:
@@ -2623,14 +2848,23 @@ def _run_test_step(plan: Mapping[str, Any]) -> Dict[str, Any]:
 
             out["error"] = "wrapper_identity_unknown"
             grace = float(plan.get("kill_grace_s") or DEFAULT_KILL_GRACE_S)
-            group_scan = supervisor._scan_group(proc.pid)
-            # ClickUp recheck P2: an empty but uncertain scan (EMFILE, EIO) is never read as
-            # "no members". Rescan until certain, bounded by the kill grace; the wrapper is
-            # still our unreaped child, so its pgid stays reserved meanwhile.
-            deadline = time.monotonic() + max(grace, 1.0)
-            while getattr(group_scan, "uncertain", False) and time.monotonic() < deadline:
-                time.sleep(terminate.POLL_S)
+            scan_tok = (
+                supervisor._SCAN_RUN_CTX.set((run_id, proc.pid, None, home))
+                if sys.platform == "win32"
+                else None
+            )
+            try:
                 group_scan = supervisor._scan_group(proc.pid)
+                # ClickUp recheck P2: an empty but uncertain scan (EMFILE, EIO) is never read as
+                # "no members". Rescan until certain, bounded by the kill grace; the wrapper is
+                # still our unreaped child, so its pgid stays reserved meanwhile.
+                deadline = time.monotonic() + max(grace, 1.0)
+                while getattr(group_scan, "uncertain", False) and time.monotonic() < deadline:
+                    time.sleep(terminate.POLL_S)
+                    group_scan = supervisor._scan_group(proc.pid)
+            finally:
+                if scan_tok is not None:
+                    supervisor._SCAN_RUN_CTX.reset(scan_tok)
             members = ScanResult(
                 {p: st for p, st in group_scan.items() if p != proc.pid},
                 uncertain=bool(getattr(group_scan, "uncertain", False)),
@@ -2659,7 +2893,10 @@ def _run_test_step(plan: Mapping[str, Any]) -> Dict[str, Any]:
         if not out["timeout"]:
             out["error"] = "no_exit_json"
     else:
-        out.update({"exit_code": exit_info.get("exit_code"), "signal": exit_info.get("signal")})
+        from mesh.daemon import supervisor as _sup
+
+        exit_code, signo = _sup.normalize_exit_info(exit_info)
+        out.update({"exit_code": exit_code, "signal": signo})
         if exit_info.get("error"):
             out["error"] = exit_info["error"]
         elif exit_info.get("capture_error"):
@@ -2745,13 +2982,15 @@ def _run_merge_pipeline(plan: Mapping[str, Any]) -> Dict[str, Any]:
         # Full review r1 P1-4: `workspace delete` removes the worktree but keeps the branch
         # (Q7); the branch is what is merged, so a deleted worktree is not an error. The
         # tip is still bound to the reviewed head below.
-        wt_clean = wt.rstrip(os.sep) if isinstance(wt, str) else ""
+        wt_clean = _plat_paths.strip_trailing_seps(wt) if isinstance(wt, str) else ""
+        if _plat_paths.is_fs_root(wt_clean):
+            wt_clean = ""
         if wt_clean and os.path.lexists(wt_clean):
             from mesh.core.paths import resolve_trusted_path
             from mesh.core.repos import is_registered_worktree
             wt_real = resolve_trusted_path(wt_clean)
             if wt_real is None or (
-                wt_real != os.path.realpath(integ)
+                not _plat_paths.same_path(wt_real, integ)
                 and not is_registered_worktree(wt_real, integ)
             ):  # integ: a meshd-owned worktree of the repo
                 # Full review r5 P1-3: never run git in a worktree the task re-pointed.
@@ -2793,27 +3032,24 @@ def _run_merge_pipeline(plan: Mapping[str, Any]) -> Dict[str, Any]:
 
         pre_symref = _head_symref(integ, "rev-parse pre-merge HEAD symref")
         head_path = _git_path(integ, "HEAD", "rev-parse pre-merge HEAD path")
-        if head_path and not os.path.islink(head_path) and os.path.isfile(head_path):
+        if head_path and not _plat_paths.is_reparse_link(head_path) and os.path.isfile(head_path):
             try:
-                with open(head_path, "r", encoding="utf-8") as f:
-                    pre_head_raw = f.read()
-            except OSError:
+                pre_head_raw = _plat_fs.read_bytes_shared(head_path).decode("utf-8")
+            except (OSError, UnicodeDecodeError):
                 pre_head_raw = None
         idx_path = _git_path(integ, "index", "rev-parse pre-merge index path")
-        if idx_path and not os.path.islink(idx_path) and os.path.isfile(idx_path):
+        if idx_path and not _plat_paths.is_reparse_link(idx_path) and os.path.isfile(idx_path):
             try:
-                with open(idx_path, "rb") as f:
-                    pre_index_bytes = f.read()
+                pre_index_bytes = _plat_fs.read_bytes_shared(idx_path)
             except OSError:
                 pre_index_bytes = None
         pre_shared_bytes = None
         sh_name = _index_bytes_shared_name(pre_index_bytes)
         if idx_path and sh_name:
             sh_path = os.path.join(os.path.dirname(idx_path), sh_name)
-            if os.path.isfile(sh_path) and not os.path.islink(sh_path):
+            if os.path.isfile(sh_path) and not _plat_paths.is_reparse_link(sh_path):
                 try:
-                    with open(sh_path, "rb") as f:
-                        pre_shared_bytes = f.read()
+                    pre_shared_bytes = _plat_fs.read_bytes_shared(sh_path)
                 except OSError:
                     pre_shared_bytes = None
 
@@ -3176,10 +3412,10 @@ def _maybe_crash_after_commit(plan: Mapping[str, Any]) -> None:
 
     if not supervisor._testing_mode() or os.environ.get("MESH_TEST_CRASH_AT") != CRASH_AFTER_MERGE_COMMIT:
         return
-    home = os.path.dirname(os.path.dirname(plan["run_dir"].rstrip(os.sep)))
+    home = os.path.dirname(os.path.dirname(_plat_paths.strip_trailing_seps(plan["run_dir"])))
     supervisor._log_meshd(home, f"MESH_TEST_CRASH_AT={CRASH_AFTER_MERGE_COMMIT}: killing meshd during "
                                 f"merge {plan['merge_id']} of task {plan['task_id']}")
-    os.kill(os.getpid(), signal.SIGKILL)
+    crash_self_now()
 
 
 def _maybe_crash_after_merge_abort(run_dir: Optional[str]) -> None:
@@ -3190,7 +3426,7 @@ def _maybe_crash_after_merge_abort(run_dir: Optional[str]) -> None:
     if not supervisor._testing_mode() or os.environ.get("MESH_TEST_CRASH_AT") != CRASH_AFTER_MERGE_ABORT:
         return
     if run_dir and isinstance(run_dir, str):
-        home = os.path.dirname(os.path.dirname(run_dir.rstrip(os.sep)))
+        home = os.path.dirname(os.path.dirname(_plat_paths.strip_trailing_seps(run_dir)))
         if home:
             try:
                 supervisor._log_meshd(
@@ -3199,7 +3435,7 @@ def _maybe_crash_after_merge_abort(run_dir: Optional[str]) -> None:
                 )
             except Exception:
                 pass
-    os.kill(os.getpid(), signal.SIGKILL)
+    crash_self_now()
 
 
 # ---------------------------------------------------------------------------
@@ -3258,6 +3494,21 @@ def _report_recovery_blocked(conn: sqlite3.Connection, run: Mapping[str, Any], e
                                              f"{type(report_exc).__name__}: {report_exc}"))
 
 
+def _merge_run_home(conn: sqlite3.Connection, run: Mapping[str, Any]) -> Optional[str]:
+    run_dir = run["run_dir"] if "run_dir" in run.keys() else None
+    if isinstance(run_dir, str) and run_dir.strip():
+        parent = os.path.dirname(os.path.dirname(_plat_paths.strip_trailing_seps(run_dir)))
+        if parent:
+            return parent
+    try:
+        db = next((row for row in conn.execute("PRAGMA database_list;") if row["name"] == "main"), None)
+        if db is not None and db["file"]:
+            return os.path.dirname(db["file"])
+    except Exception:
+        pass
+    return None
+
+
 def recover_merge_runs(conn: sqlite3.Connection, runs: List[Mapping[str, Any]]) -> Dict[str, Any]:
     """§11.7 step 2 for open ``merge_test`` runs: never adopted. For each run, a live wrapper
     (``wrapper.json`` pid alive with the same starttime) or any ``MESH_RUN_ID`` carrier is
@@ -3282,11 +3533,42 @@ def recover_merge_runs(conn: sqlite3.Connection, runs: List[Mapping[str, Any]]) 
         run_id = run["id"]
         try:
             pid, starttime = _live_wrapper(run)
-            known_wst = starttime if pid is not None else supervisor.close_identity(run)[1]
+            id_pid, id_wst = supervisor.close_identity(run)
+            known_pid = pid if pid is not None else id_pid
+            known_wst = starttime if pid is not None else id_wst
+            win_exit_members: Dict[int, int] = {}
+            if sys.platform == "win32":
+                run_home = _merge_run_home(conn, run)
+                if run_home:
+                    supervisor.record_run_home(run_id, run_home)
+                    supervisor.register_pgid_run(run_id, known_pid, known_wst, run_home)
+                    try:
+                        rjob = _plat_proc.open_run_job(run_home, run_id, terminate=True)
+                    except (OSError, ValueError) as job_exc:
+                        _log_recovery_error(conn, run, redact(f"open Win32 Named Run Job failed: {job_exc}"))
+                        rjob = None
+                    if rjob is not None:
+                        supervisor.register_run_job(
+                            run_id,
+                            rjob,
+                            pgid=known_pid,
+                            wrapper_starttime=known_wst,
+                            home=run_home,
+                        )
+                for mpid, mst in supervisor._win_exit_job_member_pairs(run):
+                    if supervisor._identity_live(mpid, mst):
+                        win_exit_members[int(mpid)] = int(mst)
             result: Dict[str, Any] = {"reason": "interrupted", "recovered": True}
             if pid is not None:
                 result["wrapper"] = {"pid": pid, "starttime": starttime}
             carriers = {} if pid is not None else terminate.run_targets_or_recheck(run_id, None, None, known_wst)
+            if pid is None and win_exit_members:
+                merged_carriers = ScanResult(
+                    dict(carriers or {}),
+                    uncertain=bool(getattr(carriers, "uncertain", False)),
+                )
+                merged_carriers.update(win_exit_members)
+                carriers = merged_carriers
             if pid is None and not carriers and getattr(carriers, "uncertain", False):
                 raise OSError(errno.EIO, f"merge test run {run_id}: carrier scan uncertain")
             if pid is not None or carriers:
@@ -3381,6 +3663,29 @@ class MergeRunHeld(Exception):
         self.pgid = pgid
 
 
+def _win_job_live_pids(run_id: str, home: Optional[str]) -> Tuple[Set[int], bool]:
+    """Return ``(pids, uncertain)`` for any live processes inside Win32 Named Run Job *run_id*."""
+    from mesh.daemon import supervisor
+
+    try:
+        job, should_close = supervisor.resolve_run_job(run_id, home=home, terminate=False)
+    except OSError:
+        return set(), True
+    if job is None:
+        return set(), False
+    try:
+        try:
+            return {int(p) for p in _plat_proc.query_job_pids(job) if int(p) > 0}, False
+        except OSError:
+            return set(), True
+    finally:
+        if should_close:
+            try:
+                job.close()
+            except Exception:
+                pass
+
+
 def merge_close_gate(conn: sqlite3.Connection, run: Mapping[str, Any], pid: Optional[int],
                      starttime: Optional[int]) -> None:
     """Round 7 / Carbon RO P1-1: the close-safety gate for a merge_test run (live or
@@ -3391,22 +3696,50 @@ def merge_close_gate(conn: sqlite3.Connection, run: Mapping[str, Any], pid: Opti
     from mesh.daemon import supervisor
 
     if pid is not None:
-        pgid, wst = pid, starttime
+        wrapper_pgid, wrapper_wst = pid, starttime
     else:
-        pgid, wst = supervisor.close_identity(run)
-    if not pgid or not supervisor.group_still_ours(pgid, wst):
+        wrapper_pgid, wrapper_wst = supervisor.close_identity(run)
+    eff_home: Optional[str] = None
+    occupied = False
+    held_pid: Optional[int] = int(wrapper_pgid) if wrapper_pgid else None
+    if sys.platform == "win32":
+        eff_home = _merge_run_home(conn, run) or supervisor.get_run_home(run["id"])
+        if eff_home:
+            supervisor.record_run_home(run["id"], eff_home)
+        for mpid, mst in supervisor._win_exit_job_member_pairs(run):
+            if supervisor._identity_live(mpid, mst):
+                occupied = True
+                if not held_pid:
+                    held_pid = int(mpid)
+                break
+    if not occupied and wrapper_pgid and supervisor.group_still_ours(wrapper_pgid, wrapper_wst):
+        if sys.platform == "win32":
+            supervisor.register_pgid_run(run["id"], wrapper_pgid, wrapper_wst, eff_home)
+            scan_tok = supervisor._SCAN_RUN_CTX.set((run["id"], int(wrapper_pgid), wrapper_wst, eff_home))
+            try:
+                scanned = supervisor._scan_group(int(wrapper_pgid))
+            finally:
+                supervisor._SCAN_RUN_CTX.reset(scan_tok)
+        else:
+            scanned = supervisor._scan_group(int(wrapper_pgid))
+        occupied = bool(scanned) or getattr(scanned, "uncertain", False)
+    if not occupied and sys.platform == "win32":
+        job_pids, job_uncertain = _win_job_live_pids(run["id"], eff_home)
+        if job_pids or job_uncertain:
+            occupied = True
+            if not held_pid and job_pids:
+                held_pid = next(iter(sorted(job_pids)))
+    if not occupied:
         return
-    scanned = supervisor._scan_group(int(pgid))
-    if not scanned and not getattr(scanned, "uncertain", False):
-        return
-    sql = ("UPDATE runs SET wrapper_pid = COALESCE(wrapper_pid, ?), pgid = COALESCE(pgid, ?), "
-           "proc_starttime = COALESCE(proc_starttime, ?) WHERE id = ?;")
-    if conn.in_transaction:
-        conn.execute(sql, (pgid, pgid, wst, run["id"]))
-    else:
-        with transaction(conn):
-            conn.execute(sql, (pgid, pgid, wst, run["id"]))
-    raise MergeRunHeld(run["id"], int(pgid))
+    if wrapper_pgid is not None:
+        sql = ("UPDATE runs SET wrapper_pid = COALESCE(wrapper_pid, ?), pgid = COALESCE(pgid, ?), "
+               "proc_starttime = COALESCE(proc_starttime, ?) WHERE id = ?;")
+        if conn.in_transaction:
+            conn.execute(sql, (wrapper_pgid, wrapper_pgid, wrapper_wst, run["id"]))
+        else:
+            with transaction(conn):
+                conn.execute(sql, (wrapper_pgid, wrapper_pgid, wrapper_wst, run["id"]))
+    raise MergeRunHeld(run["id"], int(held_pid or 0))
 
 
 def _check_live_merge_close(conn: sqlite3.Connection, plan: Mapping[str, Any],
@@ -3485,6 +3818,10 @@ def _close_recovered_merge_run(conn: sqlite3.Connection, run: Mapping[str, Any],
                          (pid, pid, starttime, run_id))
         conn.execute("DELETE FROM leases WHERE key = ? AND run_id = ?;",
                      (merge_lease_key(run["project_id"]), run_id))
+    if sys.platform == "win32":
+        from mesh.daemon import supervisor
+
+        supervisor.close_run_job(run_id)
     return status
 
 
@@ -3827,7 +4164,7 @@ def recover_merging_task(conn: sqlite3.Connection, home: str, task: Mapping[str,
         return "run_open"
     integ = rec_ctx["integ"]
     pre_head = rec_ctx["pre_head"]
-    if os.path.islink(integ.rstrip(os.sep)):
+    if _plat_paths.is_reparse_link(_plat_paths.strip_trailing_seps(integ)):
         result = {"outcome": "failed", "reason": "interrupted", "pre_head": pre_head,
                   "details": {"integration": integ, "foreign_repository": True, "restored": False}}
     elif os.path.isdir(integ):
@@ -3849,7 +4186,7 @@ async def recover_merging_task_async(conn: sqlite3.Connection, home: str, task: 
         return "run_open"
     integ = rec_ctx["integ"]
     pre_head = rec_ctx["pre_head"]
-    if os.path.islink(integ.rstrip(os.sep)):
+    if _plat_paths.is_reparse_link(_plat_paths.strip_trailing_seps(integ)):
         result = {"outcome": "failed", "reason": "interrupted", "pre_head": pre_head,
                   "details": {"integration": integ, "foreign_repository": True, "restored": False}}
     elif os.path.isdir(integ):
@@ -3922,6 +4259,10 @@ def _final_tx(conn: sqlite3.Connection, plan: Mapping[str, Any], result: Mapping
         )
         conn.execute("DELETE FROM leases WHERE key = ? AND run_id = ?;",
                      (merge_lease_key(plan["project_id"]), plan["run_id"]))
+        if sys.platform == "win32" and plan.get("run_id"):
+            from mesh.daemon import supervisor
+
+            supervisor.close_run_job(plan["run_id"])
         return {"merge_json": kept, "event": None, "to_state": None, "left_merging": True,
                 "task_status": task["status"] if task is not None else None}
     conn.execute(
@@ -3971,6 +4312,10 @@ def _final_tx(conn: sqlite3.Connection, plan: Mapping[str, Any], result: Mapping
             payload={"merge_id": plan["merge_id"], "reason": result["reason"], "pre_head": merge_json["pre_head"],
                      "details": merge_json["details"], **dict(extra or {})},
         )
+    if sys.platform == "win32" and plan.get("run_id"):
+        from mesh.daemon import supervisor
+
+        supervisor.close_run_job(plan["run_id"])
     return {"merge_json": merge_json, "event": evt, "to_state": to_state, "left_merging": False}
 
 
@@ -4104,9 +4449,12 @@ async def run_task_merge(server: Any, ctx: HandlerContext) -> HandlerResult:
             events=[plan["event"]],
         )
     conn.execute("COMMIT;")
-    _ACTIVE_MERGE_RUNS.add(plan["run_id"])
+    with _ACTIVE_TEST_LOCK:
+        _ACTIVE_MERGE_RUNS.add(plan["run_id"])
     try:
         os.makedirs(plan["run_dir"], mode=0o700, exist_ok=True)
+        if sys.platform == "win32":
+            _plat_perms.set_private_dir_acl(plan["run_dir"], 0o700)
     except OSError:
         pass  # the run dir only holds the r6 test log
 
@@ -4157,14 +4505,16 @@ async def run_task_merge(server: Any, ctx: HandlerContext) -> HandlerResult:
         return {"result": result, "final": fin, "response": response}
 
     def _on_job_done(f: "asyncio.Future", rid: str = plan["run_id"]) -> None:
-        _ACTIVE_MERGE_RUNS.discard(rid)
+        with _ACTIVE_TEST_LOCK:
+            _ACTIVE_MERGE_RUNS.discard(rid)
         if not f.cancelled():
             f.exception()
 
     try:
         job = asyncio.ensure_future(_pipeline_and_finish())
     except BaseException:
-        _ACTIVE_MERGE_RUNS.discard(plan["run_id"])
+        with _ACTIVE_TEST_LOCK:
+            _ACTIVE_MERGE_RUNS.discard(plan["run_id"])
         raise
     job.add_done_callback(_on_job_done)
     # Full review P1: meshd shutdown awaits the job before it releases the lock / DB.

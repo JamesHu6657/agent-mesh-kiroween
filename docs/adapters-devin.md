@@ -2,11 +2,12 @@
 
 A separate page, like `docs/adapters-codex-claude.md`: the tables in `docs/adapters.md` cover the six
 original vendor CLIs and are checked by `tests/unit/test_docs_m3.py` / `test_docs_m19.py`. This adapter has
-no real stream fixture or smoke evidence yet, so nothing here counts as verified by a smoke run.
+one real smoke run (2026-11-19, `unrestricted`, "Smoke tier" below); it verifies `headless` only.
 
 Launch hold: `devin` is in `LAUNCH_HOLDS` (`{"devin": "M5"}`), so it does not launch outside testing mode even with
 evidence. Without the hold the default `adapter.evidence_mode=warn` would launch it with only a `no_smoke_evidence`
-warning, while the adapter has no real smoke evidence and its plain-text output has no smoke fixture path yet. The
+warning. The smoke tier captures devin's plain-text output (see "Smoke tier" below); the 2026-11-19 results pass
+S-X-1 and S-X-6 and do not lift the hold. The
 only supported profile is `unrestricted`: `readonly` and `edit` are unsupported (measured below) and stay so until the
 per-run deny rules under "Future work" pass a real-machine check.
 
@@ -199,6 +200,42 @@ Known limits:
   although a loaded skill grants `exec`.
 - Not verified on a real machine yet: the quota, rate-limit and network wording, `devin auth status` with an API key,
   and `smart --sandbox` on a host with `bwrap` and `socat`.
+
+## Smoke tier
+
+The opt-in smoke tier (`tests/smoke/test_smoke.py`, class `DevinSmoke`) captures devin in the results format used for
+droid and kiro. One real run is committed: `tests/smoke/results/devin-3000.14.30821-2026-11-19.json` (model
+`swe-2-flash-medium`, profile `unrestricted`), with captures under `tests/fixtures/real/devin/3000.14.30821/`.
+In that run S-X-1 and S-X-6 pass, S-X-2, S-X-3 and S-X-5 are `not_applicable`, S-X-4 is `observed`, S-X-7 created
+`x.txt` and S-DEVIN-8 ran `touch y.txt` (`executed`, 0 rejected tool calls).
+
+- Gate and config: `MESH_SMOKE=1`, `devin` in `MESH_SMOKE_ADAPTERS` and in `MESH_SMOKE_CONSENT`,
+  `MESH_SMOKE_MAX_RUNS`, `MESH_SMOKE_MODEL_DEVIN` (never `auto`) and `MESH_SMOKE_OUT` under `/tmp/mh-*`.
+- Profile: `unrestricted`, the only profile the adapter supports. The harness picks it from
+  `smoke_schema.SMOKE_PROFILES`, the results file records `"profile": "unrestricted"`, and the schema refuses a devin
+  file that names another profile. Every run uses `--permission-mode dangerous`, so the CLI approves every tool
+  call. The harness starts each case with a fixed prompt in a `/tmp/mh-smoke-*` scratch directory and never in the
+  repository. That sets where the run starts, not what it can reach.
+- Output: stdout is plain text, so the capture is `smoke-<case>-stdout.txt` (redacted; terminal escapes kept as
+  printed) next to `smoke-<case>-stderr.txt`, each with a `{command, captured_at_utc, sha256}` sidecar. The
+  evaluators read both through `DevinAdapter.parse` / `output_facts`, and re-evaluation copies both back into a run
+  directory.
+- S-X-1 passes when the exit code is 0, stderr has no `Error:` line and the reply contains the token.
+- S-X-2 and S-X-3 are `not_applicable` (`resume_unsupported`): print mode prints no session id and there is no
+  resume. R2 starts no run.
+- S-X-4 is `observed` (`not_observable`): the output does not name the model.
+- S-X-5 is `not_applicable` (`effort_refused_by_adapter`, or `effort_not_listed` with
+  `MESH_SMOKE_EFFORT_DEVIN=none`): there is no effort flag. R3 starts no run.
+- S-X-6 sends SIGTERM after the first stdout line or after 5 s and passes when the process group is gone within
+  15 s. The line count comes from the output format described above. In the 2026-11-19 run devin had printed
+  nothing by 5 s, so the SIGTERM went out at the 5 s fallback (`first_byte` false, rc -15).
+- S-X-7 and S-DEVIN-8 are observations under `unrestricted`: whether `x.txt` appeared, and whether `touch y.txt`
+  ran (`executed` or `not_executed`, with the number of `warning: rejected a tool call` lines). They never report a
+  deny.
+- The schema refuses `pass` for S-X-2, S-X-3 and S-X-5 in a devin file.
+- Evidence: `mesh/adapters/evidence.py` reads a devin results file like any other (probed version, valid file,
+  S-X-1 and S-X-6 pass). A passing S-X-1 marks `headless` only; `stream_output` stays `no`. The launch hold stays
+  whatever the results say.
 
 ## Future work: per-run deny rules
 

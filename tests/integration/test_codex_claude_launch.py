@@ -28,7 +28,7 @@ from typing import Any, Dict, List
 from mesh.adapters import evidence, smoke_schema
 from tests import tierlib
 from tests.helpers import MeshHarness
-from tests.stubs import create_test_stubs
+from tests.stubs import _write_python_stub, create_test_stubs
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SYNTH = os.path.join(REPO_ROOT, "tests", "fixtures", "synthetic")
@@ -137,12 +137,13 @@ class CodexClaudeLaunchTest(unittest.TestCase):
         return resp["data"]["token"]
 
     def _vendor_agent(self, adapter: str, name: str, stream: str, rc: int) -> None:
-        path = os.path.join(self.tmp, f"bin-{name}", adapter)
-        os.makedirs(os.path.dirname(path))
+        bdir = os.path.join(self.tmp, f"bin-{name}")
         template = CODEX_STUB if adapter == "codex" else CLAUDE_STUB
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(template.format(python=sys.executable, stream=os.path.join(SYNTH, adapter, stream), rc=rc))
-        os.chmod(path, 0o755)
+        path = _write_python_stub(
+            bdir,
+            adapter,
+            template.format(python=sys.executable, stream=os.path.join(SYNTH, adapter, stream), rc=rc),
+        )
         time.sleep(0.05)  # the probe row must be newer than the binary's mtime
         rc_p, resp = self.harness.cli("adapter", "probe", adapter, "--binary", path, user=True)
         self.assertEqual(rc_p, 0, resp)
@@ -154,13 +155,17 @@ class CodexClaudeLaunchTest(unittest.TestCase):
         """PR49 gemini P2: a value the CLI does not accept fails at agent create, not at spawn."""
         for adapter, bad in (("claude", "ultra"), ("codex", "ultracode")):
             with self.subTest(adapter=adapter):
-                path = os.path.join(self.tmp, f"bin-eff-{adapter}", adapter)
-                os.makedirs(os.path.dirname(path))
+                bdir = os.path.join(self.tmp, f"bin-eff-{adapter}")
                 template = CODEX_STUB if adapter == "codex" else CLAUDE_STUB
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(template.format(python=sys.executable,
-                                            stream=os.path.join(SYNTH, adapter, "synthetic_ok.jsonl"), rc=0))
-                os.chmod(path, 0o755)
+                path = _write_python_stub(
+                    bdir,
+                    adapter,
+                    template.format(
+                        python=sys.executable,
+                        stream=os.path.join(SYNTH, adapter, "synthetic_ok.jsonl"),
+                        rc=0,
+                    ),
+                )
                 time.sleep(0.05)
                 rc_p, resp = self.harness.cli("adapter", "probe", adapter, "--binary", path, user=True)
                 self.assertEqual(rc_p, 0, resp)

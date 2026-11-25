@@ -4,11 +4,21 @@ import argparse
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from typing import Any, Dict, List, Optional
+
+from mesh.core.paths import mesh_cli_argv
+from mesh.platform import perms, pipe_pump, proc as plat_proc
+from mesh.platform.fs import open_regular_nofollow
+from mesh.platform.paths import temp_root
+
+_IGNORE_STOP_SIGNAL = False
 
 
 def parse_fake_spec(prompt_text: str) -> Optional[Dict[str, Any]]:
@@ -24,9 +34,20 @@ def parse_fake_spec(prompt_text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _mesh_base_argv() -> List[str]:
+    bin_mesh = os.environ.get("MESH_BIN")
+    if bin_mesh:
+        return [bin_mesh]
+    if sys.platform == "win32":
+        return mesh_cli_argv()
+    return ["mesh"]
+
+
 def _run_mesh(args: List[str]) -> "subprocess.CompletedProcess[str]":
-    bin_mesh = os.environ.get("MESH_BIN", "mesh")
-    return subprocess.run([bin_mesh, *args], capture_output=True, text=True)
+    cmd = [*_mesh_base_argv(), *args]
+    if sys.platform == "win32":
+        cmd = pipe_pump.prepare_win_cmd_args(cmd)
+    return subprocess.run(cmd, capture_output=True, text=True)
 
 
 def _print_cli_result(res: "subprocess.CompletedProcess[str]") -> None:
@@ -100,7 +121,11 @@ def execute_behavior(behavior: str, params: Dict[str, Any]) -> None:
             time.sleep(0.05)
 
     elif behavior == "ignore_sigterm":
+        global _IGNORE_STOP_SIGNAL
+        _IGNORE_STOP_SIGNAL = True
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if sys.platform == "win32" and hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, signal.SIG_IGN)
         while True:
             time.sleep(1)
 
@@ -122,14 +147,24 @@ def execute_behavior(behavior: str, params: Dict[str, Any]) -> None:
         seconds = float(params.get("seconds", 1000))
         code = f"import time; time.sleep({seconds})"
         if params.get("ignore_sigterm"):
-            code = "import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); " + code
+            code = (
+                "import signal, sys; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "sys.platform == 'win32' and hasattr(signal, 'SIGBREAK') and signal.signal(signal.SIGBREAK, signal.SIG_IGN); "
+                + code
+            )
         # "env": {...} replaces the environment (a sanitized child without MESH_RUN_ID).
         env = {str(k): str(v) for k, v in params["env"].items()} if isinstance(params.get("env"), dict) else None
-        proc = subprocess.Popen(
-            [sys.executable, "-c", code],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True, env=env,
-        )
+        popen_kw: Dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "env": env,
+        }
+        if sys.platform == "win32":
+            popen_kw["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kw["start_new_session"] = True
+        proc = subprocess.Popen([sys.executable, "-c", code], **popen_kw)
         if params.get("path"):
             with open(str(params["path"]), "w", encoding="utf-8") as f:
                 f.write(f"{proc.pid}\n")
@@ -146,8 +181,11 @@ def execute_behavior(behavior: str, params: Dict[str, Any]) -> None:
         # pid file may SIGTERM the member at once. With `trigger`, this step then waits
         # for that file to appear, so the test decides when the agent (and its wrapper)
         # exit.
-        code = ("import os, signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                "os.write(1, b'ready\\n'); r, w = os.pipe(); os.read(r, 1)")
+        code = (
+            "import os, signal, sys; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "sys.platform == 'win32' and hasattr(signal, 'SIGBREAK') and signal.signal(signal.SIGBREAK, signal.SIG_IGN); "
+            "os.write(1, b'ready\\n'); r, w = os.pipe(); os.read(r, 1)"
+        )
         proc = subprocess.Popen(
             [sys.executable, "-c", code],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -210,7 +248,7 @@ def execute_behavior(behavior: str, params: Dict[str, Any]) -> None:
         sys.exit(0)
 
     elif behavior == "record_pid":
-        path = params.get("path", "/tmp/acc-pids")
+        path = params.get("path", os.path.join(temp_root(), "acc-pids"))
         run_id = os.environ.get("MESH_RUN_ID", "no_run_id")
         line = f"{os.getpid()},{time.time()},{run_id}\n"
         with open(path, "a", encoding="utf-8") as f:
@@ -240,19 +278,105 @@ def execute_behavior(behavior: str, params: Dict[str, Any]) -> None:
         _print_cli_result(_run_mesh([*args, "--token-file", tok_path]))
 
     elif behavior == "bad_passphrase":
-        # Each call gets a fresh pipe holding a wrong passphrase (G27).
+        # Each call gets a fresh pipe (or private file on Windows) holding a wrong passphrase (G27).
         count = int(params.get("count", 1))
-        bin_mesh = os.environ.get("MESH_BIN", "mesh")
-        for _ in range(count):
-            r, w = os.pipe()
-            try:
-                os.write(w, b"wrong-passphrase-0000\n")
-                os.close(w)
-                cmd = [bin_mesh, "whoami", "--user", "--passphrase-fd", str(r)]
-                res = subprocess.run(cmd, capture_output=True, text=True, pass_fds=(r,))
-            finally:
-                os.close(r)
-            _print_cli_result(res)
+        base_cmd = _mesh_base_argv()
+        if sys.platform == "win32":
+            for _ in range(count):
+                pp_dir = tempfile.mkdtemp(prefix="mesh-fake-pp-", dir=temp_root())
+                try:
+                    perms.set_private_dir_acl(pp_dir, 0o700)
+                    pp_file = os.path.join(pp_dir, "passphrase")
+                    fd = open_regular_nofollow(
+                        pp_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, label="passphrase file"
+                    )
+                    try:
+                        perms.fchmod_private(fd, 0o600)
+                        data = b"wrong-passphrase-0000\n"
+                        view = memoryview(data)
+                        while view:
+                            n = os.write(fd, view)
+                            view = view[n:]
+                    finally:
+                        os.close(fd)
+                    cmd = pipe_pump.prepare_win_cmd_args([*base_cmd, "whoami", "--user", "--passphrase-file", pp_file])
+                    res = subprocess.run(cmd, capture_output=True, text=True)
+                finally:
+                    shutil.rmtree(pp_dir, ignore_errors=True)
+                _print_cli_result(res)
+        else:
+            for _ in range(count):
+                r, w = os.pipe()
+                try:
+                    os.write(w, b"wrong-passphrase-0000\n")
+                    os.close(w)
+                    cmd = [*base_cmd, "whoami", "--user", "--passphrase-fd", str(r)]
+                    res = subprocess.run(cmd, capture_output=True, text=True, pass_fds=(r,))
+                finally:
+                    os.close(r)
+                _print_cli_result(res)
+
+
+def _spec_has_ignore_sigterm(spec: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(spec, dict):
+        return False
+    if "ignore_sigterm" in spec:
+        return True
+    steps = spec.get("steps")
+    if isinstance(steps, list):
+        return any(isinstance(s, dict) and "ignore_sigterm" in s for s in steps)
+    return False
+
+
+def _start_win_stop_watcher(prompt_path: str, spec: Optional[Dict[str, Any]]) -> None:
+    """Exit gracefully when the run's Windows Named Stop Event signals (unless ignoring stop)."""
+    global _IGNORE_STOP_SIGNAL
+    if sys.platform != "win32" or _spec_has_ignore_sigterm(spec):
+        if _spec_has_ignore_sigterm(spec):
+            _IGNORE_STOP_SIGNAL = True
+        return
+    run_id = os.environ.get("MESH_RUN_ID")
+    if not run_id:
+        return
+    home = os.environ.get("MESH_HOME")
+    if not home:
+        run_dir = os.path.realpath(os.path.dirname(os.path.abspath(prompt_path)))
+        parent = os.path.dirname(run_dir)
+        if os.path.basename(parent) in ("runs", "merges"):
+            home = os.path.dirname(parent)
+    if not home:
+        return
+    try:
+        ev_name = plat_proc.run_stop_event_name(home, run_id)
+    except ValueError:
+        return
+
+    from mesh.platform import _win32_ctypes as w32
+
+    k32 = w32.get_kernel32()
+    h_ev = k32.OpenEventW(w32.SYNCHRONIZE, False, ev_name)
+    if w32.is_null_or_invalid_handle(h_ev):
+        return
+
+    def _watch() -> None:
+        try:
+            rc = int(k32.WaitForSingleObject(h_ev, w32.INFINITE))
+            if rc == w32.WAIT_OBJECT_0 and not _IGNORE_STOP_SIGNAL:
+                # Allow SIGBREAK handler a short window if console delivery succeeded first.
+                time.sleep(0.05)
+                if not _IGNORE_STOP_SIGNAL:
+                    for stream in (sys.stdout, sys.stderr):
+                        if stream is not None:
+                            try:
+                                stream.flush()
+                            except Exception:
+                                pass
+                    os._exit(143)
+        finally:
+            k32.CloseHandle(h_ev)
+
+    threading.Thread(target=_watch, daemon=True).start()
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fake agent runner for offline test mode")
@@ -260,6 +384,8 @@ def main() -> None:
     parser.add_argument("--fake-resume", help="Session id supplied by Mesh")
     parser.add_argument("prompt_path", help="Path to prompt markdown file")
     args = parser.parse_args()
+    if sys.platform == "win32" and hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, lambda _s, _f: sys.exit(143))
     if args.fake_resume:
         print(json.dumps({"fake_resume": args.fake_resume}), flush=True)
 
@@ -269,6 +395,8 @@ def main() -> None:
             prompt_content = f.read()
 
     spec = parse_fake_spec(prompt_content)
+    if sys.platform == "win32":
+        _start_win_stop_watcher(args.prompt_path, spec)
     if not spec:
         # Default behavior: succeed
         print("Default fake agent execution: succeed.")

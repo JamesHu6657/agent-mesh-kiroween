@@ -76,6 +76,7 @@ sys.exit(0)
 '''
 
 
+@unittest.skipUnless(sys.platform != "win32", 'Smoke harness (tests/smoke/harness.py) is POSIX/Linux-only')
 class SmokeBase(unittest.TestCase):
     """Shared setup; no tests here."""
 
@@ -123,6 +124,7 @@ class SmokeBase(unittest.TestCase):
         return sorted(out)
 
 
+@unittest.skipUnless(sys.platform != "win32", 'Smoke harness (tests/smoke/harness.py) is POSIX/Linux-only')
 class GateTest(SmokeBase):
     def test_closed_gate_spawns_nothing(self) -> None:
         """ACC: N25 - (a) empty env, (b) consent missing, MESH_SMOKE!=1, adapter not listed: SmokeSkip, 0 spawns, nothing written."""
@@ -165,6 +167,7 @@ class GateTest(SmokeBase):
         self.assertEqual(cfg.timeout_s, 180.0)
 
 
+@unittest.skipUnless(sys.platform != "win32", 'Smoke harness (tests/smoke/harness.py) is POSIX/Linux-only')
 class RunTest(SmokeBase):
     def test_run_capture_redaction_cap_and_results(self) -> None:
         """ACC: N11, N25, N21 - (c) cap 1 -> second case not_run(run_cap); (d) writes only under MESH_SMOKE_OUT, cwd a /tmp/mh-smoke-* workspace, MESH_* stripped; (e) planted secret redacted; (f) sidecar keys and hash; results doc validates and is named per Q4."""
@@ -269,6 +272,7 @@ class RunTest(SmokeBase):
         self.assertEqual(self.spawns(), [])  # version given, no model run
 
 
+@unittest.skipUnless(sys.platform != "win32", 'Smoke harness (tests/smoke/harness.py) is POSIX/Linux-only')
 class R2bTest(SmokeBase):
     """Kiro r1b+r2 review findings 1-4, 5d, 6."""
 
@@ -395,7 +399,11 @@ class R2bTest(SmokeBase):
         self.assertFalse(os.path.exists(self.out))
 
 
-class SchemaTest(SmokeBase):
+class SchemaTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="mh-smoke-schema-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
     def make_doc(self, root: str, name: str = "smoke-S-X-1-stdout.jsonl", data: bytes = b"{}\n") -> dict:
         tierlib.write_capture(root, f"droid/1.6.0/{name}", data, ["droid", "exec"])
         case = {"id": "S-X-1", "status": "pass", "reason": None, "rc": 0, "duration_s": 1.5,
@@ -502,6 +510,53 @@ class SchemaTest(SmokeBase):
         self.assertTrue(smoke_schema.version_ok("1.6.0"))
         for v in ("1.6.0-beta", "v1.6", "", None):
             self.assertFalse(smoke_schema.version_ok(v), v)
+
+    def test_validate_per_adapter_rules(self) -> None:
+        """ACC: N12, N21 - per-adapter schema rules (smoke-codex-claude-devin): devin results must say profile unrestricted and name smoke-S-*-stdout.txt captures, every other adapter readonly and .jsonl; a case the adapter cannot support (devin S-X-2/3/5, vibe S-X-5) is refused as pass and accepted as not_applicable; S-CODEX-8 / S-CLAUDE-8 / S-DEVIN-8 are known case ids."""
+        versions = {"droid": "1.6.0", "vibe": "3.1.0", "codex": "0.166.0", "claude": "2.1.325", "devin": "3000.14.30821"}
+        count = [0]
+
+        def errs(adapter, cid="S-X-1", status="pass", name=None, profile=None) -> list:
+            count[0] += 1
+            root = os.path.join(self.tmp, f"fxa-{count[0]}")
+            version = versions[adapter]
+            name = name or smoke_schema.stdout_capture_name(adapter, cid)
+            data = b"MESH_SMOKE_OK\n"
+            tierlib.write_capture(root, f"{adapter}/{version}/{name}", data, [adapter])
+            case = {"id": cid, "status": status, "reason": None if status in ("pass", "observed") else "x", "rc": 0,
+                    "duration_s": 1.0, "fixture": smoke_schema.fixture_rel(adapter, version, name),
+                    "fixture_sha256": tierlib.sha256_bytes(data), "observation": None, "evaluated_from": None,
+                    "carried_from": None}
+            doc = {"schema": "mesh.smoke.v1", "adapter": adapter, "binary": f"/usr/local/bin/{adapter}",
+                   "version": version, "captured_at_utc": "2026-11-20T03:04:05Z", "mesh_commit": "abc", "model": "m",
+                   "effort": None, "profile": profile or smoke_schema.smoke_profile(adapter), "timeout_s": 180,
+                   "consent_ref": "offline", "cases": [case]}
+            return smoke_schema.validate(doc, REPO_ROOT, fixture_root=root)
+
+        for adapter in versions:
+            with self.subTest(adapter=adapter):
+                self.assertEqual(errs(adapter), [])
+                wrong = "readonly" if adapter == "devin" else "unrestricted"
+                right = "unrestricted" if adapter == "devin" else "readonly"
+                self.assertEqual(errs(adapter, profile=wrong), [f"profile must be '{right}'"])
+                self.assertTrue(errs(adapter, profile="dev"))
+                other = "smoke-S-X-1-stdout.jsonl" if adapter == "devin" else "smoke-S-X-1-stdout.txt"
+                kind = "txt" if adapter == "devin" else "jsonl"
+                bad = errs(adapter, name=other)
+                self.assertEqual(len(bad), 1, bad)
+                self.assertIn(f"smoke-S-*-stdout.{kind} capture", bad[0])
+                self.assertTrue(errs(adapter, name="smoke-S-X-1-stderr.txt"))
+                self.assertEqual(errs(adapter, cid=f"S-{adapter.upper()}-8", status="observed"), [])
+        self.assertEqual(smoke_schema.smoke_profile("some_new_cli"), "readonly")
+        for adapter, cid in (("devin", "S-X-2"), ("devin", "S-X-3"), ("devin", "S-X-5"), ("vibe", "S-X-5")):
+            with self.subTest(adapter=adapter, case=cid):
+                bad = errs(adapter, cid=cid)
+                self.assertEqual(len(bad), 1, bad)
+                self.assertIn(f"{cid} cannot pass for {adapter}", bad[0])
+                self.assertEqual(errs(adapter, cid=cid, status="not_applicable"), [])
+                self.assertEqual(errs(adapter, cid=cid, status="fail"), [])
+        self.assertEqual(errs("droid", cid="S-X-5"), [])
+        self.assertEqual(errs("codex", cid="S-X-2"), [])
 
     def test_names_and_latest(self) -> None:
         """ACC: N12 - Q4 names with -2/-3 collisions; load_latest orders by (date, suffix) and ignores sidecars and other adapters."""

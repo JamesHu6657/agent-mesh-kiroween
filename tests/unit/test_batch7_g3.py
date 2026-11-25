@@ -6,7 +6,6 @@ import contextlib
 import io
 import json
 import os
-import posix
 import shutil
 import signal
 import sqlite3
@@ -17,6 +16,11 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
+
+if sys.platform != "win32":
+    import posix
+else:
+    posix = None  # type: ignore[assignment]
 
 import mesh.constants as c
 from mesh.client import MeshClient
@@ -287,11 +291,18 @@ class TestBatch7G3RuntimeIsolation(unittest.TestCase):
             tree = ast.parse(f.read(), filename=entry_path)
         imported = set()
         for node in tree.body:
-            if isinstance(node, ast.Import):
-                imported.update(alias.name for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                imported.add(node.module)
-        self.assertEqual(imported, {"posix", "sys"})
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Import):
+                    imported.update(alias.name for alias in sub.names)
+                elif isinstance(sub, ast.ImportFrom) and sub.module:
+                    imported.add(sub.module)
+        self.assertTrue(imported.issubset({"posix", "nt", "_winapi", "sys"}), imported)
+        expected_active = {"posix", "sys"} if sys.platform != "win32" else {"nt", "_winapi", "sys"}
+        self.assertTrue(expected_active.issubset(imported), imported)
+        for name in expected_active:
+            self.assertIn(name, sys.builtin_module_names, f"non-builtin import {name} in entry.py")
 
     def test_console_entrypoint_isolates_pythonpath_safe_path_user_site_and_umask(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mh-g3-f2-exec-") as d:
@@ -318,12 +329,12 @@ class TestBatch7G3RuntimeIsolation(unittest.TestCase):
             env.pop("PYTHONSAFEPATH", None)
             env["PYTHONNOUSERSITE"] = "0"
             env["MESH_TESTING"] = "1"
-            env["PYTHONPATH"] = f"{evil_dir}:{repo_root}"
+            env["PYTHONPATH"] = f"{evil_dir}{os.pathsep}{repo_root}"
 
             script = (
                 "import os, sys; "
-                "os.umask(0o022); "
-                "from mesh.cli.entry import main; "
+                + ("os.umask(0o022); " if sys.platform != "win32" else "")
+                + "from mesh.cli.entry import main; "
                 "sys.exit(main())"
             )
             proc = subprocess.run(
@@ -338,32 +349,51 @@ class TestBatch7G3RuntimeIsolation(unittest.TestCase):
             data = json.loads(proc.stdout)
             self.assertEqual(data["data"]["status"], "healthy")
 
-            # Also verify ensure_isolated_process builds exact [-P, -s, -m, mesh] execve args.
             import mesh.cli.entry as entry
 
             exec_calls = []
-            old_umask = posix.umask(0o022)
-            try:
-                fake_flags = SimpleNamespace(safe_path=0, no_user_site=0)
-                sp_dir = os.path.join(d, "lib", "python3.11", "site-packages")
-                os.makedirs(sp_dir, exist_ok=True)
-                test_env = {b"PYTHONPATH": f"{sp_dir}:{evil_dir}".encode("utf-8")}
+            fake_flags = SimpleNamespace(safe_path=0, no_user_site=0)
+            sp_dir = os.path.join(d, "lib", "python3.11", "site-packages")
+            os.makedirs(sp_dir, exist_ok=True)
+            if sys.platform == "win32":
+                test_env = {"PYTHONPATH": f"{sp_dir}{os.pathsep}{evil_dir}"}
                 with mock.patch.object(sys, "flags", fake_flags), \
                      mock.patch.object(sys, "argv", ["mesh", "whoami"]), \
-                     mock.patch.object(posix, "environ", test_env), \
-                     mock.patch.object(posix, "execve", side_effect=lambda *a: exec_calls.append(a)):
-                    entry.ensure_isolated_process()
-                current = posix.umask(0o077)
-                self.assertEqual(current, 0o077)
-            finally:
-                posix.umask(old_umask)
-            self.assertEqual(len(exec_calls), 1)
-            exe, argv, new_env = exec_calls[0]
-            self.assertEqual(exe, sys.executable)
-            self.assertEqual(argv[:4], [sys.executable, "-P", "-s", "-m"])
-            self.assertEqual(argv[4:], ["mesh", "whoami"])
-            self.assertEqual(new_env.get(b"_MESH_ORIG_PYTHONPATH"), f"{sp_dir}:{evil_dir}".encode("utf-8"))
-            self.assertNotIn(b"site-packages", new_env.get(b"PYTHONPATH", b""))
+                     mock.patch.object(entry.nt, "environ", test_env), \
+                     mock.patch.object(entry._winapi, "CreateProcess", side_effect=lambda *a: (exec_calls.append(a), (1, 2, 3, 4))[1]), \
+                     mock.patch.object(entry._winapi, "WaitForSingleObject", return_value=0), \
+                     mock.patch.object(entry._winapi, "GetExitCodeProcess", return_value=0), \
+                     mock.patch.object(entry._winapi, "CloseHandle"):
+                    with self.assertRaises(SystemExit):
+                        entry.ensure_isolated_process()
+                self.assertEqual(len(exec_calls), 1)
+                exe, cmdline = exec_calls[0][0], exec_calls[0][1]
+                new_env = exec_calls[0][6]
+                self.assertEqual(exe, sys.executable)
+                self.assertIn("-P -s -m mesh whoami", cmdline)
+                self.assertEqual(new_env.get("_MESH_ORIG_PYTHONPATH"), f"{sp_dir}{os.pathsep}{evil_dir}")
+                self.assertNotIn("site-packages", new_env.get("PYTHONPATH", ""))
+            else:
+                # Also verify ensure_isolated_process builds exact [-P, -s, -m, mesh] execve args.
+                old_umask = posix.umask(0o022)
+                try:
+                    test_env = {b"PYTHONPATH": f"{sp_dir}:{evil_dir}".encode("utf-8")}
+                    with mock.patch.object(sys, "flags", fake_flags), \
+                         mock.patch.object(sys, "argv", ["mesh", "whoami"]), \
+                         mock.patch.object(posix, "environ", test_env), \
+                         mock.patch.object(posix, "execve", side_effect=lambda *a: exec_calls.append(a)):
+                        entry.ensure_isolated_process()
+                    current = posix.umask(0o077)
+                    self.assertEqual(current, 0o077)
+                finally:
+                    posix.umask(old_umask)
+                self.assertEqual(len(exec_calls), 1)
+                exe, argv, new_env = exec_calls[0]
+                self.assertEqual(exe, sys.executable)
+                self.assertEqual(argv[:4], [sys.executable, "-P", "-s", "-m"])
+                self.assertEqual(argv[4:], ["mesh", "whoami"])
+                self.assertEqual(new_env.get(b"_MESH_ORIG_PYTHONPATH"), f"{sp_dir}:{evil_dir}".encode("utf-8"))
+                self.assertNotIn(b"site-packages", new_env.get(b"PYTHONPATH", b""))
 
     def test_site_packages_excluded_from_pythonpath_in_all_helpers(self) -> None:
         from mesh.cli.commands import setup as setup_cmd
@@ -379,13 +409,18 @@ class TestBatch7G3RuntimeIsolation(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="mh-g3-f2-sp-") as d:
             home = os.path.join(d, "h")
             os.makedirs(home, mode=0o700)
+            env_key = "LOCALAPPDATA" if sys.platform == "win32" else "XDG_CACHE_HOME"
             with mock.patch("mesh.core.paths.get_install_root", return_value=sp), \
                  mock.patch("site.getsitepackages", return_value=[sp]), \
-                 mock.patch.dict(os.environ, {"XDG_CACHE_HOME": d}):
+                 mock.patch.dict(os.environ, {env_key: d}):
                 bdir = get_mesh_bin_dir()
-                with open(os.path.join(bdir, "mesh"), "r", encoding="utf-8") as f:
+                shim_file = os.path.join(bdir, "mesh.cmd" if sys.platform == "win32" else "mesh")
+                with open(shim_file, "r", encoding="utf-8") as f:
                     shim = f.read()
-                self.assertIn("unset PYTHONPATH", shim)
+                if sys.platform == "win32":
+                    self.assertIn('set "PYTHONPATH="', shim)
+                else:
+                    self.assertIn("unset PYTHONPATH", shim)
                 self.assertNotIn(sp, shim)
 
             base_env = {"PATH": "/usr/bin", "PYTHONPATH": sp}
@@ -408,6 +443,7 @@ class TestBatch7G3RuntimeIsolation(unittest.TestCase):
                 tenv = merge._test_env("run_m1")
                 self.assertNotIn("PYTHONPATH", tenv)
 
+    @unittest.skipUnless(sys.platform != "win32", "POSIX umask(0o077) and S_IMODE permission-bit checks")
     def test_cli_and_daemon_run_server_keep_0077_umask(self) -> None:
         from mesh import client as client_mod
         from mesh.cli import main as cli_main
@@ -509,6 +545,7 @@ class TestBatch7G3TokenFileSecurity(unittest.TestCase):
             with mock.patch("mesh.core.token_roots.os.lstat", side_effect=FileNotFoundError("nope")):
                 self.assertEqual(configured_roots(d), (None, []))
 
+    @unittest.skipUnless(hasattr(os, "mkfifo") and sys.platform != "win32", "POSIX mkfifo/symlink/fstat UID token-file checks; Win32 DACL checks in test_platform_locks_perms.py")
     def test_token_file_checks_reject_fifo_symlink_and_foreign_uid(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mh-g3-f3-tf-") as d:
             home = os.path.join(d, "h")
@@ -638,7 +675,11 @@ class TestBatch7G3RunwrapDrainAndUtf8(unittest.TestCase):
                     try:
                         with open(holder_pid_file, encoding="utf-8") as pf:
                             pid = int(pf.read().strip())
-                        os.kill(pid, signal.SIGKILL)
+                        if sys.platform == "win32":
+                            from tests.helpers import _win_terminate_and_wait_pid
+                            _win_terminate_and_wait_pid(pid)
+                        else:
+                            os.kill(pid, signal.SIGKILL)
                     except OSError:
                         pass
 
@@ -865,6 +906,7 @@ class TestBatch7G3LineRedactorBoundaries(unittest.TestCase):
 class TestBatch7G3HardeningMisc(unittest.TestCase):
     """Finding 9: passphrase validation, deliverable --input dict check, init foreign dir, schema version, logfile rotation."""
 
+    @unittest.skipUnless(hasattr(os, "mkfifo") and sys.platform != "win32", "POSIX mkfifo/symlink passphrase checks; Win32 checks in test_platform_locks_perms.py")
     def test_passphrase_rejects_special_files_bad_utf8_and_empty_sources(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mh-g3-f9-pp-") as d:
             fifo = os.path.join(d, "pp.fifo")
@@ -917,6 +959,7 @@ class TestBatch7G3HardeningMisc(unittest.TestCase):
             self.assertEqual(cm.exception.code, c.INVALID_ARGUMENT)
             self.assertEqual(cm.exception.exit_code, c.EXIT_USAGE)
 
+    @unittest.skipUnless(sys.platform != "win32", "POSIX st_uid/os.chmod ownership check; Win32 SID check in test_platform_locks_perms.py")
     def test_init_mesh_home_foreign_owner_raises_insecure_permissions(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mh-g3-f9-init-") as d:
             foreign_dir = os.path.join(d, "foreign_home")
@@ -988,12 +1031,13 @@ class TestBatch7G3HardeningMisc(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(log_dir, "meshd.log.4")))
             self.assertFalse(os.path.exists(os.path.join(log_dir, "meshd.log.5")))
 
-            d2 = os.path.join(d, "sym_home")
-            os.makedirs(os.path.join(d2, "logs"), mode=0o700)
-            target = os.path.join(d, "pwned.txt")
-            os.symlink(target, os.path.join(d2, "logs", "meshd.log"))
-            logfile.append_line(d2, "should not follow symlink")
-            self.assertFalse(os.path.exists(target))
+            if sys.platform != "win32":
+                d2 = os.path.join(d, "sym_home")
+                os.makedirs(os.path.join(d2, "logs"), mode=0o700)
+                target = os.path.join(d, "pwned.txt")
+                os.symlink(target, os.path.join(d2, "logs", "meshd.log"))
+                logfile.append_line(d2, "should not follow symlink")
+                self.assertFalse(os.path.exists(target))
 
 
 if __name__ == "__main__":

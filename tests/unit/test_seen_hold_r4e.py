@@ -7,6 +7,7 @@ run is adopted, its wrapper (a session leader) has exited and an env-less member
 ignores SIGTERM is still in the wrapper's process group and session.
 """
 
+import sys
 import json
 import os
 import signal
@@ -66,6 +67,7 @@ class _R4eDb(_SeenDb):
         return sent, mock.patch("os.kill", kill), mock.patch("os.killpg", killpg)
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX os.fork() PGID session leader + os.killpg interception semantics (Windows Job Object close-gate covered in test_win_close_gate_jobs)")
 class TestForcedReleaseRollback(_R4eDb):
     """r4e item 1 (MAJOR): `run release --force-seen-unusable` changes in-memory and
     termination state only after its transaction committed."""
@@ -147,6 +149,7 @@ class TestForcedReleaseRollback(_R4eDb):
         self.assertEqual(len(self._events("run.seen_unusable", "run_f")), 1)
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX os.fork() PGID session leader + os.killpg interception semantics (Windows Job Object close-gate covered in test_win_close_gate_jobs)")
 class TestRestoredHoldDropsCache(_R4eDb):
     """r4e item 1 (second part): a refresh that restores a persisted reason invalidates
     a usable/empty seen state cached while no hold was known."""
@@ -182,6 +185,7 @@ class TestRestoredHoldDropsCache(_R4eDb):
         self.assertIsNone(self._lease("tsk_c"))
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX os.fork() PGID session leader + os.killpg interception semantics (Windows Job Object close-gate covered in test_win_close_gate_jobs)")
 class TestPendingEventSurvivesClose(_R4eDb):
     mesh_serial = True  # host-global /proc scan (dogfood merge failure)
 

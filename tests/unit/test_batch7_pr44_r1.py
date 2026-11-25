@@ -49,6 +49,15 @@ from mesh.errors import MeshError
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def _subproc_env(extra: Dict[str, str]) -> Dict[str, str]:
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    for k in ("SYSTEMROOT", "WINDIR", "COMSPEC"):
+        if k in os.environ:
+            env[k] = os.environ[k]
+    env.update(extra)
+    return env
+
+
 class _FakeReader:
     def at_eof(self) -> bool:
         return False
@@ -113,6 +122,7 @@ class TestPr44R1SitePackagesIsolation(unittest.TestCase):
 
     def test_helpers_keep_pythonpath_for_non_global_site_packages(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mh-pr44-helpers-") as d:
+            d = os.path.realpath(d)
             custom_sp = os.path.join(d, "custom", "site-packages")
             os.makedirs(custom_sp)
             cache_dir = os.path.join(d, "cache")
@@ -120,8 +130,12 @@ class TestPr44R1SitePackagesIsolation(unittest.TestCase):
 
             with mock.patch("site.getsitepackages", return_value=["/usr/lib/python3/dist-packages"]):
                 with mock.patch("mesh.core.paths.get_install_root", return_value=custom_sp), \
-                     mock.patch.dict(os.environ, {"XDG_CACHE_HOME": cache_dir}):
+                     mock.patch.dict(os.environ, {"LOCALAPPDATA": cache_dir, "XDG_CACHE_HOME": cache_dir}):
                     bdir = get_mesh_bin_dir()
+                    if sys.platform == "win32":
+                        with open(os.path.join(bdir, "mesh.cmd"), "r", encoding="utf-8") as fh:
+                            wrapper_cmd = fh.read()
+                        self.assertIn(f'set "PYTHONPATH={os.path.realpath(custom_sp)}"', wrapper_cmd)
                     with open(os.path.join(bdir, "mesh"), "r", encoding="utf-8") as fh:
                         wrapper = fh.read()
                 self.assertIn(f"export PYTHONPATH={shlex.quote(os.path.realpath(custom_sp))}", wrapper)
@@ -178,7 +192,7 @@ class TestPr44R1SitePackagesIsolation(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="mh-pr44-userbase-") as d:
             user_site_proc = subprocess.run(
                 [sys.executable, "-c", "import site; print(site.getusersitepackages())"],
-                env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONUSERBASE": d},
+                env=_subproc_env({"PYTHONUSERBASE": d}),
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -195,10 +209,7 @@ class TestPr44R1SitePackagesIsolation(unittest.TestCase):
                     "from mesh.cli.entry import main\n"
                     "sys.exit(main())\n"
                 )
-            env = {
-                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                "PYTHONUSERBASE": d,
-            }
+            env = _subproc_env({"PYTHONUSERBASE": d})
             proc = subprocess.run(
                 [sys.executable, console_script, "--version"],
                 cwd=d,
@@ -215,8 +226,8 @@ class TestPr44R1SitePackagesIsolation(unittest.TestCase):
     def test_real_venv_site_packages_strips_pythonpath(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mh-pr44-venv-") as d:
             vdir = os.path.join(d, "venv")
-            venv.create(vdir, with_pip=False, symlinks=True)
-            vpy = os.path.join(vdir, "bin", "python")
+            venv.create(vdir, with_pip=False, symlinks=(sys.platform != "win32"))
+            vpy = os.path.join(vdir, "Scripts", "python.exe") if sys.platform == "win32" else os.path.join(vdir, "bin", "python")
             vsp = subprocess.run(
                 [vpy, "-c", "import site; print(site.getsitepackages()[0])"],
                 capture_output=True,
@@ -226,7 +237,7 @@ class TestPr44R1SitePackagesIsolation(unittest.TestCase):
             ).stdout.strip()
             self._copy_mesh_pkg(vsp)
 
-            probe_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+            probe_env = _subproc_env({})
             res = subprocess.run(
                 [
                     vpy,
@@ -244,10 +255,11 @@ class TestPr44R1SitePackagesIsolation(unittest.TestCase):
             )
             self.assertEqual(res.stdout.strip(), "True True")
 
+            stale_pp = os.path.join(d, "stale")
             run_res = subprocess.run(
                 [vpy, "-m", "mesh", "--version"],
                 cwd=d,
-                env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONPATH": "/tmp/stale"},
+                env=_subproc_env({"PYTHONPATH": stale_pp}),
                 capture_output=True,
                 text=True,
                 timeout=15,
@@ -272,12 +284,11 @@ class TestPr44R1PreIsolatedPythonPath(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="mh-pr44-p21-") as d:
             evil = self._make_evil_dir(d)
             pp = f"{evil}{os.pathsep}{REPO_ROOT}"
-            env = {
-                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            env = _subproc_env({
                 "PYTHONSAFEPATH": "1",
                 "PYTHONNOUSERSITE": "1",
                 "PYTHONPATH": pp,
-            }
+            })
             proc = subprocess.run(
                 [sys.executable, "-m", "mesh", "--version"],
                 cwd=d,
@@ -295,10 +306,9 @@ class TestPr44R1PreIsolatedPythonPath(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="mh-pr44-p21ps-") as d:
             evil = self._make_evil_dir(d)
             pp = f"{evil}{os.pathsep}{REPO_ROOT}"
-            env = {
-                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            env = _subproc_env({
                 "PYTHONPATH": pp,
-            }
+            })
             proc = subprocess.run(
                 [sys.executable, "-P", "-s", "-m", "mesh", "--version"],
                 cwd=d,
@@ -313,10 +323,20 @@ class TestPr44R1PreIsolatedPythonPath(unittest.TestCase):
             )
 
     def test_already_sanitized_returns_without_reexec(self) -> None:
+        fake_flags = argparse.Namespace(safe_path=True, no_user_site=True)
+        if sys.platform == "win32":
+            fake_env = {
+                "PYTHONPATH": REPO_ROOT,
+                "_MESH_ORIG_PYTHONPATH": "__UNSET__",
+            }
+            with mock.patch.object(entry._winapi, "CreateProcess", side_effect=AssertionError("must not re-exec")), \
+                 mock.patch.object(entry.sys, "flags", fake_flags), \
+                 mock.patch.object(entry.nt, "environ", fake_env):
+                entry.ensure_isolated_process()
+            return
         with mock.patch.object(entry.posix, "execve", side_effect=AssertionError("must not re-exec")), \
              mock.patch.object(entry.posix, "umask") as umask_mock:
             expected = REPO_ROOT.encode(sys.getfilesystemencoding() or "utf-8", "surrogateescape")
-            fake_flags = argparse.Namespace(safe_path=True, no_user_site=True)
             fake_env = {
                 b"PYTHONPATH": expected,
                 b"_MESH_ORIG_PYTHONPATH": b"__UNSET__",
@@ -607,7 +627,7 @@ class TestPr44R1InputNullDeliverable(unittest.TestCase):
             fence=1,
             deliverable=None,
             summary=None,
-            home="/tmp/x",
+            home=os.path.join(temp_root() if "temp_root" in globals() else tempfile.gettempdir(), "x"),
             _from_json={"deliverable", "run", "fence"},
         )
         called: List[str] = []
@@ -641,6 +661,7 @@ class TestPr44R1InputNullDeliverable(unittest.TestCase):
         self.assertEqual(rc, c.EXIT_USAGE)
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX st_uid/os.chmod ownership check; Win32 SID check in test_platform_locks_perms.py")
 class TestPr44R1InitForeignOwner(unittest.TestCase):
     """P3-2: init_mesh_home foreign-owner check must inspect st_uid via os.stat on 0o700 dir."""
 

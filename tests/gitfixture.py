@@ -28,12 +28,20 @@ import fnmatch
 import os
 import secrets
 import shutil
+import stat
 import subprocess
+import sys
 from typing import Dict, List, Optional
 
-from tests.helpers import MeshHarness
+from mesh.platform import paths as plat_paths, perms as plat_perms
+from tests.helpers import MeshHarness, rmtree_deep
 
-BASE_PREFIX = "/tmp/mh-"
+BASE_PREFIX = os.path.join(plat_paths.temp_root(), "mh-")
+
+
+def _norm_win_path(path: str) -> str:
+    """Expand 8.3 short components and normalize case/separators for Windows comparisons."""
+    return plat_paths.norm_cmp_win(plat_paths.long_path_win(path))
 
 CALC_PY = "def add(a, b):\n    return a + b\n"
 
@@ -57,12 +65,17 @@ class GitFixture:
     """Owns a `/tmp/mh-<rand8>-git/` base dir holding K0 repos and their bare remotes."""
 
     def __init__(self) -> None:
-        self.base = f"/tmp/mh-{secrets.token_hex(4)}-git"
+        self.base = f"{BASE_PREFIX}{secrets.token_hex(4)}-git"
         os.makedirs(self.base, mode=0o700, exist_ok=True)
-        os.chmod(self.base, 0o700)
+        plat_perms.set_private_dir_acl(self.base, 0o700)
         self.empty_gitconfig = os.path.join(self.base, "empty.gitconfig")
-        with open(self.empty_gitconfig, "w", encoding="utf-8") as f:
-            f.write("")
+        with open(self.empty_gitconfig, "w", encoding="utf-8", newline="\n") as f:
+            if sys.platform == "win32":
+                # Keep git_env_vars() free of extra GIT_CONFIG_* keys while disabling
+                # Windows MAX_PATH failures and CRLF mutation across all fixture git runs.
+                f.write("[core]\n\tlongpaths = true\n\tautocrlf = false\n")
+            else:
+                f.write("")
         # Directories git calls may run in: the base dir, plus roots registered with
         # allow_root() (a GitMeshHarness registers its own home, where Mesh creates the
         # integration, lead and task worktrees).
@@ -74,6 +87,25 @@ class GitFixture:
         Refuses anything outside `/tmp/mh-` and any Mesh checkout; never widens beyond the
         given directory.
         """
+        if sys.platform == "win32":
+            assert isinstance(root, str), f"git fixture refuses allowed root outside {BASE_PREFIX}: {root!r}"
+            long_root = plat_paths.long_path_win(root)
+            assert plat_paths.norm_cmp_win(long_root).startswith(
+                _norm_win_path(BASE_PREFIX)
+            ), f"git fixture refuses allowed root outside {BASE_PREFIX}: {root!r}"
+            real = os.path.realpath(long_root)
+            real_prefix = _norm_win_path(os.path.join(os.path.realpath(plat_paths.temp_root()), "mh-"))
+            real_cmp = _norm_win_path(real)
+            assert real_cmp.startswith(real_prefix), (
+                f"git fixture refuses allowed root that resolves outside {real_prefix}: {root!r} -> {real!r}"
+            )
+            assert "mesh-fresh-v1" not in real_cmp and "mesh-wt-" not in real_cmp, (
+                f"refusing Mesh checkout {real!r}"
+            )
+            long_root_cmp = plat_paths.norm_cmp_win(long_root)
+            if all(_norm_win_path(r) != long_root_cmp for r in self.allowed_roots):
+                self.allowed_roots.append(long_root)
+            return
         assert isinstance(root, str) and root.startswith(BASE_PREFIX), (
             f"git fixture refuses allowed root outside {BASE_PREFIX}: {root!r}"
         )
@@ -90,6 +122,16 @@ class GitFixture:
     def _assert_under_base(self, path: str) -> str:
         """Refuse any path that is not inside the base dir or an allowed root (before any spawn)."""
         assert isinstance(path, str) and path, f"git fixture path must be a non-empty string, got {path!r}"
+        if sys.platform == "win32":
+            long_path = plat_paths.long_path_win(path)
+            assert plat_paths.norm_cmp_win(long_path).startswith(_norm_win_path(BASE_PREFIX)), (
+                f"git fixture refuses path outside {BASE_PREFIX}: {path}"
+            )
+            win_realpath = lambda p: plat_paths.long_path_win(os.path.realpath(p))
+            for root in self.allowed_roots:
+                if plat_paths.is_path_equal_or_parent_win(root, long_path, realpath_fn=win_realpath):
+                    return path
+            raise AssertionError(f"git fixture refuses path outside its roots {self.allowed_roots}: {path}")
         assert path.startswith(BASE_PREFIX), f"git fixture refuses path outside {BASE_PREFIX}: {path}"
         real = os.path.realpath(path)
         for root in self.allowed_roots:
@@ -135,7 +177,18 @@ class GitFixture:
             )
             assert not arg.startswith("--git-dir="), f"git fixture refuses {arg!r}"
             assert not arg.startswith("--work-tree="), f"git fixture refuses {arg!r}"
-            if arg.startswith("/"):
+            if sys.platform == "win32":
+                is_rooted = (
+                    arg.startswith("/")
+                    or arg.startswith("\\")
+                    or os.path.isabs(arg)
+                    or (len(arg) >= 2 and arg[1] == ":" and arg[0].isascii() and arg[0].isalpha())
+                )
+                if is_rooted:
+                    assert _norm_win_path(arg).startswith(
+                        _norm_win_path(BASE_PREFIX)
+                    ), f"git fixture refuses absolute path argument outside {BASE_PREFIX}: {arg}"
+            elif arg.startswith("/"):
                 assert arg.startswith(BASE_PREFIX), (
                     f"git fixture refuses absolute path argument outside {BASE_PREFIX}: {arg}"
                 )
@@ -146,6 +199,7 @@ class GitFixture:
         *args: str,
         check: bool = True,
         identity: bool = False,
+        input: Optional[str] = None,
     ) -> subprocess.CompletedProcess:
         """Run git with cwd=repo (must be under the base dir) and the hermetic env."""
         self._assert_under_base(repo)
@@ -161,6 +215,7 @@ class GitFixture:
             check=check,
             capture_output=True,
             text=True,
+            input=input,
         )
 
     # --- K0 -------------------------------------------------------------------
@@ -170,19 +225,22 @@ class GitFixture:
         repo = self.path(name)
         origin = self.path(f"{name}-origin.git")
         self.git(self.base, "init", "-b", "main", repo)
+        if sys.platform == "win32":
+            self.git(repo, "config", "core.longpaths", "true")
+            self.git(repo, "config", "core.autocrlf", "false")
         if identity:
             self.git(repo, "config", "user.name", "t")
             self.git(repo, "config", "user.email", "t@example.invalid")
-        with open(os.path.join(repo, "calc.py"), "w", encoding="utf-8") as f:
+        with open(os.path.join(repo, "calc.py"), "w", encoding="utf-8", newline="\n") as f:
             f.write(CALC_PY)
         tests_dir = os.path.join(repo, "tests")
         os.makedirs(tests_dir, exist_ok=True)
-        with open(os.path.join(tests_dir, "__init__.py"), "w", encoding="utf-8") as f:
+        with open(os.path.join(tests_dir, "__init__.py"), "w", encoding="utf-8", newline="\n") as f:
             f.write("")
-        with open(os.path.join(tests_dir, "test_calc.py"), "w", encoding="utf-8") as f:
+        with open(os.path.join(tests_dir, "test_calc.py"), "w", encoding="utf-8", newline="\n") as f:
             f.write(TEST_CALC_PY)
         # Keep the tree clean after a test run (bytecode would otherwise show up as untracked).
-        with open(os.path.join(repo, ".gitignore"), "w", encoding="utf-8") as f:
+        with open(os.path.join(repo, ".gitignore"), "w", encoding="utf-8", newline="\n") as f:
             f.write("__pycache__/\n")
         self.git(repo, "add", "-A")
         self.git(repo, "commit", "-m", "init", identity=not identity)
@@ -252,6 +310,11 @@ class GitFixture:
 
     def cleanup(self) -> None:
         """Remove the base dir (re-checking the /tmp/mh- prefix first)."""
+        if sys.platform == "win32":
+            if not _norm_win_path(self.base).startswith(_norm_win_path(BASE_PREFIX)):
+                raise AssertionError(f"refusing to remove non-{BASE_PREFIX} path: {self.base}")
+            rmtree_deep(self.base)
+            return
         if not self.base.startswith(BASE_PREFIX):
             raise AssertionError(f"refusing to remove non-/tmp/mh- path: {self.base}")
         shutil.rmtree(self.base, ignore_errors=True)

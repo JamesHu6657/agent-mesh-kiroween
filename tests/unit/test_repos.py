@@ -5,6 +5,7 @@ All git runs on K0 fixture repos under /tmp/mh-*; product git goes through gitop
 
 import os
 import subprocess
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -13,6 +14,7 @@ import mesh.constants as c
 from mesh.core import repos
 from mesh.core.paths import get_install_root
 from mesh.errors import MeshError
+from mesh.platform import paths as plat_paths, perms as plat_perms
 from tests.gitfixture import GitFixture
 
 
@@ -106,10 +108,14 @@ class TestSetupIntegration(RepoFixtureCase):
         self.assertEqual(out, {"integration_branch": "mesh/prj_k1/integration", "integration_path": wt})
         self.assertEqual(self.fixture.branches(self.repo, "mesh/*"), ["mesh/prj_k1/integration"])
         self.assertEqual(self.fixture.head(self.repo, "mesh/prj_k1/integration"), self.main)
-        entries = {os.path.realpath(e["worktree"]): e for e in self.fixture.worktrees(self.repo)}
-        self.assertIn(os.path.realpath(wt), entries)
-        self.assertEqual(entries[os.path.realpath(wt)]["branch"], "refs/heads/mesh/prj_k1/integration")
-        self.assertEqual(os.stat(os.path.dirname(wt)).st_mode & 0o777, 0o700)
+        entries = {plat_paths.norm_cmp(os.path.realpath(e["worktree"])): e for e in self.fixture.worktrees(self.repo)}
+        wt_key = plat_paths.norm_cmp(os.path.realpath(wt))
+        self.assertIn(wt_key, entries)
+        self.assertEqual(entries[wt_key]["branch"], "refs/heads/mesh/prj_k1/integration")
+        if sys.platform == "win32":
+            plat_perms.verify_private_owner_and_perms(os.path.dirname(wt), is_dir=True)
+        else:
+            self.assertEqual(os.stat(os.path.dirname(wt)).st_mode & 0o777, 0o700)
 
     def test_existing_branch_rc6(self) -> None:
         """ACC: K1 - (Q2, core level) a pre-created mesh/<prj>/integration is rc 6 ALREADY_EXISTS; nothing is created."""
@@ -170,13 +176,16 @@ class TestLeadRepoWorktree(RepoFixtureCase):
         repos.setup_integration(repo, "prj_l", self.main, self.ws_root)
         path = repos.add_lead_repo_worktree(repo, "prj_l", self.ws_root, "agt_lead1")
         self.assertEqual(path, os.path.join(self.ws_root, "prj_l", "lead", "agt_lead1", "repo"))
-        entries = {os.path.realpath(e["worktree"]): e for e in self.fixture.worktrees(self.repo)}
-        lead = entries[os.path.realpath(path)]
+        entries = {plat_paths.norm_cmp(os.path.realpath(e["worktree"])): e for e in self.fixture.worktrees(self.repo)}
+        lead = entries[plat_paths.norm_cmp(os.path.realpath(path))]
         self.assertTrue(lead.get("detached"), lead)
         self.assertNotIn("branch", lead)
         self.assertEqual(lead["head"], self.main)
         self.assertNotEqual(os.path.realpath(path), os.path.realpath(os.path.join(self.ws_root, "prj_l", "integration")))
-        self.assertEqual(os.stat(os.path.dirname(path)).st_mode & 0o777, 0o700)
+        if sys.platform == "win32":
+            plat_perms.verify_private_owner_and_perms(os.path.dirname(path), is_dir=True)
+        else:
+            self.assertEqual(os.stat(os.path.dirname(path)).st_mode & 0o777, 0o700)
         # Idempotent: an existing repo/ is kept, no second worktree.
         n = len(self.fixture.worktrees(self.repo))
         self.assertEqual(repos.add_lead_repo_worktree(repo, "prj_l", self.ws_root, "agt_lead1"), path)
@@ -206,10 +215,11 @@ class TestInstallPathWiring(unittest.TestCase):
         from mesh.daemon.handlers import project as project_handlers
 
         boom = AssertionError("git must not run")
+        repo_sample = os.path.join(plat_paths.temp_root(), "mh-x")
         cases = [
-            ({"repo": "/tmp/mh-x", "test_command": "none"}, "base_branch"),
-            ({"repo": "/tmp/mh-x", "base_branch": "main"}, "test_command"),
-            ({"repo": "/tmp/mh-x", "base_branch": "main", "test_command": "[]"}, "test_command"),
+            ({"repo": repo_sample, "test_command": "none"}, "base_branch"),
+            ({"repo": repo_sample, "base_branch": "main"}, "test_command"),
+            ({"repo": repo_sample, "base_branch": "main", "test_command": "[]"}, "test_command"),
             ({"repo": "rel/path", "base_branch": "main", "test_command": "none"}, "repo"),
             ({"base_branch": "main"}, "base_branch"),
             ({"test_command": "none"}, "test_command"),

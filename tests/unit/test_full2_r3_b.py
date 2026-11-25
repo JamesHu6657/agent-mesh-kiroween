@@ -24,6 +24,7 @@ from mesh.daemon.handlers.base import Effect, HandlerContext
 from mesh.daemon.server import DaemonServer
 from mesh.errors import MeshError
 from tests.gitfixture import GitFixture
+from tests.helpers import fake_peer_creds
 
 # merge.run_test_step scans real /proc for leftovers.
 MESH_PROC_LOCK = "shared"
@@ -59,7 +60,7 @@ async def _send_req(srv: DaemonServer, payload: dict) -> dict:
     try:
         with mock.patch(
             "mesh.daemon.server.get_peer_credentials",
-            return_value=(os.getpid(), os.getuid(), os.getgid()),
+            return_value=fake_peer_creds(),
         ), mock.patch("mesh.daemon.server.classify_peer_run_session", return_value=None), mock.patch.object(
             srv, "refresh_run_caches"
         ), mock.patch.object(
@@ -228,6 +229,8 @@ class TestP1_3IntegrationWorktreeIsolation(_RealWorktreeFixture):
         repo_git_dir = os.path.join(self.repo, ".git")
         script = (
             "import os, sys\n"
+            "if os.path.isfile('.git'):\n"
+            "    os.unlink('.git')\n"
             "with open('.git', 'w', encoding='utf-8') as f:\n"
             f"    f.write('gitdir: ' + {repo_git_dir!r} + '\\n')\n"
             "sys.exit(1)\n"
@@ -249,6 +252,9 @@ class TestP1_3IntegrationWorktreeIsolation(_RealWorktreeFixture):
         main_head_before = self.fixture.head(self.repo, "main")
         repo_git_dir = os.path.join(self.repo, ".git")
         script = (
+            "import os\n"
+            "if os.path.isfile('.git'):\n"
+            "    os.unlink('.git')\n"
             "with open('.git', 'w', encoding='utf-8') as f:\n"
             f"    f.write('gitdir: ' + {repo_git_dir!r} + '\\n')\n"
         )
@@ -273,7 +279,8 @@ class TestP1_3IntegrationWorktreeIsolation(_RealWorktreeFixture):
         out = merge.run_merge_pipeline(plan)
         self.assertEqual((out["outcome"], out["reason"]), ("failed", "integration_dirty"), out)
         self.assertIs(out["details"].get("foreign_repository"), True, out)
-        self.assertEqual(os.stat(os.path.join(outside, "ro")).st_mode & 0o777, 0o555)
+        if sys.platform != "win32":
+            self.assertEqual(os.stat(os.path.join(outside, "ro")).st_mode & 0o777, 0o555)
 
         tok = merge._PROBE_EXPECTED.set((self.repo, self.ws_root))
         try:
@@ -292,7 +299,8 @@ class TestP1_3IntegrationWorktreeIsolation(_RealWorktreeFixture):
         self.assertEqual((rec["outcome"], rec["reason"]), ("failed", "interrupted"), rec)
         self.assertIs(rec["details"].get("foreign_repository"), True, rec)
         self.assertIs(rec["details"].get("restored"), False, rec)
-        self.assertEqual(os.stat(os.path.join(outside, "ro")).st_mode & 0o777, 0o555)
+        if sys.platform != "win32":
+            self.assertEqual(os.stat(os.path.join(outside, "ro")).st_mode & 0o777, 0o555)
 
 
 class TestP1_5MergeCancelAndReleaseSync(_RealWorktreeFixture):

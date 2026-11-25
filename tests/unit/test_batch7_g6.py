@@ -88,6 +88,7 @@ def make_script_repo(base_dir):
     return repo, gitleaks
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash + scripts/coord/secret-pattern.sh and chmod 0o600 test")
 class TestSecretScannerBatch7(unittest.TestCase):
     def test_secret_pattern_matches_quoted_keys_mesh_tokens_and_private_keys(self):
         # Construct test patterns piecewise so this test file never triggers secret scanners.
@@ -210,6 +211,7 @@ class TestSecretScannerBatch7(unittest.TestCase):
             self.assertIn("pattern hits", res_pr.stdout)
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash + scripts/coord/coder-guard.sh and os.killpg test")
 class TestCoderGuardAndDispatchBatch7(unittest.TestCase):
     def test_coder_guard_detects_vibe_and_non_home_git_worktrees(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -353,6 +355,7 @@ class TestTestSuiteFixesBatch7(unittest.TestCase):
             self.assertNotIn("type object '_FailedTest'", res_err.stderr)
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash + scripts/coord/* shell-script and install test")
 class TestCoordAndInstallBatch7(unittest.TestCase):
     def test_migrate_to_paseo_fail_closed_and_no_code_injection(self):
         with tempfile.TemporaryDirectory() as tmp:

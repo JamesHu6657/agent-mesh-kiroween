@@ -15,12 +15,14 @@ ACC: K10, K11, K12.
 import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from typing import Any, Dict, List, Optional, Tuple
 
 import mesh.constants as c
 from tests.gitfixture import GitFixture, GitMeshHarness
+from tests.helpers import restore_accessible_for_test, set_inaccessible_for_test
 from tests.integration.test_execution_launch import create_agent
 from tests.stubs import create_test_stubs
 
@@ -269,11 +271,17 @@ class TestDeliverPrune(unittest.TestCase):
         marker = os.path.join(ws, "PWNED")
         with open(os.path.join(fake, ".git", "config"), "a") as f:
             f.write("[core]\n\tfsmonitor = touch %s\n" % marker)
+        if sys.platform == "win32" and os.path.exists(dot_git):
+            os.chmod(dot_git, 0o600)
+            os.unlink(dot_git)
         with open(dot_git, "w") as f:
             f.write("gitdir: sub/.git\n")
         try:
             rc, out = self.merge(tsk)
         finally:
+            if sys.platform == "win32" and os.path.exists(dot_git):
+                os.chmod(dot_git, 0o600)
+                os.unlink(dot_git)
             with open(dot_git, "w") as f:
                 f.write(saved)
         self.assertFalse(os.path.exists(marker))
@@ -292,8 +300,8 @@ class TestDeliverPrune(unittest.TestCase):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
             f.write("{}")
-        os.chmod(path, 0)
-        if os.access(path, os.R_OK):
+        set_inaccessible_for_test(path)
+        if sys.platform != "win32" and os.access(path, os.R_OK):
             os.unlink(path)
             self.skipTest("running as root")
         try:
@@ -302,7 +310,7 @@ class TestDeliverPrune(unittest.TestCase):
             self.assertTrue(os.path.lexists(path))
             self.assertEqual(self.q("SELECT COUNT(*) FROM events WHERE type = 'project.delivered';")[0][0], 0)
         finally:
-            os.chmod(path, 0o600)
+            restore_accessible_for_test(path)
             os.unlink(path)
 
     def test_full_r2_p1_d_no_intent_outlives_its_request(self) -> None:

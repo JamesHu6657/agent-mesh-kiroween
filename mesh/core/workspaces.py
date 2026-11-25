@@ -4,6 +4,7 @@ import errno
 import json
 import os
 import re
+import sys
 import threading
 import sqlite3
 import subprocess
@@ -11,6 +12,7 @@ from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 
 from mesh.core.token_roots import PROTECTED_PATH_META_PREFIX
+from mesh.platform import paths as _plat_paths
 
 
 WS_RES_PREFIX = "ws_res:"
@@ -217,14 +219,17 @@ def compute_task_workspace_path(
         dir_name = f"{task_id}.a{attempt}"
 
     ws_dir = os.path.join(workspaces_root, project_id, "tasks", dir_name)
-    if not ws_dir.endswith("/"):
-        ws_dir += "/"
+    if not ws_dir.endswith(os.sep):
+        ws_dir += os.sep
     return ws_dir
 
 
 def compute_lead_workspace_path(workspaces_root: str, project_id: str, agent_id: str) -> str:
     """Lead dir per plan §10.1: <workspaces.root>/<project_id>/lead/<agent_id>/."""
-    return os.path.join(workspaces_root, project_id, "lead", agent_id) + "/"
+    lead_dir = os.path.join(workspaces_root, project_id, "lead", agent_id)
+    if not lead_dir.endswith(os.sep):
+        lead_dir += os.sep
+    return lead_dir
 
 
 def ensure_lead_dir(conn: sqlite3.Connection, home: str, project_id: str, agent_id: str) -> Optional[str]:
@@ -243,6 +248,7 @@ def ensure_lead_dir(conn: sqlite3.Connection, home: str, project_id: str, agent_
 
 def _ensure_private_dir(path: str, label: str) -> None:
     from mesh.core.paths import resolve_trusted_path
+    from mesh.platform import perms
 
     if resolve_trusted_path(path) is None:
         raise OSError(errno.ELOOP, f"{label} path contains a symlink or is invalid", path)
@@ -250,15 +256,17 @@ def _ensure_private_dir(path: str, label: str) -> None:
     if resolve_trusted_path(path) is None:
         raise OSError(errno.ELOOP, f"{label} path contains a symlink or is invalid", path)
     try:
-        if hasattr(os, "fchmod"):
+        if sys.platform == "win32":
+            perms.set_private_dir_acl(path, 0o700)
+        elif hasattr(os, "fchmod"):
             flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0)
             fd = os.open(path, flags)
             try:
-                os.fchmod(fd, 0o700)
+                perms.fchmod_private(fd, 0o700)
             finally:
                 os.close(fd)
         else:
-            os.chmod(path, 0o700)
+            perms.set_private_dir_acl(path, 0o700)
     except Exception:
         pass
 
@@ -274,7 +282,7 @@ def require_task_worktree(path: str) -> None:
     prepared (`workspace delete` racing a start) stays absent, so the next attempt
     re-attaches the kept branch instead of finding a plain empty directory there
     (`not_a_worktree` for good)."""
-    if not os.path.lexists(os.path.join(path, ".git")):
+    if not os.path.lexists(os.path.join(_plat_paths.strip_trailing_seps(path), ".git")):
         raise WorkspaceError(f"Task worktree {path} is missing",
                              {"workspace": path, "step": "start", "reason": "workspace_missing"})
 
@@ -416,7 +424,7 @@ def _reuse(plan: Mapping[str, Any], path: str, branch: str, alt_branch: Optional
             raise _fail("workspace exists but belongs to a different repository", plan, step="reuse",
                         reason="foreign_repository", branch=branch)
     top = _git(plan, "rev-parse --show-toplevel", ["rev-parse", "--show-toplevel"], ws_real)
-    if os.path.realpath((top.stdout or "").strip()) != ws_real:
+    if not _plat_paths.same_path((top.stdout or "").strip(), ws_real):
         raise _fail("workspace exists but is not a git worktree", plan, step="reuse", reason="not_a_worktree",
                     branch=branch)
     current = _existing_worktree_branch(plan, ws_real)
@@ -428,7 +436,7 @@ def _reuse(plan: Mapping[str, Any], path: str, branch: str, alt_branch: Optional
 
 def _fresh_branch(plan: Mapping[str, Any], path: str) -> Optional[str]:
     """`mesh/<prj>/<tsk>-a<n>` for an `<tsk>.a<n>` workspace dir, else None."""
-    m = _ATTEMPT_SUFFIX.search(path.rstrip("/"))
+    m = _ATTEMPT_SUFFIX.search(_plat_paths.strip_trailing_seps(path))
     if not m:
         return None
     return f"{task_branch_name(plan['project_id'], plan['task_id'])}-a{m.group(1)}"
@@ -439,12 +447,13 @@ def _add_worktree(plan: Mapping[str, Any], repo: str, path: str, new_branch: str
     """`worktree add -b`. If it fails because a concurrent prepare of the same task just
     created this worktree on `new_branch` (review m2-r4 finding 6), return False (reuse);
     any other failure is the original WorkspaceError."""
+    clean_path = _plat_paths.strip_trailing_seps(path)
     try:
-        _git(plan, "worktree add", ["worktree", "add", "-b", new_branch, path.rstrip("/"), start], repo,
+        _git(plan, "worktree add", ["worktree", "add", "-b", new_branch, clean_path, start], repo,
              branch=new_branch, **details)
         return True
     except WorkspaceError:
-        if os.path.isdir(path):
+        if os.path.isdir(clean_path):
             try:
                 _reuse(plan, path, new_branch)
                 return False
@@ -486,6 +495,7 @@ def _run_code_workspace_plan(plan: Mapping[str, Any]) -> Dict[str, Any]:
     if not os.path.isdir(repo):
         raise _fail("project repo is missing", plan, step="plan", reason="repo_missing")
     path = plan["workspace_path"]
+    clean_path = _plat_paths.strip_trailing_seps(path)
     branch = plan.get("branch")
     task_id = plan["task_id"]
     project_id = plan["project_id"]
@@ -494,7 +504,7 @@ def _run_code_workspace_plan(plan: Mapping[str, Any]) -> Dict[str, Any]:
         # First start: `worktree add -b mesh/<prj>/<tsk> <ws>/tasks/<tsk> <integration tip>`.
         branch = task_branch_name(project_id, task_id)
         integration = plan["integration"]
-        if os.path.lexists(path.rstrip(os.sep)) or os.path.isdir(path):
+        if os.path.lexists(clean_path) or os.path.isdir(clean_path):
             # A previous prepare created it, but its T5 transaction did not commit
             # (lost race or daemon stop). Reuse it; the base is where it forked.
             _reuse(plan, path, branch)
@@ -507,7 +517,7 @@ def _run_code_workspace_plan(plan: Mapping[str, Any]) -> Dict[str, Any]:
             base = _fork_point(plan, repo, branch, integration)
             _makedirs_parent(plan, path)
             _git(plan, "worktree prune", ["worktree", "prune"], repo, branch=branch)
-            _git(plan, "worktree reattach", ["worktree", "add", path.rstrip("/"), branch], repo, branch=branch)
+            _git(plan, "worktree reattach", ["worktree", "add", clean_path, branch], repo, branch=branch)
             _reuse(plan, path, branch)
             return {"workspace_path": path, "branch": branch, "base_commit": base,
                     "action": "reused", "reattached": True}
@@ -520,7 +530,7 @@ def _run_code_workspace_plan(plan: Mapping[str, Any]) -> Dict[str, Any]:
     fresh_branch = _fresh_branch(plan, path)
     if fresh_branch == branch:
         fresh_branch = None  # the -a<n> branch is already the task's branch (T5 committed)
-    if os.path.lexists(path.rstrip(os.sep)) or os.path.isdir(path):
+    if os.path.lexists(clean_path) or os.path.isdir(clean_path):
         # Rework, retry/reassign with --reuse-workspace or after a non-lease end: same dir and branch.
         # A fresh `<tsk>.a<n>` dir already on `<tsk>-a<n>` was forked by an earlier prepare whose
         # T5 did not commit (refused start, lost race): it is still the fresh workspace
@@ -537,11 +547,11 @@ def _run_code_workspace_plan(plan: Mapping[str, Any]) -> Dict[str, Any]:
         # Full review r1 P1-4: `workspace delete` removes the directory but keeps the
         # branch (Q7). A later retry/rework re-attaches that branch (its work, as is)
         # instead of failing on workspace_missing forever.
-        if not _branch_exists(plan, repo, branch) or os.path.lexists(path.rstrip("/")):
+        if not _branch_exists(plan, repo, branch) or os.path.lexists(clean_path):
             raise _fail("task workspace is missing", plan, step="reuse", reason="workspace_missing", branch=branch)
         _makedirs_parent(plan, path)
         _git(plan, "worktree prune", ["worktree", "prune"], repo, branch=branch)
-        _git(plan, "worktree reattach", ["worktree", "add", path.rstrip("/"), branch], repo, branch=branch)
+        _git(plan, "worktree reattach", ["worktree", "add", clean_path, branch], repo, branch=branch)
         _reuse(plan, path, branch)
         return {"workspace_path": path, "branch": branch, "base_commit": plan.get("base_commit"),
                 "action": "reused", "reattached": True}
@@ -577,14 +587,15 @@ def _fork_point(plan: Mapping[str, Any], repo: str, branch: str, integration: st
 def _makedirs_parent(plan: Mapping[str, Any], path: str) -> None:
     from mesh.core.paths import resolve_trusted_path
 
-    if resolve_trusted_path(path) is None:
+    clean_path = _plat_paths.strip_trailing_seps(path)
+    if resolve_trusted_path(clean_path) is None:
         raise _fail(f"workspace path '{path}' contains a symlink", plan, step="mkdir", reason="symlink")
-    parent = os.path.dirname(path.rstrip("/"))
+    parent = os.path.dirname(clean_path)
     try:
         ensure_workspace_dir(parent)
     except OSError as e:
         raise _fail(f"cannot create {parent}: {e}", plan, step="mkdir", error=str(e))
-    if resolve_trusted_path(path) is None:
+    if resolve_trusted_path(clean_path) is None:
         raise _fail(f"workspace path '{path}' contains a symlink", plan, step="mkdir", reason="symlink")
 
 

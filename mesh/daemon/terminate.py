@@ -46,13 +46,20 @@ import contextvars
 import errno
 import os
 import signal
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from mesh.core.proc import ScanResult, get_proc_environ, get_proc_stat, is_tgid_alive
 from mesh.daemon import children
+from mesh.platform import proc as plat_proc
+
+SIGTERM = plat_proc.SIGTERM
+SIGKILL = plat_proc.SIGKILL
+_WIN_EPOCH_OFFSET_100NS = 116_444_736_000_000_000
+_WIN_TICKS_PER_S = 10_000_000
 
 POLL_S = 0.2
 KILL_WAIT_S = 10.0
@@ -156,6 +163,12 @@ def active() -> Dict[str, Termination]:
         return dict(_active)
 
 
+def active_run_ids() -> Set[str]:
+    """Return a thread-safe snapshot of run IDs with an active termination."""
+    with _active_lock:
+        return set(_active)
+
+
 def forget(run_id: str) -> None:
     with _active_lock:
         _active.pop(run_id, None)
@@ -194,6 +207,8 @@ def _wrapper_identity_alive(wrapper_pid: Optional[int], wrapper_starttime: Optio
         if errors is not None:
             errors.append(True)
         return False
+    if sys.platform == "win32":
+        return False
     # meshd's own unreaped child (review m1c-run4 §2): its pid cannot be reused until meshd
     # reaps it, so the identity still holds; an adopted wrapper is init's child and fails here.
     return int(info["ppid"]) == os.getpid()
@@ -229,21 +244,29 @@ def _descends_from(pid: int, stats: Dict[int, Dict[str, int]], anchors: Dict[int
                    errors: Optional[List[bool]] = None) -> bool:
     """True if pid's PPid chain reaches an anchor pid with the anchor's starttime."""
     cur = stats.get(pid)
+    win32 = sys.platform == "win32"
     for _ in range(64):
         if cur is None:
             return False
         ppid = int(cur["ppid"])
-        if ppid <= 1:
+        if ppid <= 1 or (win32 and ppid == 4):
             return False
         parent = stats.get(ppid)
         if parent is None:
             try:
                 parent = get_proc_stat(ppid)
-            except OSError:
-                if errors is not None:
+            except OSError as exc:
+                if win32:
+                    gone = exc.errno in (errno.ENOENT, errno.ESRCH) or getattr(exc, "winerror", None) == 87
+                    if not gone and not isinstance(exc, PermissionError) and _same_uid(ppid) and errors is not None:
+                        errors.append(True)
+                elif errors is not None:
                     errors.append(True)
                 return False
         if parent is None:
+            return False
+        if win32 and int(parent["starttime"]) > int(cur["starttime"]):
+            # Windows does not clear PPID when a parent exits; a newer starttime means PID reuse.
             return False
         if anchors.get(ppid) == int(parent["starttime"]):
             return True
@@ -263,7 +286,9 @@ def _record_scan_error(errors: Optional[List[bool]] = None) -> None:
 
 
 def _now_ticks(errors: Optional[List[bool]] = None) -> Optional[int]:
-    """Now in /proc starttime units (clock ticks since boot), or None if unknown."""
+    """Now in starttime units (POSIX clock ticks or Win32 100-ns FILETIME), or None if unknown."""
+    if sys.platform == "win32":
+        return int(time.time() * _WIN_TICKS_PER_S) + _WIN_EPOCH_OFFSET_100NS
     try:
         with open("/proc/uptime", "r", encoding="ascii") as f:
             up = float(f.read().split()[0])
@@ -278,13 +303,16 @@ def _young_from(wrapper_starttime: Optional[int]) -> Optional[int]:
     now = _now_ticks()
     recent = None
     if now is not None:
-        recent = now - int(YOUNG_S * os.sysconf("SC_CLK_TCK"))
+        ticks_per_s = _WIN_TICKS_PER_S if sys.platform == "win32" else os.sysconf("SC_CLK_TCK")
+        recent = now - int(YOUNG_S * ticks_per_s)
     if wrapper_starttime is not None:
         return int(wrapper_starttime) if recent is None else min(int(wrapper_starttime), recent)
     return recent
 
 
 def _is_kthread(pid: int, info: Dict[str, int]) -> bool:
+    if sys.platform == "win32":
+        return pid in (0, 4)
     if pid == 2 or int(info["ppid"]) == 2:
         return True
     try:
@@ -297,7 +325,31 @@ def _is_kthread(pid: int, info: Dict[str, int]) -> bool:
         return False
 
 
+_WIN_MY_SID_LOCK = threading.Lock()
+_WIN_MY_SID: Optional[str] = None
+
+
+def _win_current_user_sid() -> Optional[str]:
+    global _WIN_MY_SID
+    with _WIN_MY_SID_LOCK:
+        if _WIN_MY_SID is not None:
+            return _WIN_MY_SID
+        try:
+            _WIN_MY_SID = plat_proc.get_process_user_sid(os.getpid())
+        except OSError:
+            return None
+        return _WIN_MY_SID
+
+
 def _same_uid(pid: int) -> bool:
+    if sys.platform == "win32":
+        my_sid = _win_current_user_sid()
+        if not my_sid:
+            return False
+        try:
+            return plat_proc.get_process_user_sid(pid) == my_sid
+        except OSError:
+            return False
     try:
         return os.stat(f"/proc/{pid}").st_uid == os.geteuid()
     except OSError as exc:
@@ -428,6 +480,8 @@ _libc = None
 def _is_child_subreaper() -> bool:
     """True when this process is a child subreaper (meshd sets it at start, §11.4).
     Unknown (no libc, prctl error) is False: the stricter rule then applies."""
+    if sys.platform == "win32":
+        return False
     global _libc
     try:
         import ctypes
@@ -527,6 +581,12 @@ def _exiting_or_gone(pid: int, starttime: int) -> bool:
     base: exiting test processes with an empty cmdline). A live non-dumpable process always
     has an mm, so this does not reopen the Carbon RO P1-2 escapee case. Any other read error
     keeps the scan uncertain (returns False)."""
+    if sys.platform == "win32":
+        try:
+            info = get_proc_stat(pid)
+            return info is None or int(info["starttime"]) != int(starttime) or not is_tgid_alive(pid, info)
+        except OSError as exc:
+            return exc.errno in (errno.ENOENT, errno.ESRCH)
     try:
         info = get_proc_stat(pid)
         if info is None or int(info["starttime"]) != int(starttime) or not is_tgid_alive(pid, info):
@@ -588,6 +648,196 @@ def run_targets(
         _SCAN_ERRORS.reset(err_tok)
 
 
+def _env_get_run_id(env: Dict[str, str]) -> Optional[str]:
+    if sys.platform != "win32":
+        return env.get("MESH_RUN_ID")
+    if "MESH_RUN_ID" in env:
+        return env["MESH_RUN_ID"]
+    for k, v in env.items():
+        if k.upper() == "MESH_RUN_ID":
+            return v
+    return None
+
+
+def _win_resolve_run_job(run_id: str, *, terminate: bool = False) -> Tuple[Optional[Any], bool, Optional[str]]:
+    """Return ``(job_handle, should_close, home)`` for *run_id* on Windows."""
+    from mesh.daemon import supervisor as _sup
+
+    home = _sup.get_run_home(run_id)
+    job, should_close = _sup.resolve_run_job(run_id, home=home, terminate=terminate)
+    return job, should_close, home
+
+
+def _win_run_home(run_id: str) -> Optional[str]:
+    from mesh.daemon import supervisor as _sup
+
+    return _sup.get_run_home(run_id) or os.environ.get("MESH_HOME")
+
+
+def _run_targets_win(
+    run_id: str,
+    pgid: Optional[int],
+    wrapper_pid: Optional[int],
+    wrapper_starttime: Optional[int],
+    seen: Optional[Dict[int, int]],
+    unknown: Optional[Dict[int, int]],
+    errors: List[bool],
+) -> Dict[int, int]:
+    """Windows target/escapee scan combining Job Object PIDs, ``seen``, PEB env, and Toolhelp."""
+    _ = pgid
+    seen = seen or {}
+    me = os.getpid()
+    registered = children.registered()
+    own_wrapper: Optional[int] = None
+    if wrapper_pid and wrapper_starttime is not None:
+        reg = registered.get(int(wrapper_pid))
+        if reg is None or (reg[1] is not None and int(reg[1]) == int(wrapper_starttime)):
+            own_wrapper = int(wrapper_pid)
+    excluded = {me, 0, 1, 4} | (set(registered) - ({own_wrapper} if own_wrapper else set()))
+    wrapper_alive_now = _wrapper_identity_alive(wrapper_pid, wrapper_starttime, errors)
+    young_from = _young_from(wrapper_starttime)
+    eacces_from = (
+        int(wrapper_starttime)
+        if wrapper_starttime is not None and int(wrapper_starttime) > 0
+        else young_from
+    )
+
+    job_pids: Set[int] = set()
+    try:
+        job, should_close, _home = _win_resolve_run_job(run_id, terminate=False)
+    except OSError:
+        job, should_close = None, False
+        errors.append(True)
+    if job is not None:
+        try:
+            try:
+                job_pids = {int(p) for p in plat_proc.query_job_pids(job) if int(p) > 0}
+            except OSError:
+                errors.append(True)
+        finally:
+            if should_close:
+                try:
+                    job.close()
+                except Exception:
+                    pass
+
+    try:
+        parent_map = plat_proc.list_toolhelp_processes()
+    except OSError:
+        parent_map = {}
+        errors.append(True)
+
+    all_pids = (set(parent_map.keys()) | job_pids | {int(p) for p in seen}) - excluded
+    stats: Dict[int, Dict[str, int]] = {}
+    found = ScanResult()
+    candidates: List[int] = []
+    same_uid_candidates: List[int] = []
+    unknown_pids: Set[int] = set()
+
+    for pid in sorted(all_pids):
+        if pid <= 1 or pid == 4:
+            continue
+        try:
+            info = get_proc_stat(pid)
+        except PermissionError:
+            if pid in seen or pid in job_pids:
+                found.uncertain = True
+                if pid in seen:
+                    found[pid] = int(seen[pid])
+                    if unknown is not None:
+                        unknown[pid] = int(seen[pid])
+            continue
+        except OSError as exc:
+            gone = exc.errno in (errno.ENOENT, errno.ESRCH) or getattr(exc, "winerror", None) == 87
+            if not gone and (pid in seen or pid in job_pids or _same_uid(pid)):
+                found.uncertain = True
+            if pid in seen and not gone:
+                found[pid] = int(seen[pid])
+                if unknown is not None:
+                    unknown[pid] = int(seen[pid])
+            continue
+        if info is None:
+            continue
+        stats[pid] = info
+        try:
+            alive = is_tgid_alive(pid, info)
+        except OSError:
+            found.uncertain = True
+            if pid in seen:
+                found[pid] = int(seen[pid])
+                if unknown is not None:
+                    unknown[pid] = int(seen[pid])
+            continue
+        if not alive:
+            continue
+        st = int(info["starttime"])
+        if seen.get(pid) == st or pid in job_pids:
+            found[pid] = st
+            if unknown is not None:
+                try:
+                    env_known = get_proc_environ(pid)
+                except OSError:
+                    env_known = None
+                if not env_known:
+                    unknown[pid] = st
+            continue
+        try:
+            env = get_proc_environ(pid)
+        except PermissionError:
+            if (eacces_from is None or st >= eacces_from) and not _is_kthread(pid, info) and _same_uid(pid):
+                if not _exiting_or_gone(pid, st):
+                    found.uncertain = True
+            env = None
+        except OSError as exc:
+            gone = exc.errno in (errno.ENOENT, errno.ESRCH) or getattr(exc, "winerror", None) == 87
+            if (
+                not gone
+                and not getattr(exc, "_mesh_null_peb", False)
+                and (eacces_from is None or st >= eacces_from)
+                and not _is_kthread(pid, info)
+                and _same_uid(pid)
+                and not _exiting_or_gone(pid, st)
+            ):
+                found.uncertain = True
+            env = None
+        if env and _env_get_run_id(env) == run_id:
+            found[pid] = st
+            continue
+        is_unknown = _environ_unknown(env, pid, info, young_from)
+        if is_unknown:
+            unknown_pids.add(pid)
+            candidates.append(pid)
+        elif env:
+            same_uid_candidates.append(pid)
+
+    anchors = dict(seen)
+    anchors.update(found)
+    if own_wrapper and wrapper_alive_now:
+        anchors.setdefault(own_wrapper, int(wrapper_starttime))
+    if anchors and same_uid_candidates:
+        for pid in same_uid_candidates:
+            if _same_uid(pid):
+                candidates.append(pid)
+    progress = True
+    while candidates and progress:
+        progress = False
+        rest: List[int] = []
+        for pid in candidates:
+            if _descends_from(pid, stats, anchors, errors):
+                st = int(stats[pid]["starttime"])
+                found[pid] = st
+                anchors[pid] = st
+                if pid in unknown_pids and unknown is not None:
+                    unknown[pid] = st
+                progress = True
+            else:
+                rest.append(pid)
+        candidates = rest
+    if errors:
+        found.uncertain = True
+    return found
+
+
 def _run_targets_inner(
     run_id: str,
     pgid: Optional[int],
@@ -597,6 +847,10 @@ def _run_targets_inner(
     unknown: Optional[Dict[int, int]],
     errors: List[bool],
 ) -> Dict[int, int]:
+    if sys.platform == "win32":
+        return _run_targets_win(
+            run_id, pgid, wrapper_pid, wrapper_starttime, seen, unknown, errors
+        )
     seen = seen or {}
     me = os.getpid()
     registered = children.registered()
@@ -683,7 +937,7 @@ def _run_targets_inner(
                             and not (tree_root is not None and _outside_tree(pid, info, stats, tree_root))):
                         found.uncertain = True
             env = None
-        if env and env.get("MESH_RUN_ID") == run_id:
+        if env and _env_get_run_id(env) == run_id:
             found[pid] = st
             continue
         is_unknown = _environ_unknown(env, pid, info, young_from)
@@ -755,11 +1009,19 @@ def _targets(t: Termination) -> Dict[int, int]:
     return run_targets(t.run_id, t.pgid, t.wrapper_pid, t.wrapper_starttime, seen)
 
 
-def signal_if_same(pid: int, starttime: int, sig: int) -> bool:
+def signal_if_same(
+    pid: int,
+    starttime: int,
+    sig: int,
+    run_id: Optional[str] = None,
+    home: Optional[str] = None,
+) -> bool:
     """Send ``sig`` to ``pid`` only if it is still the same process (starttime match).
 
     Never signals meshd, pid 1, or a zombie. Returns True if the signal was sent.
     """
+    if sys.platform == "win32":
+        return plat_proc.signal_if_same(pid, starttime, sig, run_id=run_id, home=home)
     if pid <= 1 or pid == os.getpid():
         return False
     try:
@@ -773,6 +1035,17 @@ def signal_if_same(pid: int, starttime: int, sig: int) -> bool:
     except (ProcessLookupError, PermissionError):
         return False
     return True
+
+
+def _signal_target(t: Termination, pid: int, starttime: int, sig: int) -> bool:
+    """Dispatch ``signal_if_same`` passing Win32 run/home metadata only on Windows."""
+    if sys.platform != "win32":
+        return signal_if_same(pid, starttime, sig)
+    home = _win_run_home(t.run_id)
+    try:
+        return signal_if_same(pid, starttime, sig, run_id=t.run_id, home=home)
+    except TypeError:
+        return signal_if_same(pid, starttime, sig)
 
 
 def _filter_live_seen(seen: Optional[Dict[int, int]]) -> Dict[int, int]:
@@ -846,7 +1119,7 @@ def begin(
         if newly_added and phase == "term":
             termed: List[Tuple[int, int]] = []
             for pid, st in newly_added:
-                if signal_if_same(pid, st, signal.SIGTERM):
+                if _signal_target(existing, pid, st, SIGTERM):
                     termed.append((pid, st))
             if termed:
                 with _active_lock:
@@ -863,7 +1136,7 @@ def begin(
     t.initial_pids = sorted(live)
     for pid, st in live.items():
         t.seen[pid] = st
-        if signal_if_same(pid, st, signal.SIGTERM):
+        if _signal_target(t, pid, st, SIGTERM):
             t.signalled_term.add(pid)
     with _active_lock:
         existing = _active.get(run_id)
@@ -904,7 +1177,7 @@ def step(t: Termination) -> str:
     t.empty_scan_at = None
     if t.phase == "term":
         for pid, st in live.items():
-            if pid not in t.signalled_term and signal_if_same(pid, st, signal.SIGTERM):
+            if pid not in t.signalled_term and _signal_target(t, pid, st, SIGTERM):
                 t.signalled_term.add(pid)
         if now >= t.deadline:
             _sigkill_all(t, live)
@@ -913,7 +1186,7 @@ def step(t: Termination) -> str:
         return "pending"
     if t.phase == "kill":
         for pid, st in live.items():
-            if pid not in t.signalled_kill and signal_if_same(pid, st, signal.SIGKILL):
+            if pid not in t.signalled_kill and _signal_target(t, pid, st, SIGKILL):
                 t.signalled_kill.add(pid)
         if now >= t.deadline:
             t.phase = "failed"
@@ -933,6 +1206,22 @@ def step(t: Termination) -> str:
 
 
 def _sigkill_all(t: Termination, live: Dict[int, int]) -> None:
+    if sys.platform == "win32":
+        try:
+            job, should_close, _home = _win_resolve_run_job(t.run_id, terminate=True)
+        except OSError:
+            job, should_close = None, False
+        if job is not None:
+            try:
+                plat_proc.terminate_job(job, 137)
+            except OSError:
+                pass
+            finally:
+                if should_close:
+                    try:
+                        job.close()
+                    except Exception:
+                        pass
     for pid, st in live.items():
-        if signal_if_same(pid, st, signal.SIGKILL):
+        if _signal_target(t, pid, st, SIGKILL):
             t.signalled_kill.add(pid)

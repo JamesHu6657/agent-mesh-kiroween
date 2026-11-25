@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 from mesh.adapters import evidence, smoke_schema
 from tests import tierlib
 from tests.helpers import MeshHarness
-from tests.stubs import create_test_stubs
+from tests.stubs import _write_python_stub, create_test_stubs
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 REAL_KIRO = os.path.join(REPO_ROOT, "tests", "fixtures", "real", "kiro", "3.1.0")
@@ -43,10 +43,11 @@ if tuple(args) in FILES:
     sys.exit(0)
 if args[:2] == ["chat", "--no-interactive"]:
     if {leftover!r}:
-        # a setsid grandchild that outlives the leader (keeps MESH_RUN_ID): §11.3 leftovers branch
+        # a detached grandchild that outlives the leader (keeps MESH_RUN_ID): §11.3 leftovers branch
         import subprocess
-        subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True,
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        kw = {{"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}} if sys.platform == "win32" else {{"start_new_session": True}}
+        subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
     with open({stream!r}, "rb") as fp:
         sys.stdout.buffer.write(fp.read())
     sys.stdout.flush()
@@ -103,14 +104,19 @@ class VendorExitMeaningLaunchTest(unittest.TestCase):
         return resp["data"]["token"]
 
     def _kiro_agent(self, name: str, stream: str, leftover: bool = False) -> None:
-        path = os.path.join(self.tmp, f"bin-{name}", "kiro-cli")
-        os.makedirs(os.path.dirname(path))
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(STUB.format(python=sys.executable, help=os.path.join(REAL_KIRO, "help.txt"),
-                                chat_help=os.path.join(REAL_KIRO, "chat-help.txt"),
-                                models=os.path.join(REAL_KIRO, "list-models.json"), stream=stream,
-                                leftover=leftover))
-        os.chmod(path, 0o755)
+        bdir = os.path.join(self.tmp, f"bin-{name}")
+        path = _write_python_stub(
+            bdir,
+            "kiro-cli",
+            STUB.format(
+                python=sys.executable,
+                help=os.path.join(REAL_KIRO, "help.txt"),
+                chat_help=os.path.join(REAL_KIRO, "chat-help.txt"),
+                models=os.path.join(REAL_KIRO, "list-models.json"),
+                stream=stream,
+                leftover=leftover,
+            ),
+        )
         time.sleep(0.05)  # the probe row must be newer than the binary's mtime
         rc, resp = self.harness.cli("adapter", "probe", "kiro", "--binary", path, user=True)
         self.assertEqual(rc, 0, resp)
@@ -118,9 +124,11 @@ class VendorExitMeaningLaunchTest(unittest.TestCase):
                            "--allowed-model", MODEL, "--default-model", MODEL])
 
     def _run_task(self, assignee: str) -> str:
+        # Windows .cmd stubs cannot receive multiline prompts in argv under readonly.
+        profile = "edit" if sys.platform == "win32" else "readonly"
         rc, resp = self.harness.cli("task", "create", "--project", self.project_id, "--title", "t",
                                     "--spec", "say MESH_SMOKE_OK", "--assignee", assignee,
-                                    "--profile", "readonly", token=self.tok_lead)
+                                    "--profile", profile, token=self.tok_lead)
         self.assertEqual(rc, 0, resp)
         return resp["data"]["id"]
 

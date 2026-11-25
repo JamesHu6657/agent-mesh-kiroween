@@ -2,8 +2,8 @@
 
 Agent Mesh was first built for one person's machine during a hackathon, with strict
 gates while it was under review. For general use some of those gates were removed or
-made configurable. This page lists each one and why. Linux only throughout: macOS and
-Windows are not supported.
+made configurable. This page lists each one and why. Supports Linux and native
+Windows 10/11 (Python 3.12+); macOS is not supported.
 
 ## Removed
 
@@ -20,6 +20,7 @@ Windows are not supported.
 | Setting | Default | Strict value | Why |
 |---|---|---|---|
 | `adapter.evidence_mode` | `"warn"` (strict when meshd runs with `MESH_TESTING=1`) | `"strict"` | Strict mode launches a vendor CLI only when the committed smoke evidence matches the installed version exactly. Other people's CLI versions will rarely match, so by default a failing evidence check is waived and reported as `evidence_warning` in `adapter show`/`probe` and in `mesh doctor`. Not waived in warn mode: adapters on an explicit launch hold, and the hermes/openclaw stubs (no command builder). |
+| `lead.vendor_leads` | `false` (vendor launch leads refused with `vendor_lead_m3_lite`) | `false` (default) | Kept off by default so operators opt in deliberately (`mesh config set lead.vendor_leads true --user`). Once enabled, vendor launch leads follow the same `adapter.evidence_mode` policy as launch workers (`warn` launches with an evidence warning surfaced on `lead.turn_started` and assignment responses; `strict` requires valid matching probe + smoke evidence); launch holds (`devin`), `hermes`/`openclaw` stubs, and `lead.profile` default `readonly` stay enforced. Lead turns do not count against `max_concurrency` or `scheduler.max_total_runs`; at most one turn per project runs at a time via `leadturn:<prj>`. Turning it back to `false` refuses new turns/assignments without stopping an already-running turn. |
 | `mesh doctor` environment checks | — | — | Advisory: platform, Python ≥ 3.11, git, home, daemon, agent CLIs on `PATH`, evidence mode. They add `checks` and `problems` with hints; they never change the `healthy` status. |
 
 ## Kept (not changed)
@@ -31,16 +32,16 @@ Windows are not supported.
 | Scoped run tokens, central authorization, token redaction in captured output | A launched agent can only act on its own task. |
 | Approvals for gated actions (see `docs/usage.md` §3) and the review/merge gate | The human decides; `config`/`agent`/token commands stay direct-user only. |
 | Passphrase lockout window (`auth.lockout_window_s`, 300 s) and lead wake backoff (`lead.wake_backoff_s`, 30/120/600 s) | Changeable only in testing mode. Lockout is brute-force protection; the backoff stops a failing lead from burning model calls. |
-| Vendor CLIs as launch-mode leads refused (`vendor_lead_m3_lite`) | Lead-turn crash recovery does not yet track the lead's process group (process-group tracking is incomplete). Use an inbox lead for vendor agents; the test double can still be a launch lead in testing mode. |
+| Vendor CLIs as launch-mode leads refused by default (`vendor_lead_m3_lite`) | Off unless explicitly opted in via `mesh config set lead.vendor_leads true --user` (passphrase required; direct-user only). Once enabled, launch leads follow `adapter.evidence_mode` via `evidence.effective_launch` identically to workers (`warn` launches with an evidence warning surfaced on `lead.turn_started` and assignment responses; `strict` requires valid probe + smoke evidence; launch holds like `devin` and `hermes`/`openclaw` stubs still refused) with full process-group seen tracking and close-safety gating; lead turns do not count against `max_concurrency` or `scheduler.max_total_runs` and stay at most one per project via `leadturn:<prj>`. Toggling off refuses new vendor turns without stopping a turn already running. |
 | hermes and openclaw cannot launch | Their adapters are stubs (no command builder); `agent create` is refused while the CLI is not installed and launch work is refused otherwise. Connect them as inbox agents. |
 | Unimplemented commands return legacy `NOT_IMPLEMENTED_IN_M1` | The operation is unavailable; internal milestone metadata is diagnostic only. |
 | `fake` adapter only with `MESH_TESTING=1` | It is a test double, not an agent. |
-| Per-agent model/effort allowlists and concurrency caps | User configuration, set per agent at `agent create`; no global limit is imposed. |
-| Linux only | Process supervision reads `/proc` and uses process groups and Unix sockets. |
+| Per-agent model/effort allowlists and concurrency caps | User configuration, set per agent at `agent create` (and optional global `scheduler.max_total_runs`); lead turns do not count against `max_concurrency` or `scheduler.max_total_runs` (at most one per project via `leadturn:<prj>`). |
+| Linux and Windows 10/11 only | Linux uses `/proc`, process groups, `flock`, and Unix sockets; native Windows uses Named Pipes (`\\.\pipe\LOCAL\agent-mesh-...`), Job Objects, Toolhelp/PEB inspection, `LockFileEx`, and NTFS owner-only DACLs. macOS is not supported. |
 
 ## Not a sandbox
 
-Mesh runs meshd and every agent as one Unix user. It is not a security sandbox: a
+Mesh runs meshd and every agent as one OS user (a Unix user on Linux; a local user account on Windows). It is not a security sandbox: a
 launched agent can read and change anything that user can. To run agents you do not
 trust, run Mesh inside a container or VM (see the README, "Running untrusted agents").
 Container-per-agent isolation is future work.

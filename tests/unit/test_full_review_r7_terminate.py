@@ -51,7 +51,7 @@ def _kill(pid):
         pass
 
 
-@unittest.skipUnless(sys.platform.startswith("linux"), "Linux /proc semantics")
+@unittest.skipUnless(sys.platform.startswith("linux"), "Linux PR_SET_CHILD_SUBREAPER, PR_SET_DUMPABLE=0, and /proc/<pid>/environ EACCES semantics")
 class NonDumpableBystanderTest(unittest.TestCase):
     def _scenario(self, bystander_outside: bool, escapee_inside: bool):
         """Returns (uncertain, found) of one run_targets scan done by a subreaper 'meshd'."""

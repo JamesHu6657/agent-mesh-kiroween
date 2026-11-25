@@ -29,6 +29,7 @@ class TestSettingsRegistry(unittest.TestCase):
                 "lead.wake_debounce_s",
                 "lead.profile",
                 "lead.turn_timeout_s",
+                "lead.vendor_leads",
                 "scheduler.max_total_runs",
                 "workspaces.root",
                 "task.default_timeout_s",
@@ -85,6 +86,17 @@ class TestSettingsRegistry(unittest.TestCase):
             # Valid int setting -> returns int
             res = validate_setting("task.default_timeout_s", 600, home)
             self.assertEqual(res, 600)
+
+            # lead.vendor_leads defaults to False and is strict bool (L4)
+            self.assertIs(defaults["lead.vendor_leads"], False)
+            self.assertIs(validate_setting("lead.vendor_leads", True, home), True)
+            self.assertIs(validate_setting("lead.vendor_leads", False, home), False)
+            for bad_bool in ("true", "false", 1, 0, None):
+                with self.subTest(bad_bool=bad_bool):
+                    with self.assertRaises(MeshError) as ctx:
+                        validate_setting("lead.vendor_leads", bad_bool, home)
+                    self.assertEqual(ctx.exception.code, c.INVALID_SETTING)
+                    self.assertEqual(ctx.exception.details["key"], "lead.vendor_leads")
 
             # approval.policy.config is fixed -> trying to set to direct_or_relayed fails
             with self.assertRaises(MeshError) as ctx:

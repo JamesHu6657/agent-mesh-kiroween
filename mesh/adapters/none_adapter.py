@@ -20,6 +20,7 @@ class NoneAdapter(Adapter):
 
     id = "none"
     kind = "none"
+    supported_profiles = ("readonly", "edit", "dev", "elevated", "unrestricted")
     binary_names = []
     planned_version = None
     liveness = "none"

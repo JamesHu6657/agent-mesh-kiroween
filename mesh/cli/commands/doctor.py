@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import sqlite3
+import sys
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import mesh.constants as c
@@ -36,6 +37,7 @@ _KEEP_OWNER_BITS_DIRS = ("workspaces",)
 # production. Stages: "before-open-home" (round 6), "before-chmod", "before-open-dir",
 # "before-verify" (round 6).
 _RACE_HOOK: Optional[Callable[[str, str], None]] = None
+_FIX_PERMS_HOOK: Optional[Callable[[str, str], None]] = None
 
 _O_PATH = getattr(os, "O_PATH", 0)
 
@@ -46,6 +48,8 @@ _NO_FD_CHMOD = "no fd-bound chmod"
 def _hook(stage: str, rel: str) -> None:
     if _RACE_HOOK is not None:
         _RACE_HOOK(stage, rel)
+    if _FIX_PERMS_HOOK is not None:
+        _FIX_PERMS_HOOK(stage, rel)
 
 
 def _ident(st: os.stat_result) -> Tuple[int, int]:
@@ -336,7 +340,7 @@ def _verify_repaired(home_dir: str, report: _FixReport) -> None:
             report.unsafe.append({"path": rel, "reason": "changed after repair (not found again)"})
 
 
-def _fix_perms(home_dir: str, expected: Optional[Tuple[int, int]] = None) -> _FixReport:
+def _fix_perms(home_dir: str, expected: Optional[Tuple[int, int]] = None) -> Any:
     """mesh doctor --fix-perms (plan §5.1): 0700 on directories, 0600 on files.
 
     Only the home itself and the files/directories `mesh init` creates in it
@@ -352,6 +356,16 @@ def _fix_perms(home_dir: str, expected: Optional[Tuple[int, int]] = None) -> _Fi
     skipped; there is no by-name chmod fallback; every repaired path is re-verified
     after the walk (report.unsafe). Returns the report.
     """
+    if sys.platform == "win32":
+        from mesh.platform.doctor_perms_win import fix_home_permissions
+
+        return fix_home_permissions(
+            home_dir,
+            expected=expected,
+            hook=_hook,
+            known_files=_KNOWN_FILES,
+            known_dirs=_KNOWN_DIRS,
+        )
     uid = os.getuid()
     report = _FixReport()
     _hook("before-open-home", ".")
@@ -405,6 +419,10 @@ def _fix_perms(home_dir: str, expected: Optional[Tuple[int, int]] = None) -> _Fi
 
 def _home_identity(home_dir: str) -> Optional[Tuple[int, int]]:
     """(dev, ino) of the resolved home at precheck time (round 6); None if absent."""
+    if sys.platform == "win32":
+        from mesh.platform.doctor_perms_win import home_identity_win
+
+        return home_identity_win(home_dir)
     try:
         return _ident(os.lstat(home_dir))
     except OSError:

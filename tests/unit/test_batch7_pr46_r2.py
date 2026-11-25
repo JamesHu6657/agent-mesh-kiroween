@@ -65,6 +65,9 @@ class TestPr46R2Finding1JsonNullAndDefaults(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="mh-pr46r2-f1-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        if os.name == "nt":
+            from mesh.platform import perms
+            perms.set_private_dir_acl(self.tmp, 0o700)
         self.home = os.path.join(self.tmp, "home")
         os.makedirs(self.home, mode=0o700)
 
@@ -215,6 +218,9 @@ class TestPr46R2Finding2OnboardExpiresInPrecheck(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="mh-pr46r2-f2-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        if os.name == "nt":
+            from mesh.platform import perms
+            perms.set_private_dir_acl(self.tmp, 0o700)
         self.home = os.path.join(self.tmp, "home")
         self.tok_dir = os.path.join(self.tmp, "tok")
         os.makedirs(self.home, mode=0o700)
@@ -420,9 +426,9 @@ class TestPr46R2SameClassAudit(unittest.TestCase):
             return SimpleNamespace(**d)
 
         with mock.patch.object(agent_cli, "MeshClient", _CapClient):
-            # Omitted manually -> still defaults to edit / dev
+            # Omitted manually -> CLI omits default_profile so meshd applies adapter-aware safe default
             agent_cli.handle_agent_create(_base_ns())
-            self.assertEqual(sent[-1]["default_profile"], "edit")
+            self.assertNotIn("default_profile", sent[-1])
             self.assertEqual(sent[-1]["max_unapproved_profile"], "dev")
 
             # Empty / JSON null must be preserved so daemon rejects

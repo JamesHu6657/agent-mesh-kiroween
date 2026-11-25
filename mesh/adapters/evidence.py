@@ -9,7 +9,9 @@ A vendor adapter may launch only when committed smoke evidence matches what is i
   version V;
 * the latest results file for the adapter (Q4 ordering) is at version V;
 * ``smoke_schema.validate`` is clean against the matching fixture root and the results file
-  has a valid sidecar;
+  has a valid sidecar (the per-adapter rules are the schema's: the smoke profile, ``readonly``
+  except devin's ``unrestricted``; the stdout capture name, ``.jsonl`` except devin's
+  plain-text ``.txt``; no ``pass`` for a case the adapter cannot support);
 * every ``smoke_schema.LAUNCH_CASES`` case (S-X-1, S-X-6) is ``pass``.
 
 Reasons when not: ``no_probe_version``, ``no_smoke_evidence``, ``evidence_stale``,
@@ -43,7 +45,7 @@ import os
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import mesh
 from mesh.adapters import smoke_schema
@@ -54,10 +56,11 @@ HOLD_ENV = "MESH_TEST_LAUNCH_HOLD"
 REASONS = ("no_probe_version", "no_smoke_evidence", "evidence_stale", "evidence_invalid", "launch_cases_failed",
            "launch_held")
 #: L11: vendor adapters whose launch stays off whatever the evidence says -> milestone that lifts it.
-#: kiro left at M4 (N13 passed, m4-kiro-n13). devin: held until it has real smoke evidence; its
-#: plain-text output has no smoke fixture path yet. Only unrestricted is mapped: readonly and
-#: edit are unsupported because a skill loaded during the run grants it a shell (measured
-#: 2026-11-19, docs/adapters-devin.md).
+#: kiro left at M4 (N13 passed, m4-kiro-n13). devin: held until M5. The smoke tier captures
+#: its plain-text output (``smoke-<case>-stdout.txt``, smoke_schema.PLAIN_STDOUT_ADAPTERS); the
+#: committed 2026-11-19 results pass S-X-1 and S-X-6 and do not lift the hold. Only unrestricted
+#: is mapped: readonly and edit are unsupported because a skill loaded during the run grants it
+#: a shell (measured 2026-11-19, docs/adapters-devin.md).
 LAUNCH_HOLDS: Dict[str, str] = {"devin": "M5"}
 REPO_ROOT = Path(mesh.__file__).resolve().parents[1]
 #: Productize: a checkout holding tests/smoke/results and tests/fixtures/real, for installs
@@ -93,7 +96,7 @@ class Evidence:
         if not self.results_path:
             return None
         try:
-            return str(Path(self.results_path).resolve().relative_to(REPO_ROOT))
+            return Path(self.results_path).resolve().relative_to(REPO_ROOT).as_posix()
         except ValueError:
             return self.results_path
 
@@ -257,6 +260,130 @@ def effective_launch(conn: Optional[sqlite3.Connection], adapter, testing_mode: 
     return ev
 
 
+_UNSET = object()
+
+
+class LaunchInputsSignature(NamedTuple):
+    """Cached stat/DB inputs consumed by :func:`effective_launch`."""
+
+    signature: Tuple[Any, ...]
+    results_path: Optional[str]
+    fixture_paths: Tuple[str, ...]
+
+
+def _stat_sig(path: Optional[str]) -> Optional[Tuple[int, int]]:
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _referenced_fixture_paths(
+    results_path: Optional[str],
+    expected_adapter: str,
+    testing_mode: bool,
+    env: Optional[Dict[str, str]] = None,
+) -> Tuple[str, ...]:
+    """Return fixture (+ sidecar) paths referenced by ``results_path``."""
+    if not results_path:
+        return ()
+    try:
+        with open(results_path, "rb") as f:
+            doc = json.loads(f.read().decode("utf-8"))
+    except (OSError, ValueError):
+        return ()
+    if not isinstance(doc, dict):
+        return ()
+    adapter_id = doc.get("adapter")
+    version = doc.get("version")
+    cases = doc.get("cases")
+    if (
+        not isinstance(adapter_id, str)
+        or adapter_id != expected_adapter
+        or not isinstance(version, str)
+        or not isinstance(cases, list)
+    ):
+        return ()
+    froot = fixture_root(testing_mode, env)
+    root = str(froot) if froot else os.path.join(os.path.abspath(str(evidence_root(env))), "tests", "fixtures", "real")
+    out: List[str] = []
+    for case in cases:
+        if not isinstance(case, dict):
+            continue
+        fx = case.get("fixture")
+        if not isinstance(fx, str) or not fx.startswith(smoke_schema.FIXTURE_PREFIX):
+            continue
+        parts = fx.split("/")
+        if len(parts) == 6 and parts[3] == adapter_id and parts[4] == version and parts[5] not in ("", ".", ".."):
+            fpath = os.path.join(root, adapter_id, version, parts[5])
+            out.append(fpath)
+            out.append(f"{fpath}{smoke_schema.SIDECAR_SUFFIX}")
+    return tuple(sorted(set(out)))
+
+
+def launch_inputs_signature(
+    conn: Optional[sqlite3.Connection],
+    adapter,
+    testing_mode: bool,
+    binary_path: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
+    *,
+    known_paths: Any = _UNSET,
+) -> LaunchInputsSignature:
+    """Snapshot all inputs evaluated by :func:`effective_launch` without re-validating JSON/hashes."""
+    src_env = env if env is not None else os.environ
+    binary = _binary_for(adapter, binary_path)
+    probe = latest_probe(conn, adapter.id, binary)
+    probed_version = probe[0]
+    ev_mode = evidence_mode(conn, testing_mode)
+    holds = tuple(sorted(effective_holds(testing_mode, env).items()))
+    rdir = results_dir(testing_mode, env)
+    rdir_str = str(rdir) if rdir else None
+    froot = fixture_root(testing_mode, env)
+    froot_str = str(froot) if froot else None
+    env_sig = (
+        src_env.get(OVERRIDE_ENV),
+        src_env.get(EVIDENCE_ROOT_ENV),
+        src_env.get(HOLD_ENV),
+        src_env.get(UNHOLD_ENV),
+    )
+    if known_paths is _UNSET:
+        rpath: Optional[str] = None
+        if rdir:
+            try:
+                rpath = smoke_schema.load_latest(str(rdir), adapter.id, probed_version)
+            except OSError:
+                rpath = None
+        fpaths = _referenced_fixture_paths(rpath, adapter.id, testing_mode, env)
+    else:
+        rpath, fpaths = known_paths
+    fixture_stats = tuple((p, _stat_sig(p)) for p in fpaths)
+    sig = (
+        getattr(adapter, "kind", "vendor"),
+        adapter.id,
+        f"{type(adapter).__module__}.{type(adapter).__qualname__}",
+        bool(getattr(adapter, "implemented", True)),
+        bool(testing_mode),
+        binary or "",
+        _stat_sig(binary),
+        probe,
+        ev_mode,
+        holds,
+        env_sig,
+        rdir_str,
+        _stat_sig(rdir_str),
+        froot_str,
+        rpath,
+        _stat_sig(rpath),
+        _stat_sig(f"{rpath}{smoke_schema.SIDECAR_SUFFIX}") if rpath else None,
+        fixture_stats,
+    )
+    return LaunchInputsSignature(signature=sig, results_path=rpath, fixture_paths=fpaths)
+
+
 def evidence_mode(conn: Optional[sqlite3.Connection], testing_mode: bool) -> str:
     """``adapter.evidence_mode``: ``warn`` (default outside testing mode) or ``strict``."""
     default = "strict" if testing_mode else "warn"
@@ -330,9 +457,10 @@ def apply_hold(ev: Evidence, adapter_id: str, testing_mode: bool,
 def launch_allowed(conn: Optional[sqlite3.Connection], adapter_id: str, testing_mode: bool,
                    binary_path: Optional[str] = None) -> Evidence:
     """By adapter id, for callers without an adapter instance. The result is falsy unless
-    launch is allowed. The lead path (``lead_launch_check``) should call
-    :func:`effective_launch` with the lead agent's own ``binary_path`` and raise
-    ``AdapterUnsupported(..., reason=ev.reason)``; D4's vendor code gate still applies on top."""
+    launch is allowed. The lead path (``lead_launch_check``) checks ``lead.vendor_leads``
+    (off by default as ``vendor_lead_m3_lite``) and calls :func:`effective_launch` with the
+    lead agent's own ``binary_path`` under the same ``adapter.evidence_mode`` policy as
+    executors."""
     from mesh.adapters.registry import get_adapter
 
     return effective_launch(conn, get_adapter(adapter_id, testing_mode=testing_mode), testing_mode, binary_path)
@@ -352,6 +480,10 @@ def apply_to_probe(data: Dict[str, Any], adapter, ev: Evidence) -> Dict[str, Any
         cap.setdefault("verified_version", None)
         cap.setdefault("results_file", None)
         if not vendor or not ev.results_path:
+            continue
+        if cap.get("supported") == "no":
+            # A capability the adapter does not have is never smoke-verified or stale: devin's
+            # S-X-1 (headless, plain-text stdout) says nothing about its stream_output "no".
             continue
         mapped = smoke_schema.cases_for_capability(name)
         passed = [cid for cid in mapped if (ev.cases.get(cid) or {}).get("status") == "pass"]

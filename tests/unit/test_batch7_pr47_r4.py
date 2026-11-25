@@ -8,7 +8,6 @@ P3:   the no-/proc ps fallback must use POSIX `ps -A` (BSD `ps -e` lists environ
 """
 
 import ctypes
-import fcntl
 import json
 import os
 import signal
@@ -17,6 +16,11 @@ import sys
 import tempfile
 import time
 import unittest
+
+if sys.platform != "win32":
+    import fcntl
+else:
+    fcntl = None  # type: ignore[assignment]
 
 from tests.unit.test_inbox_worker_kit import SCRIPT as WORKER_SCRIPT, STUB as WORKER_STUB
 
@@ -85,6 +89,7 @@ def _run_until(proc, timeout):
         return True, err
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash + scripts/coord/* + os.fork/killpg test")
 class TestPR47R4(unittest.TestCase):
     def test_reused_pid_after_reap_is_never_signalled_and_no_spin(self):
         with tempfile.TemporaryDirectory(prefix="mh-pr47r4-reuse-") as tmp:

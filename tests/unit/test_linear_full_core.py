@@ -7,6 +7,7 @@ A3 deliver: a concurrent switch of the base worktree never advances another bran
 A5 I3 grandfathering counts leases acquired while the global cap was unlimited (NULL).
 (A4 is covered in tests/integration/test_linear_full_core.py.)"""
 
+import sys
 import json
 import os
 import sqlite3
@@ -33,6 +34,9 @@ class TestWorkspacesRootNormalForm(unittest.TestCase):
         os.makedirs(self.home, mode=0o700)
         self.ws = os.path.join(self.base, "ws")
         os.makedirs(self.ws, mode=0o700)
+        if sys.platform == "win32":
+            from mesh.platform import perms as plat_perms
+            plat_perms.set_private_dir_acl(self.ws, 0o700)
         self.install = os.path.join(self.base, "install")
         os.makedirs(self.install, mode=0o700)
 
@@ -49,9 +53,15 @@ class TestWorkspacesRootNormalForm(unittest.TestCase):
         outside = os.path.join(self.base, "outside")
         os.makedirs(os.path.join(outside, "child"), mode=0o700)
         os.chmod(outside, 0o700)
-        os.symlink(os.path.join(outside, "child"), os.path.join(self.install, "link"))
-        for val in (os.path.join(self.install, "link") + "/..", self.ws + "/", self.ws + "/.",
-                    self.ws.replace("/ws", "//ws"), self.ws + " ", " " + self.ws,
+        link_path = os.path.join(self.install, "link")
+        if sys.platform == "win32":
+            import _winapi
+            _winapi.CreateJunction(os.path.join(outside, "child"), link_path)
+        else:
+            os.symlink(os.path.join(outside, "child"), link_path)
+        sep = os.sep
+        for val in (link_path + sep + "..", self.ws + sep, self.ws + sep + ".",
+                    self.ws.replace(sep + "ws", (sep * 2) + "ws"), self.ws + " ", " " + self.ws,
                     os.path.join(self.ws, "..", "ws")):
             with self.subTest(val=val):
                 with self.assertRaises(MeshError) as cm:

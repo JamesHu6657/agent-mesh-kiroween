@@ -10,6 +10,7 @@ ACC: K14 (R8), plus the P5 reading "project cancel blocks while a task is mergin
 
 import json
 import os
+import sys
 import threading
 import time
 import unittest
@@ -19,7 +20,7 @@ import mesh.constants as c
 from mesh.daemon import terminate
 from tests.integration import test_merge as tm
 
-SLOW_TESTS = '["python3","-c","import time; time.sleep(20)"]'
+SLOW_TESTS = json.dumps([sys.executable, "-c", "import time; time.sleep(20)"])
 
 
 class TestRecoveryMerge(unittest.TestCase):
@@ -159,7 +160,7 @@ class TestRecoveryMerge(unittest.TestCase):
 
     def test_k14_crash_after_merge_commit_reconciled(self) -> None:
         """ACC: K14, I9 - meshd killed after the merge commit and before T15; restart reconciles to merged (reconciled:true, tests passed); doctor clean; a second recovery adds nothing."""
-        repo, prj = self.make_project("RB", test_command='["python3","-c","pass"]')
+        repo, prj = self.make_project("RB", test_command=json.dumps([sys.executable, "-c", "pass"]))
         self.repo = repo
         self.remote_before = self.fixture.remote_refs(repo)
         tsk, _ = self.accepted_task(prj, "Commit then crash", "crash.txt", "crash\n")

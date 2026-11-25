@@ -6,6 +6,7 @@ Uncertain item: pre-upgrade runs with a plain stored session still match; redact
 get the pre_upgrade hint (against a real meta table, no digest row).
 """
 
+import sys
 import hashlib
 import json
 import os
@@ -33,6 +34,7 @@ def _grep(lines):
     return [l for l in out.splitlines() if l]
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash + scripts/coord/secret-pattern.sh + grep -E test")
 class TestGenericApiKeyPattern(unittest.TestCase):
     # Built at runtime so this file itself never matches the pattern.
     EQ = "="
@@ -105,6 +107,7 @@ class TestStartReplayRule(unittest.TestCase):
                                                  self._hash({"task_id": "t", "session": "ses_x"}), "{}"))
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "Linux /proc and sshd bystander UID checks")
 class TestSshdVariants(unittest.TestCase):
     """candidate (us, young) -> parent (root) -> grandparent (listener, or PID 1)."""
 

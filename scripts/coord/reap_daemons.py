@@ -6,18 +6,38 @@ adhoc test process's PID/starttime) protects live suites, regardless of age.
 """
 import argparse
 import errno
-import fcntl
 import json
+import ntpath
 import os
 import re
-import select
 import signal
 import stat
 import sys
 import tempfile
 import time
 
-DEFAULT_REGISTRY = "/tmp/mesh-test-daemons"
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+if sys.platform != "win32":
+    import fcntl
+    import select
+else:
+    fcntl = None  # type: ignore[assignment]
+    select = None  # type: ignore[assignment]
+
+from mesh.platform import fs as plat_fs
+from mesh.platform import locks as plat_locks
+from mesh.platform import paths as plat_paths
+from mesh.platform import perms as plat_perms
+from mesh.platform import proc as plat_proc
+
+DEFAULT_REGISTRY = (
+    "/tmp/mesh-test-daemons"
+    if sys.platform != "win32"
+    else os.path.join(plat_paths.temp_root(), "mesh-test-daemons")
+)
 # Unlocked suite lock files older than this are leftovers of finished suites.
 STALE_LOCK_SECONDS = 3600
 
@@ -27,10 +47,30 @@ def log(message):
 
 
 def registry_dir():
-    return os.environ.get("MESH_TEST_DAEMON_REGISTRY", DEFAULT_REGISTRY)
+    default = (
+        DEFAULT_REGISTRY
+        if sys.platform != "win32"
+        else os.path.join(plat_paths.temp_root(), "mesh-test-daemons")
+    )
+    return os.environ.get("MESH_TEST_DAEMON_REGISTRY", default)
 
 
 def prepare_registry(directory):
+    if sys.platform == "win32":
+        if plat_paths.is_reparse_link(directory):
+            raise ValueError("registry must be a non-symlink directory")
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        try:
+            plat_perms.verify_owner_and_set_private_dir_acl_win(directory, 0o700)
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise ValueError("registry must be a non-symlink directory") from exc
+            raise
+        except ValueError as exc:
+            if "not owned" in str(exc):
+                raise ValueError("registry is not owned by this user") from exc
+            raise
+        return
     os.makedirs(directory, mode=0o700, exist_ok=True)
     if not stat.S_ISDIR(os.lstat(directory).st_mode):
         raise ValueError("registry must be a non-symlink directory")
@@ -71,6 +111,11 @@ def _tgid_has_live_sibling(pid, raw_stat):
 
 
 def process_stat(pid):
+    if sys.platform == "win32":
+        info = plat_proc.get_proc_stat(pid)
+        if info is None:
+            raise FileNotFoundError(errno.ESRCH, f"No such process: {pid}")
+        return str(info.get("state") or "R"), int(info["starttime"])
     with open(f"/proc/{pid}/stat", encoding="utf-8") as stream:
         raw = stream.read()
     state, starttime = parse_stat(raw)
@@ -80,6 +125,24 @@ def process_stat(pid):
 
 
 def valid_home(home):
+    if sys.platform == "win32":
+        if not isinstance(home, str) or not home or "\x00" in home:
+            return False
+        if "/" in home or plat_paths.has_traversal_segment(home):
+            return False
+        try:
+            real = os.path.realpath(home)
+        except OSError:
+            return False
+        tmp_root = plat_paths.temp_root()
+        base = ntpath.basename(real)
+        return (
+            plat_paths.norm_cmp(home) == plat_paths.norm_cmp(real)
+            and plat_paths.norm_cmp(ntpath.dirname(real)) == plat_paths.norm_cmp(tmp_root)
+            and base.startswith("mh-")
+            and len(base) > 3
+            and not plat_paths.is_reparse_link(home)
+        )
     return (isinstance(home, str) and home == os.path.realpath(home)
             and os.path.dirname(home) == "/tmp"
             and os.path.basename(home).startswith("mh-")
@@ -128,7 +191,11 @@ def register_daemon(pid, home):
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump(record, stream)
         path = os.path.join(directory, record_name(record))
-        os.replace(temporary, path)
+        if sys.platform == "win32":
+            plat_perms.set_private_file_acl(temporary, 0o600)
+            plat_fs.atomic_replace_win(temporary, path, replace_fn=os.replace)
+        else:
+            os.replace(temporary, path)
         return path, record
     except Exception as exc:
         log(f"registration_failed pid={pid}: {exc}")
@@ -167,6 +234,37 @@ def suite_alive(record, directory):
             return False
         except OSError:
             return True
+    if sys.platform == "win32":
+        path = os.path.join(directory, f"suite-{suite}.lock")
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return False
+        if plat_paths.is_reparse_stat(st) or not stat.S_ISREG(st.st_mode):
+            raise ValueError("suite lock must be a non-symlink regular file")
+        try:
+            fd = plat_fs.open_regular_nofollow(path, os.O_RDWR, label="suite lock")
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.EINVAL):
+                raise ValueError("suite lock must be a non-symlink regular file") from exc
+            raise
+        acquired = False
+        try:
+            try:
+                plat_locks.acquire_lock(fd, exclusive=True, blocking=False)
+                acquired = True
+            except BlockingIOError:
+                return True
+            return False
+        finally:
+            if acquired:
+                try:
+                    plat_locks.release_lock(fd)
+                except OSError:
+                    pass
+            os.close(fd)
     try:
         path = os.path.join(directory, f"suite-{suite}.lock")
         if not stat.S_ISREG(os.lstat(path).st_mode):
@@ -197,7 +295,90 @@ def decision(record, current_stat, home_exists, owner_alive):
     return "dead_suite" if home_exists else "home_gone"
 
 
+def _open_pidfd_win(pid, *, k32=None, get_last_error_fn=None):
+    """Open a handle-pinned Win32 process handle and read CreationTime after pinning."""
+    from mesh.platform import _win32, _win32_ctypes as w32
+
+    if int(pid) <= 0:
+        return None, None
+    dll_k32 = k32 if k32 is not None else w32.get_kernel32()
+    err_fn = get_last_error_fn if get_last_error_fn is not None else w32.get_last_error
+    access = w32.SYNCHRONIZE | w32.PROCESS_TERMINATE | w32.PROCESS_QUERY_LIMITED_INFORMATION
+    handle = dll_k32.OpenProcess(access, False, int(pid))
+    if w32.is_null_or_invalid_handle(handle):
+        err = err_fn()
+        if err == w32.ERROR_INVALID_PARAMETER:
+            return None, None
+        raise _win32._win_proc_error(err)
+    try:
+        if not _win32._is_handle_alive_win(handle, k32=dll_k32, err_fn=err_fn):
+            dll_k32.CloseHandle(handle)
+            return None, None
+        ct = _win32._get_handle_creation_time_win(handle, k32=dll_k32, err_fn=err_fn)
+        if not _win32._is_handle_alive_win(handle, k32=dll_k32, err_fn=err_fn):
+            dll_k32.CloseHandle(handle)
+            return None, None
+        return int(handle), ("R", ct)
+    except BaseException:
+        dll_k32.CloseHandle(handle)
+        raise
+
+
+def _wait_pidfd_win(handle, seconds, *, k32=None, get_last_error_fn=None):
+    from mesh.platform import _win32, _win32_ctypes as w32
+
+    dll_k32 = k32 if k32 is not None else w32.get_kernel32()
+    err_fn = get_last_error_fn if get_last_error_fn is not None else w32.get_last_error
+    timeout_ms = min(0xFFFFFFFE, max(0, int(seconds * 1000)))
+    rc = int(dll_k32.WaitForSingleObject(handle, timeout_ms))
+    if rc == w32.WAIT_OBJECT_0:
+        return True
+    if rc == w32.WAIT_TIMEOUT:
+        return False
+    if rc == w32.WAIT_FAILED:
+        raise _win32._win_proc_error(err_fn())
+    raise OSError(errno.EIO, f"WaitForSingleObject returned unexpected status {rc:#x}")
+
+
+def _stop_pidfd_win(handle, term_timeout, kill_timeout, *, k32=None, get_last_error_fn=None):
+    from mesh.platform import _win32, _win32_ctypes as w32
+
+    dll_k32 = k32 if k32 is not None else w32.get_kernel32()
+    err_fn = get_last_error_fn if get_last_error_fn is not None else w32.get_last_error
+    if _wait_pidfd_win(handle, 0, k32=dll_k32, get_last_error_fn=err_fn):
+        return "gone"
+    if not dll_k32.TerminateProcess(handle, 15):
+        err = err_fn()
+        if _wait_pidfd_win(handle, 0, k32=dll_k32, get_last_error_fn=err_fn):
+            return "gone"
+        raise _win32._win_proc_error(err)
+    if _wait_pidfd_win(handle, term_timeout, k32=dll_k32, get_last_error_fn=err_fn):
+        return "terminated"
+    if not dll_k32.TerminateProcess(handle, 137):
+        err = err_fn()
+        if _wait_pidfd_win(handle, 0, k32=dll_k32, get_last_error_fn=err_fn):
+            return "killed"
+        raise _win32._win_proc_error(err)
+    return "killed" if _wait_pidfd_win(handle, kill_timeout, k32=dll_k32, get_last_error_fn=err_fn) else "still_running"
+
+
+def _close_pidfd_win(handle, *, k32=None):
+    from mesh.platform import _win32_ctypes as w32
+
+    dll_k32 = k32 if k32 is not None else w32.get_kernel32()
+    dll_k32.CloseHandle(handle)
+
+
+def _close_pidfd(fd):
+    if sys.platform == "win32":
+        _close_pidfd_win(fd)
+        return
+    os.close(fd)
+
+
 def wait_pidfd(fd, seconds):
+    if sys.platform == "win32":
+        return _wait_pidfd_win(fd, seconds)
     poller = select.poll()
     poller.register(fd, select.POLLIN)
     return bool(poller.poll(max(0, int(seconds * 1000))))
@@ -205,6 +386,8 @@ def wait_pidfd(fd, seconds):
 
 def stop_pidfd(fd, term_timeout, kill_timeout):
     """All signals and exit checks stay bound to the originally opened process."""
+    if sys.platform == "win32":
+        return _stop_pidfd_win(fd, term_timeout, kill_timeout)
     try:
         signal.pidfd_send_signal(fd, signal.SIGTERM)
         if wait_pidfd(fd, term_timeout):
@@ -221,6 +404,8 @@ def open_pidfd(pid):
     EINVAL means the number now names a non-leader thread: not our daemon, so it
     is reported as a reused identity (stat ("?", 0) never matches a starttime).
     """
+    if sys.platform == "win32":
+        return _open_pidfd_win(pid)
     fd = None
     try:
         fd = os.pidfd_open(pid)
@@ -247,6 +432,23 @@ def _canonical(raw):
     target's, so the same relative string could name a different home there
     (Linear r7d4 MAJOR). Harness homes are always absolute, so relative = no match.
     """
+    if sys.platform == "win32":
+        try:
+            decoded = os.fsdecode(raw)
+        except ValueError:
+            return None
+        drive, rest = ntpath.splitdrive(decoded)
+        if not drive or not (
+            rest.startswith("\\")
+            or rest.startswith("/")
+            or drive.startswith("\\\\")
+            or drive.startswith("//")
+        ):
+            return None
+        try:
+            return os.fsencode(plat_paths.norm_cmp_win(os.path.realpath(decoded)))
+        except (ValueError, OSError):
+            return None
     if not raw.startswith(b"/"):
         return None
     try:
@@ -264,6 +466,7 @@ _HOME_ABBREVS = (b"--ho", b"--hom")  # argparse allow_abbrev: unique prefixes of
 # Anything else (-X/-W/-c/-O/combined/unknown) makes the argv boundary uncertain.
 _INTERPRETER_FLAGS = frozenset((b"-P", b"-s", b"-u", b"-E", b"-I", b"-B"))
 _INTERPRETER_NAME = re.compile(rb"python(3(\.[0-9]+)?)?\Z")
+_WIN_INTERPRETER_NAME = re.compile(rb"(?i:python(3(\.[0-9]+)?)?(?:\.exe)?)\Z")
 
 
 def mesh_args(argv):
@@ -272,7 +475,10 @@ def mesh_args(argv):
     option values such as ``-X --home=A`` must never be read as mesh options)."""
     if argv and argv[-1] == b"":
         argv = argv[:-1]  # /proc cmdline ends with a NUL
-    if not argv or not _INTERPRETER_NAME.match(os.path.basename(argv[0])):
+    if sys.platform == "win32":
+        if not argv or not _WIN_INTERPRETER_NAME.match(ntpath.basename(argv[0])):
+            return None
+    elif not argv or not _INTERPRETER_NAME.match(os.path.basename(argv[0])):
         return None
     index = 1
     while index < len(argv) and argv[index] in _INTERPRETER_FLAGS:
@@ -326,7 +532,14 @@ def effective_home(argv, environ):
     if values:
         canon = {_canonical(value) for value in values}
         return canon.pop() if len(canon) == 1 else None
-    env_values = {entry[10:] for entry in environ if entry.startswith(b"MESH_HOME=")}
+    if sys.platform == "win32":
+        env_values = set()
+        for entry in environ:
+            key, sep, val = entry.partition(b"=")
+            if sep and key.upper() == b"MESH_HOME":
+                env_values.add(val)
+    else:
+        env_values = {entry[10:] for entry in environ if entry.startswith(b"MESH_HOME=")}
     if len(env_values) != 1:
         return None
     return _canonical(env_values.pop())
@@ -405,6 +618,19 @@ def home_matches(pid, home):
     Whole values are compared after canonicalisation, so /tmp/mh-abc-other never
     matches /tmp/mh-abc. Relative or ambiguous values never match.
     """
+    if sys.platform == "win32":
+        try:
+            argv_strs = plat_proc.get_proc_cmdline(pid)
+            env_dict = plat_proc.get_proc_environ(pid)
+            if argv_strs is None or env_dict is None:
+                return False
+            argv = [os.fsencode(a) for a in argv_strs]
+            environ = [os.fsencode(f"{k}={v}") for k, v in env_dict.items()]
+            want = os.fsencode(plat_paths.norm_cmp(os.path.realpath(home)))
+            got = effective_home(argv, environ)
+            return got is not None and got == want
+        except OSError:
+            return False
     try:
         argv = _read_proc_file(pid, "cmdline").split(b"\0")
         environ = _read_proc_file(pid, "environ").split(b"\0")
@@ -425,6 +651,17 @@ def valid_token(token):
 
 def token_matches(pid, token):
     """True if pid's environ holds exactly ``MESH_TEST_HARNESS_TOKEN=<token>``."""
+    if sys.platform == "win32":
+        try:
+            env_dict = plat_proc.get_proc_environ(pid)
+            if env_dict is None:
+                return False
+            for k, v in env_dict.items():
+                if k.upper() == HARNESS_TOKEN_VAR and v == token:
+                    return True
+            return False
+        except OSError:
+            return False
     want = f"{HARNESS_TOKEN_VAR}={token}".encode()
     try:
         return want in _read_proc_file(pid, "environ").split(b"\0")
@@ -451,7 +688,7 @@ def stop_verified(pid, starttime, home, term_timeout=5.0, kill_timeout=5.0):
         return stop_pidfd(fd, term_timeout, kill_timeout)
     finally:
         if fd is not None:
-            os.close(fd)
+            _close_pidfd(fd)
 
 
 def stop_verified_token(pid, token, home, term_timeout=5.0, kill_timeout=5.0):
@@ -487,7 +724,7 @@ def stop_verified_token(pid, token, home, term_timeout=5.0, kill_timeout=5.0):
         return stop_pidfd(fd, term_timeout, kill_timeout)
     finally:
         if fd is not None:
-            os.close(fd)
+            _close_pidfd(fd)
 
 
 def remove_record(path, record):
@@ -516,7 +753,7 @@ def reap_record(path, record, directory, term_timeout, kill_timeout, dry_run):
             remove_record(path, record)
     finally:
         if fd is not None:
-            os.close(fd)
+            _close_pidfd(fd)
 
 
 def prune_stale_locks(directory, max_age=None):
@@ -531,6 +768,43 @@ def prune_stale_locks(directory, max_age=None):
         if not (name.startswith("suite-") and name.endswith(".lock")):
             continue
         path = os.path.join(directory, name)
+        if sys.platform == "win32":
+            try:
+                info = os.lstat(path)
+                if (
+                    plat_paths.is_reparse_stat(info)
+                    or not stat.S_ISREG(info.st_mode)
+                    or time.time() - info.st_mtime < max_age
+                ):
+                    continue
+                fd = plat_fs.open_regular_nofollow(path, os.O_RDWR, label="suite lock")
+            except OSError:
+                continue
+            acquired = False
+            try:
+                try:
+                    plat_locks.acquire_lock(fd, exclusive=True, blocking=False)
+                    acquired = True
+                except BlockingIOError:
+                    continue
+                held = os.fstat(fd)
+                current = os.lstat(path)
+                if (
+                    not plat_paths.is_reparse_stat(current)
+                    and (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
+                ):
+                    os.unlink(path)
+                    log(f"pruned_lock {name}")
+            except OSError as exc:
+                log(f"lock_prune_failed {name}: {exc}")
+            finally:
+                if acquired:
+                    try:
+                        plat_locks.release_lock(fd)
+                    except OSError:
+                        pass
+                os.close(fd)
+            continue
         try:
             info = os.lstat(path)
             if not stat.S_ISREG(info.st_mode) or time.time() - info.st_mtime < max_age:
@@ -572,9 +846,13 @@ def main(argv=None):
         for name in paths:
             path = os.path.join(args.registry, name)
             try:
-                if not stat.S_ISREG(os.lstat(path).st_mode):
+                st = os.lstat(path)
+                if plat_paths.is_reparse_stat(st) or not stat.S_ISREG(st.st_mode):
                     raise ValueError("record must be a non-symlink regular file")
-                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                if sys.platform == "win32":
+                    fd = plat_fs.open_regular_nofollow(path, os.O_RDONLY, label="record file")
+                else:
+                    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
                 with os.fdopen(fd, encoding="utf-8") as stream:
                     if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                         raise ValueError("record is not a regular file")

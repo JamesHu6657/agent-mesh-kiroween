@@ -1,5 +1,6 @@
 """Unit regression tests for batch7 PR #46 round-1 review findings."""
 
+import sys
 import argparse
 import io
 import json
@@ -358,7 +359,9 @@ class TestPr46R1Finding3SymlinkAndEvidence(unittest.TestCase):
             ))
 
     def test_load_evidence_under_symlinked_tmp_succeeds(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="mh-pr46-f3-", dir="/tmp") as stage:
+        from mesh.platform.paths import temp_root
+        t_root = temp_root()
+        with tempfile.TemporaryDirectory(prefix="mh-pr46-f3-", dir=t_root) as stage:
             fx_rel = "droid/1.6.0/smoke-S-X-1-stdout.jsonl"
             fx_bytes = b'{"ok": true}\n'
             tierlib.write_capture(stage, fx_rel, fx_bytes, ["droid"])
@@ -393,18 +396,23 @@ class TestPr46R1Finding3SymlinkAndEvidence(unittest.TestCase):
             }
             tierlib.write_capture(stage, "results/droid-1.6.0-2026-11-15.json", json.dumps(doc).encode("utf-8"), ["smoke"])
 
-            # Still reject actual symlinked directory INSIDE root
+            # Still reject actual symlinked / junctioned directory INSIDE root
             sym_sub = os.path.join(stage, "results", "symdir")
-            os.symlink(os.path.join(stage, "results"), sym_sub)
+            if sys.platform == "win32":
+                import _winapi
+                _winapi.CreateJunction(os.path.join(stage, "results"), sym_sub)
+            else:
+                os.symlink(os.path.join(stage, "results"), sym_sub)
             self.assertIsNotNone(smoke_schema._has_symlink(os.path.join(sym_sub, "f.json"), root=os.path.join(stage, "results")))
 
-            # With /tmp mocked as a symlink (like macOS /tmp -> private/tmp), load_evidence passes
-            real_islink = os.path.islink
+            # With temp root mocked as a reparse point (like macOS /tmp -> private/tmp), load_evidence passes
+            islink_attr = "mesh.adapters.smoke_schema.is_reparse_link" if sys.platform == "win32" else "os.path.islink"
+            real_islink = smoke_schema.is_reparse_link if sys.platform == "win32" else os.path.islink
             env = {
                 "MESH_TEST_SMOKE_RESULTS_DIR": os.path.join(stage, "results"),
                 "MESH_TEST_SMOKE_FIXTURES_DIR": stage,
             }
-            with mock.patch("os.path.islink", side_effect=lambda p: True if p == "/tmp" else real_islink(p)):
+            with mock.patch(islink_attr, side_effect=lambda p: True if p == t_root else real_islink(p)):
                 ev = evidence.load_evidence("droid", testing_mode=True, probed_version="1.6.0", env=env)
             self.assertTrue(ev.ok, (ev.reason, ev.errors))
 

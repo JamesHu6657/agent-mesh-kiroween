@@ -14,7 +14,6 @@ count is bounded only by the CPU count (gate item A1: keep the suite under 10 mi
 """
 
 import concurrent.futures
-import fcntl
 import tempfile
 import json
 import hashlib
@@ -33,6 +32,16 @@ from typing import Any, Dict, List, Optional, Tuple
 REPO_ROOT = os.path.realpath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
+
+try:
+    from mesh.platform import locks as _platform_locks
+except ImportError:
+    _platform_locks = None  # standalone copy in fake-repo tests without mesh package
+
+try:
+    from mesh.platform import proc as _platform_proc
+except ImportError:
+    _platform_proc = None  # standalone copy in fake-repo tests without mesh package
 
 
 def _is_importable_under(start_abs: str, root_abs: str) -> bool:
@@ -129,8 +138,29 @@ IDLE_POOL_MAX = 4
 # flock could starve an EXCLUSIVE test. Every acquirer first takes a turnstile lock
 # (EX) for the moment of its own acquisition; an exclusive waiter holds the turnstile
 # while it waits, so new shared holders queue behind it and the current ones drain.
+def _user_id_tag() -> str:
+    """Return POSIX UID or a filename-safe user identifier on Windows."""
+    if hasattr(os, "getuid"):
+        return str(os.getuid())
+    raw = os.environ.get("USERNAME") or os.environ.get("USER") or "user"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", raw) or "user"
+
+
+def _default_durations_path(test_dir: str, platform: Optional[str] = None) -> str:
+    platform = platform or sys.platform
+    # Keyed by repo root: other worktrees' suites keep their own ordering hints.
+    filename = (
+        f"mesh-test-durations-{_user_id_tag()}-"
+        f"{hashlib.sha256(os.path.realpath(test_dir).encode()).hexdigest()[:12]}-"
+        f"{os.path.basename(os.path.normpath(test_dir))}.json"
+    )
+    if platform == "win32":
+        return os.path.join(tempfile.gettempdir(), filename)
+    return "/tmp/" + filename
+
+
 PROC_LOCK_PATH = os.environ.get("MESH_TEST_PROC_LOCK") or os.path.join(
-    tempfile.gettempdir(), f"agent-mesh-proc-tests-{os.getuid()}.lock")
+    tempfile.gettempdir(), f"agent-mesh-proc-tests-{_user_id_tag()}.lock")
 PROC_TURNSTILE_PATH = PROC_LOCK_PATH + ".turnstile"
 SHARED_BY_DEFAULT_TIERS = ("integration", "recovery")
 DEFAULT_PROC_LOCK: Optional[str] = None
@@ -155,19 +185,57 @@ class _ProcLock:
 
     def __enter__(self) -> "_ProcLock":
         if self.mode in ("exclusive", "shared"):
-            self.fd = os.open(PROC_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600)
-            turn = os.open(PROC_TURNSTILE_PATH, os.O_RDWR | os.O_CREAT, 0o600)
-            try:
-                fcntl.flock(turn, fcntl.LOCK_EX)
-                fcntl.flock(self.fd, fcntl.LOCK_EX if self.mode == "exclusive" else fcntl.LOCK_SH)
-            finally:
-                os.close(turn)  # releases the turnstile
+            if _platform_locks is not None:
+                self.fd = _platform_locks.open_lock_file(PROC_LOCK_PATH)
+                turn = _platform_locks.open_lock_file(PROC_TURNSTILE_PATH)
+                try:
+                    _platform_locks.acquire_lock(turn, exclusive=True, blocking=True)
+                    _platform_locks.acquire_lock(
+                        self.fd, exclusive=(self.mode == "exclusive"), blocking=True
+                    )
+                except BaseException:
+                    try:
+                        os.close(self.fd)
+                    finally:
+                        self.fd = None
+                    raise
+                finally:
+                    try:
+                        _platform_locks.release_lock(turn)
+                    except OSError:
+                        pass
+                    os.close(turn)  # releases the turnstile
+            elif sys.platform != "win32":
+                import fcntl
+
+                self.fd = os.open(PROC_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600)
+                turn = os.open(PROC_TURNSTILE_PATH, os.O_RDWR | os.O_CREAT, 0o600)
+                try:
+                    fcntl.flock(turn, fcntl.LOCK_EX)
+                    fcntl.flock(
+                        self.fd, fcntl.LOCK_EX if self.mode == "exclusive" else fcntl.LOCK_SH
+                    )
+                except BaseException:
+                    try:
+                        os.close(self.fd)
+                    finally:
+                        self.fd = None
+                    raise
+                finally:
+                    os.close(turn)  # releases the turnstile
         return self
 
     def __exit__(self, *exc: Any) -> None:
         if self.fd is not None:
             try:
-                fcntl.flock(self.fd, fcntl.LOCK_UN)
+                if _platform_locks is not None:
+                    _platform_locks.release_lock(self.fd)
+                elif sys.platform != "win32":
+                    import fcntl
+
+                    fcntl.flock(self.fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
             finally:
                 os.close(self.fd)
                 self.fd = None
@@ -184,6 +252,11 @@ def run_single_test(
         return _run_single_test(test_id, timeout_s, pythonpath=pythonpath)
 
 
+def _can_use_win_jobs() -> bool:
+    """Return True when running natively on Windows with platform Job Object helpers."""
+    return sys.platform == "win32" and os.name == "nt" and _platform_proc is not None
+
+
 def _run_single_test(
     test_id: str, timeout_s: int, pythonpath: Optional[str] = None
 ) -> Tuple[str, str, float, str]:
@@ -196,22 +269,35 @@ def _run_single_test(
     child_env = dict(os.environ)
     child_env["PYTHONPATH"] = pythonpath if pythonpath is not None else _CHILD_PYTHONPATH
     t0 = time.monotonic()
+    popen_kwargs: Dict[str, Any] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "env": child_env,
+    }
+    if sys.platform != "win32":
+        popen_kwargs["start_new_session"] = True
+    job = None
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            start_new_session=True,
-            env=child_env,
-        )
+        if _can_use_win_jobs():
+            assert _platform_proc is not None
+            job = _platform_proc.create_ephemeral_job()
+            proc = _platform_proc.spawn_in_job(cmd, job, **popen_kwargs)
+        else:
+            proc = subprocess.Popen(cmd, **popen_kwargs)
         try:
             stdout, _ = proc.communicate(timeout=timeout_s)
         except subprocess.TimeoutExpired:
             duration = time.monotonic() - t0
-            # Kill process group
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                if sys.platform != "win32":
+                    os.killpg(proc.pid, signal.SIGKILL)
+                elif job is not None and _platform_proc is not None:
+                    _platform_proc.terminate_job(job, 137)
+                    if proc.poll() is None:
+                        proc.kill()
+                else:
+                    proc.kill()
             except Exception:
                 pass
             proc.communicate()
@@ -233,6 +319,12 @@ def _run_single_test(
     except Exception as exc:
         duration = time.monotonic() - t0
         return test_id, "ERROR", duration, f"ERROR: runner exception: {exc}\n"
+    finally:
+        if job is not None:
+            try:
+                job.close()
+            except Exception:
+                pass
 
 
 def _load_durations(path: str) -> Dict[str, float]:
@@ -336,10 +428,7 @@ def main() -> int:
     # unknown tests first (they may be long), then discovery order as the tie-break.
     durations_path = os.environ.get(
         "MESH_TEST_DURATIONS",
-        # Keyed by repo root: other worktrees' suites keep their own ordering hints.
-        f"/tmp/mesh-test-durations-{os.getuid()}-"
-        f"{hashlib.sha256(os.path.realpath(test_dir).encode()).hexdigest()[:12]}-"
-        f"{os.path.basename(os.path.normpath(test_dir))}.json"
+        _default_durations_path(test_dir),
     )
     previous = _load_durations(durations_path)
     order = {tid: i for i, tid in enumerate(parallel_ids)}

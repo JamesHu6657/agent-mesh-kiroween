@@ -1,7 +1,8 @@
 """Agent resource commands: create, update, list, show, disable, enable, token."""
 
-import os
 import argparse
+import os
+import sys
 from typing import Any, Dict
 
 from mesh.client import MeshClient
@@ -52,7 +53,10 @@ def register_agent_commands(subparsers: argparse._SubParsersAction, parent_parse
     create_parser.add_argument("--ack-timeout", metavar="DURATION",
                                help="Inbox agents: time to `task start` an offered task before it fails "
                                     "no_response (e.g. 30m, 2h; default: the global inbox.ack_timeout_s)")
-    create_parser.add_argument("--default-profile", help="Default permission profile (default: edit)")
+    create_parser.add_argument(
+        "--default-profile",
+        help="Default permission profile (default: adapter's safe default, e.g. dev for codex, edit for most others)",
+    )
     create_parser.add_argument("--max-unapproved-profile", help="Highest permission profile requiring no human approval (default: dev)")
     create_parser.add_argument("--binary", help="Explicit path to external CLI binary")
     create_parser.add_argument("--option", action="append", default=[], help="Adapter-specific option KEY=JSON (repeatable)")
@@ -266,9 +270,7 @@ def handle_agent_create(args: argparse.Namespace) -> Dict[str, Any]:
         "max_concurrency": max_concurrency,
         "can_lead": args.can_lead,
         "capabilities": capabilities,
-        "default_profile": (
-            "edit" if (args.default_profile is None and "default_profile" not in from_json) else args.default_profile
-        ),
+        "default_profile": args.default_profile,
         "max_unapproved_profile": (
             "dev"
             if (args.max_unapproved_profile is None and "max_unapproved_profile" not in from_json)
@@ -280,6 +282,8 @@ def handle_agent_create(args: argparse.Namespace) -> Dict[str, Any]:
         "no_intake": bool(getattr(args, "no_intake", False)),
         "ack_timeout": getattr(args, "ack_timeout", None),
     }
+    if args.default_profile is None and "default_profile" not in from_json:
+        del payload["default_profile"]  # not given: meshd picks the adapter's safe default
     if max_concurrency is None and "max_concurrency" not in from_json:
         del payload["max_concurrency"]  # not given: meshd uses 1 (an explicit null is still refused)
     resp = client.execute_cmd(args, "agent.create", payload)
@@ -379,6 +383,8 @@ def _check_out_path(
     import mesh.constants as c
     from mesh.cli.commands.setup import _check_token_destination
     from mesh.errors import MeshError
+    from mesh.platform import perms
+    from mesh.platform.paths import is_reparse_link
 
     if not isinstance(out, str) or not out.strip() or "\x00" in out:
         # PR #37 #3: `--out ""` must never fall back to printing the token.
@@ -391,17 +397,24 @@ def _check_out_path(
         return MeshError(code=c.INVALID_ARGUMENT, exit_code=c.EXIT_USAGE, message=f"{prefix}: {msg}",
                          details={"param": "out", "token_file": path})
 
-    if out.endswith(os.sep) or os.path.isdir(path):
+    if out.endswith(os.sep) or (os.altsep and out.endswith(os.altsep)) or os.path.isdir(path):
         raise usage(f"{path} is a directory; give a file path")
     # Same location guards as `mesh setup` (and the --token-file read side): not under
     # runs/, workspaces/, a configured workspace root, a project repo or a git work tree;
     # never through a symlink; never over a non-regular file; tdir owned & private.
     _check_token_destination(home, path, prefix=prefix)
-    if os.path.lexists(path) and not os.path.islink(path):
+    if os.path.lexists(path) and not is_reparse_link(path):
         st_file = os.lstat(path)
         if not stat_mod.S_ISREG(st_file.st_mode):
             raise usage(f"{path} is not a regular file")
-        if hasattr(os, "geteuid") and st_file.st_uid not in (os.geteuid(), 0):
+        if sys.platform == "win32":
+            try:
+                owned = perms.is_owned_by_current_user(path)
+            except OSError as exc:
+                raise usage(f"{path} cannot be verified safely: {exc.strerror or exc}") from exc
+            if not owned:
+                raise usage(f"{path} is owned by another user")
+        elif hasattr(os, "geteuid") and st_file.st_uid not in (os.geteuid(), 0):
             raise usage(f"{path} is owned by another user")
         if not force and not allow_existing:
             raise usage(f"{path} already exists; use --force to replace it")
@@ -412,15 +425,30 @@ def _write_out(path: str, token: str, force: bool) -> None:
     """Write the token file with mode 0600. Without --force the file is created with
     O_EXCL (never overwrites, never follows a symlink); with --force it is replaced
     atomically by a rename."""
-    import os
+    from mesh.platform import perms
+    from mesh.platform.fs import open_regular_nofollow
 
     if force:
         from mesh.cli.commands.setup import _write_token
         _write_token(path, token)
         return
-    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    tdir = os.path.dirname(path)
+    existed = os.path.isdir(tdir) if tdir else True
+    if tdir:
+        os.makedirs(tdir, mode=0o700, exist_ok=True)
+        if sys.platform == "win32" and not existed:
+            perms.set_private_dir_acl(tdir, 0o700)
+    if sys.platform == "win32":
+        fd = open_regular_nofollow(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, label="token file")
+    else:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
+        try:
+            if sys.platform == "win32":
+                perms.fchmod_private(fd, 0o600)
+        except BaseException:
+            os.close(fd)
+            raise
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(token + "\n")
             f.flush()
@@ -600,7 +628,6 @@ def handle_agent_onboard(args: argparse.Namespace) -> Dict[str, Any]:
         "ack_timeout": args.ack_timeout,
         "allowed_models": [],
         "allowed_efforts": [],
-        "default_profile": "edit",
         "max_unapproved_profile": "dev",
         "options": [],
     }

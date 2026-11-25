@@ -7,6 +7,7 @@ Offline only. The example script is syntax-checked with `bash -n`, every `mesh <
 stub `mesh` executable that returns canned JSON. No meshd, network or real token is involved.
 """
 
+import sys
 import json
 import os
 import re
@@ -96,6 +97,7 @@ esac
 """
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash scripts/coord/inbox-worker.sh static analysis and UID test")
 class InboxWorkerKitStaticTest(unittest.TestCase):
     def test_script_exists_and_is_executable(self):
         self.assertTrue(os.path.isfile(SCRIPT))
@@ -158,6 +160,7 @@ class InboxWorkerKitStaticTest(unittest.TestCase):
             self.assertIn(topic, text, f"guide should mention {topic!r}")
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash scripts/coord/inbox-worker.sh runtime test")
 class InboxWorkerScriptRunTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

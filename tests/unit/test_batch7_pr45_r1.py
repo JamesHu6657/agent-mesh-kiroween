@@ -36,6 +36,7 @@ from mesh.daemon.handlers.run import handle_workspace_prune
 from mesh.daemon.server import DaemonServer
 from mesh.errors import MeshError
 from tests.gitfixture import GitFixture
+from tests.helpers import fake_peer_creds
 from tests.unit import test_merge as tm
 
 # Calls merge.run_merge_pipeline and supervisor.watch_launch_runs scanning real /proc.
@@ -328,7 +329,7 @@ class TestP2_1WorkspaceDeleteFailureAndParentSymlinks(unittest.TestCase):
                 async def wait_closed(self) -> None:
                     pass
 
-            with mock.patch("mesh.daemon.server.get_peer_credentials", return_value=(os.getpid(), os.getuid(), os.getgid())), \
+            with mock.patch("mesh.daemon.server.get_peer_credentials", return_value=fake_peer_creds()), \
                  mock.patch.object(srv, "authenticate_and_authorize",
                                    return_value=({"id": "usr_1", "kind": "user", "name": "user"}, "user", "direct", None)):
                 await srv.handle_client(reader, _W())
@@ -492,7 +493,7 @@ class TestP2_1WorkspaceDeleteFailureAndParentSymlinks(unittest.TestCase):
                             async def wait_closed(self) -> None:
                                 pass
 
-                        with mock.patch("mesh.daemon.server.get_peer_credentials", return_value=(os.getpid(), os.getuid(), os.getgid())), \
+                        with mock.patch("mesh.daemon.server.get_peer_credentials", return_value=fake_peer_creds()), \
                              mock.patch.object(srv, "authenticate_and_authorize",
                                                return_value=({"id": "usr_1", "kind": "user", "name": "user"}, "user", "direct", None)):
                             await srv.handle_client(reader, _W())

@@ -9,7 +9,6 @@ import os
 import platform
 import re
 import shutil
-import socket
 import sqlite3
 import subprocess
 import sys
@@ -31,18 +30,9 @@ def _check(name: str, ok: bool, detail: str, hint: Optional[str] = None, level: 
 
 
 def _daemon_running(home_dir: str) -> Optional[bool]:
-    sock_path = os.path.join(home_dir, "run", "mesh.sock")
-    if not os.path.exists(sock_path):
-        return False
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(1.0)
-    try:
-        s.connect(sock_path)
-        return True
-    except OSError:
-        return False
-    finally:
-        s.close()
+    from mesh.platform import ipc
+
+    return ipc.probe_daemon_endpoint(home_dir, timeout=1.0)
 
 
 def _setting(db_path: str, key: str) -> Any:
@@ -79,12 +69,22 @@ def _scheduler_errors_check(home_dir: str) -> Dict[str, Any]:
 def environment_checks(home_dir: str, db_present: bool, testing_mode: bool = False) -> List[Dict[str, Any]]:
     checks: List[Dict[str, Any]] = []
     plat = platform.system()
-    checks.append(_check("platform", plat == "Linux", f"{plat} {platform.release()}",
-                         "Agent Mesh supports Linux only (it relies on /proc, Unix sockets and process groups)"))
     v = sys.version_info
-    checks.append(_check("python", v >= (3, 11), f"{v.major}.{v.minor}.{v.micro} ({sys.executable})",
-                         "Python 3.11 or newer is required"))
-    git = shutil.which("git")
+    if plat == "Windows":
+        plat_ok = v >= (3, 12)
+        plat_hint = "Agent Mesh on Windows requires Python 3.12 or newer"
+        py_ok = v >= (3, 12)
+        py_hint = "Python 3.12 or newer is required on Windows"
+    else:
+        plat_ok = plat == "Linux"
+        plat_hint = "Agent Mesh supports Linux and Windows 10/11 (Python 3.12+ on Windows)"
+        py_ok = v >= (3, 11)
+        py_hint = "Python 3.11 or newer is required"
+    checks.append(_check("platform", plat_ok, f"{plat} {platform.release()}", plat_hint))
+    checks.append(_check("python", py_ok, f"{v.major}.{v.minor}.{v.micro} ({sys.executable})", py_hint))
+    from mesh.core.gitops import resolve_git_binary
+
+    git, git_source = resolve_git_binary()
     gver = ""
     git_ok = False
     if git:
@@ -97,7 +97,10 @@ def environment_checks(home_dir: str, db_present: bool, testing_mode: bool = Fal
                 gver = f"{git} does not work (git --version exit {gp.returncode})"
         except (OSError, subprocess.SubprocessError) as exc:
             gver = f"{git} does not run ({exc.__class__.__name__})"
-    checks.append(_check("git", git_ok, gver or "not found on PATH",
+    git_detail = (
+        f"{gver} (bundled MinGit)" if (git_ok and git_source == "bundled_mingit") else (gver or "not found on PATH")
+    )
+    checks.append(_check("git", git_ok, git_detail,
                          "install git; repo projects and task worktrees need it", level="warning"))
     if git_ok:
         m = re.match(r"git version (\d+)\.(\d+)", gver)

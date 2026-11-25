@@ -5,10 +5,12 @@ Supporting fixture for K1-K14 (fixture K0); it carries no ACC tag of its own.
 
 import os
 import subprocess
+import sys
 import unittest
 from unittest import mock
 
-from tests.gitfixture import GitFixture, GitMeshHarness
+from mesh.platform import paths as plat_paths
+from tests.gitfixture import BASE_PREFIX, GitFixture, GitMeshHarness
 from tests.helpers import MeshHarness
 
 
@@ -24,12 +26,12 @@ class TestGitFixture(unittest.TestCase):
     def test_k0_repo_shape_and_suite(self):
         """K0 repo is on main with a repo-local identity and a passing unittest suite."""
         repo = self.fixture.make_k0()
-        self.assertTrue(repo.startswith("/tmp/mh-"))
+        self.assertTrue(repo.startswith(BASE_PREFIX))
         self.assertEqual(self.fixture.git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip(), "main")
         self.assertEqual(self.fixture.git(repo, "config", "--get", "user.name").stdout.strip(), "t")
         self.assertEqual(self.fixture.git(repo, "config", "--get", "user.email").stdout.strip(), "t@example.invalid")
         cp = subprocess.run(
-            ["python3", "-m", "unittest", "discover", "-s", "tests", "-t", "."],
+            [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-t", "."],
             cwd=repo,
             env=self.fixture.env(),
             capture_output=True,
@@ -181,7 +183,7 @@ class TestGitMeshHarness(unittest.TestCase):
                 env = harness.get_env()
             expected = MeshHarness.get_env(harness)
             self.assertEqual(env["PATH"], expected["PATH"])
-            self.assertTrue(env["PATH"].startswith(self.extra_path + ":"))
+            self.assertTrue(env["PATH"].startswith(self.extra_path + os.pathsep))
             self.assertIn(os.path.join(harness.repo_root, "tests", "shims"), env["PATH"])
             self.assertEqual(env["MESH_HOME"], harness.home)
             self.assertEqual(env["MESH_TESTING"], "1")
@@ -219,12 +221,13 @@ class TestGitMeshHarness(unittest.TestCase):
             self.assertEqual(self.fixture.path("x"), os.path.join(self.fixture.base, "x"))
             with mock.patch("subprocess.run", side_effect=AssertionError("subprocess.run must not be called")):
                 with self.assertRaises(AssertionError):
-                    self.fixture.git("/tmp/mh-not-registered", "status")
+                    self.fixture.git(BASE_PREFIX + "not-registered", "status")
                 with self.assertRaises(AssertionError):
                     self.fixture.git(harness.home + "-sibling", "status")
                 with self.assertRaises(AssertionError):
                     self.fixture.git("/home/user/workspace/mesh-fresh-v1", "status")
-            for bad in ("/tmp/other", "/home/user/workspace/mesh-fresh-v1", "relative/mh-x"):
+            outside = os.path.join(plat_paths.temp_root(), "other")
+            for bad in (outside, "/tmp/other", "/home/user/workspace/mesh-fresh-v1", "relative/mh-x"):
                 with self.assertRaises(AssertionError):
                     self.fixture.allow_root(bad)
             self.assertEqual(self.fixture.allowed_roots, [self.fixture.base, harness.home])

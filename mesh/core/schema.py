@@ -62,12 +62,131 @@ INITIAL_SCHEMA_STATEMENTS: List[str] = [
     "INSERT INTO meta (key, value) VALUES ('schema_version', '1');",
 ]
 
+# Migration version 2: Chat-First project conversation, structured plans, and pre-dispatch gate
+MIGRATION_V2_STATEMENTS: List[str] = [
+    # 1. Project plans
+    """CREATE TABLE plans (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        version INTEGER NOT NULL CHECK (version >= 1),
+        status TEXT NOT NULL CHECK (status IN (
+            'proposed',
+            'approved_pending_dispatch',
+            'dispatched',
+            'revising',
+            'superseded',
+            'rejected',
+            'cancelled'
+        )),
+        title TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        steps_json TEXT NOT NULL,
+        plan_hash TEXT NOT NULL,
+        proposed_by_agent_id TEXT NOT NULL REFERENCES agents(id),
+        proposed_by_run_id TEXT REFERENCES runs(id),
+        proposed_event_seq INTEGER NOT NULL,
+        approval_id TEXT REFERENCES approvals(id),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        dispatched_at TEXT,
+        UNIQUE(project_id, version)
+    ) STRICT;""",
+    "CREATE UNIQUE INDEX one_proposed_plan_per_project ON plans(project_id) WHERE status IN ('proposed', 'approved_pending_dispatch');",
+    "CREATE INDEX idx_plans_project_created ON plans(project_id, version DESC);",
+
+    # 2. Project chat messages
+    """CREATE TABLE chat_messages (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        event_seq INTEGER NOT NULL UNIQUE REFERENCES events(seq),
+        role TEXT NOT NULL CHECK (role IN ('user', 'lead', 'system')),
+        kind TEXT NOT NULL CHECK (kind IN (
+            'text',
+            'plan_card',
+            'approval_card',
+            'escalation_card',
+            'dispatch_notice',
+            'clarification'
+        )),
+        actor_id TEXT NOT NULL REFERENCES principals(id),
+        actor_kind TEXT NOT NULL CHECK (actor_kind IN ('user', 'agent', 'system')),
+        via TEXT NOT NULL,
+        run_id TEXT REFERENCES runs(id),
+        plan_id TEXT REFERENCES plans(id),
+        approval_id TEXT REFERENCES approvals(id),
+        task_id TEXT REFERENCES tasks(id),
+        body TEXT NOT NULL,
+        meta_json TEXT NOT NULL DEFAULT '{}',
+        consumed_by_approval_id TEXT REFERENCES approvals(id),
+        created_at TEXT NOT NULL
+    ) STRICT;""",
+    "CREATE INDEX idx_chat_messages_project_seq ON chat_messages(project_id, event_seq ASC);",
+    "CREATE UNIQUE INDEX idx_chat_messages_consumed_apr ON chat_messages(consumed_by_approval_id) WHERE consumed_by_approval_id IS NOT NULL;",
+
+    # 3. Persistent narrowly-scoped standing grants (created via card 'always_allow')
+    """CREATE TABLE standing_grants (
+        id TEXT PRIMARY KEY,
+        project_id TEXT REFERENCES projects(id),
+        category TEXT NOT NULL CHECK (category IN ('permission_escalation', 'retry_over_limit')),
+        scope_agent_id TEXT REFERENCES agents(id),
+        scope_profile TEXT CHECK (scope_profile IS NULL OR scope_profile IN ('readonly','edit','dev','elevated','unrestricted')),
+        -- Vestigial column kept for additive v2 schema compatibility (always NULL; 'config' standing grants were removed; config writes remain direct-user-only)
+        scope_config_key TEXT,
+        scope_key TEXT NOT NULL,
+        source_approval_id TEXT REFERENCES approvals(id),
+        created_by TEXT NOT NULL REFERENCES principals(id),
+        created_via TEXT NOT NULL CHECK (created_via = 'direct'),
+        created_at TEXT NOT NULL,
+        user_mac TEXT NOT NULL,
+        revoked_at TEXT,
+        revoked_by TEXT REFERENCES principals(id),
+        revoked_reason TEXT,
+        revoked_user_mac TEXT
+    ) STRICT;""",
+    "CREATE UNIQUE INDEX one_active_standing_grant_per_scope ON standing_grants(scope_key) WHERE revoked_at IS NULL;",
+    "CREATE INDEX idx_standing_grants_project ON standing_grants(project_id, category, revoked_at);",
+    "CREATE INDEX idx_events_type_project ON events(type, project_id, seq);",
+
+    # 4. Incremental columns on tasks and projects (existing rows stay backward-compatible)
+    "ALTER TABLE tasks ADD COLUMN plan_id TEXT REFERENCES plans(id);",
+    "ALTER TABLE tasks ADD COLUMN plan_step_key TEXT;",
+    "CREATE INDEX idx_tasks_plan ON tasks(plan_id, plan_step_key);",
+    "ALTER TABLE projects ADD COLUMN plan_gate_mode TEXT NOT NULL DEFAULT 'off' CHECK (plan_gate_mode IN ('off', 'require_approval'));",
+    "ALTER TABLE projects ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'plan' CHECK (permission_mode IN ('supervised', 'plan', 'auto'));",
+
+    # 4. Backfill v2 default settings for already-initialized v1 databases (fresh init_db leaves settings empty for init_mesh_home)
+    """INSERT OR IGNORE INTO settings (key, value_json, updated_at, updated_by)
+       SELECT 'approval.policy.plan_dispatch', '"direct_only"',
+              COALESCE((SELECT updated_at FROM settings LIMIT 1), '1970-01-01T00:00:00.000Z'), id
+       FROM principals WHERE kind = 'user' AND EXISTS (SELECT 1 FROM settings LIMIT 1) LIMIT 1;""",
+    """INSERT OR IGNORE INTO settings (key, value_json, updated_at, updated_by)
+       SELECT 'approval.policy.step_dispatch', '"direct_only"',
+              COALESCE((SELECT updated_at FROM settings LIMIT 1), '1970-01-01T00:00:00.000Z'), id
+       FROM principals WHERE kind = 'user' AND EXISTS (SELECT 1 FROM settings LIMIT 1) LIMIT 1;""",
+    """INSERT OR IGNORE INTO settings (key, value_json, updated_at, updated_by)
+       SELECT 'lead.chat_wake_debounce_s', '0',
+              COALESCE((SELECT updated_at FROM settings LIMIT 1), '1970-01-01T00:00:00.000Z'), id
+       FROM principals WHERE kind = 'user' AND EXISTS (SELECT 1 FROM settings LIMIT 1) LIMIT 1;""",
+    """INSERT OR IGNORE INTO settings (key, value_json, updated_at, updated_by)
+       SELECT 'project.default_plan_gate', '"off"',
+              COALESCE((SELECT updated_at FROM settings LIMIT 1), '1970-01-01T00:00:00.000Z'), id
+       FROM principals WHERE kind = 'user' AND EXISTS (SELECT 1 FROM settings LIMIT 1) LIMIT 1;""",
+
+    # Bump schema version
+    "UPDATE meta SET value = '2' WHERE key = 'schema_version';",
+]
+
 MIGRATIONS: List[Migration] = [
     Migration(
         version=1,
         name="initial_schema",
         statements=INITIAL_SCHEMA_STATEMENTS,
-    )
+    ),
+    Migration(
+        version=2,
+        name="chat_and_plans",
+        statements=MIGRATION_V2_STATEMENTS,
+    ),
 ]
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2

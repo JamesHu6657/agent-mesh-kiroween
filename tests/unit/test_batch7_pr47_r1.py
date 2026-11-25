@@ -1,7 +1,6 @@
 """Regression tests for batch7 PR #47 round-1 review findings (1-8)."""
 
 import ast
-import fcntl
 import glob
 import importlib
 import json
@@ -15,6 +14,11 @@ import tempfile
 import threading
 import time
 import unittest
+
+if sys.platform != "win32":
+    import fcntl
+else:
+    fcntl = None  # type: ignore[assignment]
 
 from tests import run_tier
 from tests.unit import test_merge as tm
@@ -84,6 +88,7 @@ def _grep_secret_pattern(lines):
     return proc.stdout.splitlines()
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash + scripts/coord/merge.sh ref-pinning test")
 class TestFinding1MergeRefPinning(unittest.TestCase):
     """P1: scripts/coord/merge.sh must merge verified refs/heads/wt/<N> SHA and refuse moves."""
 
@@ -188,6 +193,7 @@ class TestFinding1MergeRefPinning(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(repo, "late.txt")))
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash + scripts/coord/secret-pattern.sh test")
 class TestFinding2SecretPatternQuotesAndPrefixes(unittest.TestCase):
     """P1: secret-pattern.sh must catch escaped quotes, triple quotes, and Python prefixes."""
 
@@ -303,6 +309,7 @@ class TestFinding2SecretPatternQuotesAndPrefixes(unittest.TestCase):
                 self.assertEqual(_grep_secret_pattern(fh.read().splitlines()), [], rel)
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash + scripts/coord/migrate-to-paseo.sh test")
 class TestFinding3MigrateToPaseoFailClosed(unittest.TestCase):
     """P2: migrate-to-paseo.sh paseo_auto_accept must fail closed on non-bools, wildcards, duplicates."""
 
@@ -537,14 +544,16 @@ class TestFinding4UnitProcLockAudit(unittest.TestCase):
             holder = subprocess.Popen(
                 [
                     sys.executable, "-c",
-                    "import fcntl, os, sys, time; "
-                    "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600); "
-                    "fcntl.flock(fd, fcntl.LOCK_EX); "
+                    "import os, sys, time; "
+                    "from mesh.platform import locks as plat_locks; "
+                    "fd = plat_locks.open_lock_file(sys.argv[1]); "
+                    "plat_locks.acquire_lock(fd, exclusive=True, blocking=True); "
                     "open(sys.argv[2], 'w').write('held'); "
                     "time.sleep(0.6); "
-                    "fcntl.flock(fd, fcntl.LOCK_UN)",
+                    "plat_locks.release_lock(fd); os.close(fd)",
                     lock_path, os.path.join(tmp, "held"),
-                ]
+                ],
+                env=dict(os.environ, PYTHONPATH=ROOT),
             )
             try:
                 deadline = time.monotonic() + 5
@@ -565,6 +574,7 @@ class TestFinding4UnitProcLockAudit(unittest.TestCase):
                 holder.wait(timeout=5)
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash + scripts/coord/inbox-worker.sh cleanup test")
 class TestFinding5And8InboxWorkerCleanup(unittest.TestCase):
     """P2/P3: heartbeat child is exec'd (no orphan $MESH_BIN) and leftovers get SIGTERM promptly."""
 
@@ -860,6 +870,7 @@ class TestFinding6RunTierDiscoveryAndSkip(unittest.TestCase):
             self.assertIn("errors=2", res.stdout)
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash + scripts/coord/coder-guard.sh + os.killpg test")
 class TestFinding7CoderGuardErrorHandlingAndSubdirs(unittest.TestCase):
     """P3: coder-guard.sh degrades on non-git dirs under pipefail, refuses loudly on git failure, handles subdirs."""
 

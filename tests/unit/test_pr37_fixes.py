@@ -67,7 +67,11 @@ class TestTokenOut(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
         self.dir = tempfile.mkdtemp(prefix="mh-pr37-")
-        os.chmod(self.dir, 0o700)
+        if os.name == "nt":
+            from mesh.platform import perms
+            perms.set_private_dir_acl(self.dir, 0o700)
+        else:
+            os.chmod(self.dir, 0o700)
         self.home = tempfile.mkdtemp(prefix="mh-pr37-home-")
 
     def args(self, out, force=False):

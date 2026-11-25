@@ -87,6 +87,7 @@ def _wait(pred, timeout, step=0.02):
 # Real /proc scans: hold the runner's host-wide /proc lock shared (tests/run_tier.py).
 MESH_PROC_LOCK = "shared"
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX _LAUNCHER/_WRAPPER PGID seen_held and /proc adoption (Windows Named Job close-gate covered in test_win_close_gate_jobs)")
 class TestAdoptWrapperExitsBeforeFirstWatch(unittest.TestCase):
     """ACC: N18, A8 (M3 gate P1-1)."""
     # Host-global /proc scans + same-uid non-dumpable escapees: run serially so a
@@ -1321,6 +1322,7 @@ class TestAdoptWrapperExitsBeforeFirstWatch(unittest.TestCase):
         os.kill(member, signal.SIGKILL)
         self.assertTrue(_wait(lambda: not _alive(member, mst), 10))
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX setsid/env-stripped escapee and /proc EIO spawn-abort (Windows Job spawn-abort covered in test_win_close_gate_jobs)")
 class TestSpawnFailsAfterPopen(unittest.TestCase):
     """Round 7 (Linear P2): Popen succeeded, then registration (or the TX B identity
     read) fails with EIO: the wrapper and its group are killed through the unreaped
@@ -1870,6 +1872,7 @@ class TestSpawnFailsAfterPopen(unittest.TestCase):
         self._assert_aborted()
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX sh/PGID merge leftovers scan before reap (Windows Job merge isolation covered in test_win_close_gate_jobs)")
 class TestMergeTestStepScansBeforeReap(unittest.TestCase):
     """ACC: N26, A8 (M3 gate P1-2): zero mocks, real mesh.runwrap via run_test_step()."""
     # Host-global /proc scans + same-uid non-dumpable escapees: run serially so a
@@ -2077,6 +2080,7 @@ libc.syscall(SYS_exit, 0)
 """
 
 
+@unittest.skipUnless(sys.platform != "win32", "Linux/POSIX leader-zombie pthread SYS_exit and /proc EACCES/EIO checks (Windows Toolhelp/Job checks covered in test_platform_win_jobs)")
 class TestRound11LeaderZombieAndProcUnknown(unittest.TestCase):
     """ACC: N18, A8 (Round 11: Carbon P1-1 multithreaded leader-zombie; Linear r10 P1-1 EACCES/EIO unknown)."""
     # Host-global /proc scans + same-uid non-dumpable escapees: run serially so a
@@ -2296,6 +2300,7 @@ class TestRound11LeaderZombieAndProcUnknown(unittest.TestCase):
         self.assertIsNone(proc_mod.get_proc_stat(proc.pid))
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX setsid/os.fork spawn-abort prior_members and close-held recovery (Windows Job close-gate covered in test_win_close_gate_jobs)")
 class TestRound11SpawnAbortAndPostPopen(unittest.TestCase):
     """Round 11 (Items 2, 5, 6a):
     - Item 5: _SpawnAbort.known & prior_members store cumulative (pid, starttime) pairs
@@ -2924,18 +2929,29 @@ class TestRound11AdapterAuthzBinaryAsyncDryRun(unittest.TestCase):
         self.assertEqual(rc, 0, r)
         tok_agent = r["data"]["token"]
 
+        from tests.stubs import _write_python_stub, stub_path
+
         marker = os.path.join(self.stubs_dir, "custom_bin_ran.marker")
-        custom_bin = os.path.join(self.stubs_dir, "custom-kiro")
-        kiro_stub = os.path.join(self.stubs_dir, "kiro-cli")
-        with open(kiro_stub, "r", encoding="utf-8") as f:
-            stub_src = f.read()
-        with open(custom_bin, "w", encoding="utf-8") as f:
-            f.write(
-                "#!/usr/bin/env python3\n"
-                f"open({marker!r}, 'w').write('ran')\n"
-                + "\n".join(stub_src.splitlines()[1:]) + "\n"
+        if sys.platform == "win32":
+            with open(os.path.join(self.stubs_dir, "kiro-cli.py"), "r", encoding="utf-8") as f:
+                stub_src = f.read()
+            custom_bin = _write_python_stub(
+                self.stubs_dir,
+                "custom-kiro",
+                f"#!/usr/bin/env python3\nopen({marker!r}, 'w').write('ran')\n" + "\n".join(stub_src.splitlines()[1:]) + "\n",
             )
-        os.chmod(custom_bin, 0o755)
+        else:
+            custom_bin = os.path.join(self.stubs_dir, "custom-kiro")
+            kiro_stub = stub_path(self.stubs_dir, "kiro-cli")
+            with open(kiro_stub, "r", encoding="utf-8") as f:
+                stub_src = f.read()
+            with open(custom_bin, "w", encoding="utf-8") as f:
+                f.write(
+                    "#!/usr/bin/env python3\n"
+                    f"open({marker!r}, 'w').write('ran')\n"
+                    + "\n".join(stub_src.splitlines()[1:]) + "\n"
+                )
+            os.chmod(custom_bin, 0o755)
 
         # 1. CLI `mesh adapter models kiro --binary ...` must be rejected by CLI parser with rc 2!
         rc, resp = h.cli("adapter", "models", "kiro", "--binary", custom_bin, user=True)
@@ -2983,24 +2999,31 @@ class TestRound11AdapterAuthzBinaryAsyncDryRun(unittest.TestCase):
         rc, r = h.setup_cli("agent", "create", "--name", "ag-lp", "--adapter", "fake", "--max-concurrency", "1",
                             "--allowed-model", "m1", "--default-model", "m1", "--can-lead", user=True)
         self.assertEqual(rc, 0, r)
+        from tests.stubs import _write_python_stub
+
         started_flag = os.path.join(self.stubs_dir, "slow_probe_started")
         pid_file = os.path.join(self.stubs_dir, "slow_probe.pid")
-        slow_bin = os.path.join(self.stubs_dir, "slow-kiro")
-        kiro_stub = os.path.join(self.stubs_dir, "kiro-cli")
-        with open(kiro_stub, "r", encoding="utf-8") as f:
-            stub_lines = f.read().splitlines()[1:]
-        with open(slow_bin, "w", encoding="utf-8") as f:
-            f.write(
-                "#!/usr/bin/env python3\n"
-                "import os, sys, time\n"
-                "if '--version' in sys.argv:\n"
-                f"    open({pid_file!r} + '.t', 'w').write(str(os.getpid()))\n"
-                f"    os.rename({pid_file!r} + '.t', {pid_file!r})\n"
-                f"    open({started_flag!r}, 'w').write('1')\n"
-                "    time.sleep(0.8)\n"
-                + "\n".join(stub_lines) + "\n"
-            )
-        os.chmod(slow_bin, 0o755)
+        slow_body_prefix = (
+            "#!/usr/bin/env python3\n"
+            "import os, sys, time\n"
+            "if '--version' in sys.argv:\n"
+            f"    open({pid_file!r} + '.t', 'w').write(str(os.getpid()))\n"
+            f"    os.replace({pid_file!r} + '.t', {pid_file!r})\n"
+            f"    open({started_flag!r}, 'w').write('1')\n"
+            "    time.sleep(0.8)\n"
+        )
+        if sys.platform == "win32":
+            with open(os.path.join(self.stubs_dir, "kiro-cli.py"), "r", encoding="utf-8") as f:
+                stub_lines = f.read().splitlines()[1:]
+            slow_bin = _write_python_stub(self.stubs_dir, "slow-kiro", slow_body_prefix + "\n".join(stub_lines) + "\n")
+        else:
+            slow_bin = os.path.join(self.stubs_dir, "slow-kiro")
+            kiro_stub = os.path.join(self.stubs_dir, "kiro-cli")
+            with open(kiro_stub, "r", encoding="utf-8") as f:
+                stub_lines = f.read().splitlines()[1:]
+            with open(slow_bin, "w", encoding="utf-8") as f:
+                f.write(slow_body_prefix + "\n".join(stub_lines) + "\n")
+            os.chmod(slow_bin, 0o755)
 
         probe_out = {}
 
@@ -3066,18 +3089,31 @@ class TestRound11AdapterAuthzBinaryAsyncDryRun(unittest.TestCase):
         tok_agent = r["data"]["token"]
 
         # Replace stubs in stubs_dir with marker-writing wrappers so ANY subprocess execution is caught!
+        from tests.stubs import _write_python_stub, stub_path
+
         exec_log = os.path.join(self.stubs_dir, "dry_run_exec.log")
         for bin_name in ("droid", "agy", "kiro-cli", "vibe"):
-            p = os.path.join(self.stubs_dir, bin_name)
-            with open(p, "r", encoding="utf-8") as f:
-                lines = f.read().splitlines()[1:]
-            with open(p, "w", encoding="utf-8") as f:
-                f.write(
+            if sys.platform == "win32":
+                with open(os.path.join(self.stubs_dir, f"{bin_name}.py"), "r", encoding="utf-8") as f:
+                    lines = f.read().splitlines()[1:]
+                _write_python_stub(
+                    self.stubs_dir,
+                    bin_name,
                     "#!/usr/bin/env python3\n"
                     f"open({exec_log!r}, 'a').write({bin_name!r} + '\\n')\n"
-                    + "\n".join(lines) + "\n"
+                    + "\n".join(lines) + "\n",
                 )
-            os.chmod(p, 0o755)
+            else:
+                p = os.path.join(self.stubs_dir, bin_name)
+                with open(p, "r", encoding="utf-8") as f:
+                    lines = f.read().splitlines()[1:]
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(
+                        "#!/usr/bin/env python3\n"
+                        f"open({exec_log!r}, 'a').write({bin_name!r} + '\\n')\n"
+                        + "\n".join(lines) + "\n"
+                    )
+                os.chmod(p, 0o755)
 
         db_path = os.path.join(h.home, "mesh.db")
         conn = sqlite3.connect(db_path, timeout=10.0)
@@ -3088,7 +3124,7 @@ class TestRound11AdapterAuthzBinaryAsyncDryRun(unittest.TestCase):
             conn.close()
 
         client = MeshClient(h.home)
-        custom_bin = os.path.join(self.stubs_dir, "kiro-cli")
+        custom_bin = stub_path(self.stubs_dir, "kiro-cli")
         for idx, (cmd_name, cmd_args) in enumerate([
             ("adapter.list", {}),
             ("adapter.show", {"adapter_id": "kiro"}),
@@ -3142,6 +3178,7 @@ class TestRound11AdapterAuthzBinaryAsyncDryRun(unittest.TestCase):
         self.assertEqual(idem_after, idem_before, "dry_run wrote idempotency rows!")
 
 
+@unittest.skipUnless(sys.platform != "win32", "Linux/POSIX /proc EACCES/EIO/EMFILE scan uncertainty across close gates (Windows Toolhelp/Job uncertainty covered in test_win_close_gate_jobs)")
 class TestClickUpP1ScanUncertain(unittest.TestCase):
     """ACC: N18, A8 (ClickUp P1-1: /proc scan errors must report uncertainty, never empty)."""
     # Host-global /proc scans + same-uid non-dumpable escapees: run serially so a
@@ -3699,6 +3736,7 @@ class TestClickUpP1ScanUncertain(unittest.TestCase):
         self.assertTrue(_alive(bg_pers["pid"], bg_pers["st"]))
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX _scan_group(pgid) hold check (Windows Job Object group scan covered in test_win_close_gate_jobs)")
 class TestClickUpP1SeenHoldUncertain(unittest.TestCase):
     """ACC: N18, A8 (ClickUp P1-1, Quest verification: the seen hold reads an uncertain
     group scan as occupied, so an unusable-seen adopted run never closes on a scan error)."""
@@ -3726,6 +3764,7 @@ class TestClickUpP1SeenHoldUncertain(unittest.TestCase):
             self.assertFalse(supervisor.snapshot_hold(run, snap))
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX /proc EMFILE group scan uncertainty during merge step (Windows Job/Toolhelp uncertainty covered in test_win_close_gate_jobs)")
 class TestClickUpRecheckMergeUnknownIdentityUncertain(unittest.TestCase):
     """ACC: N18, A8 (ClickUp recheck P2): merge test step with unknown wrapper identity and an
     empty but uncertain group scan (EMFILE on /proc). A transient error is rescanned and the
@@ -3803,6 +3842,7 @@ class TestClickUpRecheckMergeUnknownIdentityUncertain(unittest.TestCase):
         self.assertTrue(out["termination"].get("scan_uncertain"), out)
 
 
+@unittest.skipUnless(sys.platform != "win32", "Linux/POSIX prctl non-dumpable escapee, /proc EMFILE, and os.killpg merge-gate checks (Windows Job checks covered in test_win_close_gate_jobs)")
 class TestCarbonRoP1b(unittest.TestCase):
     """ACC: N18, A8 (Carbon RO review m3-clickup-p1-carbon.md, round p1b):
     - P1-1: live task.merge holds open merge_test + merge:<prj> on uncertain scan (2A/2B) and
@@ -4668,6 +4708,7 @@ class TestCarbonRoP1bCoverage(unittest.TestCase):
             merge._check_live_merge_close(conn, {"run_id": "run_m2"}, clean)
         gate2.assert_called_once()
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux /proc/<pid>/stat _is_kthread check")
     def test_is_kthread_stat_error_is_recorded_as_scan_error(self):
         """M4: an EIO reading ``/proc/<pid>/stat`` inside ``_is_kthread`` during a scan is
         recorded (scan uncertain); ENOENT is a lookup miss and is not."""
@@ -4751,6 +4792,7 @@ libc.syscall(SYS_exit, 0)
 """
 
 
+@unittest.skipUnless(sys.platform != "win32", "Linux/POSIX prctl non-dumpable escapee and /proc/<pid>/task sibling-thread scan (no Windows kernel equivalent)")
 class TestCarbonRoP1c(unittest.TestCase):
     """ACC: N18, A8 (Carbon RO review m3-clickup-p1b-carbon.md, round p1c):
     - P1-1: crash recovery passes known wrapper_starttime into _env_carriers, _terminate_carriers,
@@ -5212,6 +5254,7 @@ class TestCarbonRoP1c(unittest.TestCase):
 
 
 
+@unittest.skipUnless(sys.platform != "win32", "Linux /proc/<pid>/status mm/VmSize and SYS_exit thread-group exiting filter")
 class TestP1cFinalExitingFilter(unittest.TestCase):
     """m3-p1c-final: EACCES from an exiting/zombie/gone process does not hold a run;
     a live non-dumpable same-uid process still does."""

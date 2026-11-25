@@ -7,11 +7,14 @@ line in their modes). It reacts to the argv KiroAdapter.build() makes. Every env
 os.environ never gets MESH_SMOKE* or MESH_PROBE*. No real vendor binary runs.
 """
 
+import sys
 import io
 import json
 import os
 import shutil
+import signal
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -26,7 +29,7 @@ from tests.stubs import make_executable
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 STUB = r'''#!/usr/bin/env python3
-import json, os, signal, sys, time
+import json, os, resource, signal, sys, time
 args = sys.argv[1:]
 with open(CALLS, "a", encoding="utf-8") as f:
     f.write(json.dumps(args) + "\n")
@@ -62,11 +65,19 @@ if "Count from 1" in prompt:
             time.sleep(0.2)
             os.abort()
         signal.signal(signal.SIGTERM, on_term)
+        # No core dump on abort: a large or piped (core_pattern) dump can hold the
+        # dying process in a non-zombie state past the gone_within_s window.
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     termed = []
     if mode == "term_run_error":
         # Only set a flag here: printing from the handler could interrupt a print in the
         # loop (reentrant BufferedWriter -> RuntimeError, rc 1 under load).
         signal.signal(signal.SIGTERM, lambda signo, frame: termed.append(signo))
+    if mode in ("term_abort", "term_run_error"):
+        # Written only after the SIGTERM handler is installed; the test gates the
+        # harness's SIGTERM on this marker so it never lands on the default action.
+        with open(READY, "w") as f:
+            f.write("ready\n")
     for i in range(1, 100000):
         if termed:
             emit("runError", {"sessionId": sid, "stage": "prompt", "message": "Internal error: the response stream was closed."})
@@ -88,17 +99,19 @@ sys.exit(0)
 '''
 
 
+@unittest.skipUnless(sys.platform != "win32", 'Smoke harness (tests/smoke/harness.py) is POSIX/Linux-only')
 class KiroCasesBase(unittest.TestCase):
     def setUp(self) -> None:
         self.assertEqual([k for k in os.environ if k.startswith(("MESH_SMOKE", "MESH_PROBE"))], [])
         self.tmp = tempfile.mkdtemp(prefix="mh-smoke-k-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.calls = os.path.join(self.tmp, "calls.log")
+        self.ready = os.path.join(self.tmp, "sigterm-ready")
         os.makedirs(os.path.join(self.tmp, "bin"))
         self.binary = os.path.join(self.tmp, "bin", "kiro-cli")
         first, rest = STUB.split("\n", 1)
         with open(self.binary, "w", encoding="utf-8") as f:
-            f.write(first + f"\nCALLS = {self.calls!r}\n" + rest)
+            f.write(first + f"\nCALLS = {self.calls!r}\nREADY = {self.ready!r}\n" + rest)
         make_executable(self.binary)
         self.out = os.path.join(self.tmp, "out")
         self.env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "MESH_SMOKE": "1",
@@ -125,7 +138,26 @@ class KiroCasesBase(unittest.TestCase):
     def by_id(doc) -> dict:
         return {c["id"]: c for c in doc["cases"]}
 
+    def gate_sigterm_on_ready(self):
+        """Patch harness.signal_session so the R4 SIGTERM is sent only once the stub's
+        READY file exists (the stub writes it right after installing its SIGTERM
+        handler). run_and_signal may otherwise fire at wait_first_byte_s before the
+        handler is up: the default action then reads rc -15 as a pass, or an
+        inherited SIG_IGN keeps the stub looping -> group_survived_sigterm."""
+        real_signal_session = harness.signal_session
+        ready = self.ready
 
+        def _wrapper(pgid, sig):
+            if sig == signal.SIGTERM and not os.path.exists(ready):
+                deadline = time.monotonic() + 10
+                while not os.path.exists(ready) and time.monotonic() < deadline:
+                    time.sleep(0.02)
+            real_signal_session(pgid, sig)
+
+        return mock.patch.object(harness, "signal_session", _wrapper)
+
+
+@unittest.skipUnless(sys.platform != "win32", 'Smoke harness (tests/smoke/harness.py) is POSIX/Linux-only')
 class KiroFlowTest(KiroCasesBase):
     def test_all_runs_results_and_reevaluate(self) -> None:
         """ACC: N11, N12, N24 - R1..R6 against the kiro stub: readonly argv (--trust-tools=, never trust-all), the smoke model, --resume-id, --effort; S-X-1/2/3/5/6 pass, S-X-4 observed(not_observable), S-X-7 observed, S-KIRO-8 deny with the [denied] count; results validate and list KIRO_CASES; reevaluate re-parses S-X-1/2/4/5 without spawning."""
@@ -237,19 +269,31 @@ def _read(name: str) -> str:
         return f.read()
 
 
-class KiroFixRoundTest(KiroCasesBase):
+class KiroFixRoundTest(unittest.TestCase):
     """Linear review A of PR #12 (MAJOR 2, MINOR 1, MINOR 2): rc-0 vendor errors never pass."""
 
+    @staticmethod
+    def by_id(doc) -> dict:
+        return KiroCasesBase.by_id(doc)
+
+    @unittest.skipUnless(sys.platform != "win32", "Smoke harness (tests/smoke/harness.py) is POSIX/Linux-only")
     def test_sx6_rc0_runerror_on_sigterm_fails(self) -> None:
         """MAJOR 2: kiro alive at SIGTERM, then writes a runError to stdout and exits 0 (no stderr):
         S-X-6 fail(exited_with_error) with vendor_exit_meaning, not pass."""
-        s = self.session(STUB_MODE="term_run_error")
-        cases.run_r4(s, gone_within_s=5, wait_first_byte_s=5)
-        c = {x["id"]: x for x in s.cases}["S-X-6"]
-        self.assertEqual((c["status"], c["reason"]), ("fail", "exited_with_error"))
-        self.assertEqual(c["observation"]["rc"], 0)
-        self.assertTrue(c["observation"]["alive_at_term"])
-        self.assertEqual(c["observation"]["vendor_exit_meaning"], "run_error")
+        case = KiroCasesBase("runTest")
+        case.setUp()
+        try:
+            s = case.session(STUB_MODE="term_run_error")
+            with case.gate_sigterm_on_ready():
+                cases.run_r4(s, gone_within_s=5, wait_first_byte_s=5)
+            c = {x["id"]: x for x in s.cases}["S-X-6"]
+            self.assertEqual((c["status"], c["reason"]), ("fail", "exited_with_error"))
+            self.assertEqual(c["observation"]["rc"], 0)
+            self.assertTrue(c["observation"]["alive_at_term"])
+            self.assertEqual(c["observation"]["vendor_exit_meaning"], "run_error")
+        finally:
+            case.doCleanups()
+            case.tearDown()
 
     def test_sx6_eval_counterexamples(self) -> None:
         """MAJOR 2: eval_sx6 on literal observations. rc 0 + the real auth runError stream -> fail;
@@ -284,59 +328,80 @@ class KiroFixRoundTest(KiroCasesBase):
         st = ev.eval_sx6(info, _read("smoke-S-X-6-stdout.jsonl"), _read("smoke-S-X-6-stderr.txt"), "kiro")
         self.assertEqual(st[:2], ("pass", None))
 
+    @unittest.skipUnless(sys.platform != "win32", "Smoke harness (tests/smoke/harness.py) is POSIX/Linux-only")
     def test_staged_resume_refuses_failed_r1(self) -> None:
         """MINOR 1: stage 1 = R1 with an rc-0 runError (S-X-1 fail, S-X-2 fail(vendor_error));
         stage 2 = R2 only: staged_session_id is None, S-X-3 blocked(no_session_id), no resume spawned."""
-        s1 = self.session(STUB_MODE="run_error", MESH_SMOKE_MAX_RUNS="1")
-        self.assertIsNone(cases.run_r1(s1))
-        c = {x["id"]: x for x in s1.cases}
-        self.assertEqual((c["S-X-2"]["status"], c["S-X-2"]["reason"]), ("fail", "vendor_error"))
-        self.assertEqual(c["S-X-2"]["observation"]["vendor_exit_meaning"], "auth_failed")
-        cases.finish_stage(s1, ["R1"])
-        s2 = self.session(MESH_SMOKE_MAX_RUNS="1")
-        self.assertIsNone(cases.staged_session_id(s2))
-        cases.run_r2(s2, cases.staged_session_id(s2))
-        c3 = {x["id"]: x for x in s2.cases}["S-X-3"]
-        self.assertEqual((c3["status"], c3["reason"]), ("blocked", "no_session_id"))
-        self.assertEqual(len(self.model_runs()), 1)
+        case = KiroCasesBase("runTest")
+        case.setUp()
+        try:
+            s1 = case.session(STUB_MODE="run_error", MESH_SMOKE_MAX_RUNS="1")
+            self.assertIsNone(cases.run_r1(s1))
+            c = {x["id"]: x for x in s1.cases}
+            self.assertEqual((c["S-X-2"]["status"], c["S-X-2"]["reason"]), ("fail", "vendor_error"))
+            self.assertEqual(c["S-X-2"]["observation"]["vendor_exit_meaning"], "auth_failed")
+            cases.finish_stage(s1, ["R1"])
+            s2 = case.session(MESH_SMOKE_MAX_RUNS="1")
+            self.assertIsNone(cases.staged_session_id(s2))
+            cases.run_r2(s2, cases.staged_session_id(s2))
+            c3 = {x["id"]: x for x in s2.cases}["S-X-3"]
+            self.assertEqual((c3["status"], c3["reason"]), ("blocked", "no_session_id"))
+            self.assertEqual(len(case.model_runs()), 1)
+        finally:
+            case.doCleanups()
+            case.tearDown()
 
+    @unittest.skipUnless(sys.platform != "win32", "Smoke harness (tests/smoke/harness.py) is POSIX/Linux-only")
     def test_staged_resume_uses_good_r1(self) -> None:
         """MINOR 1 (control): a successful staged R1 -> its session id is resumed in stage 2."""
-        s1 = self.session(MESH_SMOKE_MAX_RUNS="1")
-        self.assertEqual(cases.run_r1(s1), "kiro-stub-session-7")
-        cases.finish_stage(s1, ["R1"])
-        s2 = self.session(MESH_SMOKE_MAX_RUNS="1")
-        self.assertEqual(cases.staged_session_id(s2), "kiro-stub-session-7")
-        cases.run_r2(s2, cases.staged_session_id(s2))
-        runs = self.model_runs()
-        self.assertEqual(len(runs), 2)
-        self.assertEqual(runs[1][runs[1].index("--resume-id") + 1], "kiro-stub-session-7")
+        case = KiroCasesBase("runTest")
+        case.setUp()
+        try:
+            s1 = case.session(MESH_SMOKE_MAX_RUNS="1")
+            self.assertEqual(cases.run_r1(s1), "kiro-stub-session-7")
+            cases.finish_stage(s1, ["R1"])
+            s2 = case.session(MESH_SMOKE_MAX_RUNS="1")
+            self.assertEqual(cases.staged_session_id(s2), "kiro-stub-session-7")
+            cases.run_r2(s2, cases.staged_session_id(s2))
+            runs = case.model_runs()
+            self.assertEqual(len(runs), 2)
+            self.assertEqual(runs[1][runs[1].index("--resume-id") + 1], "kiro-stub-session-7")
+        finally:
+            case.doCleanups()
+            case.tearDown()
 
+    @unittest.skipUnless(sys.platform != "win32", "Smoke harness (tests/smoke/harness.py) is POSIX/Linux-only")
     def test_staged_session_requires_sx1_pass_same_capture(self) -> None:
         """MINOR 1: staged documents written by hand. S-X-2 pass but S-X-1 fail(vendor_error) -> None;
         S-X-1 and S-X-2 pass from different captures -> None; S-X-1 fail(parse_pending) at rc 0 in the
         same capture -> resumed (droid rule unchanged); a newer failed R1 hides an older good one -> None."""
-        s = self.session()
-        fx_a = {"fixture": "tests/fixtures/real/kiro/3.1.0/smoke-S-X-1-stdout.jsonl", "fixture_sha256": "a" * 64}
-        fx_b = {"fixture": "tests/fixtures/real/kiro/3.1.0/smoke-S-X-1-stdout-2.jsonl", "fixture_sha256": "b" * 64}
-        good2 = dict(fx_a, id="S-X-2", status="pass", observation={"session_id": "sid-1"})
-        with mock.patch.object(s, "staged_documents", return_value=[
-                {"cases": [dict(fx_a, id="S-X-1", status="fail", reason="vendor_error", rc=0, observation=None), good2]}]):
-            self.assertIsNone(cases.staged_session_id(s))
-        with mock.patch.object(s, "staged_documents", return_value=[
-                {"cases": [dict(fx_a, id="S-X-1", status="fail", reason="parse_pending", rc=0, observation=None), good2]}]):
-            self.assertEqual(cases.staged_session_id(s), "sid-1")
-        with mock.patch.object(s, "staged_documents", return_value=[
-                {"cases": [dict(fx_b, id="S-X-1", status="pass", rc=0, observation=None), good2]}]):
-            self.assertIsNone(cases.staged_session_id(s))
-        with mock.patch.object(s, "staged_documents", return_value=[
-                {"cases": [dict(fx_a, id="S-X-1", status="pass", rc=0, observation=None), good2]}]):
-            self.assertEqual(cases.staged_session_id(s), "sid-1")
-        with mock.patch.object(s, "staged_documents", return_value=[
-                {"cases": [dict(fx_a, id="S-X-1", status="pass", rc=0, observation=None), good2]},
-                {"cases": [dict(fx_b, id="S-X-1", status="fail", observation=None),
-                           dict(fx_b, id="S-X-2", status="fail", observation={"session_id": "sid-2"})]}]):
-            self.assertIsNone(cases.staged_session_id(s))
+        case = KiroCasesBase("runTest")
+        case.setUp()
+        try:
+            s = case.session()
+            fx_a = {"fixture": "tests/fixtures/real/kiro/3.1.0/smoke-S-X-1-stdout.jsonl", "fixture_sha256": "a" * 64}
+            fx_b = {"fixture": "tests/fixtures/real/kiro/3.1.0/smoke-S-X-1-stdout-2.jsonl", "fixture_sha256": "b" * 64}
+            good2 = dict(fx_a, id="S-X-2", status="pass", observation={"session_id": "sid-1"})
+            with mock.patch.object(s, "staged_documents", return_value=[
+                    {"cases": [dict(fx_a, id="S-X-1", status="fail", reason="vendor_error", rc=0, observation=None), good2]}]):
+                self.assertIsNone(cases.staged_session_id(s))
+            with mock.patch.object(s, "staged_documents", return_value=[
+                    {"cases": [dict(fx_a, id="S-X-1", status="fail", reason="parse_pending", rc=0, observation=None), good2]}]):
+                self.assertEqual(cases.staged_session_id(s), "sid-1")
+            with mock.patch.object(s, "staged_documents", return_value=[
+                    {"cases": [dict(fx_b, id="S-X-1", status="pass", rc=0, observation=None), good2]}]):
+                self.assertIsNone(cases.staged_session_id(s))
+            with mock.patch.object(s, "staged_documents", return_value=[
+                    {"cases": [dict(fx_a, id="S-X-1", status="pass", rc=0, observation=None), good2]}]):
+                self.assertEqual(cases.staged_session_id(s), "sid-1")
+            with mock.patch.object(s, "staged_documents", return_value=[
+                    {"cases": [dict(fx_a, id="S-X-1", status="pass", rc=0, observation=None), good2]},
+                    {"cases": [dict(fx_b, id="S-X-1", status="fail", observation=None),
+                               dict(fx_b, id="S-X-2", status="fail", observation={"session_id": "sid-2"})]}]):
+                self.assertIsNone(cases.staged_session_id(s))
+        finally:
+            case.doCleanups()
+            case.tearDown()
 
     def test_sx5_rc0_vendor_error_fails(self) -> None:
         """MINOR 2: the real auth-error stream echoes effort=high before its runError; rc 0, requested
@@ -347,13 +412,20 @@ class KiroFixRoundTest(KiroCasesBase):
         self.assertEqual(ev.eval_sx5(_read("stream-effort-high-ok.jsonl"), "", 0, False, "high",
                                      adapter_id="kiro"), ("pass", None, {"echoed": "high"}))
 
+    @unittest.skipUnless(sys.platform != "win32", "Smoke harness (tests/smoke/harness.py) is POSIX/Linux-only")
     def test_sx5_run_r3_stub_run_error(self) -> None:
         """MINOR 2: run_r3 against the stub's rc-0 runError mode -> S-X-5 fail(vendor_error)."""
-        s = self.session(STUB_MODE="run_error", MESH_SMOKE_MAX_RUNS="1")
-        cases.run_r3(s, "high")
-        c = {x["id"]: x for x in s.cases}["S-X-5"]
-        self.assertEqual((c["status"], c["reason"]), ("fail", "vendor_error"))
-        self.assertEqual(c["observation"]["requested_effort"], "high")
+        case = KiroCasesBase("runTest")
+        case.setUp()
+        try:
+            s = case.session(STUB_MODE="run_error", MESH_SMOKE_MAX_RUNS="1")
+            cases.run_r3(s, "high")
+            c = {x["id"]: x for x in s.cases}["S-X-5"]
+            self.assertEqual((c["status"], c["reason"]), ("fail", "vendor_error"))
+            self.assertEqual(c["observation"]["requested_effort"], "high")
+        finally:
+            case.doCleanups()
+            case.tearDown()
 
     def test_sx2_sx4_rc0_vendor_error_fail(self) -> None:
         """MINOR 1: eval_sx2 / eval_sx4 on the real auth-error stream at rc 0 -> fail(vendor_error),
@@ -371,7 +443,7 @@ class KiroFixRoundTest(KiroCasesBase):
                          ("fail", "vendor_error"))
 
 
-class KiroRound2Test(KiroCasesBase):
+class KiroRound2Test(unittest.TestCase):
     """PR #12 fix round 2 (Linear r2 + Quest review on 81e2836)."""
 
     def _parse(self, events) -> str:
@@ -439,14 +511,22 @@ class KiroRound2Test(KiroCasesBase):
         self.assertEqual(v(0, auth), ("fail", "exited_with_error"))
         self.assertEqual(v(-15, auth), ("pass", None))
 
+    @unittest.skipUnless(sys.platform != "win32", "Smoke harness (tests/smoke/harness.py) is POSIX/Linux-only")
     def test_sx6_stub_ignores_sigterm_then_aborts(self) -> None:
         """Item 1: a stub that ignores SIGTERM and then calls os.abort() (rc -6) -> fail(unexpected_signal)."""
-        s = self.session(STUB_MODE="term_abort")
-        cases.run_r4(s, gone_within_s=5, wait_first_byte_s=5)
-        c = {x["id"]: x for x in s.cases}["S-X-6"]
-        self.assertEqual((c["status"], c["reason"]), ("fail", "unexpected_signal"))
-        self.assertEqual((c["observation"]["rc"], c["observation"]["signal"]), (-6, 6))
-        self.assertTrue(c["observation"]["alive_at_term"])
+        case = KiroCasesBase("runTest")
+        case.setUp()
+        try:
+            s = case.session(STUB_MODE="term_abort")
+            with case.gate_sigterm_on_ready():
+                cases.run_r4(s, gone_within_s=5, wait_first_byte_s=5)
+            c = {x["id"]: x for x in s.cases}["S-X-6"]
+            self.assertEqual((c["status"], c["reason"]), ("fail", "unexpected_signal"))
+            self.assertEqual((c["observation"]["rc"], c["observation"]["signal"]), (-6, 6))
+            self.assertTrue(c["observation"]["alive_at_term"])
+        finally:
+            case.doCleanups()
+            case.tearDown()
 
 
 if __name__ == "__main__":

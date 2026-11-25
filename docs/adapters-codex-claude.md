@@ -1,8 +1,9 @@
 # Codex CLI and Claude Code adapters
 
 A separate page on purpose: the tables in `docs/adapters.md` cover the six original vendor CLIs and
-are checked by `tests/unit/test_docs_m3.py` / `test_docs_m19.py`. These two adapters have no real
-fixtures or smoke evidence yet, so nothing here counts as verified.
+are checked by `tests/unit/test_docs_m3.py` / `test_docs_m19.py`. Each adapter has one real smoke
+run (2026-11-19, "Smoke tier" at the end of this page); everything else here is from the vendor
+documentation and synthetic fixtures.
 
 | | `codex` | `claude` |
 |---|---|---|
@@ -30,3 +31,25 @@ Not installed: `adapter probe` reports `not_installed` with an install hint; a `
 tripwire on PATH counts as not installed.
 
 Effort values: codex accepts `low|medium|high|xhigh|max|ultra`, claude `low|medium|high|xhigh|max|ultracode`. Other values are rejected at agent create/update, task create and scheduling (`EFFORT_NOT_ALLOWED`, reason `effort_not_supported_by_cli`), not only at spawn.
+
+Smoke tier: both adapters have opt-in smoke cases (`tests/smoke/test_smoke.py`, classes `CodexSmoke` and `ClaudeSmoke`;
+S-X-1..7 plus S-CODEX-8 / S-CLAUDE-8) under the `readonly` profile, with `MESH_SMOKE_MODEL_CODEX` /
+`MESH_SMOKE_MODEL_CLAUDE` (never `auto`) and `MESH_SMOKE_EFFORT_CODEX` / `MESH_SMOKE_EFFORT_CLAUDE` (default `low`).
+The harness feeds the prompt on stdin, as meshd does. `docs/adapters.md` ("Smoke tier for codex, claude and devin")
+lists what each case can show.
+
+Real runs (2026-11-19), with captures under `tests/fixtures/real/codex/0.166.0/` and
+`tests/fixtures/real/claude/2.1.325/`:
+
+- `tests/smoke/results/codex-0.166.0-2026-11-19.json` (model `gpt-5.6-luna`): S-X-1, S-X-2, S-X-3 and S-X-6 pass;
+  S-X-4 and S-X-5 are `observed` (the stream names neither the model nor the effort). S-X-7 left no `x.txt` and
+  stderr has `patch rejected: writing is blocked by read-only sandbox`. S-CODEX-8 left no `y.txt`; the stream has
+  no command item (`commands` 0, `failed_commands` 0), only the model's message that the file system is read-only.
+- `tests/smoke/results/claude-2.1.325-2026-11-19.json` (model `ds-flash`: DeepSeek through an Anthropic-compatible
+  proxy, not an Anthropic model; stderr has `[claude-code:unrecognized_model]`): S-X-1, S-X-2, S-X-3, S-X-4 and
+  S-X-6 pass; S-X-5 is `not_applicable`. S-X-7 and S-CLAUDE-8 left no `x.txt` / `y.txt` with 0
+  `permission_denials`: the readonly deny list removes Bash, Edit and Write from the session, so there was no tool
+  call to deny. In both captures the model handed the task to an `Agent` subagent, which did not create the file
+  either. `Agent` is not on the readonly deny list.
+
+With these files both adapters pass the strict launch rule (S-X-1 and S-X-6 pass at the probed version).

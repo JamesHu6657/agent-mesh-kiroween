@@ -58,8 +58,8 @@ class TestPromptT5TooLongWithRework(unittest.TestCase):
         # The spec alone fits comfortably under the limit (the rendered prompt adds a few KB of template).
         spec = 'FAKE {"succeed": {}}\n' + ("s" * 96_000)
         rc, resp = self.harness.cli("task", "create", "--project", self.project_id, "--title", "N16",
-                                    "--spec", spec, "--assignee", "fx", "--profile", "readonly",
-                                    token=self.tok_lead1)
+                                    "--spec", "-", "--assignee", "fx", "--profile", "readonly",
+                                    token=self.tok_lead1, stdin=spec)
         self.assertEqual(rc, 0, resp)
         task_id = resp["data"]["id"]
 

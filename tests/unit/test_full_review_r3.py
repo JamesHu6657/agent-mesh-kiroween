@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -239,6 +240,23 @@ class TestR3P1_6DaemonEnv(unittest.TestCase):
 
     def test_daemon_run_reexecs_without_credentials(self) -> None:
         from mesh.cli.commands import daemon as d
+
+        if sys.platform == "win32":
+            from mesh.platform import proc as plat_proc
+
+            with mock.patch.dict(os.environ, self.SECRETS), mock.patch.object(plat_proc, "reexec_clean_env") as ex:
+                ex.side_effect = SystemExit(0)
+                with self.assertRaises(SystemExit):
+                    d._exec_without_secret_env()
+            env = ex.call_args[0][1]
+            for k in self.SECRETS:
+                self.assertNotIn(k, env)
+            with mock.patch.object(plat_proc, "reexec_clean_env") as ex2:
+                env2 = {k: v for k, v in os.environ.items() if k not in self.SECRETS}
+                with mock.patch.dict(os.environ, env2, clear=True):
+                    d._exec_without_secret_env()
+                ex2.assert_not_called()
+            return
 
         with mock.patch.dict(os.environ, self.SECRETS), mock.patch.object(d.os, "execve") as ex:
             ex.side_effect = SystemExit(0)

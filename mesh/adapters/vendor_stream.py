@@ -16,9 +16,17 @@ the official sources its event names come from; this module only holds what both
 import json
 import os
 import re
+import sys
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
-from mesh.adapters.base import Probe, open_run_file_nofollow, record_adapter_probe
+from mesh.adapters.base import (
+    Probe,
+    _win_pathext,
+    is_tripwire_shim_path,
+    open_run_file_nofollow,
+    record_adapter_probe,
+    resolve_executable_on_path,
+)
 from mesh.constants import build_external_env
 from mesh.core.redact import redact
 
@@ -136,25 +144,12 @@ def end_of_stream_meaning(info: Dict[str, Any]) -> str:
 
 
 def resolve_on_path(binary_names: List[str]) -> Optional[str]:
-    """First ``binary_names`` hit on the external PATH, or None.
+    """First ``binary_names`` hit on absolute entries of the external PATH, or None.
 
     A ``tests/shims/`` tripwire counts as not installed and stops the search (the suite puts
     tests/shims first on PATH, so a real codex/claude later on PATH is never run offline). The
     shim only has to exist: a checkout without its exec bit still hides the real binary."""
-    env_path = build_external_env().get("PATH") or ""
-    for name in binary_names:
-        for entry in env_path.split(os.pathsep):
-            if not entry:
-                continue
-            candidate = os.path.join(entry, name)
-            if not os.path.isfile(candidate):
-                continue
-            real = os.path.realpath(candidate)
-            if "/tests/shims/" in real or "/tests/shims/" in os.path.abspath(candidate):
-                return None
-            if os.access(candidate, os.X_OK):
-                return os.path.abspath(candidate)
-    return None
+    return resolve_executable_on_path(binary_names, stop_on_tripwire=True)
 
 
 def error_probe(adapter, conn, status: str, version: Optional[str], binary_path: Optional[str],

@@ -2,6 +2,7 @@
 git budget for project setup), D1 (slow coder start keeps the admission lock), D13 (split
 multibyte record)."""
 
+import sys
 import os
 import signal
 import subprocess
@@ -15,6 +16,7 @@ from mesh.errors import MeshError
 from tests.unit.test_linear_full_scripts import RepoCase, git, write
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX /bin/sh pre-commit hook descendant timeout kill test")
 class TestGitTimeoutKillsHooks(unittest.TestCase):
     def test_b4_hook_descendant_dies(self):
         with tempfile.TemporaryDirectory() as d:
@@ -54,6 +56,7 @@ class TestSetupIntegrationBudget(unittest.TestCase):
         self.assertTrue(all(t <= 1.0 for t in seen), seen)
 
 
+@unittest.skipUnless(sys.platform != "win32", "POSIX bash + scripts/coord/coder-guard.sh + pkill test")
 class TestCoderGuardSlowStart(RepoCase):
     def test_d1_slow_start_keeps_lock(self):
         wt = os.path.join(self.tmp, "workspace", "mesh-d1s")
@@ -94,7 +97,7 @@ class TestViewerMultibyte(RepoCase):
         os.makedirs(os.path.dirname(log), exist_ok=True)
         with open(log, "wb") as f:
             f.write(line[:cut])
-        p = subprocess.Popen(["python3", os.path.join(self.repo, "scripts", "coord", "view-kiro-live.py")],
+        p = subprocess.Popen([sys.executable, os.path.join(self.repo, "scripts", "coord", "view-kiro-live.py")],
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         try:
             time.sleep(2.5)

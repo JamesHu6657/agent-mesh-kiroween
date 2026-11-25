@@ -1,0 +1,21 @@
+{
+  "captured_at_utc": "2026-11-19T11:20:44Z",
+  "command": [
+    "vibe",
+    "--prompt-file",
+    "/tmp/mh-smk-vibe/.runs/S-X-6-plzk70o9/prompt.md",
+    "--output",
+    "streaming",
+    "--workdir",
+    "/tmp/mh-smoke-fbnv7s1_",
+    "--model",
+    "ds-flash",
+    "--agent",
+    "ask",
+    "--time-limit",
+    "180",
+    "--output-dir",
+    "/tmp/mh-smk-vibe/.runs/S-X-6-plzk70o9/vibe-out"
+  ],
+  "sha256": "8218eead34321b44e02a739b8b22c5c4d76155ae76aa0d9a60db98633a05b879"
+}

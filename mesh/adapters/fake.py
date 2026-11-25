@@ -27,6 +27,7 @@ class FakeAdapter(Adapter):
 
     id = "fake"
     kind = "test_double"
+    supported_profiles = ("readonly", "edit", "dev", "elevated", "unrestricted")
     binary_names = ["python3"]
     planned_version = "1.0.0"
     liveness = "stream"

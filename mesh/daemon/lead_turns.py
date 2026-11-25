@@ -30,7 +30,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import mesh.constants as c
 from mesh.adapters.base import AdapterUnsupported, RunRequest, TestDoubleDisabled
@@ -47,8 +47,10 @@ from mesh.core.lead_actions import (
     MAX_ACTIONS,
     action_idempotency_key,
     action_request_args,
+    extract_fallback_reply_text,
     parse_actions,
     parse_final_actions_block,
+    strip_mesh_actions_blocks,
 )
 from mesh.core.leases import get_lease_ttl_s
 from mesh.core.paths import get_install_root
@@ -65,6 +67,9 @@ from mesh.core.workspaces import (
 from mesh.daemon.handlers.base import HandlerContext
 from mesh.errors import MeshError
 
+#: Interval/TTL helper (patchable in unit/integration tests without replacing `time.monotonic`).
+_monotonic = time.monotonic
+
 #: §12.4: at most this many messages go into one turn.
 LEAD_WAKE_BATCH_MAX = 50
 
@@ -77,6 +82,9 @@ LEAD_PROMPT_LIMIT_BYTES = PROMPT_LIMIT_BYTES
 #: The message type that never triggers a turn by itself (Q8).
 ACTION_FAILED_TYPE = "lead.action_failed"
 
+#: Fast-lane wake message types (Chat-First Batch 1.2): use `lead.chat_wake_debounce_s` (default 0s).
+IMMEDIATE_WAKE_TYPES = ("chat.message", "approval.decided")
+
 #: Run-token expiry grace after the deadline (§7.1).
 RUN_TOKEN_EXPIRY_GRACE_S = 300
 
@@ -84,9 +92,10 @@ RUN_TOKEN_EXPIRY_GRACE_S = 300
 DEFAULT_LEAD_PROFILE = "readonly"
 DEFAULT_LEAD_TURN_TIMEOUT_S = 1800
 
-#: How many recent events / notes the prompt carries (§12.6).
+#: How many recent events / notes / chat messages the prompt carries (§12.6).
 PROMPT_EVENT_LIMIT = 200
 PROMPT_NOTE_LIMIT = 100
+PROMPT_CHAT_LIMIT = 20
 
 
 def _setting(conn: sqlite3.Connection, key: str, default: Any) -> Any:
@@ -98,6 +107,16 @@ def _setting(conn: sqlite3.Connection, key: str, default: Any) -> Any:
     except (ValueError, TypeError):
         return default
     return default if value is None else value
+
+
+def vendor_leads_enabled(conn: Optional[sqlite3.Connection]) -> bool:
+    """True only when direct-user opt-in setting ``lead.vendor_leads`` is enabled (fail closed)."""
+    if conn is None:
+        return False
+    try:
+        return _setting(conn, "lead.vendor_leads", False) is True
+    except sqlite3.Error:
+        return False
 
 
 def lead_wake_backoff_s(conn: sqlite3.Connection, testing_mode: bool = False) -> List[int]:
@@ -147,12 +166,31 @@ def pending_lead_wake(conn: sqlite3.Connection, project_id: str, agent_id: str,
     ).fetchall()
 
 
+def _project_uses_chat(conn: sqlite3.Connection, project_id: str, plan_gate_mode: Optional[str] = None) -> bool:
+    """True when project is chat-gated (`require_approval`) or already has chat_messages rows (P3-1)."""
+    if plan_gate_mode == "require_approval":
+        return True
+    if plan_gate_mode is None:
+        prow = conn.execute("SELECT plan_gate_mode FROM projects WHERE id = ?;", (project_id,)).fetchone()
+        if prow is not None and prow["plan_gate_mode"] == "require_approval":
+            return True
+    has_tbl = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chat_messages';"
+    ).fetchone()
+    if not has_tbl:
+        return False
+    return conn.execute(
+        "SELECT 1 FROM chat_messages WHERE project_id = ? AND role = 'user' LIMIT 1;",
+        (project_id,),
+    ).fetchone() is not None
+
+
 def should_start_turn(conn: sqlite3.Connection, project_id: str, lead: Mapping[str, Any],
                       now: str) -> Optional[List[sqlite3.Row]]:
     """The messages a turn would carry, or None when the trigger does not fire (§12.4)."""
     if lead.get("delivery") != "launch":
         return None
-    project = conn.execute("SELECT status FROM projects WHERE id = ?;", (project_id,)).fetchone()
+    project = conn.execute("SELECT status, plan_gate_mode FROM projects WHERE id = ?;", (project_id,)).fetchone()
     if project is None or project["status"] != "active":
         return None
     if not _lease_free(conn, project_id):
@@ -168,7 +206,14 @@ def should_start_turn(conn: sqlite3.Connection, project_id: str, lead: Mapping[s
         return None
     if len(messages) >= LEAD_WAKE_BATCH_TRIGGER:
         return messages
-    debounce_s = int(_setting(conn, "lead.wake_debounce_s", 5) or 0)
+    use_fast_lane = any(m["type"] == "chat.message" for m in messages) or (
+        any(m["type"] == "approval.decided" for m in messages)
+        and _project_uses_chat(conn, project_id, project["plan_gate_mode"])
+    )
+    if use_fast_lane:
+        debounce_s = int(_setting(conn, "lead.chat_wake_debounce_s", 0) or 0)
+    else:
+        debounce_s = int(_setting(conn, "lead.wake_debounce_s", 5) or 0)
     oldest = messages[0]["created_at"]
     try:
         age = parse_utc(now).timestamp() - parse_utc(oldest).timestamp()
@@ -311,10 +356,145 @@ def _messages(rows: List[sqlite3.Row]) -> List[Dict[str, Any]]:
     return out
 
 
+def _workers(conn: sqlite3.Connection, project_id: str, testing_mode: bool = False) -> List[Dict[str, Any]]:
+    """Enabled worker agents (excluding the project's current lead) with profiles & allowed models."""
+    lead = get_project_active_lead(conn, project_id)
+    lead_id = lead["agent_id"] if lead else None
+    rows = conn.execute(
+        """SELECT a.id, p.name, a.adapter, a.delivery, a.default_profile,
+                  a.max_unapproved_profile, a.allowed_models_json
+           FROM agents a JOIN principals p ON a.id = p.id
+           WHERE p.disabled_at IS NULL
+           ORDER BY p.name ASC;"""
+    ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        if lead_id is not None and r["id"] == lead_id:
+            continue
+        try:
+            allowed_models = json.loads(r["allowed_models_json"] or "[]")
+        except (ValueError, TypeError):
+            allowed_models = []
+        supported_profiles: List[str] = []
+        try:
+            adapter = get_adapter(r["adapter"], testing_mode=testing_mode)
+            supported_profiles = list(getattr(adapter, "supported_profiles", ()) or ())
+        except Exception:
+            supported_profiles = []
+        out.append({
+            "name": r["name"],
+            "adapter": r["adapter"],
+            "delivery": r["delivery"],
+            "default_profile": r["default_profile"],
+            "max_unapproved_profile": r["max_unapproved_profile"],
+            "supported_profiles": supported_profiles,
+            "allowed_models": [str(m) for m in allowed_models],
+        })
+    return out
+
+
+def _active_plan(conn: sqlite3.Connection, project_id: str) -> Optional[Dict[str, Any]]:
+    """Most recent active or dispatched plan for this project."""
+    row = conn.execute(
+        """SELECT * FROM plans
+           WHERE project_id = ? AND status IN ('proposed', 'approved_pending_dispatch', 'revising', 'dispatched')
+           ORDER BY version DESC LIMIT 1;""",
+        (project_id,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    try:
+        steps = json.loads(row["steps_json"] or "[]")
+    except (ValueError, TypeError):
+        steps = []
+    apr_status = None
+    if row["approval_id"]:
+        arow = conn.execute("SELECT status FROM approvals WHERE id = ?;", (row["approval_id"],)).fetchone()
+        if arow is not None:
+            apr_status = arow["status"]
+    return {
+        "id": row["id"],
+        "version": row["version"],
+        "status": row["status"],
+        "title": redact(row["title"]) if row["title"] else row["title"],
+        "summary": redact(row["summary"]) if row["summary"] else row["summary"],
+        "plan_hash": row["plan_hash"],
+        "approval_id": row["approval_id"],
+        "approval_status": apr_status,
+        "steps": redact_value(steps),
+    }
+
+
+def _chat_messages(conn: sqlite3.Connection, project_id: str) -> List[Dict[str, Any]]:
+    """Last PROMPT_CHAT_LIMIT non-cancelled chat messages for this project, oldest first."""
+    rows = conn.execute(
+        """SELECT cm.id, cm.role, cm.kind, cm.actor_id, cm.via, cm.body, cm.meta_json, cm.created_at,
+                  p.name AS actor_name
+           FROM chat_messages cm
+           LEFT JOIN principals p ON cm.actor_id = p.id
+           WHERE cm.project_id = ?
+           ORDER BY cm.event_seq DESC LIMIT ?;""",
+        (project_id, PROMPT_CHAT_LIMIT * 2),
+    ).fetchall()
+    kept: List[Dict[str, Any]] = []
+    for r in rows:
+        meta_obj: Dict[str, Any] = {}
+        if r["meta_json"]:
+            try:
+                m = json.loads(r["meta_json"])
+                if isinstance(m, dict):
+                    meta_obj = m
+            except (TypeError, ValueError):
+                meta_obj = {}
+        if meta_obj.get("queued_cancelled"):
+            continue
+        relayed_by_name = (
+            (r["actor_name"] or meta_obj.get("relayed_by_name"))
+            if r["via"] == "relayed"
+            else None
+        )
+        kept.append(
+            {
+                "id": r["id"],
+                "role": r["role"],
+                "kind": r["kind"],
+                "actor_id": r["actor_id"],
+                "actor_name": r["actor_name"],
+                "relayed_by_name": relayed_by_name,
+                "via": r["via"],
+                "body": redact(r["body"]) if r["body"] else r["body"],
+                "created_at": r["created_at"],
+            }
+        )
+        if len(kept) >= PROMPT_CHAT_LIMIT:
+            break
+    kept.reverse()
+    return kept
+
+
 def build_prompt_input(conn: sqlite3.Connection, project_id: str, messages: List[sqlite3.Row],
-                       limit_bytes: int) -> LeadPromptInput:
+                       limit_bytes: int, testing_mode: bool = False) -> LeadPromptInput:
     """Everything the lead prompt is rendered from (§12.6)."""
-    project = conn.execute("SELECT id, name, goal FROM projects WHERE id = ?;", (project_id,)).fetchone()
+    project = conn.execute(
+        "SELECT id, name, goal, plan_gate_mode, permission_mode FROM projects WHERE id = ?;",
+        (project_id,),
+    ).fetchone()
+    plan_gate_mode = (
+        project["plan_gate_mode"]
+        if (project is not None and "plan_gate_mode" in project.keys() and project["plan_gate_mode"])
+        else "off"
+    )
+    permission_mode = (
+        project["permission_mode"]
+        if (project is not None and "permission_mode" in project.keys() and project["permission_mode"])
+        else "plan"
+    )
+    chat_msgs = _chat_messages(conn, project_id)
+    active_plan = _active_plan(conn, project_id)
+    workers = _workers(conn, project_id, testing_mode=testing_mode) if (
+        plan_gate_mode == "require_approval" or chat_msgs or active_plan is not None
+    ) else []
     return LeadPromptInput(
         project={
             "id": project["id"],
@@ -329,6 +509,11 @@ def build_prompt_input(conn: sqlite3.Connection, project_id: str, messages: List
         messages=_messages(messages),
         authority=_authority(conn, project_id),
         limit_bytes=limit_bytes,
+        workers=workers,
+        active_plan=active_plan,
+        chat_messages=chat_msgs,
+        plan_gate_mode=plan_gate_mode,
+        permission_mode=permission_mode,
     )
 
 
@@ -436,25 +621,130 @@ _TURN_REFUSED_REASONS = {
     c.TEST_DOUBLE_DISABLED: "test_double_disabled",
 }
 
+#: Round 2 P3-7 / Round 3 P1-1, P3-1: per-assignment cache for vendor launch refusals during
+#: turn planning. Stores only error metadata (code, exit_code, message, details) and never a live
+#: exception/traceback; keyed on settings, holds, binary stat, latest probe row, results dir
+#: stat, results file + sidecar stats, and referenced fixture + sidecar stats with a 30s TTL.
+VENDOR_REFUSAL_CACHE_TTL_S = 30.0
+_VENDOR_REFUSAL_CACHE_MAX = 256
+_VENDOR_REFUSAL_LOCK = threading.Lock()
 
-def lead_launch_check(conn: sqlite3.Connection, adapter: Any, testing_mode: bool = False,
-                      binary_path: Optional[str] = None) -> None:
-    """Raise unless a lead turn may launch on `adapter` (rc 13).
 
-    The same check as a launch assignee of `task create/assign`
-    (handlers/task.py `_validate_assignment_guards`): the test double only in testing
-    mode, and only a `launch_enabled` adapter; a vendor adapter is rc 13
-    `ADAPTER_UNSUPPORTED` with the milestone that enables it.
+class _VendorRefusalEntry(NamedTuple):
+    code: str
+    exit_code: int
+    message: str
+    details: Dict[str, Any]
+    state_key: Tuple[Any, ...]
+    results_path: Optional[str]
+    fixture_paths: Tuple[str, ...]
+    cached_at: float
 
-    C-5 (m4-p3-cleanup): after the vendor rule, the gate is `evidence.effective_launch`
-    (the same evidence gate as task assignment, with the lead's `binary_path`). Today only
-    non-vendor kinds reach it, where it returns the class attribute; it is already in place
-    for when vendor leads open (which also needs L4 resolved first).
+
+_VENDOR_REFUSAL_CACHE: Dict[Tuple[str, str], _VendorRefusalEntry] = {}
+
+
+def _vendor_refusal_signature(
+    conn: sqlite3.Connection,
+    adapter: Any,
+    testing_mode: bool,
+    binary_path: Optional[str],
+    *,
+    use_known: bool = False,
+    results_path: Optional[str] = None,
+    fixture_paths: Tuple[str, ...] = (),
+) -> Tuple[Tuple[Any, ...], Optional[str], Tuple[str, ...]]:
+    from mesh.adapters import evidence
+
+    if not vendor_leads_enabled(conn):
+        return (("disabled", adapter.id, bool(testing_mode)), None, ())
+    if use_known:
+        sig = evidence.launch_inputs_signature(
+            conn, adapter, testing_mode, binary_path, known_paths=(results_path, fixture_paths),
+        )
+    else:
+        sig = evidence.launch_inputs_signature(conn, adapter, testing_mode, binary_path)
+    return (("enabled", sig.signature), sig.results_path, sig.fixture_paths)
+
+
+def _plan_lead_launch_check(
+    conn: sqlite3.Connection,
+    home: str,
+    lead: Mapping[str, Any],
+    adapter: Any,
+    testing_mode: bool,
+    binary_path: Optional[str],
+) -> Optional[str]:
+    """Run ``lead_launch_check`` with per-assignment refusal caching for vendor leads."""
+    if getattr(adapter, "kind", None) != "vendor":
+        return lead_launch_check(conn, adapter, testing_mode, binary_path=binary_path)
+    cache_id = (home or "", str(lead.get("assignment_id") or lead.get("agent_id") or ""))
+    with _VENDOR_REFUSAL_LOCK:
+        cached = _VENDOR_REFUSAL_CACHE.get(cache_id)
+    now_mono = _monotonic()
+    if cached is not None and (now_mono - cached.cached_at) < VENDOR_REFUSAL_CACHE_TTL_S:
+        try:
+            cur_key, _, _ = _vendor_refusal_signature(
+                conn,
+                adapter,
+                testing_mode,
+                binary_path,
+                use_known=True,
+                results_path=cached.results_path,
+                fixture_paths=cached.fixture_paths,
+            )
+            matched = cur_key == cached.state_key
+        except Exception:  # noqa: BLE001 - fall through to fresh check on signature error
+            matched = False
+        if matched:
+            raise MeshError(
+                code=cached.code,
+                exit_code=cached.exit_code,
+                message=cached.message,
+                details=dict(cached.details),
+            )
+    try:
+        warning = lead_launch_check(conn, adapter, testing_mode, binary_path=binary_path)
+    except MeshError as exc:
+        try:
+            new_key, rpath, fpaths = _vendor_refusal_signature(conn, adapter, testing_mode, binary_path)
+            entry = _VendorRefusalEntry(
+                code=exc.code,
+                exit_code=exc.exit_code,
+                message=exc.message,
+                details=dict(exc.details or {}),
+                state_key=new_key,
+                results_path=rpath,
+                fixture_paths=fpaths,
+                cached_at=_monotonic(),
+            )
+            with _VENDOR_REFUSAL_LOCK:
+                if len(_VENDOR_REFUSAL_CACHE) >= _VENDOR_REFUSAL_CACHE_MAX and cache_id not in _VENDOR_REFUSAL_CACHE:
+                    _VENDOR_REFUSAL_CACHE.pop(next(iter(_VENDOR_REFUSAL_CACHE)))
+                _VENDOR_REFUSAL_CACHE[cache_id] = entry
+        except Exception:  # noqa: BLE001 - never let cache-key failure hide the refusal MeshError
+            pass
+        raise
+    with _VENDOR_REFUSAL_LOCK:
+        _VENDOR_REFUSAL_CACHE.pop(cache_id, None)
+    return warning
+
+
+def lead_launch_check(conn: Optional[sqlite3.Connection], adapter: Any, testing_mode: bool = False,
+                      binary_path: Optional[str] = None) -> Optional[str]:
+    """Raise unless a lead turn may launch on ``adapter`` (rc 13); return any evidence warning.
+
+    Vendor leads are refused by default (``vendor_lead_m3_lite``) until
+    ``lead.vendor_leads`` is explicitly enabled (direct user setting). When enabled,
+    vendor leads pass through ``evidence.effective_launch`` (with the lead's
+    ``binary_path``) under the same ``adapter.evidence_mode`` policy as task
+    executors (``warn`` allows launch with an evidence warning; ``strict`` requires
+    valid launch evidence; launch holds and unimplemented stubs stay refused).
+    Non-vendor adapters keep testing-mode / ``launch_enabled`` gating.
     """
-    if adapter.kind == "vendor":
-        # N19 (M3-lite): vendor lead turns are off whatever the evidence says. Checked
-        # first (coordinator ruling, r4b), before the launch-enabled and any evidence
-        # gate, so every vendor lead is refused with `vendor_lead_m3_lite`.
+    if adapter.kind == "vendor" and not vendor_leads_enabled(conn):
+        # Default (off): vendor lead turns are refused whatever the evidence says.
+        # Checked first so every vendor lead is refused with `vendor_lead_m3_lite`.
         raise vendor_lead_refused(adapter)
     if adapter.kind == "test_double" and not testing_mode:
         raise TestDoubleDisabled()
@@ -468,26 +758,28 @@ def lead_launch_check(conn: sqlite3.Connection, adapter: Any, testing_mode: bool
             milestone=getattr(ev, "milestone", None) or adapter.launch_milestone or "M3",
             reason=ev.reason,
         )
+    return ev.warning
 
 
-#: N19: the `lead.turn_refused` reason for a launch-enabled vendor lead in M3-lite.
+#: N19: the `lead.turn_refused` reason for a launch-enabled vendor lead when opt-in is off.
 VENDOR_LEAD_REFUSED_REASON = "vendor_lead_m3_lite"
 
 
 def vendor_lead_refused(adapter: Any) -> AdapterUnsupported:
-    """The rc 13 error for a vendor lead turn in M3-lite (`details.reason` set)."""
+    """The rc 13 error for a vendor lead turn while ``lead.vendor_leads`` is off."""
     exc = AdapterUnsupported(
-        f"Adapter '{adapter.id}' cannot run launch-mode lead turns (vendor lead turns are off; use an inbox lead)",
+        f"Adapter '{adapter.id}' cannot run launch-mode lead turns (vendor lead turns are off; set lead.vendor_leads true --user or use an inbox lead)",
         milestone="M3",
     )
     exc.details["reason"] = VENDOR_LEAD_REFUSED_REASON
     return exc
 
 
-def lead_launch_allowed(conn: sqlite3.Connection, adapter: Any, testing_mode: bool = False) -> bool:
+def lead_launch_allowed(conn: Optional[sqlite3.Connection], adapter: Any, testing_mode: bool = False,
+                        binary_path: Optional[str] = None) -> bool:
     """True when `lead_launch_check` passes."""
     try:
-        lead_launch_check(conn, adapter, testing_mode)
+        lead_launch_check(conn, adapter, testing_mode, binary_path=binary_path)
     except MeshError:
         return False
     return True
@@ -495,12 +787,14 @@ def lead_launch_allowed(conn: sqlite3.Connection, adapter: Any, testing_mode: bo
 
 def _record_turn_refused(conn: sqlite3.Connection, project_id: str, lead: Mapping[str, Any],
                          adapter_id: str, exc: MeshError) -> None:
-    """One `lead.turn_refused` event per lead assignment; the messages stay pending."""
+    """One `lead.turn_refused` event per `(lead_assignment_id, reason)`; messages stay pending."""
     assignment_id = lead.get("assignment_id")
+    reason = (exc.details or {}).get("reason") or _TURN_REFUSED_REASONS.get(exc.code, "launch_refused")
     seen = conn.execute(
         "SELECT 1 FROM events WHERE type = 'lead.turn_refused' AND project_id = ? "
-        "AND json_extract(payload_json, '$.lead_assignment_id') = ? LIMIT 1;",
-        (project_id, assignment_id),
+        "AND json_extract(payload_json, '$.lead_assignment_id') = ? "
+        "AND json_extract(payload_json, '$.reason') = ? LIMIT 1;",
+        (project_id, assignment_id, reason),
     ).fetchone()
     if seen is not None:
         return
@@ -517,8 +811,7 @@ def _record_turn_refused(conn: sqlite3.Connection, project_id: str, lead: Mappin
                 "lead_assignment_id": assignment_id,
                 "agent_id": lead.get("agent_id"),
                 "adapter": adapter_id,
-                "reason": (exc.details or {}).get("reason")
-                or _TURN_REFUSED_REASONS.get(exc.code, "launch_refused"),
+                "reason": reason,
                 "code": exc.code,
                 "milestone": (exc.details or {}).get("milestone"),
             },
@@ -549,7 +842,9 @@ def plan_lead_turn(conn: sqlite3.Connection, home: str, project_id: str,
     try:
         adapter = get_adapter(adapter_id, testing_mode=testing_mode,
                               options=json.loads(agent["adapter_options_json"] or "{}"))
-        lead_launch_check(conn, adapter, testing_mode, binary_path=agent["binary_path"])
+        evidence_warning = _plan_lead_launch_check(
+            conn, home, lead, adapter, testing_mode, binary_path=agent["binary_path"]
+        )
     except MeshError as exc:
         _record_turn_refused(conn, project_id, lead, adapter_id, exc)
         return None
@@ -567,7 +862,7 @@ def plan_lead_turn(conn: sqlite3.Connection, home: str, project_id: str,
 
     # --- Render the prompt (before TX: it decides which messages are included) ---
     batch = list(messages)[:LEAD_WAKE_BATCH_MAX]
-    inp = build_prompt_input(conn, project_id, batch, limit_bytes)
+    inp = build_prompt_input(conn, project_id, batch, limit_bytes, testing_mode=testing_mode)
     rendered = render_lead_prompt(inp)
     included = list(rendered.included_message_ids)
     if not included:
@@ -583,6 +878,7 @@ def plan_lead_turn(conn: sqlite3.Connection, home: str, project_id: str,
         "rendered": rendered,
         "included": included,
         "testing_mode": testing_mode,
+        "evidence_warning": evidence_warning,
     }
 
 
@@ -609,6 +905,7 @@ def commit_lead_turn(conn: sqlite3.Connection, home: str,
     rendered = plan["rendered"]
     included = plan["included"]
     testing_mode = plan["testing_mode"]
+    evidence_warning = plan.get("evidence_warning")
     try:
         adapter = get_adapter(adapter_id, testing_mode=testing_mode,
                               options=json.loads(agent["adapter_options_json"] or "{}"))
@@ -616,6 +913,12 @@ def commit_lead_turn(conn: sqlite3.Connection, home: str,
         _log(home, f"lead turn adapter '{adapter_id}' unavailable: {type(exc).__name__}: {exc}")
         return None
 
+    from mesh.core.policy import resolve_model_and_effort
+
+    resolved_model, resolved_effort = resolve_model_and_effort(
+        default_model=agent["default_model"],
+        default_effort=agent["default_effort"],
+    )
     run_id = generate_id("run")
     run_dir = os.path.join(home, "runs", run_id)
     ws_root = get_workspaces_root(conn, home)
@@ -641,10 +944,10 @@ def commit_lead_turn(conn: sqlite3.Connection, home: str,
                     id, kind, task_id, project_id, agent_id, attempt, fence,
                     adapter, model, effort, profile, status, boot_id, run_dir,
                     argv_redacted_json, started_at, deadline_at, lead_assignment_id
-                ) VALUES (?, 'lead_turn', NULL, ?, ?, NULL, 0, ?, NULL, NULL, ?, 'starting', ?, ?,
+                ) VALUES (?, 'lead_turn', NULL, ?, ?, NULL, 0, ?, ?, ?, ?, 'starting', ?, ?,
                           '[]', ?, ?, ?);""",
-                (run_id, project_id, agent["id"], adapter_id, profile, boot_id, run_dir,
-                 now, deadline_at, lead["assignment_id"]),
+                (run_id, project_id, agent["id"], adapter_id, resolved_model, resolved_effort,
+                 profile, boot_id, run_dir, now, deadline_at, lead["assignment_id"]),
             )
             conn.execute(
                 """INSERT INTO leases (
@@ -675,6 +978,16 @@ def commit_lead_turn(conn: sqlite3.Connection, home: str,
                     WHERE id IN ({placeholders}) AND status = 'pending';""",
                 (run_id, *included),
             )
+            turn_payload: Dict[str, Any] = {
+                "run_id": run_id,
+                "project_id": project_id,
+                "lead_assignment_id": lead["assignment_id"],
+                "messages": len(included),
+                "prompt_bytes": rendered.bytes,
+                "omitted": rendered.omitted,
+            }
+            if evidence_warning:
+                turn_payload["evidence_warning"] = evidence_warning
             record_event(
                 conn=conn,
                 type_="lead.turn_started",
@@ -683,14 +996,7 @@ def commit_lead_turn(conn: sqlite3.Connection, home: str,
                 via="system",
                 project_id=project_id,
                 run_id=run_id,
-                payload={
-                    "run_id": run_id,
-                    "project_id": project_id,
-                    "lead_assignment_id": lead["assignment_id"],
-                    "messages": len(included),
-                    "prompt_bytes": rendered.bytes,
-                    "omitted": rendered.omitted,
-                },
+                payload=turn_payload,
             )
     except sqlite3.IntegrityError as exc:
         unregister_secret(f"run_token:{run_id}")
@@ -709,14 +1015,13 @@ def commit_lead_turn(conn: sqlite3.Connection, home: str,
             # The renderer caps at the adapter's own limit, so this cannot happen; if it
             # ever does, the turn must not launch (a lead that cannot read its task).
             raise RuntimeError(f"lead prompt of {rendered.bytes} bytes exceeds {limit_bytes}")
-        argv_prompt = pointer_prompt(run_dir) if strategy == "pointer" else rendered.text
         assignment = conn.execute("SELECT session_id FROM lead_assignments WHERE id = ?;",
                                   (lead["assignment_id"],)).fetchone()
         request = RunRequest(
             prompt_path=prompt_path,
             workspace=lead_dir,
-            model=None,
-            effort=None,
+            model=resolved_model,
+            effort=resolved_effort,
             profile=profile,
             timeout_s=timeout_s,
             resume_session_id=verified_resume_session(
@@ -728,10 +1033,19 @@ def commit_lead_turn(conn: sqlite3.Connection, home: str,
             ),
             options=build_run_options(agent, run_id),
         )
+        from mesh.daemon.supervisor import apply_cmd_pointer_fallback, register_run_job, register_wrapper
+        from mesh.platform import ipc as plat_ipc, proc as plat_proc
+
         spec_cmd = adapter.build(request)
-        argv = list(spec_cmd.argv)
-        if strategy == "pointer":
-            argv = [argv_prompt if part == prompt_path else part for part in argv]
+        strategy, argv = apply_cmd_pointer_fallback(
+            list(spec_cmd.argv),
+            strategy,
+            prompt_path=prompt_path,
+            prompt_text=rendered.text,
+            run_dir=run_dir,
+            adapter_id=adapter_id,
+            profile=profile,
+        )
         spec = build_spec(
             argv=argv,
             cwd=spec_cmd.cwd,
@@ -741,7 +1055,7 @@ def commit_lead_turn(conn: sqlite3.Connection, home: str,
         )
         _write_json(os.path.join(run_dir, "spec.json"), spec)
 
-        socket_path = os.path.join(home, "run", "mesh.sock")
+        socket_path = plat_ipc.daemon_endpoint_path(home)
         child_env = build_lead_child_env(
             base_env=dict(os.environ),
             token=token,
@@ -749,6 +1063,11 @@ def commit_lead_turn(conn: sqlite3.Connection, home: str,
             project_id=project_id,
             socket_path=socket_path,
         )
+        run_job = None
+        if sys.platform == "win32":
+            run_job = plat_proc.create_run_job(home, run_id, kill_on_close=False)
+            register_run_job(run_id, run_job, home=home)
+        popen_extra: Dict[str, Any] = {"job": run_job} if run_job is not None else {}
         proc = children.popen_registered(
             "wrapper",
             [sys.executable, "-P", "-s", "-m", "mesh.runwrap", run_dir],
@@ -759,13 +1078,21 @@ def commit_lead_turn(conn: sqlite3.Connection, home: str,
             env=child_env,
             start_new_session=True,
             close_fds=True,
+            **popen_extra,
         )
         from mesh.core.proc import get_proc_stat
-        from mesh.daemon.supervisor import handle_spawn_failure, register_wrapper
 
         register_wrapper(run_id, proc)
         # --- TX B: run running with wrapper identity (inside try so any TX B error aborts) ---
         stat_info = get_proc_stat(proc.pid)
+        if sys.platform == "win32":
+            register_run_job(
+                run_id,
+                run_job,
+                pgid=proc.pid,
+                wrapper_starttime=stat_info["starttime"] if stat_info else None,
+                home=home,
+            )
         with transaction(conn):
             conn.execute(
                 "UPDATE runs SET status = 'running', wrapper_pid = ?, pgid = ?, proc_starttime = ?, "
@@ -788,16 +1115,21 @@ def commit_lead_turn(conn: sqlite3.Connection, home: str,
 
 
 def _write_text(path: str, text: str, mode: int = 0o600) -> None:
+    from mesh.platform import perms as plat_perms
+
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     try:
         os.write(fd, text.encode("utf-8"))
         os.fsync(fd)
+        if sys.platform == "win32":
+            plat_perms.fchmod_private(fd, mode)
     finally:
         os.close(fd)
-    try:
-        os.chmod(path, mode)
-    except OSError:
-        pass
+    if sys.platform != "win32":
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            pass
 
 
 def _write_json(path: str, obj: Any, mode: int = 0o600) -> None:
@@ -807,22 +1139,26 @@ def _write_json(path: str, obj: Any, mode: int = 0o600) -> None:
 def _fail_lead_turn_spawn(conn: sqlite3.Connection, run_id: str, project_id: str,
                           message: str, after_popen: Optional[Dict[str, Any]] = None,
                           testing_mode: Optional[bool] = None) -> None:
-    """A lead turn that could not spawn: close it and put its messages back (§12.4)."""
+    """A lead turn that could not spawn: close it through the gate and put its messages back (§12.4)."""
     from mesh.daemon import supervisor
 
-    now = now_iso_utc()
     tmode = supervisor._testing_mode() if testing_mode is None else bool(testing_mode)
     payload: Dict[str, Any] = {"reason": "spawn_failed", "message": message}
     if after_popen:
         payload["after_popen"] = after_popen
-    conn.execute(
-        "UPDATE runs SET status = 'spawn_failed', end_reason = 'spawn_failed', ended_at = ?, "
-        "result_json = ? WHERE id = ?;",
-        (now, json.dumps(redact_value(payload)), run_id),
+        if after_popen.get("pid"):
+            conn.execute(
+                "UPDATE runs SET wrapper_pid = COALESCE(wrapper_pid, ?), pgid = COALESCE(pgid, ?), "
+                "proc_starttime = COALESCE(proc_starttime, ?) WHERE id = ?;",
+                (after_popen["pid"], after_popen["pid"], after_popen.get("starttime"), run_id),
+            )
+    run = conn.execute("SELECT * FROM runs WHERE id = ?;", (run_id,)).fetchone()
+    if run is None:
+        raise RuntimeError(f"lead_turn run '{run_id}' missing in _fail_lead_turn_spawn")
+    supervisor._close_run(
+        conn, run, "spawn_failed", "spawn_failed", None, payload, testing_mode=tmode,
     )
-    conn.execute("DELETE FROM leases WHERE key = ? AND run_id = ?;", (f"leadturn:{project_id}", run_id))
     _release_messages(conn, run_id, ok=False, project_id=project_id, testing_mode=tmode)
-    supervisor.revoke_run_token(conn, run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1035,6 +1371,19 @@ def _queue_lead_merge(item: Dict[str, Any]) -> None:
     with _QUEUED_MERGES_LOCK:
         if not any(m["request_id"] == item["request_id"] for m in _QUEUED_MERGES):
             _QUEUED_MERGES.append(item)
+
+
+def _queued_merge_ids_for(run_id: str) -> set:
+    with _QUEUED_MERGES_LOCK:
+        return {m["request_id"] for m in _QUEUED_MERGES if m.get("run_id") == run_id}
+
+
+def _discard_queued_merges_since(run_id: str, keep_ids: set) -> None:
+    with _QUEUED_MERGES_LOCK:
+        _QUEUED_MERGES[:] = [
+            m for m in _QUEUED_MERGES
+            if not (m.get("run_id") == run_id and m.get("request_id") not in keep_ids)
+        ]
 
 
 def _log_queued_merge_recovery_error(conn: sqlite3.Connection, message: str) -> None:
@@ -1390,10 +1739,13 @@ def finish_lead_turn_committed(conn: sqlite3.Connection, home: str, run: Mapping
     from mesh.core.db import transaction
 
     del _PENDING_INTENT_UNLINKS[:]
-    try:
-        settle_project = run["project_id"]
-    except (KeyError, IndexError, TypeError):
-        settle_project = None
+    run_id = run["id"] if "id" in run.keys() else None
+    if run_id is not None:
+        from mesh.daemon.supervisor import close_gate
+
+        close_gate(run, "lost" if exit_info is None else "exited")
+    merges_before = _queued_merge_ids_for(run_id) if run_id is not None else set()
+    settle_project = run["project_id"] if "project_id" in run.keys() else None
     if settle_project:
         # Full review r4 P1-1: an earlier lost delivery of this project is settled in
         # its own transaction before the turn's actions run (as `handle_client` does).
@@ -1405,9 +1757,14 @@ def finish_lead_turn_committed(conn: sqlite3.Connection, home: str, run: Mapping
             _log(home, f"deliver intent of {settle_project} not settled: {type(exc).__name__}: {exc}")
     try:
         with transaction(conn):
-            outcome = finish_lead_turn(conn, home, run, exit_info, testing_mode)
+            if run_id is not None:
+                outcome = finish_lead_turn(conn, home, run, exit_info, testing_mode, pre_gated=True)
+            else:
+                outcome = finish_lead_turn(conn, home, run, exit_info, testing_mode)
     except BaseException:
         del _PENDING_INTENT_UNLINKS[:]
+        if run_id is not None:
+            _discard_queued_merges_since(run_id, merges_before)
         raise
     paths, _PENDING_INTENT_UNLINKS[:] = list(_PENDING_INTENT_UNLINKS), []
     for path in paths:
@@ -1418,25 +1775,52 @@ def finish_lead_turn_committed(conn: sqlite3.Connection, home: str, run: Mapping
     return outcome
 
 
+def _token_expired_before_finish(
+    conn: sqlite3.Connection,
+    run: Mapping[str, Any],
+    exit_info: Optional[Dict[str, Any]],
+) -> bool:
+    """True when an exited lead turn's run token expired before finishing (e.g. gate hold or downtime)."""
+    from mesh.daemon import supervisor
+
+    run_id = run["id"]
+    ended_at = (exit_info or {}).get("ended_at")
+    if isinstance(ended_at, str) and ended_at:
+        exp = conn.execute(
+            "SELECT expires_at FROM credentials WHERE kind = 'run_token' "
+            "AND json_extract(scope_json, '$.run_id') = ? ORDER BY created_at DESC LIMIT 1;",
+            (run_id,),
+        ).fetchone()
+        if exp and isinstance(exp["expires_at"], str) and exp["expires_at"] and ended_at <= exp["expires_at"]:
+            return True
+    if run_id in supervisor._CLOSE_REFUSED_LOGGED or run_id in supervisor._SEEN_UNUSABLE:
+        return True
+    return bool(conn.execute("SELECT 1 FROM meta WHERE key = ?;", (supervisor.seen_hold_key(run_id),)).fetchone())
+
+
 def finish_lead_turn(conn: sqlite3.Connection, home: str, run: Mapping[str, Any],
                      exit_info: Optional[Dict[str, Any]],
-                     testing_mode: bool = False) -> str:
+                     testing_mode: bool = False,
+                     *,
+                     pre_gated: bool = False) -> str:
     """Close a lead turn and apply its outcome (§12.4). Caller owns the transaction.
 
     The supervisor routes `kind='lead_turn'` runs here, never to T7/T8: a lead turn
-    has no task, so no task transition may fire. On exit 0 the turn's actions run
-    first (`execute_lead_actions`), then the messages are acked and the run closes.
+    has no task, so no task transition may fire. Close-gate checks run first so a
+    held close never runs `execute_lead_actions` or releases outbox messages
+    prematurely; on exit 0 once clear, actions run, messages ack and the run closes.
     """
-    from mesh.daemon.supervisor import _close_run, vendor_failure_meaning
+    from mesh.daemon.supervisor import _close_run, close_gate, normalize_exit_info, vendor_failure_meaning
 
+    if not pre_gated:
+        close_gate(run, "lost" if exit_info is None else "exited")
     project_id = run["project_id"]
     exit_code = None
     signo = None
     capture_error = None
     vendor_meaning = None
     if exit_info is not None:
-        exit_code = exit_info.get("exit_code")
-        signo = exit_info.get("signal")
+        exit_code, signo = normalize_exit_info(exit_info)
         capture_error = exit_info.get("capture_error")
         if exit_code == 0 and signo is None and not capture_error:
             vendor_meaning = vendor_failure_meaning(run["run_dir"], run["adapter"], testing_mode=testing_mode)
@@ -1448,24 +1832,108 @@ def finish_lead_turn(conn: sqlite3.Connection, home: str, run: Mapping[str, Any]
         and vendor_meaning is None
     )
     actions: Optional[Dict[str, int]] = None
+    actions_deferred: Optional[str] = None
+    chat_reply_count = 0
     if ok:
         # Q10: the actions run while the run is still open and its token valid; a
         # terminated turn (set-lead, timeout) never reaches here.
         conn.execute("SAVEPOINT lead_actions;")
         pending_before = len(_PENDING_INTENT_UNLINKS)
+        merges_before = _queued_merge_ids_for(run["id"])
+        token_expired_deferred = False
         try:
             executed = execute_lead_actions(conn, home, run, testing_mode)
+            if any(r.get("error_code") == c.TOKEN_EXPIRED for r in executed) and _token_expired_before_finish(
+                conn, run, exit_info
+            ):
+                token_expired_deferred = True
+                raise RuntimeError("lead run token expired before finish")
         except Exception as exc:  # noqa: BLE001 - a broken action pass must not wedge the run
             conn.execute("ROLLBACK TO lead_actions;")
             # r4 P1-1: the rolled-back deliveries' intents stay for recovery.
             del _PENDING_INTENT_UNLINKS[pending_before:]
-            _log(home, f"lead actions of run {run['id']} not executed: {type(exc).__name__}: {exc}")
+            _discard_queued_merges_since(run["id"], merges_before)
             executed = []
             ok = False
+            if token_expired_deferred:
+                actions_deferred = "token_expired"
+                _log(home, f"lead actions of run {run['id']} deferred (token expired before finish); retrying wake")
+            else:
+                _log(home, f"lead actions of run {run['id']} not executed: {type(exc).__name__}: {exc}")
         conn.execute("RELEASE lead_actions;")
         actions = {"ok": sum(1 for r in executed if r["ok"]),
                    "failed": sum(1 for r in executed if not r["ok"])}
+        chat_reply_count = sum(1 for r in executed if r["ok"] and r.get("cmd") == "chat.reply")
+
+        # Safe fallback reply on chat-first projects if lead exited 0 without emitting chat.reply (P3-2)
+        if ok and chat_reply_count == 0 and project_id:
+            prow = conn.execute("SELECT plan_gate_mode FROM projects WHERE id = ?;", (project_id,)).fetchone()
+            had_chat_wake = conn.execute(
+                "SELECT 1 FROM outbox WHERE delivering_run_id = ? AND channel = 'lead_wake' AND type = 'chat.message' LIMIT 1;",
+                (run["id"],),
+            ).fetchone() is not None
+            if (prow is not None and prow["plan_gate_mode"] == "require_approval") or had_chat_wake:
+                fallback_raw = extract_fallback_reply_text(lead_turn_final_text(run, testing_mode))
+                if fallback_raw:
+                    fallback_body = redact(fallback_raw)
+                    fb_msg_id = generate_id("cmsg")
+                    fb_now = now_iso_utc()
+                    fb_ev = record_event(
+                        conn=conn,
+                        type_="chat.message",
+                        actor_id=run["agent_id"] or "principal_system",
+                        actor_kind="agent" if run["agent_id"] else "system",
+                        via="lead_turn",
+                        project_id=project_id,
+                        run_id=run["id"],
+                        payload={
+                            "message_id": fb_msg_id,
+                            "project_id": project_id,
+                            "role": "lead",
+                            "kind": "text",
+                            "body": fallback_body,
+                            "fallback_reply": True,
+                        },
+                    )
+                    conn.execute(
+                        """INSERT INTO chat_messages (
+                            id, project_id, event_seq, role, kind, actor_id, actor_kind, via,
+                            run_id, plan_id, approval_id, task_id, body, meta_json,
+                            consumed_by_approval_id, created_at
+                        ) VALUES (?, ?, ?, 'lead', 'text', ?, ?, 'lead_turn',
+                                  ?, NULL, NULL, NULL, ?, '{"fallback_reply":true}', NULL, ?);""",
+                        (
+                            fb_msg_id,
+                            project_id,
+                            fb_ev["seq"],
+                            run["agent_id"] or "principal_system",
+                            "agent" if run["agent_id"] else "system",
+                            run["id"],
+                            fallback_body,
+                            fb_now,
+                        ),
+                    )
+                    chat_reply_count = 1
     counts = _release_messages(conn, run["id"], ok, project_id, testing_mode)
+    # P3-1: Emit lead.turn_finished only on chat-gated or chat-active projects so legacy projects stay unchanged.
+    if project_id and (chat_reply_count > 0 or _project_uses_chat(conn, project_id)):
+        record_event(
+            conn=conn,
+            type_="lead.turn_finished",
+            actor_id="system",
+            actor_kind="system",
+            via="system",
+            project_id=project_id,
+            run_id=run["id"],
+            payload={
+                "run_id": run["id"],
+                "project_id": project_id,
+                "ok": ok,
+                "exit_code": exit_code,
+                "chat_reply_count": chat_reply_count,
+                "actions_summary": actions or {"ok": 0, "failed": 0},
+            },
+        )
     result = {
         "exit_code": exit_code,
         "signal": signo,
@@ -1478,6 +1946,8 @@ def finish_lead_turn(conn: sqlite3.Connection, home: str, run: Mapping[str, Any]
         result["vendor_exit_meaning"] = vendor_meaning
     if actions is not None:
         result["actions"] = actions
+    if actions_deferred is not None:
+        result["actions_deferred"] = actions_deferred
     if exit_info is None:
         _close_run(
             conn,
@@ -1495,14 +1965,21 @@ def finish_lead_turn(conn: sqlite3.Connection, home: str, run: Mapping[str, Any]
     return "acked" if ok else "retry"
 
 
+LEAD_INTERRUPT_META_PREFIX = "lead_interrupt:"
+
+
+def lead_interrupt_meta_key(run_id: str) -> str:
+    return f"{LEAD_INTERRUPT_META_PREFIX}{run_id}"
+
+
 def lead_turn_termination_reason(conn: sqlite3.Connection, run: Mapping[str, Any]) -> Optional[str]:
     """Why a live lead turn must be terminated now, or None (§11.3, §11.4).
 
     A lead turn has no task, so no task status, no post-submit grace and no idle
-    timeout can end it. Two reasons apply, both derived from durable state on every
-    watch pass: the turn's assignment is no longer the project's current one
-    (`lead_superseded`, §8 set-lead; the backstop for the set-lead effect after a
-    restart or a failed effect), checked first, then the deadline (`timeout`).
+    timeout can end it. Durable termination reasons checked on every watch pass:
+    the turn's assignment is no longer current (`lead_superseded`), the project
+    was cancelled (`project_cancelled`), an explicit direct-user interrupt was
+    requested (`user_interrupted`), or the deadline expired (`timeout`).
     """
     current = get_project_active_lead(conn, run["project_id"])
     if current is None or current["assignment_id"] != run["lead_assignment_id"] or not current["can_lead"]:
@@ -1510,6 +1987,12 @@ def lead_turn_termination_reason(conn: sqlite3.Connection, run: Mapping[str, Any
     prow = conn.execute("SELECT status FROM projects WHERE id = ?;", (run["project_id"],)).fetchone()
     if prow is None or prow["status"] == "cancelled":
         return "project_cancelled"
+    run_id = run["id"] if "id" in run.keys() else None
+    if run_id and conn.execute(
+        "SELECT 1 FROM meta WHERE key = ?;",
+        (lead_interrupt_meta_key(run_id),),
+    ).fetchone() is not None:
+        return "user_interrupted"
     if run["deadline_at"] and time.time() > parse_utc(run["deadline_at"]).timestamp():
         return "timeout"
     return None
@@ -1544,7 +2027,7 @@ def _lead_repo_prep_worker(entry: Dict[str, Any], home: str, plan: Mapping[str, 
         entry["result"] = result
         entry["error"] = error
         entry["done"] = True
-        entry["done_at"] = time.monotonic()
+        entry["done_at"] = _monotonic()
 
 
 def _lead_repo_state(home: str, plan: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1556,7 +2039,7 @@ def _lead_repo_state(home: str, plan: Mapping[str, Any]) -> Optional[Dict[str, A
             if not entry["done"]:
                 return None
             del _LEAD_REPO_PREP[key]
-            if time.monotonic() - entry.get("done_at", 0.0) <= LEAD_REPO_PREP_MAX_AGE_S:
+            if _monotonic() - entry.get("done_at", 0.0) <= LEAD_REPO_PREP_MAX_AGE_S:
                 return entry
         entry = {"key": key, "done": False, "result": None, "error": None}
         _LEAD_REPO_PREP[key] = entry

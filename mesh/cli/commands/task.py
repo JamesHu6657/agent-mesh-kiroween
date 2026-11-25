@@ -843,7 +843,11 @@ def handle_task_keepalive(args: argparse.Namespace) -> Dict[str, Any]:
         finally:
             stop["in_call"] = False
 
-    old = {sig: signal.signal(sig, _on_signal) for sig in (signal.SIGTERM, signal.SIGINT)}
+    sigs = [signal.SIGTERM, signal.SIGINT]
+    sig_break = getattr(signal, "SIGBREAK", None)
+    if sig_break is not None and sig_break not in sigs:
+        sigs.append(sig_break)
+    old = {sig: signal.signal(sig, _on_signal) for sig in sigs}
     beats = 0
     ttl_s: Optional[int] = None
     last_ok = _t.monotonic()
@@ -889,7 +893,8 @@ def handle_task_keepalive(args: argparse.Namespace) -> Dict[str, Any]:
             else:
                 sleep_for = float(every)
             slept = 0.0
-            step = min(1.0, float(sleep_for))
+            max_step = 0.5 if sys.platform == "win32" else 1.0
+            step = min(max_step, float(sleep_for))
             while slept < sleep_for and stop["signal"] is None:
                 _t.sleep(step)
                 slept += step
