@@ -33,7 +33,7 @@ class TestWindowsPackagingArtifacts(unittest.TestCase):
         self.assertIn("HKCU, UserEnvKey, 'Path'", iss)
         self.assertNotIn("HKLM, 'SYSTEM\\CurrentControlSet", iss)
         # Uninstaller keeps ~/.agent-mesh unless user explicitly opts in (default No = MB_DEFBUTTON2)
-        self.assertIn(r"{userprofile}\.agent-mesh", iss)
+        self.assertIn(r"{%USERPROFILE}\.agent-mesh", iss)
         self.assertIn("MB_YESNO or MB_DEFBUTTON2", iss)
         self.assertIn("/PURGEDATA", iss)
         # Uninstaller stops only Agent Mesh executables (UTF-16 hex encoded path) and cleans runtime __pycache__

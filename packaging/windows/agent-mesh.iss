@@ -269,7 +269,7 @@ begin
     RemoveDir(AppDir);
 
     // Keep %USERPROFILE%\.agent-mesh user data by default unless the user explicitly opts in.
-    DataDir := ExpandConstant('{userprofile}\.agent-mesh');
+    DataDir := ExpandConstant('{%USERPROFILE}\.agent-mesh');
     if DirExists(DataDir) then
     begin
       ShouldPurge := False;
