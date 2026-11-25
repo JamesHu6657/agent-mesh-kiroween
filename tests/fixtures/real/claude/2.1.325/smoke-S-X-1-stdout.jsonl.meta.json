@@ -1,0 +1,20 @@
+{
+  "captured_at_utc": "2026-11-19T13:36:12Z",
+  "command": [
+    "claude",
+    "-p",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--model",
+    "ds-flash",
+    "--setting-sources",
+    "user",
+    "--strict-mcp-config",
+    "--permission-mode",
+    "dontAsk",
+    "--disallowedTools",
+    "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch"
+  ],
+  "sha256": "911853a89ce84fe430b76f68902d954b9a5bf2b65c5da0182c799d94a835a3fe"
+}

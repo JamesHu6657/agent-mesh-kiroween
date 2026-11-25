@@ -1,0 +1,18 @@
+{
+  "captured_at_utc": "2026-11-09T06:12:00Z",
+  "command": [
+    "kiro-cli",
+    "chat",
+    "--no-interactive",
+    "--agent",
+    "mesh-reviewer",
+    "--model",
+    "claude-opus-5.5",
+    "--effort",
+    "high",
+    "--output-format",
+    "stream-json",
+    "<prompt>"
+  ],
+  "sha256": "a6221cafd36824f2afdebd0e34fce94172fec69e500564c0b78acdbc0be62d1c"
+}

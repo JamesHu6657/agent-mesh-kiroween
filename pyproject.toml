@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-mesh"
+dynamic = ["version"]
+description = "A local coordinator for CLI coding agents on one Linux or Windows machine"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = []
+classifiers = [
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "License :: OSI Approved :: MIT License",
+  "Environment :: Console",
+]
+
+[project.optional-dependencies]
+desktop = ["pywebview>=6.0,<7"]
+
+[project.urls]
+Homepage = "https://github.com/JamesHu6657/agent-mesh-kiroween"
+
+[project.scripts]
+mesh = "mesh.cli.entry:main"
+
+[project.gui-scripts]
+mesh-desktop = "mesh.desktop.app:main"
+
+[tool.setuptools]
+license-files = ["LICENSE"]
+
+[tool.setuptools.dynamic]
+version = { attr = "mesh.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["mesh*"]
+
+[tool.setuptools.package-data]
+"mesh.desktop" = ["assets/*"]

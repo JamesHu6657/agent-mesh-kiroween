@@ -1,0 +1,776 @@
+"""Main entry point, parser tree, JSON envelope, and error conversion for Agent Mesh CLI."""
+
+import argparse
+import json
+import math
+import os
+import secrets
+import sys
+from typing import Any, Dict, List, Optional
+
+import mesh.constants as c
+from mesh.errors import MeshError
+from mesh.core.paths import resolve_home
+from mesh.cli.help import TOP_HELP_EPILOG, HELP_TOPICS, get_topic_help
+
+from mesh.cli.commands.top import register_top_commands
+from mesh.cli.commands.daemon import register_daemon_commands
+from mesh.cli.commands.config import register_config_commands
+from mesh.cli.commands.agent import register_agent_commands
+from mesh.cli.commands.adapter import register_adapter_commands
+from mesh.cli.commands.intake import register_intake_commands
+from mesh.cli.commands.project import register_project_commands
+from mesh.cli.commands.task import register_task_commands
+from mesh.cli.commands.dep import register_dep_commands
+from mesh.cli.commands.approval import register_approval_commands
+from mesh.cli.commands.inbox import register_inbox_commands
+from mesh.cli.commands.event import register_event_commands
+from mesh.cli.commands.run import register_run_commands
+from mesh.cli.commands.workspace import register_workspace_commands
+from mesh.cli.commands.doctor import register_doctor_commands
+from mesh.cli.commands.audit import register_audit_commands
+from mesh.cli.commands.desktop import register_desktop_command
+
+
+def is_text_format(argv: Optional[List[str]] = None) -> bool:
+    """Check if --format text was requested in argv."""
+    if argv is None:
+        argv = sys.argv[1:]
+    # Full review: the last --format wins, and nothing after "--" is an option.
+    found = None
+    for i, arg in enumerate(argv):
+        if arg == "--":
+            break
+        if arg == "--format" and i + 1 < len(argv):
+            found = argv[i + 1]
+        elif arg.startswith("--format="):
+            found = arg.split("=", 1)[1]
+    return found == "text"
+
+
+def generate_request_id() -> str:
+    """Generate a random request ID (e.g. req_0123456789abcdef)."""
+    return f"req_{secrets.token_hex(8)}"
+
+
+def format_error_response(
+    code: str,
+    message: str,
+    exit_code: int = c.EXIT_USAGE,
+    details: Optional[Dict[str, Any]] = None,
+    request_id: Optional[str] = None,
+    text_format: bool = False,
+    data: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Print error response either as JSON envelope to stdout or text to stderr."""
+    if details is None:
+        details = {}
+    # Full review P1: CLI-side errors are redacted like daemon envelopes (§15.2).
+    from mesh.core.redact import redact, redact_value
+    message = redact(message) if isinstance(message, str) else message
+    details = redact_value(details)
+    if data is not None:
+        data = redact_value(data)
+    if text_format:
+        sys.stderr.write(f"mesh: error [{code}]: {message}\n")
+    else:
+        doc = {
+            "ok": False,
+            "error": {
+                "code": code,
+                "message": message,
+                "details": details,
+            },
+            "exit_code": exit_code,
+            "request_id": request_id,
+        }
+        if data is not None:
+            doc["data"] = data
+        sys.stdout.write(json.dumps(doc) + "\n")
+        sys.stdout.flush()
+
+
+def format_success_response(
+    data: Any,
+    warnings: Optional[List[str]] = None,
+    request_id: Optional[str] = None,
+    idempotent_replay: bool = False,
+    dry_run: bool = False,
+    text_format: bool = False,
+) -> None:
+    """Print success response as JSON envelope or formatted text."""
+    if warnings is None:
+        warnings = []
+    if request_id is None:
+        request_id = generate_request_id()
+
+    if text_format:
+        from mesh.cli.render import render_text
+        sys.stdout.write(render_text(data) + "\n")
+        for w in warnings:
+            sys.stderr.write(f"mesh: warning: {w}\n")
+        sys.stdout.flush()
+    else:
+        doc = {
+            "ok": True,
+            "data": data,
+            "warnings": warnings,
+            "request_id": request_id,
+            "idempotent_replay": idempotent_replay,
+            "dry_run": dry_run,
+        }
+        sys.stdout.write(json.dumps(doc) + "\n")
+        sys.stdout.flush()
+
+
+class MeshArgumentParser(argparse.ArgumentParser):
+    """Custom ArgumentParser that overrides error() to output the JSON envelope with exit 2."""
+
+    def error(self, message: str) -> None:
+        text_fmt = is_text_format()
+        format_error_response(
+            code=c.INVALID_ARGUMENT,
+            message=message,
+            exit_code=c.EXIT_USAGE,
+            details={},
+            request_id=None,
+            text_format=text_fmt,
+        )
+        sys.exit(c.EXIT_USAGE)
+
+
+def create_parent_parser() -> argparse.ArgumentParser:
+    """Create the parent parser holding every global flag."""
+    parent = argparse.ArgumentParser(add_help=False)
+    default_home = os.environ.get("MESH_HOME") or os.path.expanduser("~/.agent-mesh")
+    parent.add_argument("--home", default=argparse.SUPPRESS, help="Storage root directory (default: %s)" % default_home.replace("%", "%%"))
+    parent.add_argument("--format", choices=["json", "text"], default=argparse.SUPPRESS, help="Output format (default: json)")
+    parent.add_argument("--user", action="store_true", default=argparse.SUPPRESS, help="Authenticate as direct human user")
+    parent.add_argument("--passphrase-fd", type=int, default=argparse.SUPPRESS, help="File descriptor to read passphrase from")
+    parent.add_argument("--passphrase-file", default=argparse.SUPPRESS,
+                        help="0600 file holding the passphrase (env: MESH_PASSPHRASE_FILE or MESH_PASSPHRASE)")
+    parent.add_argument("--token-file", default=argparse.SUPPRESS, help="Path to 0600 file containing agent token")
+    parent.add_argument("--input", default=argparse.SUPPRESS, help="Read JSON parameters from FILE or '-' for stdin")
+    parent.add_argument("--idempotency-key", default=argparse.SUPPRESS, help="Unique key for safe mutation replay (1-128 chars)")
+    parent.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help="Simulate execution without persisting changes")
+    parent.add_argument("--relayed", action="store_true", default=argparse.SUPPRESS, help="Relay user approval on behalf of human")
+    parent.add_argument("--user-statement", default=argparse.SUPPRESS, help="Relayed approval statement from user")
+    parent.add_argument("--evidence-ref", default=argparse.SUPPRESS, help="Evidence reference for relayed approval")
+    parent.add_argument("--approval", default=argparse.SUPPRESS, help="Approval ID authorizing this gated operation")
+    parent.add_argument("--if-version", type=int, default=argparse.SUPPRESS, help="Optimistic concurrency version check")
+    parent.add_argument("--timeout", default=argparse.SUPPRESS, help="Client response timeout duration")
+    parent.add_argument("-q", "--quiet", action="store_true", default=argparse.SUPPRESS, help="Suppress diagnostic output")
+    return parent
+
+
+def build_parser() -> MeshArgumentParser:
+    """Build the complete CLI parser tree."""
+    parent_parser = create_parent_parser()
+
+    root_parser = MeshArgumentParser(
+        prog="mesh",
+        description="Agent Mesh v1 — Deterministic local orchestration for autonomous AI coding agents.",
+        epilog=TOP_HELP_EPILOG,
+        parents=[parent_parser],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    root_parser.add_argument("--version", action="store_true", default=argparse.SUPPRESS, dest="show_version",
+                             help="Show the Agent Mesh version and exit (same as `mesh version`)")
+
+    subparsers = root_parser.add_subparsers(dest="resource", metavar="<resource>")
+
+    # Top-level commands
+    register_top_commands(subparsers, parent_parser)
+
+    # Resource commands
+    register_daemon_commands(subparsers, parent_parser)
+    register_config_commands(subparsers, parent_parser)
+    register_agent_commands(subparsers, parent_parser)
+    register_adapter_commands(subparsers, parent_parser)
+    register_intake_commands(subparsers, parent_parser)
+    register_project_commands(subparsers, parent_parser)
+    register_task_commands(subparsers, parent_parser)
+    register_dep_commands(subparsers, parent_parser)
+    register_approval_commands(subparsers, parent_parser)
+    register_inbox_commands(subparsers, parent_parser)
+    register_event_commands(subparsers, parent_parser)
+    register_run_commands(subparsers, parent_parser)
+    register_workspace_commands(subparsers, parent_parser)
+    register_doctor_commands(subparsers, parent_parser)
+    from mesh.cli.commands.setup import register_setup_command
+    register_setup_command(subparsers, parent_parser)
+    register_audit_commands(subparsers, parent_parser)
+    register_desktop_command(subparsers, parent_parser)
+
+    _keep_help_layout(root_parser)
+    return root_parser
+
+
+def _keep_help_layout(parser: argparse.ArgumentParser) -> None:
+    """Keep the line breaks of every description and epilog (examples stay one per line).
+
+    argparse's default formatter rewraps them into one paragraph; the raw-description
+    formatter keeps them as written and still wraps the argument help."""
+    parser.formatter_class = argparse.RawDescriptionHelpFormatter
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for sub in action.choices.values():
+                _keep_help_layout(sub)
+
+
+GLOBAL_FLAG_DESTS = {
+    "home",
+    "format",
+    "user",
+    "passphrase_fd",
+    "passphrase_file",
+    "token_file",
+    "input",
+    "idempotency_key",
+    "dry_run",
+    "relayed",
+    "user_statement",
+    "evidence_ref",
+    "approval",
+    "if_version",
+    "timeout",
+    "quiet",
+    "func",
+    "resource",
+    "verb",
+    "token_verb",
+    "help",
+    "show_version",
+}
+
+SYNONYMS = {
+    "allowed_models": "allowed_model",
+    "allowed_efforts": "allowed_effort",
+    "capabilities": "capability",
+    "options": "option",
+    "depends_on": "on",
+    "criteria": "criterion",
+    "depends_on_projects": "depends_on_project",
+}
+
+
+def get_active_subparser(parser: argparse.ArgumentParser, args: argparse.Namespace) -> argparse.ArgumentParser:
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for name, sub in action.choices.items():
+                if getattr(args, action.dest, None) == name:
+                    return get_active_subparser(sub, args)
+    return parser
+
+
+def _argv_before_double_dash(argv: Optional[List[str]]) -> List[str]:
+    if not argv:
+        return []
+    return list(argv[:argv.index("--")]) if "--" in argv else list(argv)
+
+
+def relax_required_actions(parser: argparse.ArgumentParser) -> None:
+    for action in parser._actions:
+        if action.required and not isinstance(action, argparse._SubParsersAction):
+            setattr(action, "_orig_required", True)
+        action.required = False
+        if isinstance(action, argparse._SubParsersAction):
+            for sub in action.choices.values():
+                relax_required_actions(sub)
+
+
+def parse_and_apply_input_file(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    argv: Optional[List[str]] = None,
+) -> None:
+    """Process --input FILE|-."""
+    input_source = getattr(args, "input", None)
+    if input_source is None:
+        return
+    if not isinstance(input_source, str) or not input_source.strip():
+        raise MeshError(
+            code=c.INVALID_ARGUMENT,
+            exit_code=c.EXIT_USAGE,
+            message="--input requires a non-empty file path or '-'",
+            details={"param": "input"},
+        )
+
+    try:
+        if input_source == "-":
+            from mesh.cli.stdin import read_stdin
+            raw_data = read_stdin("--input")
+        else:
+            with open(input_source, "r", encoding="utf-8") as f:
+                raw_data = f.read()
+        json_obj = json.loads(raw_data)
+    except Exception as exc:
+        raise MeshError(
+            code=c.INVALID_JSON,
+            exit_code=c.EXIT_USAGE,
+            message=f"Failed to parse JSON input from '{input_source}': {exc}",
+        ) from exc
+
+    if not isinstance(json_obj, dict):
+        raise MeshError(
+            code=c.INVALID_JSON,
+            exit_code=c.EXIT_USAGE,
+            message="JSON input must be a JSON object (mapping)",
+        )
+
+    # Disallow passing passphrase via stdin JSON (checklist G17)
+    if "passphrase" in json_obj:
+        raise MeshError(
+            code=c.PASSPHRASE_SOURCE_REJECTED,
+            exit_code=c.EXIT_USAGE,
+            message="Passphrase cannot be supplied via stdin JSON. Use /dev/tty or --passphrase-fd.",
+        )
+
+    active_sub = get_active_subparser(parser, args)
+
+    # Get valid command-specific parameter destinations
+    valid_params = set()
+    for action in active_sub._actions:
+        if action.dest not in GLOBAL_FLAG_DESTS:
+            valid_params.add(action.dest)
+    # Commands where timeout is also a valid command parameter
+    sub_prog = getattr(active_sub, "prog", "")
+    if any(cmd in sub_prog for cmd in ("task create", "task wait", "inbox wait", "project wait", "event tail")):
+        valid_params.add("timeout")
+
+    # Add known synonyms
+    for syn, canonical in SYNONYMS.items():
+        if canonical in valid_params:
+            valid_params.add(syn)
+
+    # Track flags specified directly on CLI argv (only options before "--")
+    cli_specified_flags = set()
+    opt_argv = _argv_before_double_dash(argv)
+    opt_takes_val: Dict[str, bool] = {}
+    for a in active_sub._actions:
+        for o in a.option_strings:
+            opt_takes_val[o] = (
+                not isinstance(a, (argparse._StoreTrueAction, argparse._StoreFalseAction,
+                                   argparse.BooleanOptionalAction,
+                                   argparse._CountAction, argparse._HelpAction, argparse._VersionAction))
+                and a.nargs != 0
+            )
+    i = 0
+    while i < len(opt_argv):
+        tok = opt_argv[i]
+        if tok.startswith("--") and len(tok) > 2:
+            flag = tok.split("=", 1)[0]
+            exact_or_pref = [
+                a for a in active_sub._actions
+                if any(o == flag or o.startswith(flag) for o in a.option_strings if o.startswith("--"))
+            ]
+            exact = [a for a in exact_or_pref if flag in a.option_strings]
+            matched = exact or (exact_or_pref if len({a.dest for a in exact_or_pref}) == 1 else [])
+            if matched:
+                act = matched[0]
+                if act.dest in valid_params or act.dest == "input":
+                    cli_specified_flags.add(act.dest)
+                if "=" not in tok and any(opt_takes_val.get(o, True) for o in act.option_strings if o.startswith(flag)):
+                    i += 2
+                    continue
+            else:
+                cli_specified_flags.add(flag[2:].replace("-", "_"))
+        i += 1
+
+    # Linear full review C2: a target given on the command line (a positional, or a flag
+    # through any of its spellings such as --proj) must not be silently replaced by JSON.
+    for action in active_sub._actions:
+        if (action.dest in GLOBAL_FLAG_DESTS and action.dest not in valid_params) or action.dest == "help":
+            continue
+        if not action.option_strings:
+            if getattr(args, action.dest, None) not in (None, action.default):
+                cli_specified_flags.add(action.dest)
+
+    from_json = set()
+    for key, val in json_obj.items():
+        if (key in GLOBAL_FLAG_DESTS and key not in valid_params) or key not in valid_params:
+            raise MeshError(
+                code=c.UNKNOWN_PARAM,
+                exit_code=c.EXIT_USAGE,
+                message=f"Unknown parameter in JSON input: '{key}'",
+                details={"param": key},
+            )
+
+        canonical_key = SYNONYMS.get(key, key)
+        if canonical_key in cli_specified_flags or key in cli_specified_flags:
+            raise MeshError(
+                code=c.DUPLICATE_PARAM,
+                exit_code=c.EXIT_USAGE,
+                message=f"Parameter '{key}' provided both via command-line flag and JSON input",
+                details={"param": key},
+            )
+        if canonical_key in from_json or key in from_json:
+            raise MeshError(
+                code=c.DUPLICATE_PARAM,
+                exit_code=c.EXIT_USAGE,
+                message=f"Parameter '{key}' conflicts with synonym already provided in JSON input",
+                details={"param": key},
+            )
+
+        setattr(args, key, val)
+        if canonical_key != key:
+            setattr(args, canonical_key, val)
+        from_json.add(key)
+        from_json.add(canonical_key)
+
+    # Validate types, choices, and originally-required fields after JSON merge.
+    action_by_dest = {
+        a.dest: a for a in active_sub._actions
+        if not isinstance(a, argparse._SubParsersAction) and a.dest != "help"
+    }
+    if "timeout" in from_json:
+        tval = getattr(args, "timeout", None)
+        if tval is not None and (isinstance(tval, bool) or not isinstance(tval, (str, int))):
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message="Parameter 'timeout' must be a duration string or integer seconds",
+                details={"param": "timeout", "got": type(tval).__name__},
+            )
+    is_agent_mut = sub_prog.endswith(" agent create") or sub_prog.endswith(" agent update")
+    is_agent_mut_or_onboard = is_agent_mut or sub_prog.endswith(" agent onboard")
+    for canonical_key in sorted(from_json):
+        act = action_by_dest.get(canonical_key)
+        if act is None or canonical_key in GLOBAL_FLAG_DESTS:
+            continue
+        val = getattr(args, canonical_key, None)
+        allow_null_val = (
+            (sub_prog.endswith(" config set") and canonical_key == "value")
+            or (sub_prog.endswith(" task submit") and canonical_key == "deliverable")
+            or (sub_prog.endswith(" agent update") and canonical_key in ("default_model", "default_effort"))
+            or (is_agent_mut_or_onboard and canonical_key == "max_concurrency")
+        )
+        if val is None:
+            if act.default not in (None, argparse.SUPPRESS) and not allow_null_val:
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Parameter '{canonical_key}' cannot be null",
+                    details={"param": canonical_key, "got": "NoneType"},
+                )
+            continue
+        if isinstance(act, (argparse._StoreTrueAction, argparse._StoreFalseAction, argparse.BooleanOptionalAction)):
+            if not isinstance(val, bool):
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Parameter '{canonical_key}' must be a boolean",
+                    details={"param": canonical_key, "got": type(val).__name__},
+                )
+            continue
+        is_list_action = isinstance(act, argparse._AppendAction) or act.nargs in ("+", "*")
+        if is_list_action:
+            if is_agent_mut and canonical_key == "option":
+                if not (isinstance(val, dict) or (isinstance(val, list) and all(isinstance(x, str) for x in val))):
+                    raise MeshError(
+                        code=c.INVALID_ARGUMENT,
+                        exit_code=c.EXIT_USAGE,
+                        message="Parameter 'options' must be an object or list of strings",
+                        details={"param": canonical_key, "got": type(val).__name__},
+                    )
+                continue
+            if not isinstance(val, list):
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Parameter '{canonical_key}' must be a list",
+                    details={"param": canonical_key, "got": type(val).__name__},
+                )
+            if act.nargs == "+" and len(val) == 0:
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Parameter '{canonical_key}' must be a non-empty list",
+                    details={"param": canonical_key},
+                )
+            items = val
+        else:
+            items = (val,)
+
+        for item in items:
+            if act.type is int:
+                if isinstance(item, bool) or not isinstance(item, int):
+                    raise MeshError(
+                        code=c.INVALID_ARGUMENT,
+                        exit_code=c.EXIT_USAGE,
+                        message=f"Parameter '{canonical_key}' must be an integer",
+                        details={"param": canonical_key, "got": type(item).__name__},
+                    )
+            elif act.type is float:
+                if isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item):
+                    raise MeshError(
+                        code=c.INVALID_ARGUMENT,
+                        exit_code=c.EXIT_USAGE,
+                        message=f"Parameter '{canonical_key}' must be a finite number",
+                        details={"param": canonical_key, "got": type(item).__name__},
+                    )
+            elif act.choices is not None:
+                if item not in act.choices:
+                    raise MeshError(
+                        code=c.INVALID_ARGUMENT,
+                        exit_code=c.EXIT_USAGE,
+                        message=f"Invalid value for '{canonical_key}': {item!r}; expected one of {list(act.choices)}",
+                        details={"param": canonical_key, "choices": list(act.choices)},
+                    )
+            elif is_list_action and act.type is None:
+                if not isinstance(item, str):
+                    raise MeshError(
+                        code=c.INVALID_ARGUMENT,
+                        exit_code=c.EXIT_USAGE,
+                        message=f"Parameter '{canonical_key}' items must be strings",
+                        details={"param": canonical_key, "got": type(item).__name__},
+                    )
+
+        if not is_list_action and act.type is None and act.nargs in (None, "?"):
+            if sub_prog.endswith(" config set") and canonical_key == "value":
+                pass  # arbitrary JSON value (including null/int/bool/object/array)
+            elif sub_prog.endswith(" task submit") and canonical_key == "deliverable":
+                pass  # validated in task.py (dict vs null/non-dict)
+            elif is_agent_mut_or_onboard and canonical_key == "max_concurrency":
+                pass  # validated in server/handler with INVALID_CONCURRENCY
+            elif (
+                (sub_prog.endswith(" approval request") and canonical_key == "operation")
+                or (sub_prog.endswith(" project complete") and canonical_key == "report")
+            ):
+                if not isinstance(val, (str, dict)):
+                    raise MeshError(
+                        code=c.INVALID_ARGUMENT,
+                        exit_code=c.EXIT_USAGE,
+                        message=f"Parameter '{canonical_key}' must be a string or JSON object",
+                        details={"param": canonical_key, "got": type(val).__name__},
+                    )
+            elif (
+                (is_agent_mut_or_onboard and canonical_key == "ack_timeout")
+                or (sub_prog.endswith(" task create") and canonical_key == "idle_timeout")
+            ):
+                if isinstance(val, bool) or not isinstance(val, (str, int)):
+                    raise MeshError(
+                        code=c.INVALID_ARGUMENT,
+                        exit_code=c.EXIT_USAGE,
+                        message=f"Parameter '{canonical_key}' must be a duration string or integer seconds",
+                        details={"param": canonical_key, "got": type(val).__name__},
+                    )
+            elif not isinstance(val, str):
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Parameter '{canonical_key}' must be a string",
+                    details={"param": canonical_key, "got": type(val).__name__},
+                )
+
+    for act in active_sub._actions:
+        if not getattr(act, "_orig_required", False):
+            continue
+        dest = act.dest
+        cur_val = getattr(args, dest, None)
+        allow_null_json = sub_prog.endswith(" config set") and dest == "value" and dest in from_json
+        if act.nargs == "+":
+            if not isinstance(cur_val, list) or not cur_val:
+                raise MeshError(
+                    code=c.INVALID_ARGUMENT,
+                    exit_code=c.EXIT_USAGE,
+                    message=f"Missing required parameter '{dest}'" if not cur_val else f"Parameter '{dest}' must be a non-empty list",
+                    details={"param": dest},
+                )
+        elif not allow_null_json and cur_val is None:
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message=f"Missing required parameter '{dest}'",
+                details={"param": dest},
+            )
+        elif (
+            not allow_null_json
+            and act.type is None
+            and act.nargs is None
+            and not (sub_prog.endswith(" approval request") and dest == "operation")
+            and not (sub_prog.endswith(" project complete") and dest == "report")
+            and not isinstance(cur_val, str)
+        ):
+            raise MeshError(
+                code=c.INVALID_ARGUMENT,
+                exit_code=c.EXIT_USAGE,
+                message=f"Parameter '{dest}' must be a string",
+                details={"param": dest, "got": type(cur_val).__name__},
+            )
+
+    setattr(args, "_from_json", from_json)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Main CLI entry point."""
+    in_process = argv is not None
+    if not in_process:
+        from mesh.cli.entry import ensure_isolated_process
+
+        ensure_isolated_process()
+        argv = sys.argv[1:]
+        os.umask(0o077)
+        return _run_cli(argv)
+
+    old_umask = os.umask(0o077)
+    try:
+        return _run_cli(argv)
+    finally:
+        os.umask(old_umask)
+
+
+def _run_cli(argv: List[str]) -> int:
+    """Run parsed CLI dispatch under process umask 0o077."""
+
+    parser = build_parser()
+
+    # If invoked with no arguments at all, print top-level help
+    if not argv:
+        parser.print_help()
+        return c.EXIT_OK
+
+    req_id = generate_request_id()
+    text_fmt = is_text_format(argv)
+    from mesh.cli import stdin as _stdin
+    _stdin.reset()
+
+    opt_argv = _argv_before_double_dash(argv)
+    has_input = any(
+        "--input".startswith(arg.split("=", 1)[0]) and len(arg.split("=", 1)[0]) >= 4
+        for arg in opt_argv
+        if arg.startswith("--")
+    )
+    if has_input:
+        relax_required_actions(parser)
+
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return exc.code
+
+    setattr(args, "request_id", req_id)
+    default_home = os.environ.get("MESH_HOME") or os.path.expanduser("~/.agent-mesh")
+    # Blind review P2: an explicit --home (even the default path) beats MESH_SOCKET.
+    from mesh import client as _client_mod
+    _client_mod.EXPLICIT_HOME = hasattr(args, "home")
+    if not hasattr(args, "home"):
+        setattr(args, "home", default_home)
+    # m3-test-kdf round 3: --home / MESH_HOME is resolved once, here, for every verb.
+    # Round 4: an empty home or "/" is refused here (rc 2), before any verb runs.
+    try:
+        setattr(args, "home", resolve_home(args.home))
+    except MeshError as exc:
+        format_error_response(
+            code=exc.code,
+            message=exc.message,
+            exit_code=exc.exit_code,
+            details=exc.details,
+            request_id=req_id,
+            text_format=text_fmt,
+            data=exc.data,
+        )
+        return exc.exit_code
+    if not hasattr(args, "format"):
+        setattr(args, "format", "json")
+    # Full review: argparse is the source of truth (prefixes, repeats).
+    text_fmt = args.format == "text"
+    if not hasattr(args, "user"):
+        setattr(args, "user", False)
+    if not hasattr(args, "passphrase_fd"):
+        setattr(args, "passphrase_fd", None)
+    if not hasattr(args, "passphrase_file"):
+        setattr(args, "passphrase_file", None)
+    if not hasattr(args, "token_file"):
+        setattr(args, "token_file", None)
+    if not hasattr(args, "input"):
+        setattr(args, "input", None)
+    if not hasattr(args, "idempotency_key"):
+        setattr(args, "idempotency_key", None)
+    if not hasattr(args, "dry_run"):
+        setattr(args, "dry_run", False)
+    if not hasattr(args, "relayed"):
+        setattr(args, "relayed", False)
+    if not hasattr(args, "user_statement"):
+        setattr(args, "user_statement", None)
+    if not hasattr(args, "evidence_ref"):
+        setattr(args, "evidence_ref", None)
+    if not hasattr(args, "approval"):
+        setattr(args, "approval", None)
+    if not hasattr(args, "if_version"):
+        setattr(args, "if_version", None)
+    if not hasattr(args, "timeout"):
+        setattr(args, "timeout", None)
+    if not hasattr(args, "quiet"):
+        setattr(args, "quiet", False)
+
+    if getattr(args, "show_version", False):
+        from mesh.cli.commands.top import handle_version
+        format_success_response(data=handle_version(args), request_id=req_id, text_format=text_fmt)
+        return c.EXIT_OK
+
+    # Check for subcommand function
+    func = getattr(args, "func", None)
+    if func is None:
+        sub = get_active_subparser(parser, args)
+        if text_fmt:
+            sub.print_help()
+        else:
+            format_error_response(
+                code=c.INVALID_ARGUMENT,
+                message=f"Missing subcommand for '{sub.prog}'. Run '{sub.prog} --help' for usage.",
+                exit_code=c.EXIT_USAGE,
+                details={"command": sub.prog},
+                request_id=req_id,
+                text_format=False,
+            )
+        return c.EXIT_USAGE
+
+    try:
+        # Handle --input FILE|-
+        parse_and_apply_input_file(args, parser, argv)
+
+        # Execute handler
+        result = func(args)
+
+        if getattr(args, "_raw_ndjson", False):
+            return c.EXIT_OK
+
+        idempotent_replay = bool(getattr(args, "_idempotent_replay", False))
+        warnings = getattr(args, "_warnings", [])
+        format_success_response(
+            data=result,
+            warnings=warnings,
+            request_id=req_id,
+            idempotent_replay=idempotent_replay,
+            dry_run=getattr(args, "dry_run", False),
+            text_format=text_fmt,
+        )
+        return c.EXIT_OK
+
+    except MeshError as exc:
+        format_error_response(
+            code=exc.code,
+            message=exc.message,
+            exit_code=exc.exit_code,
+            details=exc.details,
+            request_id=req_id,
+            text_format=text_fmt,
+            data=exc.data,
+        )
+        return exc.exit_code
+    except Exception as exc:
+        format_error_response(
+            code=c.INTERNAL_ERROR,
+            message=f"Internal unexpected error: {exc}",
+            exit_code=c.EXIT_INTERNAL,
+            details={},
+            request_id=req_id,
+            text_format=text_fmt,
+        )
+        return c.EXIT_INTERNAL
+
+
+if __name__ == "__main__":
+    sys.exit(main())

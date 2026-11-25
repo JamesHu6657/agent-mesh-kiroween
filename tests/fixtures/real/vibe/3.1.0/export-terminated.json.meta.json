@@ -1,0 +1,24 @@
+{
+  "captured_at_utc": "2026-11-08T13:13:46Z",
+  "command": [
+    "vibe",
+    "--workdir",
+    "<repo>",
+    "--trust",
+    "--add-dir",
+    "/tmp",
+    "--model",
+    "ds-flash",
+    "--prompt-file",
+    "<prompt-file>",
+    "--output",
+    "streaming",
+    "--output-dir",
+    "<export-dir>",
+    "--time-limit",
+    "5400",
+    "--max-turns",
+    "200"
+  ],
+  "sha256": "a5c84da87fb4af4b97c07c93385ea7f3e7fc53732f95778d6060745d78a7f190"
+}

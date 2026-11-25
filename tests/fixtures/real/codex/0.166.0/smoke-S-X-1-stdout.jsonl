@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"01a1f3f9-ee44-7a33-b138-f2bdb719dbef"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"MESH_SMOKE_OK"}}
+{"type":"turn.completed","usage":{"input_tokens":12502,"cached_input_tokens":9728,"cache_write_input_tokens":0,"output_tokens":9,"reasoning_output_tokens":0}}

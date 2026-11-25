@@ -1,0 +1,2 @@
+Error: Refusing to run in an untrusted workspace: /tmp/ws
+Start `devin` interactively in this directory to trust it, or set `respect_workspace_trust: false` in your config to restore the previous behavior.

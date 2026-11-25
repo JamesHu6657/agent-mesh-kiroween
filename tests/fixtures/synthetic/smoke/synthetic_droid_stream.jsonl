@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","session_id":"synthetic-session-0001","model":"synthetic-model","cwd":"/tmp/mh-synthetic","note":"SYNTHETIC: hand-written for offline harness tests (m3-r2); not captured from droid"}
+{"type":"message","role":"assistant","text":"MESH_SMOKE_OK"}
+{"type":"result","subtype":"success","is_error":false,"duration_ms":1,"final_text":"MESH_SMOKE_OK","session_id":"synthetic-session-0001"}

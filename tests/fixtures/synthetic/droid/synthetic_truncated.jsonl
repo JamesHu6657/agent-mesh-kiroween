@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","session_id":"synthetic-droid-0001","model":"synthetic-model","note":"SYNTHETIC: hand-written for m3-r6 parse robustness tests; not captured from droid"}
+{"type":"message","role":"assistant","text":"SYNTHETIC_PARTIAL"}
+{"type":"completion","finalText":"SYNTHETIC_FI

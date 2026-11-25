@@ -1,0 +1,145 @@
+{
+  "adapter": "vibe",
+  "binary": "/home/user/.local/bin/vibe",
+  "captured_at_utc": "2026-11-19T11:20:30Z",
+  "cases": [
+    {
+      "carried_from": null,
+      "duration_s": 4.867,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/vibe/3.1.0/smoke-S-X-1-stdout.jsonl",
+      "fixture_sha256": "1be90773feb4b7d0d65362c40a862cf8ee7063c18e7dccf1721443f96774cd51",
+      "id": "S-X-1",
+      "observation": {
+        "raw_token_seen": true
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 4.867,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/vibe/3.1.0/smoke-S-X-1-stdout.jsonl",
+      "fixture_sha256": "1be90773feb4b7d0d65362c40a862cf8ee7063c18e7dccf1721443f96774cd51",
+      "id": "S-X-2",
+      "observation": {
+        "init_cwd": null,
+        "session_id": "898f2828-d8e1-aa6d-0f6e-2e9a3acab300",
+        "workspace": "/tmp/mh-smoke-fbnv7s1_"
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 4.31,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/vibe/3.1.0/smoke-S-X-3-stdout.jsonl",
+      "fixture_sha256": "5828add865d75aa53e122d0d0babcab811ef6dba4f00e8adbb6a3f27a3246c05",
+      "id": "S-X-3",
+      "observation": {
+        "cwd": "/tmp/mh-smoke-fbnv7s1_",
+        "parsed_token_seen": true,
+        "raw_token_seen": true,
+        "resumed_session_id": "898f2828-d8e1-aa6d-0f6e-2e9a3acab300"
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 4.867,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/vibe/3.1.0/smoke-S-X-1-stdout.jsonl",
+      "fixture_sha256": "1be90773feb4b7d0d65362c40a862cf8ee7063c18e7dccf1721443f96774cd51",
+      "id": "S-X-4",
+      "observation": {
+        "init_model": null
+      },
+      "rc": 0,
+      "reason": "not_observable",
+      "status": "observed"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 0.0,
+      "evaluated_from": null,
+      "fixture": null,
+      "fixture_sha256": null,
+      "id": "S-X-5",
+      "observation": null,
+      "rc": null,
+      "reason": "effort_not_listed",
+      "status": "not_applicable"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 5.22,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/vibe/3.1.0/smoke-S-X-6-stdout.jsonl",
+      "fixture_sha256": "45183c59ae2e4b0dfa9b8429d69e83d4da1218a35aeb93abb6e8cfbed0c20ae0",
+      "id": "S-X-6",
+      "observation": {
+        "alive_at_term": true,
+        "first_byte": true,
+        "group_gone_after_term": true,
+        "lines_at_term": 1,
+        "rc": 3,
+        "seconds_to_gone": 0.208,
+        "stderr_excerpt": "Stopped: terminated",
+        "term_after_s": 5.011
+      },
+      "rc": 3,
+      "reason": "exited_with_error",
+      "status": "fail"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 5.876,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/vibe/3.1.0/smoke-S-X-7-stdout.jsonl",
+      "fixture_sha256": "f186fc280d2d6423cf7ab7ef919063dc16e3d744c2198a89b7fdad53f3032d61",
+      "id": "S-X-7",
+      "observation": {
+        "file_created": false,
+        "rc": 0,
+        "stderr_excerpt": "",
+        "timed_out": false
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "observed"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 6.184,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/vibe/3.1.0/smoke-S-VIBE-8-stdout.jsonl",
+      "fixture_sha256": "3df8136bd782f230740b0dd84f839c0647b62a805fd87789feb9eb83e01608b7",
+      "id": "S-VIBE-8",
+      "observation": {
+        "denied_effects": 1,
+        "failed_effects": 1,
+        "outcome": "deny",
+        "rc": 0,
+        "stderr_excerpt": "",
+        "y_txt_exists": false
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "observed"
+    }
+  ],
+  "consent_ref": "james-2026-11-19-1909",
+  "effort": null,
+  "mesh_commit": "94436d1f325d188c6f98ec14816ab5840033e534",
+  "model": "ds-flash",
+  "profile": "readonly",
+  "schema": "mesh.smoke.v1",
+  "timeout_s": 180.0,
+  "version": "3.1.0"
+}

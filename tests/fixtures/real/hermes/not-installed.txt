@@ -1,0 +1,4 @@
+# captured 2026-11-07T06:47:40Z on box
+$ command -v hermes
+(not found; exit 1)
+(no match in ~/.local/bin)

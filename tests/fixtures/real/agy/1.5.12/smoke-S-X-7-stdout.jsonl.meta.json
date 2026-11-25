@@ -1,0 +1,17 @@
+{
+  "captured_at_utc": "2026-11-19T14:09:21Z",
+  "command": [
+    "agy",
+    "--print",
+    "Create a file named x.txt containing the word hello in the current directory.",
+    "--output-format",
+    "stream-json",
+    "--model",
+    "gemini-3.8-flash-low",
+    "--mode",
+    "plan",
+    "--print-timeout",
+    "180s"
+  ],
+  "sha256": "995bebb7477daa0e33edde10f7f8e8f54460185c8e0cf63f10674b6e80945428"
+}

@@ -1,0 +1,2 @@
+error: agent executor error: generating and executing: request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": net/http: cannot rewind body after connection loss
+AGY_ERROR: {"short_error":"agent executor error: generating and executing: request failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse\": net/http: cannot rewind body after connection loss","status":"UNKNOWN","error_code":2,"code_kind":"grpc","retryable":false,"error_id":"a7f595f3-2217-48ed-be9f-5f37cdeeadc7-101"}

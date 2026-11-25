@@ -1,0 +1,19 @@
+{
+  "captured_at_utc": "2026-11-19T14:09:06Z",
+  "command": [
+    "agy",
+    "--print",
+    "What token did you reply with?",
+    "--output-format",
+    "stream-json",
+    "--model",
+    "gemini-3.8-flash-low",
+    "--mode",
+    "plan",
+    "--conversation",
+    "a4b9aab8-e897-4cf2-8ec3-911a85a5d155",
+    "--print-timeout",
+    "180s"
+  ],
+  "sha256": "c8bede5ef3b154f5c049c094f437ec3486d0b8d400b9e2deec52458ff62aa1aa"
+}

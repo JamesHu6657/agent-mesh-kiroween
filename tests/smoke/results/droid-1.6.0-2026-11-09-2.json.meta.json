@@ -1,0 +1,10 @@
+{
+  "captured_at_utc": "2026-11-09T14:55:45Z",
+  "command": [
+    "python3",
+    "-m",
+    "tests.smoke.harness",
+    "droid"
+  ],
+  "sha256": "0ecac29451728400024c2602535a87e1c224383f899216d4f5d23325ee88f61b"
+}

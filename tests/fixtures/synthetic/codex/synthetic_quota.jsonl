@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}
+{"type":"turn.started"}
+{"type":"error","message":"You've hit your usage limit. Upgrade to Plus to continue using Codex, or try again at Nov 17th, 2026 3:00 PM."}
+{"type":"turn.failed","error":{"message":"You've hit your usage limit. Upgrade to Plus to continue using Codex, or try again at Nov 17th, 2026 3:00 PM."}}

@@ -1,0 +1,147 @@
+{
+  "adapter": "devin",
+  "binary": "/home/user/.local/bin/devin",
+  "captured_at_utc": "2026-11-19T13:15:49Z",
+  "cases": [
+    {
+      "carried_from": null,
+      "duration_s": 14.815,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/devin/3000.14.30821/smoke-S-X-1-stdout.txt",
+      "fixture_sha256": "a38ba51bd7c2ac22dae2bde10f66e11d0827021ccc31fe7bc28725699830e224",
+      "id": "S-X-1",
+      "observation": {
+        "raw_token_seen": true
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 14.815,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/devin/3000.14.30821/smoke-S-X-1-stdout.txt",
+      "fixture_sha256": "a38ba51bd7c2ac22dae2bde10f66e11d0827021ccc31fe7bc28725699830e224",
+      "id": "S-X-2",
+      "observation": {
+        "capability": "resume",
+        "init_cwd": null,
+        "note": "no session id is printed in print mode",
+        "session_id": null,
+        "supported": "no",
+        "workspace": "/tmp/mh-smoke-mr5uuzg1"
+      },
+      "rc": 0,
+      "reason": "resume_unsupported",
+      "status": "not_applicable"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 0.0,
+      "evaluated_from": null,
+      "fixture": null,
+      "fixture_sha256": null,
+      "id": "S-X-3",
+      "observation": {
+        "capability": "resume",
+        "note": "no session id is printed in print mode",
+        "supported": "no"
+      },
+      "rc": null,
+      "reason": "resume_unsupported",
+      "status": "not_applicable"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 14.815,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/devin/3000.14.30821/smoke-S-X-1-stdout.txt",
+      "fixture_sha256": "a38ba51bd7c2ac22dae2bde10f66e11d0827021ccc31fe7bc28725699830e224",
+      "id": "S-X-4",
+      "observation": {
+        "init_model": null
+      },
+      "rc": 0,
+      "reason": "not_observable",
+      "status": "observed"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 0.0,
+      "evaluated_from": null,
+      "fixture": null,
+      "fixture_sha256": null,
+      "id": "S-X-5",
+      "observation": null,
+      "rc": null,
+      "reason": "effort_not_listed",
+      "status": "not_applicable"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 5.186,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/devin/3000.14.30821/smoke-S-X-6-stdout.txt",
+      "fixture_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "id": "S-X-6",
+      "observation": {
+        "alive_at_term": true,
+        "first_byte": false,
+        "group_gone_after_term": true,
+        "lines_at_term": 0,
+        "rc": -15,
+        "seconds_to_gone": 0.157,
+        "term_after_s": 5.027
+      },
+      "rc": -15,
+      "reason": null,
+      "status": "pass"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 17.873,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/devin/3000.14.30821/smoke-S-X-7-stdout.txt",
+      "fixture_sha256": "2a17b7c42bc53b4862216dce5621d45df0d33767308fe0645ef12559c3cb6349",
+      "id": "S-X-7",
+      "observation": {
+        "file_created": true,
+        "profile": "unrestricted",
+        "rc": 0,
+        "stderr_excerpt": "",
+        "timed_out": false
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "observed"
+    },
+    {
+      "carried_from": null,
+      "duration_s": 18.087,
+      "evaluated_from": null,
+      "fixture": "tests/fixtures/real/devin/3000.14.30821/smoke-S-DEVIN-8-stdout.txt",
+      "fixture_sha256": "5c2647a34cd3e308e6d2d06d77f2a24ba1f3367f1a874bf894e05235d5d85683",
+      "id": "S-DEVIN-8",
+      "observation": {
+        "outcome": "executed",
+        "profile": "unrestricted",
+        "rc": 0,
+        "stderr_excerpt": "",
+        "tool_rejections": 0,
+        "y_txt_exists": true
+      },
+      "rc": 0,
+      "reason": null,
+      "status": "observed"
+    }
+  ],
+  "consent_ref": "james-2026-11-19-1909",
+  "effort": null,
+  "mesh_commit": "a1ac7acaa5d027988c1b3ded8cc8042dd9301e2e",
+  "model": "swe-2-flash-medium",
+  "profile": "unrestricted",
+  "schema": "mesh.smoke.v1",
+  "timeout_s": 180.0,
+  "version": "3000.14.30821"
+}

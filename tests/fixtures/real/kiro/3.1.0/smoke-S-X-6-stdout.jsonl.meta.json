@@ -1,0 +1,15 @@
+{
+  "captured_at_utc": "2026-11-10T01:59:34Z",
+  "command": [
+    "kiro-cli",
+    "chat",
+    "--no-interactive",
+    "--output-format",
+    "stream-json",
+    "--model",
+    "claude-haiku-5.5",
+    "--trust-tools=",
+    "Count from 1 to 2000, one number per line, with no other text."
+  ],
+  "sha256": "344088c51b0d11878c718d25053ec6ef9c78c668b781de84a6c8fa15d2eff947"
+}

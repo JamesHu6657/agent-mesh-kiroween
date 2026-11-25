@@ -1,0 +1,17 @@
+{
+  "enabled": true,
+  "name": "Acceptance consistency",
+  "description": "When a gate report (docs/*gate-report*.md) or a spec under .kiro/specs/ is saved, check that every cited checklist id exists in docs/acceptance-checklist.md (or the M3 addendum docs/coordination/m3-acceptance-addendum.md) and every cited test name or tests/ path exists. Read-only; exits 1 on an unknown id or a missing test.",
+  "version": "1",
+  "when": {
+    "type": "fileEdited",
+    "patterns": [
+      "docs/*gate-report*.md",
+      ".kiro/specs/**/*.md"
+    ]
+  },
+  "then": {
+    "type": "runCommand",
+    "command": "python3 .kiro/hooks/scripts/acceptance-check.py"
+  }
+}

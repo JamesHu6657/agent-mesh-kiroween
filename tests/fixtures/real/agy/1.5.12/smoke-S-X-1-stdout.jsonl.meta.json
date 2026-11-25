@@ -1,0 +1,17 @@
+{
+  "captured_at_utc": "2026-11-19T14:08:55Z",
+  "command": [
+    "agy",
+    "--print",
+    "Reply with exactly MESH_SMOKE_OK",
+    "--output-format",
+    "stream-json",
+    "--model",
+    "gemini-3.8-flash-low",
+    "--mode",
+    "plan",
+    "--print-timeout",
+    "180s"
+  ],
+  "sha256": "51c024df9b16cebc83a3f25203d2bc759946cabe8902ad4cc0bdd4f7bc3a43b1"
+}

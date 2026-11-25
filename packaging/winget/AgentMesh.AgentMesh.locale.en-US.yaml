@@ -1,0 +1,26 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+PackageIdentifier: AgentMesh.AgentMesh
+PackageVersion: "1.0.0.dev0"
+PackageLocale: en-US
+Publisher: AgentMesh
+PublisherUrl: https://github.com/JamesHu6657/agent-mesh-kiroween
+PublisherSupportUrl: https://github.com/JamesHu6657/agent-mesh-kiroween/issues
+PackageName: Agent Mesh
+PackageUrl: https://github.com/JamesHu6657/agent-mesh-kiroween
+License: MIT
+LicenseUrl: https://github.com/JamesHu6657/agent-mesh-kiroween/blob/main/LICENSE
+ShortDescription: Local-first multi-agent orchestrator with chat-first desktop UI and inline approval cards.
+Description: >-
+  Agent Mesh coordinates local AI coding CLIs (Claude Code, Codex, Antigravity, Droid, Kiro, Vibe)
+  with a single Lead planner, per-task Git worktrees, inline card-button approvals, standing grants,
+  and a hash-chained cryptographic audit log. Runs strictly locally with no network listener.
+Moniker: agent-mesh
+Tags:
+  - ai
+  - agent
+  - orchestrator
+  - git-worktree
+  - desktop
+ReleaseNotesUrl: https://github.com/JamesHu6657/agent-mesh-kiroween/releases/tag/v1.0.0.dev0
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

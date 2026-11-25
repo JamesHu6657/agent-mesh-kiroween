@@ -1,0 +1,4 @@
+Error: Print mode runs a single turn non-interactively, so it needs a prompt.
+
+Examples:
+  devin -p "fix the failing test"

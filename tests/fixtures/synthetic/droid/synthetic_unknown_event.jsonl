@@ -1,0 +1,8 @@
+{"type":"system","subtype":"init","session_id":"synthetic-droid-0002","model":"synthetic-model","note":"SYNTHETIC: hand-written for m3-r6 parse robustness tests; not captured from droid"}
+{"type":"future_event","payload":{"x":1},"session_id":"synthetic-droid-0002"}
+[]
+null
+"plain string"
+{not json
+{"type":"message","role":"assistant","text":"SYNTHETIC_ASSISTANT_TEXT"}
+{"type":"completion","finalText":"SYNTHETIC_FINAL","usage":"not-a-dict","session_id":"synthetic-droid-0002"}

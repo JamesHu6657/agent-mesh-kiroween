@@ -1,0 +1,42 @@
+#include <winver.h>
+
+#define IDI_APPICON 101
+IDI_APPICON ICON "icon.ico"
+
+#ifdef MESH_CLI
+#define AM_FILE_DESC "Agent Mesh CLI"
+#define AM_INTERNAL_NAME "mesh"
+#define AM_ORIG_FILENAME "mesh.exe"
+#else
+#define AM_FILE_DESC "Agent Mesh Desktop"
+#define AM_INTERNAL_NAME "Agent Mesh"
+#define AM_ORIG_FILENAME "Agent Mesh.exe"
+#endif
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     1,0,0,0
+PRODUCTVERSION  1,0,0,0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0x0L
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Agent Mesh"
+            VALUE "FileDescription",  AM_FILE_DESC
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "InternalName",     AM_INTERNAL_NAME
+            VALUE "OriginalFilename", AM_ORIG_FILENAME
+            VALUE "ProductName",      "Agent Mesh"
+            VALUE "ProductVersion",   "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

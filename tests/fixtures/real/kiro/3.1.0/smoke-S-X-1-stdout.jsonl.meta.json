@@ -1,0 +1,15 @@
+{
+  "captured_at_utc": "2026-11-10T01:59:29Z",
+  "command": [
+    "kiro-cli",
+    "chat",
+    "--no-interactive",
+    "--output-format",
+    "stream-json",
+    "--model",
+    "claude-haiku-5.5",
+    "--trust-tools=",
+    "Reply with exactly MESH_SMOKE_OK"
+  ],
+  "sha256": "2973eb2c0e27407d7630bd21310188e60f2a7eca3ccf86661c3b6134a40d2fd5"
+}

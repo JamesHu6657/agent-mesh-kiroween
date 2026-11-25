@@ -1,0 +1,16 @@
+{
+  "captured_at_utc": "2026-11-19T13:16:45Z",
+  "command": [
+    "devin",
+    "-p",
+    "--prompt-file",
+    "/tmp/mh-smk-devin/.runs/S-DEVIN-8-3lpwjrkf/prompt.md",
+    "--model",
+    "swe-2-flash-medium",
+    "--permission-mode",
+    "dangerous",
+    "--respect-workspace-trust",
+    "false"
+  ],
+  "sha256": "5c2647a34cd3e308e6d2d06d77f2a24ba1f3367f1a874bf894e05235d5d85683"
+}

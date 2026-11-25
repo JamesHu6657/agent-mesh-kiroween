@@ -1,0 +1,21 @@
+{
+  "captured_at_utc": "2026-11-19T13:23:43Z",
+  "command": [
+    "codex",
+    "--ask-for-approval",
+    "never",
+    "exec",
+    "--json",
+    "--skip-git-repo-check",
+    "--cd",
+    "/tmp/mh-smoke-2adbikxu",
+    "--model",
+    "gpt-5.6-luna",
+    "--sandbox",
+    "read-only",
+    "resume",
+    "01a1f3f9-ee44-7a33-b138-f2bdb719dbef",
+    "-"
+  ],
+  "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}
