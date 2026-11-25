@@ -12,7 +12,7 @@
   "architecture": {
     "64bit": {
       "url": "https://github.com/JamesHu6657/agent-mesh-kiroween/releases/download/v1.0.0.dev0/AgentMesh-1.0.0.dev0-win-x64-portable.zip",
-      "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "hash": "3cf38260a0ddc81e1ae5fe0a7a4d399befd885c22e736518ab7b4e601f61e597",
       "extract_dir": "AgentMesh-1.0.0.dev0-win-x64-portable"
     }
   },
