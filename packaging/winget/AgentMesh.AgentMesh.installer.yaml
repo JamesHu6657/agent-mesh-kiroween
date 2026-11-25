@@ -10,7 +10,7 @@ Installers:
     Scope: user
     InstallerType: inno
     InstallerUrl: https://github.com/JamesHu6657/agent-mesh-kiroween/releases/download/v1.0.0.dev1/AgentMesh-1.0.0.dev1-win-x64-setup.exe
-    InstallerSha256: "09526288A401B2820364505925DC0C7397CF16671F9B9F5D8BE9B3A516BEB33E"
+    InstallerSha256: "32EB2F204CBC919206608858FC51E0B96945675AAD06B77173A79EA38B75E1F8"
     InstallerSwitches:
       Silent: /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
       SilentWithProgress: /SILENT /SUPPRESSMSGBOXES /NORESTART
