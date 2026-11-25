@@ -931,6 +931,19 @@ class TestB4WindowsManifestsAndInstallPs1(unittest.TestCase):
             self.assertIsNone(ver_re.match(bad_ver), f"install.ps1 version regex must reject {bad_ver!r}")
         for good_ver in ("1.0", "0.1.0", "1.0.0.dev0", "1.2.3-rc.1+build.7", "v2.3.4"):
             self.assertIsNotNone(ver_re.match(good_ver), f"install.ps1 version regex must accept {good_ver!r}")
+
+        # Unpinned resolution must prefer the latest stable release but fall back to a prerelease-only repository.
+        resolve_fn = self._extract_ps1_function(ps1, "Resolve-TargetVersion")
+        self.assertIn("/releases/latest", resolve_fn)
+        self.assertIn("/releases?per_page=1", resolve_fn)
+        self.assertIn("if ($httpStatus -ne 404) { throw }", resolve_fn)
+        self.assertLess(
+            resolve_fn.index("/releases/latest"),
+            resolve_fn.index("/releases?per_page=1"),
+            "install.ps1 must try the stable latest-release endpoint before the prerelease fallback",
+        )
+        self.assertIn("$candidate.PSObject.Properties['draft']", resolve_fn)
+
         self.assertIn("$resolvedTarget = [System.IO.Path]::GetFullPath($targetDir)", install_fn)
         self.assertIn("$resolvedTarget.StartsWith($versionsRoot", install_fn)
         self.assertLess(
