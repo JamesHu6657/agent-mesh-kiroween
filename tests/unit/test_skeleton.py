@@ -376,7 +376,7 @@ class TestSkeleton(unittest.TestCase):
         rc, out = self.harness.cli("version")
         self.assertEqual(rc, 0)
         self.assertTrue(out.get("ok"))
-        self.assertEqual(out.get("data", {}).get("version"), "1.0.0.dev0")
+        self.assertEqual(out.get("data", {}).get("version"), "1.0.0.dev1")
 
     def test_tripwire_shims(self):
         """Verify shims in tests/shims trigger tripwire and exit 99 when invoked. ACC: A3"""

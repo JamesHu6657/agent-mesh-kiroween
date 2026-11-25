@@ -130,7 +130,7 @@ class _FakeDaemonController:
                         "request_id": req_id,
                     }
                 if cmd == "version":
-                    return {"ok": True, "data": {"version": "1.0.0.dev0"}, "request_id": req_id}
+                    return {"ok": True, "data": {"version": "1.0.0.dev1"}, "request_id": req_id}
 
                 if auth.get("type") != "user":
                     return {
@@ -4366,7 +4366,7 @@ class TestDesktopBridgeAutoStartS1(unittest.TestCase):
                             version_entered.set()
                             version_release.wait(timeout=3.0)
                             # Simulate version finishing (either ok or error) after stop_daemon ran
-                            return {"ok": True, "data": {"version": "1.0.0.dev0"}, "request_id": req_id}
+                            return {"ok": True, "data": {"version": "1.0.0.dev1"}, "request_id": req_id}
                     if cmd == "daemon.stop":
                         with state_lock:
                             state["online"] = False

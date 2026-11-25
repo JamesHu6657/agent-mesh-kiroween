@@ -1028,7 +1028,7 @@ class TestPhase1bEntryPathsFsync(unittest.TestCase):
                 timeout=20,
             )
             self.assertEqual(res.returncode, 0, f"stdout={res.stdout!r}\nstderr={res.stderr!r}")
-            self.assertIn("1.0.0.dev0", res.stdout)
+            self.assertIn("1.0.0.dev1", res.stdout)
 
             # 2. Exact non-zero exit code propagation across _winapi.CreateProcess
             res_err = subprocess.run(
@@ -1056,7 +1056,7 @@ class TestPhase1bEntryPathsFsync(unittest.TestCase):
                 timeout=20,
             )
             self.assertEqual(res_cmd.returncode, 0, f"stdout={res_cmd.stdout!r}\nstderr={res_cmd.stderr!r}")
-            self.assertIn("1.0.0.dev0", res_cmd.stdout)
+            self.assertIn("1.0.0.dev1", res_cmd.stdout)
 
             res_help = subprocess.run(
                 [cmd_path, "--help"],

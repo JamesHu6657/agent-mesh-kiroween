@@ -90,7 +90,7 @@ Build the installer (on Windows with Inno Setup 6, or on Linux with Wine + Inno 
 ```bash
 # Build portable zip + stage and compile setup.exe (or prepare helper scripts if ISCC is absent on Linux):
 python3 scripts/build_windows_portable.py --out dist
-python3 scripts/build_windows_installer.py --out dist --portable-zip dist/AgentMesh-1.0.0.dev0-win-x64-portable.zip
+python3 scripts/build_windows_installer.py --out dist --portable-zip dist/AgentMesh-1.0.0.dev1-win-x64-portable.zip
 
 # On Linux without Inno Setup installed locally, the command above writes:
 #   dist/installer-stage/          (ready payload)

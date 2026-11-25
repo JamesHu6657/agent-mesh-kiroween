@@ -10,7 +10,7 @@
 ; - Unsigned build (no paid code-signing certificate required).
 
 #ifndef AppVersion
-  #define AppVersion "1.0.0.dev0"
+  #define AppVersion "1.0.0.dev1"
 #endif
 #ifndef StageDir
   #define StageDir "..\..\dist\stage"

@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
 PackageIdentifier: AgentMesh.AgentMesh
-PackageVersion: "1.0.0.dev0"
+PackageVersion: "1.0.0.dev1"
 PackageLocale: en-US
 Publisher: AgentMesh
 PublisherUrl: https://github.com/JamesHu6657/agent-mesh-kiroween
@@ -21,6 +21,6 @@ Tags:
   - orchestrator
   - git-worktree
   - desktop
-ReleaseNotesUrl: https://github.com/JamesHu6657/agent-mesh-kiroween/releases/tag/v1.0.0.dev0
+ReleaseNotesUrl: https://github.com/JamesHu6657/agent-mesh-kiroween/releases/tag/v1.0.0.dev1
 ManifestType: defaultLocale
 ManifestVersion: 1.6.0

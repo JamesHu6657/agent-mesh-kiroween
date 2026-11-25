@@ -45,7 +45,7 @@ def read_mesh_version() -> str:
     for line in init_py.read_text(encoding="utf-8").splitlines():
         if line.startswith("__version__"):
             exec(line, ns)
-    return str(ns.get("__version__", "1.0.0.dev0"))
+    return str(ns.get("__version__", "1.0.0.dev1"))
 
 
 def parse_sha256sums(path: Path) -> Dict[str, str]:

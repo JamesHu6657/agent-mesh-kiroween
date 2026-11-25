@@ -68,7 +68,7 @@ Third-party Python packages MUST NOT be imported. `cryptography` happens to be i
 
 ```
 bin/mesh                       # POSIX sh shim: exec python3 -P -s -m mesh "$@" with PYTHONPATH=<realpath of install root> (§7.6 mitigation 8)
-mesh/__init__.py               # __version__ = "1.0.0.dev0"
+mesh/__init__.py               # __version__ = "1.0.0.dev1"
 mesh/__main__.py               # -> mesh.cli.main()
 mesh/cli/main.py               # argparse tree, global flags, envelope, exit codes
 mesh/cli/help.py               # layered help text, topics, examples

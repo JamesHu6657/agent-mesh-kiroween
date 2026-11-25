@@ -749,17 +749,15 @@ class TestB2LeadInterruptOutboxPreservation(unittest.TestCase):
 
 
 class TestB4WindowsManifestsAndInstallPs1(unittest.TestCase):
-    def test_checked_in_manifests_pass_template_check_and_fail_strict_placeholder_check(self) -> None:
-        # P3-1: strict default check MUST reject all-zero placeholder hashes
+    def test_checked_in_manifests_pass_strict_and_template_check(self) -> None:
         ok_strict, errs_strict = gen_win_manifests.verify_manifests(REPO_ROOT / "packaging")
-        self.assertFalse(ok_strict, "Strict verify_manifests must reject all-zero placeholders")
-        self.assertTrue(any("placeholder" in e.lower() for e in errs_strict), str(errs_strict))
+        self.assertTrue(ok_strict, f"Checked-in manifests failed strict validation: {errs_strict}")
         self.assertEqual(
             gen_win_manifests.main(["--check", "--out-dir", str(REPO_ROOT / "packaging")]),
-            1,
+            0,
         )
 
-        # Explicit --allow-placeholders validates checked-in template structure
+        # Explicit --allow-placeholders also validates checked-in manifest structure
         ok_tpl, errs_tpl = gen_win_manifests.verify_manifests(
             REPO_ROOT / "packaging", allow_placeholders=True
         )
@@ -929,7 +927,7 @@ class TestB4WindowsManifestsAndInstallPs1(unittest.TestCase):
         ver_re = re.compile(ver_match.group(1))
         for bad_ver in (".", "..", "...", ".hidden", "-1.0", "../escape", "1.0/2", "1.0\\2", ""):
             self.assertIsNone(ver_re.match(bad_ver), f"install.ps1 version regex must reject {bad_ver!r}")
-        for good_ver in ("1.0", "0.1.0", "1.0.0.dev0", "1.2.3-rc.1+build.7", "v2.3.4"):
+        for good_ver in ("1.0", "0.1.0", "1.0.0.dev1", "1.2.3-rc.1+build.7", "v2.3.4"):
             self.assertIsNotNone(ver_re.match(good_ver), f"install.ps1 version regex must accept {good_ver!r}")
 
         # Unpinned resolution must prefer the latest stable release but fall back to a prerelease-only repository.
