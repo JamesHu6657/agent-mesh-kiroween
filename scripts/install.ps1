@@ -7,7 +7,7 @@
 #   irm https://raw.githubusercontent.com/JamesHu6657/agent-mesh-kiroween/main/scripts/install.ps1 | iex
 #
 # Configurable environment variables:
-#   AGENT_MESH_VERSION          Pin a specific release version (defaults to latest GitHub release)
+#   AGENT_MESH_VERSION          Pin a specific release version (defaults to latest stable GitHub release, or latest prerelease when no stable release exists)
 #   AGENT_MESH_REPO             GitHub owner/repo slug (defaults to JamesHu6657/agent-mesh-kiroween)
 #   AGENT_MESH_RELEASE_BASE_URL Custom mirror base URL for release assets
 #   AGENT_MESH_INSTALL_DIR      Root directory for versioned installs (defaults to %LOCALAPPDATA%\AgentMesh)
@@ -193,13 +193,33 @@ function Resolve-TargetVersion {
   param([hashtable]$Config)
   $version = $Config.PinnedVersion
   if ([string]::IsNullOrWhiteSpace($version)) {
-    $latestApiUrl = "https://api.github.com/repos/$($Config.Repo)/releases/latest"
     $apiHeaders = @{
       'User-Agent' = 'agent-mesh-installer'
       'Accept'     = 'application/vnd.github+json'
     }
-    $releaseMeta = Invoke-HttpWithBackoff -Operation {
-      Invoke-RestMethod -Uri $latestApiUrl -UseBasicParsing -Headers $apiHeaders
+    $releaseMeta = $null
+    $latestApiUrl = "https://api.github.com/repos/$($Config.Repo)/releases/latest"
+    try {
+      $releaseMeta = Invoke-HttpWithBackoff -Operation {
+        Invoke-RestMethod -Uri $latestApiUrl -UseBasicParsing -Headers $apiHeaders
+      }
+    } catch {
+      $httpStatus = Get-HttpStatusCodeFromError -ErrorRecord $_
+      if ($httpStatus -ne 404) { throw }
+
+      # /releases/latest excludes prereleases and returns 404 when none exist.
+      # In that case, use the newest public release, which may be a prerelease.
+      $releasesApiUrl = "https://api.github.com/repos/$($Config.Repo)/releases?per_page=1"
+      $releaseList = Invoke-HttpWithBackoff -Operation {
+        Invoke-RestMethod -Uri $releasesApiUrl -UseBasicParsing -Headers $apiHeaders
+      }
+      foreach ($candidate in @($releaseList)) {
+        if ($null -eq $candidate) { continue }
+        if ($candidate.PSObject.Properties['draft'] -and $candidate.draft) { continue }
+        if ((-not $candidate.PSObject.Properties['tag_name']) -or [string]::IsNullOrWhiteSpace($candidate.tag_name)) { continue }
+        $releaseMeta = $candidate
+        break
+      }
     }
     if (-not $releaseMeta -or [string]::IsNullOrWhiteSpace($releaseMeta.tag_name)) {
       Stop-InstallFailure 'unable to read latest release tag from GitHub API; set AGENT_MESH_VERSION manually'
