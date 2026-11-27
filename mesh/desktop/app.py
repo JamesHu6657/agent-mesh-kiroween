@@ -32,10 +32,11 @@ from mesh.desktop.bridge import (
     compute_saved_window_placement,
     index_html_path,
 )
+from mesh.desktop.i18n import resolve_effective_language, tr as _tr
 from mesh.desktop.tray_win import SingleInstanceGuard, WindowsTrayController, resolve_app_icon_path
 from mesh.errors import MeshError
 
-REQUIRED_ASSET_FILES = ("index.html", "styles.css", "app.js")
+REQUIRED_ASSET_FILES = ("index.html", "styles.css", "i18n.js", "app.js")
 WEBVIEW2_CLIENT_GUID = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
 WEBVIEW2_DOWNLOAD_URL = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
 _WIN32_MB_OK = 0x00000000
@@ -151,17 +152,27 @@ def detect_webview2_runtime(winreg_mod: Any = None) -> Optional[str]:
     return None
 
 
-def ensure_webview2_runtime(winreg_mod: Any = None) -> str:
+def ensure_webview2_runtime(winreg_mod: Any = None, *, language: Optional[str] = None) -> str:
     """Verify Microsoft Edge WebView2 Runtime is installed on Windows, or fail fast."""
     version = detect_webview2_runtime(winreg_mod=winreg_mod)
     if not version:
+        lang = resolve_effective_language(language)
         raise MeshError(
             code=c.INTERNAL_ERROR,
             exit_code=c.EXIT_INTERNAL,
-            message=(
-                "未检测到 Microsoft Edge WebView2 Runtime（桌面端禁止静默回退到 MSHTML）。\n\n"
-                "请先下载并安装 WebView2 Runtime（可按 Ctrl+C 复制以下链接）：\n"
-                f"{WEBVIEW2_DOWNLOAD_URL}"
+            message=_tr(
+                lang,
+                (
+                    "未检测到 Microsoft Edge WebView2 Runtime（桌面端禁止静默回退到 MSHTML）。\n\n"
+                    "请先下载并安装 WebView2 Runtime（可按 Ctrl+C 复制以下链接）：\n"
+                    f"{WEBVIEW2_DOWNLOAD_URL}"
+                ),
+                (
+                    "Microsoft Edge WebView2 Runtime was not detected "
+                    "(silent fallback to legacy MSHTML is disabled).\n\n"
+                    "Please download and install WebView2 Runtime (press Ctrl+C to copy the link):\n"
+                    f"{WEBVIEW2_DOWNLOAD_URL}"
+                ),
             ),
             details={
                 "missing_runtime": "webview2",
@@ -207,6 +218,20 @@ def _import_webview() -> Any:
         ) from exc
 
 
+def _load_saved_language_pref(home: Optional[str]) -> Optional[str]:
+    """Best-effort lookup of persisted desktop UI language preference before bridge init."""
+    if not home:
+        return None
+    try:
+        from mesh.desktop.state import DesktopStateStore
+
+        prefs = DesktopStateStore(home).load_prefs()
+        lang = prefs.get("language")
+        return str(lang) if isinstance(lang, str) and lang.strip() else None
+    except Exception:
+        return None
+
+
 def launch_desktop(
     home: Optional[str] = None,
     *,
@@ -215,6 +240,7 @@ def launch_desktop(
 ) -> Dict[str, Any]:
     """Launch the Agent Mesh desktop window bound to local IPC via :class:`DesktopBridge`."""
     resolved_home = resolve_home(home or os.environ.get("MESH_HOME") or os.path.expanduser("~/.agent-mesh"))
+    saved_lang = _load_saved_language_pref(resolved_home)
     append_desktop_log(
         resolved_home,
         "INFO",
@@ -224,7 +250,7 @@ def launch_desktop(
     )
     assets = verify_assets()
     if sys.platform == "win32":
-        wv2_ver = ensure_webview2_runtime()
+        wv2_ver = ensure_webview2_runtime(language=saved_lang)
         append_desktop_log(
             resolved_home,
             "INFO",
@@ -471,9 +497,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
         if no_console or sys.stderr is None:
             if sys.platform == "win32":
+                crash_lang = resolve_effective_language(_load_saved_language_pref(home))
                 _show_win32_error_dialog(
                     "Agent Mesh",
-                    f"启动 Agent Mesh 桌面端时发生未预期错误：\n\n{summary}",
+                    _tr(
+                        crash_lang,
+                        f"启动 Agent Mesh 桌面端时发生未预期错误：\n\n{summary}",
+                        f"An unexpected error occurred while starting Agent Mesh Desktop:\n\n{summary}",
+                    ),
                 )
         else:
             _write_json_stream(

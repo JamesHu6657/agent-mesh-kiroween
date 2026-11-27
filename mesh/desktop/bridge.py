@@ -46,6 +46,7 @@ from mesh.core.paths import (
     write_autostart_hold,
 )
 from mesh.core.redact import redact, redact_value
+from mesh.desktop.i18n import normalize_language_pref, resolve_effective_language, tr as _tr
 from mesh.desktop.state import DesktopStateStore
 from mesh.errors import MeshError
 from mesh.platform import _win32_cred as win_cred
@@ -603,14 +604,23 @@ def compute_saved_window_placement(
     return out
 
 
-def _validate_bridge_call_args(method: str, args: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _validate_bridge_call_args(
+    method: str,
+    args: Dict[str, Any],
+    *,
+    lang: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """Reject high-risk executable/command arguments from WebView JS callers."""
     if method.startswith("adapter.") or method.startswith("agent."):
         for k, v in args.items():
             if isinstance(k, str) and k.lower() in _BLOCKED_BINARY_KEYS and v is not None:
                 return _error_envelope(
                     "ARGUMENT_NOT_ALLOWED",
-                    f"桌面端不允许在 '{method}' 中指定 '{k}'",
+                    _tr(
+                        lang,
+                        f"桌面端不允许在 '{method}' 中指定 '{k}'",
+                        f"Desktop client does not allow specifying '{k}' in '{method}'",
+                    ),
                     exit_code=c.EXIT_USAGE,
                     details={"method": method, "param": k},
                 )
@@ -621,7 +631,11 @@ def _validate_bridge_call_args(method: str, args: Dict[str, Any]) -> Optional[Di
                     if isinstance(k, str) and k.lower() in _BLOCKED_BINARY_KEYS and v is not None:
                         return _error_envelope(
                             "ARGUMENT_NOT_ALLOWED",
-                            f"桌面端不允许在 '{method}' 中指定 'options.{k}'",
+                            _tr(
+                                lang,
+                                f"桌面端不允许在 '{method}' 中指定 'options.{k}'",
+                                f"Desktop client does not allow specifying 'options.{k}' in '{method}'",
+                            ),
                             exit_code=c.EXIT_USAGE,
                             details={"method": method, "param": f"{opt_key}.{k}"},
                         )
@@ -632,7 +646,11 @@ def _validate_bridge_call_args(method: str, args: Dict[str, Any]) -> Optional[Di
                         if k.lower() in _BLOCKED_BINARY_KEYS:
                             return _error_envelope(
                                 "ARGUMENT_NOT_ALLOWED",
-                                f"桌面端不允许在 '{method}' 中指定 'options.{k}'",
+                                _tr(
+                                    lang,
+                                    f"桌面端不允许在 '{method}' 中指定 'options.{k}'",
+                                    f"Desktop client does not allow specifying 'options.{k}' in '{method}'",
+                                ),
                                 exit_code=c.EXIT_USAGE,
                                 details={"method": method, "param": f"{opt_key}.{k}"},
                             )
@@ -641,7 +659,11 @@ def _validate_bridge_call_args(method: str, args: Dict[str, Any]) -> Optional[Di
         if setting_key in _BLOCKED_SETTINGS:
             return _error_envelope(
                 "SETTING_NOT_ALLOWED",
-                f"桌面端不允许修改高危设置 '{setting_key}'",
+                _tr(
+                    lang,
+                    f"桌面端不允许修改高危设置 '{setting_key}'",
+                    f"Desktop client does not allow modifying restricted setting '{setting_key}'",
+                ),
                 exit_code=c.EXIT_USAGE,
                 details={"method": method, "key": setting_key},
             )
@@ -677,14 +699,20 @@ def _sanitize_value(value: Any) -> Any:
     return redact_value(value)
 
 
-def _parse_bridge_int(value: Any, *, name: str) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
+def _parse_bridge_int(
+    value: Any,
+    *,
+    name: str,
+    lang: Optional[str] = None,
+) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
     """Parse an integer bridge argument or return an ``INVALID_ARGUMENT`` error envelope."""
+    err_msg = _tr(lang, f"参数 '{name}' 必须为整数", f"Parameter '{name}' must be an integer")
     if isinstance(value, bool):
         return (
             None,
             _error_envelope(
                 c.INVALID_ARGUMENT,
-                f"参数 '{name}' 必须为整数",
+                err_msg,
                 exit_code=c.EXIT_USAGE,
                 details={"param": name},
             ),
@@ -698,7 +726,7 @@ def _parse_bridge_int(value: Any, *, name: str) -> Tuple[Optional[int], Optional
             None,
             _error_envelope(
                 c.INVALID_ARGUMENT,
-                f"参数 '{name}' 必须为整数",
+                err_msg,
                 exit_code=c.EXIT_USAGE,
                 details={"param": name},
             ),
@@ -712,7 +740,7 @@ def _parse_bridge_int(value: Any, *, name: str) -> Tuple[Optional[int], Optional
         None,
         _error_envelope(
             c.INVALID_ARGUMENT,
-            f"参数 '{name}' 必须为整数",
+            err_msg,
             exit_code=c.EXIT_USAGE,
             details={"param": name},
         ),
@@ -850,12 +878,20 @@ class DesktopBridge:
         auto_start_window_s: float = 300.0,
         state_store: Optional[DesktopStateStore] = None,
         cred_store: Any = None,
+        language: Optional[str] = None,
     ) -> None:
         raw_home = home or os.environ.get("MESH_HOME") or os.path.expanduser("~/.agent-mesh")
         self.home: str = resolve_home(raw_home)
         self._client_factory = client_factory or MeshClient
         self._state_store: DesktopStateStore = state_store or DesktopStateStore(self.home)
         self._cred_store: Any = cred_store if cred_store is not None else win_cred
+        norm_init_lang = normalize_language_pref(language) if language is not None else None
+        if norm_init_lang is not None:
+            self._language_pref: str = norm_init_lang
+            self._language_overridden: bool = True
+        else:
+            self._language_pref = str(self._state_store.load_prefs().get("language", "auto"))
+            self._language_overridden = False
         self._backoff: Sequence[float] = tuple(backoff_schedule) or _DEFAULT_BACKOFF
         self._rpc_timeout_s: float = float(rpc_timeout_s)
         self._probe_timeout_s: float = float(probe_timeout_s)
@@ -1246,14 +1282,14 @@ class DesktopBridge:
         if win is None:
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                "未绑定桌面窗口",
+                self._t("未绑定桌面窗口", "No desktop window is attached"),
                 exit_code=c.EXIT_INTERNAL,
             )
         fn = getattr(win, "minimize", None)
         if not callable(fn):
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                "当前窗口不支持最小化操作",
+                self._t("当前窗口不支持最小化操作", "Current window does not support minimizing"),
                 exit_code=c.EXIT_INTERNAL,
             )
         try:
@@ -1261,7 +1297,7 @@ class DesktopBridge:
         except Exception as exc:
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                f"最小化窗口失败: {exc}",
+                self._t(f"最小化窗口失败: {exc}", f"Failed to minimize window: {exc}"),
                 exit_code=c.EXIT_INTERNAL,
             )
         with self._lock:
@@ -1289,7 +1325,7 @@ class DesktopBridge:
         if win is None:
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                "未绑定桌面窗口",
+                self._t("未绑定桌面窗口", "No desktop window is attached"),
                 exit_code=c.EXIT_INTERNAL,
             )
 
@@ -1339,7 +1375,7 @@ class DesktopBridge:
                         if not ok:
                             return _error_envelope(
                                 c.INTERNAL_ERROR,
-                                "切换窗口最大化状态失败: SetWindowPos 调用失败",
+                                self._t("切换窗口最大化状态失败: SetWindowPos 调用失败", "Failed to toggle maximize: SetWindowPos failed"),
                                 exit_code=c.EXIT_INTERNAL,
                             )
                         return _success_envelope(
@@ -1378,7 +1414,7 @@ class DesktopBridge:
                     if not ok:
                         return _error_envelope(
                             c.INTERNAL_ERROR,
-                            "切换窗口最大化状态失败: SetWindowPos 调用失败",
+                            self._t("切换窗口最大化状态失败: SetWindowPos 调用失败", "Failed to toggle maximize: SetWindowPos failed"),
                             exit_code=c.EXIT_INTERNAL,
                         )
                     return _success_envelope(
@@ -1420,7 +1456,7 @@ class DesktopBridge:
                         except Exception as exc:
                             return _error_envelope(
                                 c.INTERNAL_ERROR,
-                                f"切换窗口最大化状态失败: {exc}",
+                                self._t(f"切换窗口最大化状态失败: {exc}", f"Failed to toggle maximize: {exc}"),
                                 exit_code=c.EXIT_INTERNAL,
                             )
                         finally:
@@ -1449,7 +1485,7 @@ class DesktopBridge:
                     except Exception as exc:
                         return _error_envelope(
                             c.INTERNAL_ERROR,
-                            f"切换窗口最大化状态失败: {exc}",
+                            self._t(f"切换窗口最大化状态失败: {exc}", f"Failed to toggle maximize: {exc}"),
                             exit_code=c.EXIT_INTERNAL,
                         )
                     finally:
@@ -1462,7 +1498,7 @@ class DesktopBridge:
         if not callable(fn):
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                f"当前窗口不支持 {action_name} 操作",
+                self._t(f"当前窗口不支持 {action_name} 操作", f"Current window does not support {action_name}"),
                 exit_code=c.EXIT_INTERNAL,
             )
         if not target_state:
@@ -1487,7 +1523,7 @@ class DesktopBridge:
         except Exception as exc:
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                f"切换窗口最大化状态失败: {exc}",
+                self._t(f"切换窗口最大化状态失败: {exc}", f"Failed to toggle maximize: {exc}"),
                 exit_code=c.EXIT_INTERNAL,
             )
         finally:
@@ -1507,13 +1543,13 @@ class DesktopBridge:
         if win is None:
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                "未绑定桌面窗口",
+                self._t("未绑定桌面窗口", "No desktop window is attached"),
                 exit_code=c.EXIT_INTERNAL,
             )
         if not _is_finite_number(ratio_x) or not _is_finite_number(offset_y):
             return _error_envelope(
                 c.INVALID_ARGUMENT,
-                "拖动还原参数必须为有限数值",
+                self._t("拖动还原参数必须为有限数值", "Drag-restore parameters must be finite numbers"),
                 exit_code=c.EXIT_USAGE,
                 details={"param": "ratio_x/offset_y"},
             )
@@ -1570,7 +1606,7 @@ class DesktopBridge:
                 if not ok:
                     return _error_envelope(
                         c.INTERNAL_ERROR,
-                        "拖动还原窗口失败: SetWindowPos 调用失败",
+                        self._t("拖动还原窗口失败: SetWindowPos 调用失败", "Failed to restore window for drag: SetWindowPos failed"),
                         exit_code=c.EXIT_INTERNAL,
                     )
                 return _success_envelope(
@@ -1601,7 +1637,7 @@ class DesktopBridge:
                 except Exception as exc:
                     return _error_envelope(
                         c.INTERNAL_ERROR,
-                        f"拖动还原窗口失败: {exc}",
+                        self._t(f"拖动还原窗口失败: {exc}", f"Failed to restore window for drag: {exc}"),
                         exit_code=c.EXIT_INTERNAL,
                     )
                 finally:
@@ -1613,7 +1649,7 @@ class DesktopBridge:
         if not callable(restore_fn):
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                "当前窗口不支持还原操作",
+                self._t("当前窗口不支持还原操作", "Current window does not support restoring"),
                 exit_code=c.EXIT_INTERNAL,
             )
         with self._lock:
@@ -1630,7 +1666,7 @@ class DesktopBridge:
         except Exception as exc:
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                f"拖动还原窗口失败: {exc}",
+                self._t(f"拖动还原窗口失败: {exc}", f"Failed to restore window for drag: {exc}"),
                 exit_code=c.EXIT_INTERNAL,
             )
         finally:
@@ -1647,20 +1683,20 @@ class DesktopBridge:
         if win is None:
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                "未绑定桌面窗口",
+                self._t("未绑定桌面窗口", "No desktop window is attached"),
                 exit_code=c.EXIT_INTERNAL,
             )
         if not _is_finite_number(dx) or not _is_finite_number(dy):
             return _error_envelope(
                 c.INVALID_ARGUMENT,
-                "窗口拖动偏移必须为有限数值",
+                self._t("窗口拖动偏移必须为有限数值", "Window drag offset must be finite numbers"),
                 exit_code=c.EXIT_USAGE,
                 details={"param": "dx/dy"},
             )
         if not drag_active:
             return _error_envelope(
                 c.INVALID_TRANSITION,
-                "当前未处于窗口拖动状态",
+                self._t("当前未处于窗口拖动状态", "Window is not currently being dragged"),
                 exit_code=c.EXIT_CONFLICT,
             )
 
@@ -1701,7 +1737,7 @@ class DesktopBridge:
                 except Exception as exc:
                     return _error_envelope(
                         c.INTERNAL_ERROR,
-                        f"拖动窗口失败: {exc}",
+                        self._t(f"拖动窗口失败: {exc}", f"Failed to drag window: {exc}"),
                         exit_code=c.EXIT_INTERNAL,
                     )
         return _success_envelope({"moved": False})
@@ -1716,7 +1752,7 @@ class DesktopBridge:
         if win is None:
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                "未绑定桌面窗口",
+                self._t("未绑定桌面窗口", "No desktop window is attached"),
                 exit_code=c.EXIT_INTERNAL,
             )
         return _success_envelope({"ended": True, "was_active": was_active})
@@ -1728,13 +1764,13 @@ class DesktopBridge:
         if win is None:
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                "未绑定桌面窗口",
+                self._t("未绑定桌面窗口", "No desktop window is attached"),
                 exit_code=c.EXIT_INTERNAL,
             )
         if not isinstance(edge, str):
             return _error_envelope(
                 c.INVALID_ARGUMENT,
-                "无效的缩放方向参数",
+                self._t("无效的缩放方向参数", "Invalid resize edge parameter"),
                 exit_code=c.EXIT_USAGE,
                 details={"param": "edge"},
             )
@@ -1742,7 +1778,7 @@ class DesktopBridge:
         if norm_edge not in _VALID_RESIZE_EDGES:
             return _error_envelope(
                 c.INVALID_ARGUMENT,
-                f"不支持的缩放方向: {edge}",
+                self._t(f"不支持的缩放方向: {edge}", f"Unsupported resize edge: {edge}"),
                 exit_code=c.EXIT_USAGE,
                 details={"param": "edge"},
             )
@@ -1786,7 +1822,7 @@ class DesktopBridge:
         if win is None:
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                "未绑定桌面窗口",
+                self._t("未绑定桌面窗口", "No desktop window is attached"),
                 exit_code=c.EXIT_INTERNAL,
             )
         return _success_envelope({"ended": True, "was_active": was_active})
@@ -1804,13 +1840,13 @@ class DesktopBridge:
         if win is None:
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                "未绑定桌面窗口",
+                self._t("未绑定桌面窗口", "No desktop window is attached"),
                 exit_code=c.EXIT_INTERNAL,
             )
         if not _is_finite_number(width) or not _is_finite_number(height):
             return _error_envelope(
                 c.INVALID_ARGUMENT,
-                "窗口宽高必须为有限数值",
+                self._t("窗口宽高必须为有限数值", "Window width and height must be finite numbers"),
                 exit_code=c.EXIT_USAGE,
                 details={"param": "width/height"},
             )
@@ -1819,7 +1855,7 @@ class DesktopBridge:
             if not isinstance(edge, str):
                 return _error_envelope(
                     c.INVALID_ARGUMENT,
-                    "无效的缩放方向参数",
+                    self._t("无效的缩放方向参数", "Invalid resize edge parameter"),
                     exit_code=c.EXIT_USAGE,
                     details={"param": "edge"},
                 )
@@ -1828,7 +1864,7 @@ class DesktopBridge:
                 if stripped not in _VALID_RESIZE_EDGES:
                     return _error_envelope(
                         c.INVALID_ARGUMENT,
-                        f"不支持的缩放方向: {edge}",
+                        self._t(f"不支持的缩放方向: {edge}", f"Unsupported resize edge: {edge}"),
                         exit_code=c.EXIT_USAGE,
                         details={"param": "edge"},
                     )
@@ -1907,7 +1943,7 @@ class DesktopBridge:
                         if not ok:
                             return _error_envelope(
                                 c.INTERNAL_ERROR,
-                                "调整窗口大小失败: SetWindowPos 调用失败",
+                                self._t("调整窗口大小失败: SetWindowPos 调用失败", "Failed to resize window: SetWindowPos failed"),
                                 exit_code=c.EXIT_INTERNAL,
                             )
                         return _success_envelope(
@@ -1958,7 +1994,7 @@ class DesktopBridge:
                 if not ok:
                     return _error_envelope(
                         c.INTERNAL_ERROR,
-                        "调整窗口大小失败: SetWindowPos 调用失败",
+                        self._t("调整窗口大小失败: SetWindowPos 调用失败", "Failed to resize window: SetWindowPos failed"),
                         exit_code=c.EXIT_INTERNAL,
                     )
                 return _success_envelope(
@@ -1974,7 +2010,7 @@ class DesktopBridge:
         if not callable(resize_fn):
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                "当前窗口不支持调整大小操作",
+                self._t("当前窗口不支持调整大小操作", "Current window does not support resizing"),
                 exit_code=c.EXIT_INTERNAL,
             )
 
@@ -1999,7 +2035,7 @@ class DesktopBridge:
         except Exception as exc:
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                f"调整窗口大小失败: {exc}",
+                self._t(f"调整窗口大小失败: {exc}", f"Failed to resize window: {exc}"),
                 exit_code=c.EXIT_INTERNAL,
             )
         finally:
@@ -2028,14 +2064,14 @@ class DesktopBridge:
         if win is None:
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                "未绑定桌面窗口",
+                self._t("未绑定桌面窗口", "No desktop window is attached"),
                 exit_code=c.EXIT_INTERNAL,
             )
         fn = getattr(win, "destroy", None)
         if not callable(fn):
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                "当前窗口不支持关闭操作",
+                self._t("当前窗口不支持关闭操作", "Current window does not support closing"),
                 exit_code=c.EXIT_INTERNAL,
             )
         try:
@@ -2043,7 +2079,7 @@ class DesktopBridge:
         except Exception as exc:
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                f"关闭窗口失败: {exc}",
+                self._t(f"关闭窗口失败: {exc}", f"Failed to close window: {exc}"),
                 exit_code=c.EXIT_INTERNAL,
             )
         with self._lock:
@@ -2052,6 +2088,16 @@ class DesktopBridge:
                 self._window_drag_anchor = None
                 self._clear_window_resize_state_locked()
         return _success_envelope({"closing": True, "hidden_to_tray": False})
+
+    def effective_language(self) -> str:
+        """Return effective desktop UI language (``'en'`` or ``'zh-CN'``)."""
+        with self._lock:
+            pref = self._language_pref
+        return resolve_effective_language(pref)
+
+    def _t(self, zh: str, en: str) -> str:
+        """Return localized bridge message for the active desktop language."""
+        return _tr(self.effective_language(), zh, en)
 
     def attach_tray(self, tray: Any) -> None:
         """Bind an optional Windows system tray controller."""
@@ -2063,6 +2109,7 @@ class DesktopBridge:
         """Return thread-safe daemon/auth/window status for system tray display."""
         with self._lock:
             ds = self._daemon_status or {}
+            pref = self._language_pref
             return {
                 "connected": bool(self._connected),
                 "daemon_starting": bool(self._daemon_starting),
@@ -2070,6 +2117,7 @@ class DesktopBridge:
                 "auth_verified": bool(self._auth_verified),
                 "window_visible": bool(self._window_visible),
                 "pid": ds.get("pid") if isinstance(ds, dict) else None,
+                "language": resolve_effective_language(pref),
             }
 
     def _notify_tray_status(self) -> None:
@@ -2101,14 +2149,26 @@ class DesktopBridge:
             win = self._window
             tray = self._tray
         if win is None:
-            return _error_envelope(c.INTERNAL_ERROR, "未绑定桌面窗口", exit_code=c.EXIT_INTERNAL)
+            return _error_envelope(
+                c.INTERNAL_ERROR,
+                self._t("未绑定桌面窗口", "No desktop window is attached"),
+                exit_code=c.EXIT_INTERNAL,
+            )
         hide_fn = getattr(win, "hide", None)
         if not callable(hide_fn):
-            return _error_envelope(c.INTERNAL_ERROR, "当前窗口不支持隐藏到托盘", exit_code=c.EXIT_INTERNAL)
+            return _error_envelope(
+                c.INTERNAL_ERROR,
+                self._t("当前窗口不支持隐藏到托盘", "Current window does not support hiding to tray"),
+                exit_code=c.EXIT_INTERNAL,
+            )
         try:
             hide_fn()
         except Exception as exc:
-            return _error_envelope(c.INTERNAL_ERROR, f"隐藏窗口失败: {exc}", exit_code=c.EXIT_INTERNAL)
+            return _error_envelope(
+                c.INTERNAL_ERROR,
+                self._t(f"隐藏窗口失败: {exc}", f"Failed to hide window: {exc}"),
+                exit_code=c.EXIT_INTERNAL,
+            )
         with self._lock:
             self._window_visible = False
             self._window_drag_active = False
@@ -2123,8 +2183,11 @@ class DesktopBridge:
                 if callable(balloon_fn):
                     try:
                         balloon_fn(
-                            "Agent Mesh 已最小化到托盘",
-                            "后台服务继续运行，会话保持解锁。点击托盘图标可随时恢复窗口。",
+                            self._t("Agent Mesh 已最小化到托盘", "Agent Mesh minimized to system tray"),
+                            self._t(
+                                "后台服务继续运行，会话保持解锁。点击托盘图标可随时恢复窗口。",
+                                "Daemon continues running and your session stays unlocked. Click the tray icon anytime to restore.",
+                            ),
                         )
                     except Exception:
                         pass
@@ -2135,13 +2198,21 @@ class DesktopBridge:
         with self._lock:
             win = self._window
         if win is None:
-            return _error_envelope(c.INTERNAL_ERROR, "未绑定桌面窗口", exit_code=c.EXIT_INTERNAL)
+            return _error_envelope(
+                c.INTERNAL_ERROR,
+                self._t("未绑定桌面窗口", "No desktop window is attached"),
+                exit_code=c.EXIT_INTERNAL,
+            )
         show_fn = getattr(win, "show", None)
         if callable(show_fn):
             try:
                 show_fn()
             except Exception as exc:
-                return _error_envelope(c.INTERNAL_ERROR, f"显示窗口失败: {exc}", exit_code=c.EXIT_INTERNAL)
+                return _error_envelope(
+                    c.INTERNAL_ERROR,
+                    self._t(f"显示窗口失败: {exc}", f"Failed to show window: {exc}"),
+                    exit_code=c.EXIT_INTERNAL,
+                )
         if sys.platform == "win32":
             user32 = _get_win32_user32()
             hwnd = _extract_win32_hwnd(win)
@@ -2217,13 +2288,21 @@ class DesktopBridge:
     def desktop_prefs(self) -> Dict[str, Any]:
         """Return safe non-sensitive desktop preferences and tray/vault capability flags."""
         prefs = self._state_store.load_prefs()
+        stored_lang = normalize_language_pref(prefs.get("language")) or "auto"
         with self._lock:
+            if self._language_overridden:
+                lang_pref = self._language_pref
+            else:
+                lang_pref = stored_lang
+                self._language_pref = lang_pref
             tray_active = bool(self._tray is not None and getattr(self._tray, "active", False))
         cred_supported = self._cred_supported()
         cred_present = self._cred_present() if cred_supported else False
         return _success_envelope(
             {
                 "close_to_tray": bool(prefs.get("close_to_tray", True)),
+                "language": lang_pref,
+                "effective_language": resolve_effective_language(lang_pref),
                 "tray_active": tray_active,
                 "tray_supported": sys.platform == "win32",
                 "stored_credential_supported": cred_supported,
@@ -2232,11 +2311,11 @@ class DesktopBridge:
         )
 
     def set_desktop_prefs(self, prefs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Update whitelisted non-sensitive desktop preferences (e.g. ``close_to_tray``)."""
+        """Update whitelisted non-sensitive desktop preferences (e.g. ``close_to_tray``, ``language``)."""
         if not isinstance(prefs, dict):
             return _error_envelope(
                 c.INVALID_ARGUMENT,
-                "偏好设置参数必须为 JSON 对象",
+                self._t("偏好设置参数必须为 JSON 对象", "Preferences argument must be a JSON object"),
                 exit_code=c.EXIT_USAGE,
                 details={"param": "prefs"},
             )
@@ -2245,12 +2324,30 @@ class DesktopBridge:
             if not isinstance(prefs["close_to_tray"], bool):
                 return _error_envelope(
                     c.INVALID_ARGUMENT,
-                    "参数 'close_to_tray' 必须为布尔值",
+                    self._t("参数 'close_to_tray' 必须为布尔值", "Parameter 'close_to_tray' must be a boolean"),
                     exit_code=c.EXIT_USAGE,
                     details={"param": "close_to_tray"},
                 )
             allowed_updates["close_to_tray"] = prefs["close_to_tray"]
-        self._state_store.update_prefs(allowed_updates)
+        if "language" in prefs:
+            norm_lang = normalize_language_pref(prefs["language"])
+            if norm_lang is None:
+                return _error_envelope(
+                    c.INVALID_ARGUMENT,
+                    self._t(
+                        "参数 'language' 必须为 'auto'、'en' 或 'zh-CN'",
+                        "Parameter 'language' must be 'auto', 'en', or 'zh-CN'",
+                    ),
+                    exit_code=c.EXIT_USAGE,
+                    details={"param": "language"},
+                )
+            allowed_updates["language"] = norm_lang
+        updated = self._state_store.update_prefs(allowed_updates)
+        if "language" in allowed_updates:
+            with self._lock:
+                self._language_pref = str(updated.get("language", "auto"))
+                self._language_overridden = False
+            self._notify_tray_status()
         return self.desktop_prefs()
 
     def quit_app(self, stop_daemon: bool = False) -> Dict[str, Any]:
@@ -2258,7 +2355,7 @@ class DesktopBridge:
         if not isinstance(stop_daemon, bool):
             return _error_envelope(
                 c.INVALID_ARGUMENT,
-                "参数 'stop_daemon' 必须为布尔值",
+                self._t("参数 'stop_daemon' 必须为布尔值", "Parameter 'stop_daemon' must be a boolean"),
                 exit_code=c.EXIT_USAGE,
                 details={"param": "stop_daemon"},
             )
@@ -2388,7 +2485,7 @@ class DesktopBridge:
         if not isinstance(passphrase, str) or len(passphrase) == 0:
             return _error_envelope(
                 c.INVALID_ARGUMENT,
-                "口令不能为空",
+                self._t("口令不能为空", "Passphrase cannot be empty"),
                 exit_code=c.EXIT_USAGE,
                 details={"param": "passphrase"},
             )
@@ -2569,7 +2666,7 @@ class DesktopBridge:
         if not isinstance(passphrase, str) or len(passphrase) < 12:
             return _error_envelope(
                 c.INVALID_ARGUMENT,
-                "用户口令长度至少需要 12 个字符",
+                self._t("用户口令长度至少需要 12 个字符", "Passphrase must be at least 12 characters long"),
                 exit_code=c.EXIT_USAGE,
                 details={"param": "passphrase", "min_length": 12},
             )
@@ -2577,7 +2674,7 @@ class DesktopBridge:
         if not self._init_home_lock.acquire(blocking=False):
             return _error_envelope(
                 c.CONCURRENCY_LIMIT,
-                "正在初始化数据目录，请稍候",
+                self._t("正在初始化数据目录，请稍候", "Initializing data directory, please wait"),
                 exit_code=c.EXIT_CONFLICT,
                 details={"home": self.home},
             )
@@ -2585,7 +2682,10 @@ class DesktopBridge:
             if self._refresh_home_initialized():
                 return _error_envelope(
                     c.ALREADY_EXISTS,
-                    "当前数据目录已初始化，请直接输入口令解锁",
+                    self._t(
+                        "当前数据目录已初始化，请直接输入口令解锁",
+                        "Data directory is already initialized; please enter your passphrase to unlock",
+                    ),
                     exit_code=c.EXIT_CONFLICT,
                     details={"home": self.home, "home_initialized": True},
                 )
@@ -2618,7 +2718,7 @@ class DesktopBridge:
                 )
                 return _error_envelope(
                     c.INTERNAL_ERROR,
-                    f"初始化数据目录失败: {exc}",
+                    self._t(f"初始化数据目录失败: {exc}", f"Failed to initialize data directory: {exc}"),
                     exit_code=c.EXIT_INTERNAL,
                     details={"home": self.home},
                 )
@@ -2627,7 +2727,10 @@ class DesktopBridge:
                 self._refresh_home_initialized()
                 return _error_envelope(
                     c.ALREADY_EXISTS,
-                    "当前数据目录已初始化，请直接输入口令解锁",
+                    self._t(
+                        "当前数据目录已初始化，请直接输入口令解锁",
+                        "Data directory is already initialized; please enter your passphrase to unlock",
+                    ),
                     exit_code=c.EXIT_CONFLICT,
                     details={"home": self.home, "home_initialized": True},
                 )
@@ -2643,7 +2746,12 @@ class DesktopBridge:
                 self._auto_start_timestamps.clear()
                 self._last_start_error = None
                 self._last_error = None
-            self._record_diag("info", "HOME_INITIALIZED", "已在桌面端完成 MESH_HOME 初始化", {"home": self.home})
+            self._record_diag(
+                "info",
+                "HOME_INITIALIZED",
+                self._t("已在桌面端完成 MESH_HOME 初始化", "Initialized MESH_HOME from desktop client"),
+                {"home": self.home},
+            )
 
             start_res = self._start_daemon_impl(auto=False)
             if start_res.get("ok") and (start_res.get("data") or {}).get("in_progress"):
@@ -2657,12 +2765,18 @@ class DesktopBridge:
             if not start_res.get("ok") or not daemon_running:
                 err = start_res.get("error") or {
                     "code": c.DAEMON_UNAVAILABLE,
-                    "message": "目录已初始化，但后台服务尚未就绪，请稍后重试或手动启动服务",
+                    "message": self._t(
+                        "目录已初始化，但后台服务尚未就绪，请稍后重试或手动启动服务",
+                        "Directory initialized, but daemon is not ready yet; retry shortly or start it manually",
+                    ),
                     "exit_code": c.EXIT_DAEMON_UNAVAILABLE,
                 }
                 return _error_envelope(
                     err.get("code", c.INTERNAL_ERROR),
-                    err.get("message", "目录已初始化，但启动后台服务失败"),
+                    err.get(
+                        "message",
+                        self._t("目录已初始化，但启动后台服务失败", "Directory initialized, but failed to start daemon"),
+                    ),
                     exit_code=err.get("exit_code", c.EXIT_INTERNAL),
                     details={
                         "home": self.home,
@@ -2678,12 +2792,21 @@ class DesktopBridge:
             if not auth_verified:
                 err = auth_res.get("error") or {
                     "code": c.DAEMON_UNAVAILABLE,
-                    "message": "目录已初始化，但未能校验自动解锁状态，请手动输入口令解锁",
+                    "message": self._t(
+                        "目录已初始化，但未能校验自动解锁状态，请手动输入口令解锁",
+                        "Directory initialized, but automatic unlock verification failed; please unlock manually",
+                    ),
                     "exit_code": c.EXIT_UNAUTHENTICATED,
                 }
                 return _error_envelope(
                     err.get("code", c.INTERNAL_ERROR),
-                    err.get("message", "目录已初始化并启动服务，但自动解锁失败，请手动输入口令解锁"),
+                    err.get(
+                        "message",
+                        self._t(
+                            "目录已初始化并启动服务，但自动解锁失败，请手动输入口令解锁",
+                            "Directory initialized and daemon started, but automatic unlock failed; please unlock manually",
+                        ),
+                    ),
                     exit_code=err.get("exit_code", c.EXIT_UNAUTHENTICATED),
                     details={
                         "home": self.home,
@@ -2707,14 +2830,23 @@ class DesktopBridge:
             self._init_home_lock.release()
 
     @staticmethod
-    def _passive_cli_auth_probe(adapter: Any, bin_path: Optional[str]) -> Dict[str, Any]:
+    def _passive_cli_auth_probe(
+        adapter: Any,
+        bin_path: Optional[str],
+        *,
+        lang: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Strictly passive CLI auth readiness check (B5): NEVER spawns logins or browsers.
 
         Never reads or returns raw secret values, emails, or organizations.
         """
         aid = str(getattr(adapter, "id", "") or "")
         if not bin_path:
-            return {"state": "unknown", "method": "none", "detail": "未安装可执行文件"}
+            return {
+                "state": "unknown",
+                "method": "none",
+                "detail": _tr(lang, "未安装可执行文件", "Executable not installed"),
+            }
 
         env = c.build_external_env()
 
@@ -2731,23 +2863,31 @@ class DesktopBridge:
                         return {
                             "state": "ready",
                             "method": method,
-                            "detail": f"已通过 {method} 登录就绪",
+                            "detail": _tr(lang, f"已通过 {method} 登录就绪", f"Signed in via {method}"),
                         }
                     if env_keys:
                         return {
                             "state": "ready",
                             "method": "env_key",
-                            "detail": f"已检测到环境变量 {env_keys[0]}",
+                            "detail": _tr(lang, f"已检测到环境变量 {env_keys[0]}", f"Detected env var {env_keys[0]}"),
                         }
                     if method == "none":
                         return {
                             "state": "needs_login",
                             "method": "none",
-                            "detail": "尚未登录，请先在终端完成登录或配置 API Key",
+                            "detail": _tr(
+                                lang,
+                                "尚未登录，请先在终端完成登录或配置 API Key",
+                                "Not signed in yet — sign in via terminal or set an API key",
+                            ),
                         }
             except Exception:
                 pass
-            return {"state": "unknown", "method": "unknown", "detail": "无法被动确认登录状态"}
+            return {
+                "state": "unknown",
+                "method": "unknown",
+                "detail": _tr(lang, "无法被动确认登录状态", "Could not passively verify sign-in status"),
+            }
 
         # 2. Purely passive env-var & local config-dir existence checks for other CLIs (no login spawns)
         passive_rules: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
@@ -2762,7 +2902,7 @@ class DesktopBridge:
                 return {
                     "state": "ready",
                     "method": "env_key",
-                    "detail": f"已检测到环境变量 {ename}",
+                    "detail": _tr(lang, f"已检测到环境变量 {ename}", f"Detected env var {ename}"),
                 }
         for raw_p in cfg_paths:
             expanded = os.path.expanduser(raw_p)
@@ -2770,15 +2910,19 @@ class DesktopBridge:
                 return {
                     "state": "ready",
                     "method": "local_config",
-                    "detail": "已检测到本机配置目录",
+                    "detail": _tr(lang, "已检测到本机配置目录", "Detected local config directory"),
                 }
         if env_names or cfg_paths:
             return {
                 "state": "needs_login",
                 "method": "none",
-                "detail": "未检测到本机登录配置或 API Key 环境变量",
+                "detail": _tr(
+                    lang,
+                    "未检测到本机登录配置或 API Key 环境变量",
+                    "No local sign-in config or API key env var detected",
+                ),
             }
-        return {"state": "unknown", "method": "unknown", "detail": "已安装"}
+        return {"state": "unknown", "method": "unknown", "detail": _tr(lang, "已安装", "Installed")}
 
     def detect_local_clis(self) -> Dict[str, Any]:
         """Detect installed local vendor CLIs safely (no caller binary paths, <=3s version check, passive auth probe)."""
@@ -2786,6 +2930,7 @@ class DesktopBridge:
         from mesh.adapters.evidence import held_milestone
         from mesh.adapters.registry import list_adapters
 
+        lang = self.effective_language()
         display_order = {
             "claude": 0,
             "codex": 1,
@@ -2814,7 +2959,11 @@ class DesktopBridge:
                 bin_path = None
             installed = bool(bin_path)
             version: Optional[str] = None
-            auth_status: Dict[str, Any] = {"state": "unknown", "method": "none", "detail": "未安装"}
+            auth_status: Dict[str, Any] = {
+                "state": "unknown",
+                "method": "none",
+                "detail": _tr(lang, "未安装", "Not installed"),
+            }
             if installed and implemented and bin_path:
                 try:
                     res = run_readonly_cmd([bin_path, "--version"], timeout_s=3.0)
@@ -2822,7 +2971,7 @@ class DesktopBridge:
                         version = parse_version_output(res.stdout) or parse_version_output(res.stderr)
                 except Exception:
                     version = None
-                auth_status = self._passive_cli_auth_probe(adapter, bin_path)
+                auth_status = self._passive_cli_auth_probe(adapter, bin_path, lang=lang)
 
             raw_presets = getattr(adapter, "model_presets", None)
             presets: Optional[Dict[str, Any]] = None
@@ -2844,13 +2993,21 @@ class DesktopBridge:
             )
             ineligible_reason: Optional[str] = None
             if not implemented:
-                ineligible_reason = "该工具集成尚未完成，暂不支持启动"
+                ineligible_reason = _tr(lang, "该工具集成尚未完成，暂不支持启动", "Adapter integration is not yet complete")
             elif held is not None:
-                ineligible_reason = f"当前处于 {held} 暂停状态且不支持只读 Lead 档位，不可作为 Lead"
+                ineligible_reason = _tr(
+                    lang,
+                    f"当前处于 {held} 暂停状态且不支持只读 Lead 档位，不可作为 Lead",
+                    f"Currently on {held} launch hold and does not support the readonly Lead profile",
+                )
             elif "readonly" not in supported_profiles:
-                ineligible_reason = "不支持只读 (readonly) 权限档位，不可作为 Lead"
+                ineligible_reason = _tr(
+                    lang,
+                    "不支持只读 (readonly) 权限档位，不可作为 Lead",
+                    "Does not support the readonly permission profile required for a Lead",
+                )
             elif not installed:
-                ineligible_reason = "未在本机 PATH 中检测到可执行文件"
+                ineligible_reason = _tr(lang, "未在本机 PATH 中检测到可执行文件", "Executable not found on local PATH")
 
             return {
                 "id": adapter.id,
@@ -2901,14 +3058,14 @@ class DesktopBridge:
         if win is None:
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                "未绑定桌面窗口，无法打开文件夹选择器",
+                self._t("未绑定桌面窗口，无法打开文件夹选择器", "No desktop window attached; cannot open folder picker"),
                 exit_code=c.EXIT_INTERNAL,
             )
         create_dialog = getattr(win, "create_file_dialog", None)
         if not callable(create_dialog):
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                "当前桌面窗口不支持原生文件夹选择器",
+                self._t("当前桌面窗口不支持原生文件夹选择器", "Current desktop window does not support native folder picker"),
                 exit_code=c.EXIT_INTERNAL,
             )
         dialog_type: Any = 20  # webview.FOLDER_DIALOG compat fallback
@@ -2940,13 +3097,13 @@ class DesktopBridge:
             except Exception as exc:
                 return _error_envelope(
                     c.INTERNAL_ERROR,
-                    f"打开文件夹选择器失败: {exc}",
+                    self._t(f"打开文件夹选择器失败: {exc}", f"Failed to open folder picker: {exc}"),
                     exit_code=c.EXIT_INTERNAL,
                 )
         except Exception as exc:
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                f"打开文件夹选择器失败: {exc}",
+                self._t(f"打开文件夹选择器失败: {exc}", f"Failed to open folder picker: {exc}"),
                 exit_code=c.EXIT_INTERNAL,
             )
 
@@ -2968,9 +3125,15 @@ class DesktopBridge:
     def _check_repo_path_conflict(self, candidate: str) -> Optional[str]:
         ws_root = os.path.join(self.home, "workspaces")
         if is_path_equal_or_parent(self.home, candidate) or is_path_equal_or_parent(candidate, self.home):
-            return f"所选目录与 Agent Mesh 数据目录 ({self.home}) 存在包含重叠，请选择独立的代码仓库目录"
+            return self._t(
+                f"所选目录与 Agent Mesh 数据目录 ({self.home}) 存在包含重叠，请选择独立的代码仓库目录",
+                f"Selected folder overlaps with Agent Mesh data directory ({self.home}); choose a separate repository folder",
+            )
         if is_path_equal_or_parent(ws_root, candidate) or is_path_equal_or_parent(candidate, ws_root):
-            return f"所选目录与 Agent Mesh 工作区目录 ({ws_root}) 存在包含重叠，请选择独立的代码仓库目录"
+            return self._t(
+                f"所选目录与 Agent Mesh 工作区目录 ({ws_root}) 存在包含重叠，请选择独立的代码仓库目录",
+                f"Selected folder overlaps with Agent Mesh workspaces directory ({ws_root}); choose a separate repository folder",
+            )
         try:
             check_install_path_secure(
                 install_root=get_install_root(),
@@ -2979,11 +3142,15 @@ class DesktopBridge:
                 repo_paths=[candidate],
             )
         except MeshError as exc:
-            return f"目录路径安全校验未通过：{exc.message}"
+            return self._t(f"目录路径安全校验未通过：{exc.message}", f"Directory path security check failed: {exc.message}")
         return None
 
     @staticmethod
-    def _detect_test_command_candidates(root_dir: str) -> List[Dict[str, Any]]:
+    def _detect_test_command_candidates(
+        root_dir: str,
+        *,
+        lang: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """Read-only heuristic detection of common test commands (never executes repo code)."""
         candidates: List[Dict[str, Any]] = []
         if any(
@@ -2994,7 +3161,7 @@ class DesktopBridge:
                 {
                     "label": "pytest (Python)",
                     "argv": ["pytest"],
-                    "reason": "检测到 Python 项目配置文件",
+                    "reason": _tr(lang, "检测到 Python 项目配置文件", "Detected Python project config"),
                 }
             )
         pkg_json = os.path.join(root_dir, "package.json")
@@ -3014,7 +3181,7 @@ class DesktopBridge:
                             {
                                 "label": "npm test (Node.js)",
                                 "argv": ["npm", "test"],
-                                "reason": "检测到 package.json scripts.test",
+                                "reason": _tr(lang, "检测到 package.json scripts.test", "Detected package.json scripts.test"),
                             }
                         )
             except (OSError, ValueError):
@@ -3024,7 +3191,7 @@ class DesktopBridge:
                 {
                     "label": "cargo test (Rust)",
                     "argv": ["cargo", "test"],
-                    "reason": "检测到 Cargo.toml",
+                    "reason": _tr(lang, "检测到 Cargo.toml", "Detected Cargo.toml"),
                 }
             )
         if os.path.isfile(os.path.join(root_dir, "go.mod")):
@@ -3032,17 +3199,18 @@ class DesktopBridge:
                 {
                     "label": "go test ./... (Go)",
                     "argv": ["go", "test", "./..."],
-                    "reason": "检测到 go.mod",
+                    "reason": _tr(lang, "检测到 go.mod", "Detected go.mod"),
                 }
             )
         return candidates
 
     def inspect_repo_folder(self, path: str) -> Dict[str, Any]:
         """Inspect a local folder read-only using allow-listed ``run_git`` subcommands (S4)."""
+        lang = self.effective_language()
         if not isinstance(path, str) or not path.strip() or "\x00" in path:
             return _error_envelope(
                 c.INVALID_ARGUMENT,
-                "文件夹路径不能为空",
+                _tr(lang, "文件夹路径不能为空", "Folder path cannot be empty"),
                 exit_code=c.EXIT_USAGE,
                 details={"param": "path"},
             )
@@ -3050,7 +3218,7 @@ class DesktopBridge:
         if not os.path.isabs(raw):
             return _error_envelope(
                 c.INVALID_ARGUMENT,
-                f"仓库路径必须为绝对路径: {raw}",
+                _tr(lang, f"仓库路径必须为绝对路径: {raw}", f"Repository path must be absolute: {raw}"),
                 exit_code=c.EXIT_USAGE,
                 details={"param": "path"},
             )
@@ -3059,7 +3227,7 @@ class DesktopBridge:
         except OSError as exc:
             return _error_envelope(
                 c.INVALID_ARGUMENT,
-                f"无法解析目录路径: {exc}",
+                _tr(lang, f"无法解析目录路径: {exc}", f"Failed to resolve folder path: {exc}"),
                 exit_code=c.EXIT_USAGE,
                 details={"param": "path"},
             )
@@ -3081,7 +3249,7 @@ class DesktopBridge:
                     "test_candidates": [],
                     "default_test_command": "none",
                     "path_conflict": None,
-                    "git_error": "所选路径不存在或不是文件夹",
+                    "git_error": _tr(lang, "所选路径不存在或不是文件夹", "Selected path does not exist or is not a folder"),
                 }
             )
 
@@ -3133,18 +3301,26 @@ class DesktopBridge:
                     if not recommended_branch and branches:
                         recommended_branch = branches[0]
             else:
-                git_error = "该目录不是 Git 仓库（留空仓库路径仍可创建通用对话项目）"
+                git_error = _tr(
+                    lang,
+                    "该目录不是 Git 仓库（留空仓库路径仍可创建通用对话项目）",
+                    "This folder is not a Git repository (leave repo path empty to create a general chat project)",
+                )
         except FileNotFoundError:
             git_available = False
-            git_error = "未检测到 Git，请安装 Git for Windows 或使用含内置 MinGit 的发行包"
+            git_error = _tr(
+                lang,
+                "未检测到 Git，请安装 Git for Windows 或使用含内置 MinGit 的发行包",
+                "Git was not detected; install Git or use the release bundle with bundled MinGit",
+            )
         except subprocess.TimeoutExpired:
-            git_error = "Git 仓库检测超时（5s），请稍后重试"
+            git_error = _tr(lang, "Git 仓库检测超时（5s），请稍后重试", "Git repository inspection timed out (5s); please retry")
         except OSError as exc:
             git_available = False
-            git_error = f"无法运行 Git: {exc}"
+            git_error = _tr(lang, f"无法运行 Git: {exc}", f"Unable to run Git: {exc}")
 
         inspect_root = toplevel if (is_git_repo and toplevel) else real
-        test_candidates = self._detect_test_command_candidates(inspect_root)
+        test_candidates = self._detect_test_command_candidates(inspect_root, lang=lang)
         suggested_title = os.path.basename(inspect_root.rstrip("\\/")) or ""
 
         return _success_envelope(
@@ -3180,19 +3356,22 @@ class DesktopBridge:
         if not isinstance(method, str) or method not in ALLOWED_RPC_METHODS:
             return _error_envelope(
                 "RPC_NOT_ALLOWED",
-                f"RPC 方法 '{method}' 不在桌面端白名单中",
+                self._t(
+                    f"RPC 方法 '{method}' 不在桌面端白名单中",
+                    f"RPC method '{method}' is not in the desktop allowlist",
+                ),
                 exit_code=c.EXIT_USAGE,
                 details={"method": method},
             )
         if params is not None and not isinstance(params, dict):
             return _error_envelope(
                 c.INVALID_ARGUMENT,
-                "RPC 参数必须为 JSON 对象",
+                self._t("RPC 参数必须为 JSON 对象", "RPC parameters must be a JSON object"),
                 exit_code=c.EXIT_USAGE,
                 details={"method": method},
             )
         args = dict(params or {})
-        arg_err = _validate_bridge_call_args(method, args)
+        arg_err = _validate_bridge_call_args(method, args, lang=self.effective_language())
         if arg_err is not None:
             return arg_err
         auth_res = self._auth_for_method(method)
@@ -3317,7 +3496,7 @@ class DesktopBridge:
             return _success_envelope(snap)
         return _error_envelope(
             (err or {}).get("code", c.DAEMON_UNAVAILABLE),
-            (err or {}).get("message", "meshd 未连接"),
+            (err or {}).get("message", self._t("meshd 未连接", "meshd is not connected")),
             exit_code=(err or {}).get("exit_code", c.EXIT_DAEMON_UNAVAILABLE),
             details={"connection": snap},
         )
@@ -3346,7 +3525,7 @@ class DesktopBridge:
                     aborted_for_user_stop = True
                     return _error_envelope(
                         c.DAEMON_UNAVAILABLE,
-                        "用户已请求停止 meshd，跳过自动启动",
+                        self._t("用户已请求停止 meshd，跳过自动启动", "User requested stopping meshd; skipping auto-start"),
                         exit_code=c.EXIT_DAEMON_UNAVAILABLE,
                         details={"user_stopped": True},
                     )
@@ -3364,7 +3543,9 @@ class DesktopBridge:
             self._record_diag(
                 "info",
                 "DAEMON_STARTING",
-                "自动启动 meshd 守护进程..." if auto else "手动启动 meshd 守护进程...",
+                self._t("自动启动 meshd 守护进程...", "Auto-starting meshd daemon...")
+                if auto
+                else self._t("手动启动 meshd 守护进程...", "Starting meshd daemon..."),
                 {"auto": auto},
             )
             self._enqueue_and_push(
@@ -3407,7 +3588,7 @@ class DesktopBridge:
             except OSError as exc:
                 err_env = _error_envelope(
                     c.INTERNAL_ERROR,
-                    f"启动 meshd 失败: {exc}",
+                    self._t(f"启动 meshd 失败: {exc}", f"Failed to start meshd: {exc}"),
                     exit_code=c.EXIT_INTERNAL,
                 )
                 err_with_meta = dict(err_env["error"])
@@ -3421,7 +3602,7 @@ class DesktopBridge:
             except subprocess.TimeoutExpired:
                 err_env = _error_envelope(
                     c.WAIT_TIMEOUT,
-                    "启动 meshd 超时 (35s)",
+                    self._t("启动 meshd 超时 (35s)", "Starting meshd timed out (35s)"),
                     exit_code=c.EXIT_WAIT_TIMEOUT,
                 )
                 err_with_meta = dict(err_env["error"])
@@ -3449,7 +3630,10 @@ class DesktopBridge:
                     hint = self._setup_command_hint()
                     err_env = _error_envelope(
                         HOME_NOT_INITIALIZED,
-                        f"当前 MESH_HOME 尚未初始化，请先运行 `{hint}`（路径: {self.home}）",
+                        self._t(
+                            f"当前 MESH_HOME 尚未初始化，请先运行 `{hint}`（路径: {self.home}）",
+                            f"MESH_HOME is not initialized yet; run `{hint}` first (path: {self.home})",
+                        ),
                         exit_code=c.EXIT_NOT_FOUND,
                         details={"home": self.home, "db_path": db_path, "hint": hint},
                     )
@@ -3472,7 +3656,7 @@ class DesktopBridge:
                     if err_details.get("status") == "stopping":
                         err_env = _error_envelope(
                             c.DAEMON_ALREADY_RUNNING,
-                            "守护进程正在完成收尾，稍后自动重连",
+                            self._t("守护进程正在完成收尾，稍后自动重连", "Daemon is finishing shutdown; will reconnect automatically"),
                             exit_code=parsed.get("exit_code", c.EXIT_INTERNAL) if parsed else c.EXIT_INTERNAL,
                             details=err_details,
                         )
@@ -3487,7 +3671,11 @@ class DesktopBridge:
                         self._daemon_starting = False
                     if self._probe_once():
                         self._wake_event.set()
-                        self._record_diag("info", "DAEMON_ALREADY_RUNNING", "meshd 已在运行，已自动连接")
+                        self._record_diag(
+                            "info",
+                            "DAEMON_ALREADY_RUNNING",
+                            self._t("meshd 已在运行，已自动连接", "meshd is already running; connected automatically"),
+                        )
                         return _success_envelope(
                             {
                                 "started": {"status": "already_running"},
@@ -3498,7 +3686,7 @@ class DesktopBridge:
                 if err_dict is not None:
                     err_env = _error_envelope(
                         err_code,
-                        err_dict.get("message", "启动 meshd 失败"),
+                        err_dict.get("message", self._t("启动 meshd 失败", "Failed to start meshd")),
                         exit_code=parsed.get("exit_code", c.EXIT_INTERNAL),
                         details=err_dict.get("details"),
                     )
@@ -3506,7 +3694,7 @@ class DesktopBridge:
                     stderr = (getattr(proc, "stderr", "") or "").strip()
                     err_env = _error_envelope(
                         c.INTERNAL_ERROR,
-                        stderr or f"mesh daemon start 退出码 {rc}",
+                        stderr or self._t(f"mesh daemon start 退出码 {rc}", f"mesh daemon start exited with code {rc}"),
                         exit_code=c.EXIT_INTERNAL,
                         details={"returncode": rc, "stderr": stderr[:1000]} if stderr else {"returncode": rc},
                     )
@@ -3526,7 +3714,7 @@ class DesktopBridge:
                 self._auto_start_attempted = False
             self._probe_once()
             self._wake_event.set()
-            self._record_diag("info", "DAEMON_STARTED", "meshd 守护进程已启动")
+            self._record_diag("info", "DAEMON_STARTED", self._t("meshd 守护进程已启动", "meshd daemon started"))
             data = parsed.get("data") if isinstance(parsed, dict) else None
             return _success_envelope(
                 {
@@ -3573,13 +3761,17 @@ class DesktopBridge:
                 boot_id=stopped_boot_id,
                 source="desktop",
             )
-        self._record_diag("info", "DAEMON_STOPPING", "用户请求优雅停止 meshd 守护进程")
+        self._record_diag(
+            "info",
+            "DAEMON_STOPPING",
+            self._t("用户请求优雅停止 meshd 守护进程", "User requested graceful stop of meshd daemon"),
+        )
         self.stop_event_stream()
         self._mark_disconnected(
             {
                 "code": c.DAEMON_UNAVAILABLE,
                 "exit_code": c.EXIT_DAEMON_UNAVAILABLE,
-                "message": "守护进程正在停止",
+                "message": self._t("守护进程正在停止", "Daemon is stopping"),
                 "details": {"status": "stopping"},
             },
             clear_backoff=True,
@@ -3633,7 +3825,7 @@ class DesktopBridge:
         except OSError as exc:
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                f"环境诊断失败: {exc}",
+                self._t(f"环境诊断失败: {exc}", f"Environment diagnostics failed: {exc}"),
                 exit_code=c.EXIT_INTERNAL,
                 details={"error": str(exc)},
             )
@@ -3846,7 +4038,7 @@ class DesktopBridge:
 
     def poll_events(self, limit: int = 200) -> Dict[str, Any]:
         """Drain up to *limit* queued daemon/desktop events for JS polling."""
-        limit_val, err = _parse_bridge_int(limit, name="limit")
+        limit_val, err = _parse_bridge_int(limit, name="limit", lang=self.effective_language())
         if err is not None:
             return err
         assert limit_val is not None
@@ -3865,7 +4057,7 @@ class DesktopBridge:
         """Ensure background ``event.tail`` subscription is running when authenticated."""
         since_i: Optional[int] = None
         if since is not None:
-            since_i, err = _parse_bridge_int(since, name="since")
+            since_i, err = _parse_bridge_int(since, name="since", lang=self.effective_language())
             if err is not None:
                 return err
         with self._lock:
@@ -3875,7 +4067,7 @@ class DesktopBridge:
             if self._passphrase is None:
                 return _error_envelope(
                     c.TOKEN_MISSING,
-                    "需要先解锁口令才能订阅实时事件流",
+                    self._t("需要先解锁口令才能订阅实时事件流", "Unlock with your passphrase before subscribing to live events"),
                     exit_code=c.EXIT_UNAUTHENTICATED,
                 )
             if self._stream_thread is not None and self._stream_thread.is_alive():
@@ -3967,7 +4159,7 @@ class DesktopBridge:
         if pw is None:
             return _error_envelope(
                 c.TOKEN_MISSING,
-                "需要输入用户口令 (Passphrase) 才能执行操作",
+                self._t("需要输入用户口令 (Passphrase) 才能执行操作", "Passphrase is required to perform this action"),
                 exit_code=c.EXIT_UNAUTHENTICATED,
                 details={"reason": "passphrase_not_set"},
             )
@@ -4006,7 +4198,7 @@ class DesktopBridge:
         except OSError as exc:
             return _error_envelope(
                 c.DAEMON_UNAVAILABLE,
-                f"无法连接守护进程: {exc}",
+                self._t(f"无法连接守护进程: {exc}", f"Unable to connect to daemon: {exc}"),
                 exit_code=c.EXIT_DAEMON_UNAVAILABLE,
                 details={"error": str(exc)},
                 request_id=req_id,
@@ -4015,7 +4207,7 @@ class DesktopBridge:
         if not isinstance(resp, dict):
             return _error_envelope(
                 c.INTERNAL_ERROR,
-                "守护进程返回了无效响应",
+                self._t("守护进程返回了无效响应", "Daemon returned an invalid response"),
                 exit_code=c.EXIT_INTERNAL,
                 request_id=req_id,
             )
@@ -4030,7 +4222,7 @@ class DesktopBridge:
         err = resp.get("error") or {}
         return _error_envelope(
             err.get("code", c.INTERNAL_ERROR),
-            err.get("message", "请求失败"),
+            err.get("message", self._t("请求失败", "Request failed")),
             exit_code=resp.get("exit_code", c.EXIT_INTERNAL),
             details=err.get("details"),
             request_id=resp.get("request_id", req_id),
@@ -4508,7 +4700,10 @@ class DesktopBridge:
                             self._record_diag(
                                 "info",
                                 "DAEMON_STOPPED_EXTERNAL",
-                                "检测到外部请求停止 meshd，暂停自动重启",
+                                self._t(
+                                    "检测到外部请求停止 meshd，暂停自动重启",
+                                    "Detected external stop request for meshd; pausing auto-restart",
+                                ),
                             )
                             self._enqueue_and_push(
                                 {
@@ -4537,7 +4732,11 @@ class DesktopBridge:
                                 self._daemon_stopping = False
                                 cleared_snap = self._connection_snapshot_unlocked()
                         if cleared_snap is not None:
-                            self._record_diag("info", "DAEMON_STOPPED", "meshd 已按请求完成停止")
+                            self._record_diag(
+                                "info",
+                                "DAEMON_STOPPED",
+                                self._t("meshd 已按请求完成停止", "meshd stopped as requested"),
+                            )
                             self._enqueue_and_push(
                                 {
                                     "type": "_desktop.connection",
@@ -4596,9 +4795,15 @@ class DesktopBridge:
                                 cap_err = {
                                     "code": "AUTO_START_RATE_LIMITED",
                                     "exit_code": c.EXIT_INTERNAL,
-                                    "message": (
-                                        f"meshd 在 {int(self._auto_start_window_s)}s 内已自动重启 "
-                                        f"{self._auto_start_max_attempts} 次后仍异常退出，已暂停自动启动，请查看日志或手动启动"
+                                    "message": self._t(
+                                        (
+                                            f"meshd 在 {int(self._auto_start_window_s)}s 内已自动重启 "
+                                            f"{self._auto_start_max_attempts} 次后仍异常退出，已暂停自动启动，请查看日志或手动启动"
+                                        ),
+                                        (
+                                            f"meshd crashed after {self._auto_start_max_attempts} automatic restarts "
+                                            f"within {int(self._auto_start_window_s)}s; auto-start paused — check logs or start manually"
+                                        ),
                                     ),
                                     "details": {
                                         "max_attempts": self._auto_start_max_attempts,
@@ -4633,7 +4838,10 @@ class DesktopBridge:
                         self._record_diag(
                             "info",
                             "DAEMON_BUSY_OR_STOPPING",
-                            "meshd.lock 仍被持有（进程繁忙或正在收尾），跳过自动启动并等待重试",
+                            self._t(
+                                "meshd.lock 仍被持有（进程繁忙或正在收尾），跳过自动启动并等待重试",
+                                "meshd.lock is still held (busy or shutting down); skipping auto-start and retrying shortly",
+                            ),
                         )
                         self._enqueue_and_push(busy_stopping_event)
                     if rate_limited_event is not None:
@@ -4646,7 +4854,10 @@ class DesktopBridge:
                         except Exception as exc:
                             err_env = _error_envelope(
                                 c.INTERNAL_ERROR,
-                                f"自动启动 meshd 发生未预期异常: {exc}",
+                                self._t(
+                                    f"自动启动 meshd 发生未预期异常: {exc}",
+                                    f"Unexpected error while auto-starting meshd: {exc}",
+                                ),
                                 exit_code=c.EXIT_INTERNAL,
                                 details={"exception": type(exc).__name__},
                             )
@@ -4762,7 +4973,7 @@ class DesktopBridge:
                             {
                                 "code": c.DAEMON_UNAVAILABLE,
                                 "exit_code": c.EXIT_DAEMON_UNAVAILABLE,
-                                "message": "实时事件流已断开",
+                                "message": self._t("实时事件流已断开", "Live event stream disconnected"),
                                 "details": {},
                             }
                         )
@@ -4777,7 +4988,11 @@ class DesktopBridge:
         except (MeshError, OSError, ValueError) as exc:
             if not self._stop_event.is_set() and not stop_ev.is_set():
                 code = exc.code if isinstance(exc, MeshError) else c.DAEMON_UNAVAILABLE
-                msg = exc.message if isinstance(exc, MeshError) else f"事件流连接失败: {exc}"
+                msg = (
+                    exc.message
+                    if isinstance(exc, MeshError)
+                    else self._t(f"事件流连接失败: {exc}", f"Event stream connection failed: {exc}")
+                )
                 self._log_desktop(
                     "WARNING",
                     "EVENT_STREAM_ERROR",
