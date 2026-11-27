@@ -466,7 +466,6 @@ def handle_agent_create(ctx: HandlerContext) -> HandlerResult:
     ack_timeout_s = _ack_timeout_arg(ctx, delivery)
 
     if not adapter.is_installed(binary_path=binary_override):
-        from mesh.adapters.base import AdapterNotInstalled
         raise AdapterNotInstalled(adapter_name)
 
     now = now_iso_utc()

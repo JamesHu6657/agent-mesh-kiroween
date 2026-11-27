@@ -1024,9 +1024,12 @@ class TestDesktopUiPayloadContracts(unittest.TestCase):
         self.assertNotIn("binary_path", lead_pop_fn)
 
 
-@unittest.skipUnless(shutil.which("node"), "node runtime required for JS behavior tests")
 class TestDesktopUiBehaviorContracts(unittest.TestCase):
     """Execute exported pure helpers from mesh/desktop/assets/app.js via Node to verify behavior."""
+
+    def setUp(self) -> None:
+        if shutil.which("node") is None:
+            self.skipTest("node runtime required for JS behavior tests")
 
     def _run_node(self, script_body: str) -> dict:
         wrapped = (

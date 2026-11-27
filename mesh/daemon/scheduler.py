@@ -14,9 +14,8 @@ from mesh.core.db import transaction
 from mesh.core.policy import parse_json_str_list, resolve_model_and_effort, validate_resolved_effort
 from mesh.core.redact import redact
 from mesh.core.events import last_rejection, record_event
-from mesh.core.settings import get_agent_ack_timeout_s
-from mesh.errors import MeshError
 from mesh.core.settings import get_agent_ack_timeout_s, is_testing_mode
+from mesh.errors import MeshError
 
 #: M3 gate re-review P2 (L11): T6 failure reason for a queued launch task whose adapter is
 #: held (``evidence.LAUNCH_HOLDS``), e.g. a kiro task queued before the hold landed.
