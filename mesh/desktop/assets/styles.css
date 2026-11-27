@@ -329,6 +329,15 @@ body.window-maximized .resize-handle {
   margin-right: 4px;
 }
 
+.titlebar-lang-btn {
+  width: auto;
+  min-width: 34px;
+  padding: 0 8px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
 .window-controls {
   display: flex;
   align-items: stretch;
@@ -2653,6 +2662,19 @@ button.param-row:hover {
   font-size: 13px;
   color: var(--text-secondary);
   margin-top: 2px;
+}
+
+.wizard-head-right {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.wizard-lang-btn {
+  min-width: 48px;
+  flex-shrink: 0;
 }
 
 .wizard-steps {

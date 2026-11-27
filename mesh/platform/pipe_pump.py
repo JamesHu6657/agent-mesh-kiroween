@@ -28,7 +28,7 @@ import signal
 import sys
 import threading
 import time
-from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 _PIPE_SEQ = itertools.count(1)
 _DEFAULT_BUF_BYTES = 65536

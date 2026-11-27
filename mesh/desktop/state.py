@@ -16,11 +16,13 @@ import tempfile
 import threading
 from typing import Any, Dict, Optional
 
+from mesh.desktop.i18n import normalize_language_pref
 from mesh.platform import perms
 from mesh.platform.fs import atomic_replace
 
 _ALLOWED_WINDOW_KEYS = frozenset({"x", "y", "width", "height", "maximized"})
 _ALLOWED_PREF_KEYS = frozenset({"close_to_tray", "tray_hint_shown"})
+_ALLOWED_STR_PREF_KEYS = frozenset({"language"})
 
 
 def default_desktop_state_path() -> str:
@@ -180,6 +182,7 @@ class DesktopStateStore:
         prefs: Dict[str, Any] = {
             "close_to_tray": True,
             "tray_hint_shown": False,
+            "language": "auto",
         }
         with self._lock:
             doc = self._read_raw_locked()
@@ -195,10 +198,14 @@ class DesktopStateStore:
             for key in _ALLOWED_PREF_KEYS:
                 if key in raw_prefs and isinstance(raw_prefs[key], bool):
                     prefs[key] = raw_prefs[key]
+            if "language" in raw_prefs:
+                norm_lang = normalize_language_pref(raw_prefs["language"])
+                if norm_lang is not None:
+                    prefs["language"] = norm_lang
         return prefs
 
     def update_prefs(self, updates: Dict[str, Any]) -> Dict[str, Any]:
-        """Persist whitelisted boolean desktop preferences and return the resulting prefs."""
+        """Persist whitelisted non-sensitive desktop preferences and return the resulting prefs."""
         with self._lock:
             doc = self._read_raw_locked()
             by_home = doc.get("by_home")
@@ -211,15 +218,24 @@ class DesktopStateStore:
             prefs: Dict[str, Any] = {
                 "close_to_tray": True,
                 "tray_hint_shown": False,
+                "language": "auto",
             }
             if isinstance(cur, dict):
                 for key in _ALLOWED_PREF_KEYS:
                     if key in cur and isinstance(cur[key], bool):
                         prefs[key] = cur[key]
+                if "language" in cur:
+                    norm_lang = normalize_language_pref(cur["language"])
+                    if norm_lang is not None:
+                        prefs["language"] = norm_lang
             if isinstance(updates, dict):
                 for key, val in updates.items():
                     if key in _ALLOWED_PREF_KEYS and isinstance(val, bool):
                         prefs[key] = val
+                    elif key in _ALLOWED_STR_PREF_KEYS and key == "language":
+                        norm_lang = normalize_language_pref(val)
+                        if norm_lang is not None:
+                            prefs["language"] = norm_lang
             entry["prefs"] = prefs
             by_home[self.home_key] = entry
             doc["version"] = 1

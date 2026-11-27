@@ -207,7 +207,8 @@ class TestDesktopUiPayloadContracts(unittest.TestCase):
         self.assertIn("data-plan-hash=", btn_footer_fn)
         self.assertIn("data-op-hash=", btn_footer_fn)
         self.assertIn("data-decide-reason=", btn_footer_fn)
-        self.assertIn('aria-label="拒绝原因或备注（可选）"', btn_footer_fn)
+        self.assertIn("拒绝原因或备注（可选）", btn_footer_fn)
+        self.assertIn('aria-label="${esc(reasonAriaLabel)}"', btn_footer_fn)
         self.assertIn("升级为直连拒绝", btn_footer_fn)
         self.assertIn("拒绝 / 清除", btn_footer_fn)
 
@@ -330,7 +331,7 @@ class TestDesktopUiPayloadContracts(unittest.TestCase):
         settings_fn = _extract_js_block(self.app_js, "function renderSettingsView({ force = false } = {}) {")
         self.assertIn('id="standingGrantsTable"', settings_fn)
         self.assertIn("data-revoke-grant-id=", settings_fn)
-        self.assertIn(">撤销</button>", settings_fn)
+        self.assertIn('>${esc(tr("撤销", "Revoke"))}</button>', settings_fn)
         self.assertIn('id="toggleIncludeRevokedGrants"', settings_fn)
         self.assertIn('id="settingsProjectPermissionMode"', settings_fn)
 
@@ -447,7 +448,7 @@ class TestDesktopUiPayloadContracts(unittest.TestCase):
 
         # A7: Onboarding polish (Ready vs Install/Login grouping, copyable auth commands, preview box, starters)
         wiz_fn = _extract_js_block(self.app_js, "function renderWizard()")
-        self.assertIn("VENDOR_AUTH_HINTS", wiz_fn)
+        self.assertIn("getVendorAuthHint(", wiz_fn)
         self.assertIn("wizard-preview-box", wiz_fn)
         self.assertIn("data-copy-code=", wiz_fn)
         self.assertIn("welcome-starter-chip", chat_fn)
@@ -481,6 +482,8 @@ class TestDesktopUiPayloadContracts(unittest.TestCase):
         # Step 2: detect_local_clis -> pick ONE lead -> creates <cli>-lead + <cli>-worker -> vendor_leads=true -> chat
         scan_fn = _extract_js_block(self.app_js, "async function scanWizardClis()")
         self.assertIn("window.pywebview.api.detect_local_clis()", scan_fn)
+        self.assertIn("STATE.wizard.scanQueued = true", scan_fn)
+        self.assertIn("restartIfQueued()", scan_fn)
 
         finish_fn = _extract_js_block(self.app_js, "async function handleWizardFinish()")
         self.assertIn("const leadName = `${chosen}-lead`", finish_fn)
@@ -863,11 +866,11 @@ class TestDesktopUiPayloadContracts(unittest.TestCase):
         self.assertIn("let s = esc(raw);", md_section)
         self.assertIn("esc(body)", md_section)
         self.assertIn("esc(msg.body || \"\")", chat_fn)
-        self.assertIn("esc(plan.title || \"执行计划\")", plan_fn)
+        self.assertIn('esc(plan.title || tr("执行计划", "Execution Plan"))', plan_fn)
         self.assertIn("esc(plan.summary)", plan_fn)
         self.assertIn("esc(st.title || st.key)", plan_fn)
-        self.assertIn("esc(apr.summary || fallbackBody || formatApprovalOpName(apr))", gate_fn)
-        self.assertIn('esc((STATE.auth.principal && STATE.auth.principal.name) || "user")', self.app_js)
+        self.assertIn("esc(localizeDaemonCardBody(apr, apr.summary || fallbackBody) || formatApprovalOpName(apr))", gate_fn)
+        self.assertIn('esc(STATE.auth.auth_verified ? tr(`已认证：${(STATE.auth.principal && STATE.auth.principal.name) || "user"}`', self.app_js)
         # test_command confirmation contract in both composer and manual project modal
         man_prj_fn = _extract_js_block(self.app_js, "function openManualNewProjectModal()")
         self.assertIn("showConfirmDialog(", man_prj_fn)
@@ -1023,9 +1026,12 @@ class TestDesktopUiPayloadContracts(unittest.TestCase):
         self.assertNotIn("binary_path", lead_pop_fn)
 
 
-@unittest.skipUnless(shutil.which("node"), "node runtime required for JS behavior tests")
 class TestDesktopUiBehaviorContracts(unittest.TestCase):
     """Execute exported pure helpers from mesh/desktop/assets/app.js via Node to verify behavior."""
+
+    def setUp(self) -> None:
+        if shutil.which("node") is None:
+            self.skipTest("node runtime required for JS behavior tests")
 
     def _run_node(self, script_body: str) -> dict:
         wrapped = (
@@ -4594,6 +4600,234 @@ class TestDesktopUiBehaviorContracts(unittest.TestCase):
             assert.equal(settingsScroll.innerHTML, prevSettingsHtml);
             settingsPassInp.value = "";
             global.document.activeElement = null;
+            """
+        )
+
+    def test_english_ui_i18n_rendering_and_live_language_switch(self) -> None:
+        """Verify full English UI mode, daemon card translation, DOM applyToDom, and live zh-CN/en toggle."""
+        app_js_src = APP_JS_PATH.read_text(encoding="utf-8")
+        self.assertIn("trackLanguageSync(", app_js_src)
+        self.assertIn(".catch(() => false)", app_js_src)
+        self.assertIn("return synced;", app_js_src)
+        self.assertIn("notifyLanguageSyncFailure()", app_js_src)
+
+        i18n_js_lit = json.dumps(str(APP_JS_PATH.parent / "i18n.js"))
+        self._run_node(
+            f"const i18n = require({i18n_js_lit});\n"
+            + r"""
+            const cjkRe = /[\u4e00-\u9fff]/;
+
+            // 1. Default headless Node starts in zh-CN, switching to en updates state & DOM cleanly
+            assert.equal(app.getLanguage(), "zh-CN");
+
+            // Simulate DOM nodes with data-i18n* attributes + stale data-orig-title
+            const fakeDocTitleNode = { textContent: "原始标题", attributes: { "data-i18n": "sidebar.navChats" }, getAttribute(k) { return this.attributes[k] || null; }, removeAttribute(k) { delete this.attributes[k]; } };
+            const fakeTitleAttrNode = { title: "旧标题", attributes: { "data-i18n-title": "sidebar.navSettingsTitle", "data-orig-title": "设置" }, getAttribute(k) { return this.attributes[k] || null; }, removeAttribute(k) { delete this.attributes[k]; } };
+            const fakePlaceholderNode = { placeholder: "旧占位", attributes: { "data-i18n-placeholder": "composer.placeholder" }, getAttribute(k) { return this.attributes[k] || null; }, removeAttribute(k) { delete this.attributes[k]; } };
+            const fakeAriaNode = { attributes: { "data-i18n-aria-label": "titlebar.langTitle" }, getAttribute(k) { return this.attributes[k] || null; }, setAttribute(k, v) { this.attributes[k] = v; }, removeAttribute(k) { delete this.attributes[k]; } };
+            const fakeRoot = {
+              documentElement: {
+                lang: "zh-CN",
+                setAttribute(k, v) { if (k === "lang") this.lang = v; },
+              },
+              title: "Agent Mesh",
+              querySelectorAll(sel) {
+                if (sel === "[data-i18n]") return [fakeDocTitleNode];
+                if (sel === "[data-i18n-title]") return [fakeTitleAttrNode];
+                if (sel === "[data-i18n-placeholder]") return [fakePlaceholderNode];
+                if (sel === "[data-i18n-aria-label]") return [fakeAriaNode];
+                return [];
+              },
+            };
+
+            app.setLanguage("en", { persist: false, syncBridge: false, rerender: false });
+            assert.equal(app.getLanguage(), "en");
+            assert.equal(app.isEnglish(), true);
+            i18n.applyToDom(fakeRoot);
+            assert.equal(fakeRoot.documentElement.lang, "en");
+            assert.equal(fakeDocTitleNode.textContent, "Chats");
+            assert.equal(fakeTitleAttrNode.title, "Settings & Diagnostics");
+            assert.equal(fakeTitleAttrNode.getAttribute("data-orig-title"), null);
+            assert.ok(!cjkRe.test(fakePlaceholderNode.placeholder), fakePlaceholderNode.placeholder);
+            assert.ok(fakeAriaNode.attributes["aria-label"].includes("Switch UI language"));
+
+            // 2. Plan card, Gate card (with daemon-generated Chinese boilerplate), Buttons footer, Hints
+            app.STATE.connected = true;
+            app.STATE.bridgeReady = true;
+            app.STATE.auth.auth_verified = true;
+            app.STATE.projects = [{ id: "prj_en_1", name: "Demo Project", status: "active", permission_mode: "plan", plan_gate_mode: "require_approval", repo: "/tmp/demo" }];
+            app.STATE.activeProjectId = "prj_en_1";
+            app.STATE.chatProjectStatus = "active";
+            app.STATE.chatPermissionMode = "plan";
+
+            const planApr = {
+              id: "apr_en_plan",
+              category: "plan_dispatch",
+              status: "pending",
+              project_id: "prj_en_1",
+              plan_hash: "sha256:planhash_en",
+              op_hash: "sha256:ophash_en",
+              available_actions: ["allow", "always_allow", "reject"],
+              always_allow_effect: { kind: "project_mode_auto", project_id: "prj_en_1" },
+            };
+            app.STATE.chatApprovalsById[planApr.id] = planApr;
+            app.setApprovals([planApr]);
+            const planHtml = app.renderPlanCardHtml({
+              id: "pln_en_1",
+              project_id: "prj_en_1",
+              version: 1,
+              title: "Implement English UI",
+              summary: "Add bilingual support",
+              status: "proposed",
+              approval_id: planApr.id,
+              plan_hash: "sha256:planhash_en",
+              steps: [{ key: "s1", title: "Update UI", assignee: "codex-worker", profile: "edit", kind: "code", spec: "Update desktop assets", timeout_s: 300, max_attempts: 2 }],
+            });
+            assert.ok(planHtml.includes("Plan v1"), planHtml);
+            assert.ok(planHtml.includes("Needs approval"), planHtml);
+            assert.ok(planHtml.includes(">Allow</button>"), planHtml);
+            assert.ok(planHtml.includes(">Always allow</button>"), planHtml);
+            assert.ok(planHtml.includes(">Reject</button>"), planHtml);
+            assert.ok(!cjkRe.test(planHtml), "Unexpected CJK in English plan card: " + planHtml);
+
+            // Daemon-generated Chinese boilerplate in gate summary gets translated cleanly
+            const gateApr = {
+              id: "apr_en_gate",
+              category: "permission_escalation",
+              status: "pending",
+              project_id: "prj_en_1",
+              op_hash: "sha256:gatehash_en",
+              op_json: { type: "task.create", args: { agent: "codex-worker", profile: "elevated" } },
+              summary: "需要提权确认：步骤 's1' (Run migrations) 请求为 'codex-worker' 提升权限至 'elevated'。请使用卡片按钮（允许 / 始终允许 / 拒绝）决定。",
+              available_actions: ["allow", "always_allow", "reject"],
+              always_allow_effect: { kind: "standing_grant", category: "permission_escalation", scope_key: "permission_escalation:prj_en_1:agt_1:elevated", scope_agent_name: "codex-worker", scope_profile: "elevated" },
+            };
+            const gateHtml = app.renderGateCardHtml(gateApr, gateApr.summary);
+            assert.ok(gateHtml.includes("Permission Escalation"), gateHtml);
+            assert.ok(gateHtml.includes("Permission escalation required"), gateHtml);
+            assert.ok(gateHtml.includes(">Allow</button>"), gateHtml);
+            assert.ok(!cjkRe.test(gateHtml), "Unexpected CJK in English gate card: " + gateHtml);
+
+            // 3. Auto-mode confirm copy, approval decision toast, relayed badge, error formatting, audit verify modal
+            const autoCopy = app.buildAutoModeConfirmCopy({ project_id: "prj_en_1", project_name: "Demo Project" });
+            assert.ok(autoCopy.title.includes("Full Auto (auto)"), autoCopy.title);
+            assert.ok(!cjkRe.test(autoCopy.title) && !cjkRe.test(autoCopy.body) && !cjkRe.test(autoCopy.confirmLabel));
+
+            const toastInfo = app.formatApprovalDecisionToast("always_allow", { mode_changed: true, permission_mode: "auto", cancelled_step_approvals: ["a1"] }, { category: "plan_dispatch" });
+            assert.ok(toastInfo.text.includes("Full Auto (auto)"), toastInfo.text);
+            assert.ok(!cjkRe.test(toastInfo.text), toastInfo.text);
+
+            assert.equal(app.formatRelayedBadgeText({ relayed: true, meta: { relayed_by: "bot" } }), "Relayed via bot");
+
+            const errMsg = app.formatErrorMessage({ code: "PASSPHRASE_INVALID", message: "bad passphrase" });
+            assert.ok(errMsg.includes("Incorrect passphrase"), errMsg);
+            assert.ok(!cjkRe.test(errMsg), errMsg);
+
+            const auditOkHtml = app.renderAuditVerifyModalBodyHtml({ ok: true, data: { events_verified: 10, approvals_verified: 2, direct_decisions: 2, relayed_decisions: 0, delegated_decisions: 0 } });
+            assert.ok(auditOkHtml.includes("Passed"), auditOkHtml);
+            assert.ok(!cjkRe.test(auditOkHtml), auditOkHtml);
+
+            const auditBadHtml = app.renderAuditVerifyModalBodyHtml({ ok: false, error: { code: "AUDIT_MISMATCH", details: { broken_event_seqs: [3], broken_approval_ids: [], state_mismatches: ["project_mode:prj_en_1"], reasons: [] } } });
+            assert.ok(auditBadHtml.includes("Failed"), auditBadHtml);
+            assert.ok(auditBadHtml.includes("Permission Mode (permission_mode) Mismatch"), auditBadHtml);
+            assert.ok(!cjkRe.test(auditBadHtml), auditBadHtml);
+
+            // 4. Settings view renders #selectUiLanguage with en selected and zero stray CJK (except 简体中文 option label)
+            const settingsRoot = { innerHTML: "", querySelector: () => null, querySelectorAll: () => [], contains: () => false };
+            const prevDoc = global.document;
+            global.document = {
+              documentElement: { lang: "en" },
+              title: "Agent Mesh",
+              activeElement: null,
+              getElementById: id => (id === "settingsPageScroll" ? settingsRoot : null),
+              querySelectorAll: () => [],
+            };
+            try {
+              app.renderSettingsView({ force: true });
+              assert.ok(settingsRoot.innerHTML.includes('id="selectUiLanguage"'), "Settings must render #selectUiLanguage");
+              assert.ok(settingsRoot.innerHTML.includes("Interface Language"), settingsRoot.innerHTML);
+              const settingsWithoutZhOption = settingsRoot.innerHTML.replace("简体中文", "");
+              assert.ok(!cjkRe.test(settingsWithoutZhOption), "Unexpected CJK in English Settings view: " + settingsWithoutZhOption);
+
+              // 5. Toggle back to zh-CN restores Chinese cleanly
+              app.toggleLanguage();
+              assert.equal(app.getLanguage(), "zh-CN");
+              assert.equal(app.formatRelayedBadgeText({ relayed: true, meta: { relayed_by: "bot" } }), "经由 bot 转发");
+            } finally {
+              global.document = prevDoc;
+            }
+
+            // 6. Auto-detection & bridge setSystemLang override in i18n.js
+            const prevWin = global.window;
+            try {
+              global.window = { navigator: { language: "en-US", languages: ["en-US", "en"] } };
+              i18n.setSystemLang(null);
+              i18n.setPref("auto", { persist: false });
+              assert.equal(i18n.getLang(), "en");
+              global.window = { navigator: { language: "zh-CN", languages: ["zh-CN"] } };
+              assert.equal(i18n.getLang(), "zh-CN");
+              // Bridge effective_language (e.g. MESH_UI_LANG=en on Chinese OS) overrides navigator when pref === "auto"
+              i18n.setSystemLang("en");
+              assert.equal(i18n.getLang(), "en");
+              i18n.setSystemLang(null);
+              assert.equal(i18n.getLang(), "zh-CN");
+            } finally {
+              i18n.setSystemLang(null);
+              global.window = prevWin;
+            }
+
+            // 7. Blind-review regression guards:
+            // (a) plan.version XSS escaping
+            app.setLanguage("en", { persist: false, syncBridge: false, rerender: false });
+            const xssPlanHtml = app.renderPlanCardHtml({
+              id: "pln_xss",
+              project_id: "prj_en_1",
+              version: "<img src=x onerror=alert(1)>",
+              title: "Safe Title",
+              status: "proposed",
+              steps: [],
+            });
+            assert.ok(!xssPlanHtml.includes("<img src=x"), "plan.version must be HTML-escaped: " + xssPlanHtml);
+            assert.ok(xssPlanHtml.includes("&lt;img src=x"), xssPlanHtml);
+
+            // (b) applyToDom must NOT overwrite dynamic titles inside an open modal,
+            // while still updating static controls such as the close-button tooltip
+            const openModalTitle = {
+              id: "modalTitle",
+              textContent: "Confirm High-Privilege Profile · elevated",
+              attributes: { "data-i18n": "modal.defaultTitle" },
+              getAttribute(k) { return this.attributes[k] || null; },
+              closest(sel) { return sel.includes(".modal-backdrop:not(.hidden)") ? {} : null; },
+            };
+            const openModalClose = {
+              title: "关闭",
+              attributes: { "data-i18n-title": "modal.closeTitle" },
+              getAttribute(k) { return this.attributes[k] || null; },
+              removeAttribute(k) { delete this.attributes[k]; },
+              closest(sel) { return sel.includes(".modal-backdrop:not(.hidden)") ? {} : null; },
+            };
+            i18n.applyToDom({
+              documentElement: { setAttribute() {} },
+              querySelectorAll(sel) {
+                if (sel === "[data-i18n]") return [openModalTitle];
+                if (sel === "[data-i18n-title]") return [openModalClose];
+                return [];
+              },
+            });
+            assert.equal(openModalTitle.textContent, "Confirm High-Privilege Profile · elevated");
+            assert.equal(openModalClose.title, "Close");
+
+            // (c) Daemon PLAN_APPROVAL_REQUIRED & default acceptance criterion leak zero CJK in English mode
+            const planReqErr = app.formatErrorMessage({
+              code: "PLAN_APPROVAL_REQUIRED",
+              message: "Plan 'pln_1' has not been approved by the user yet (click 允许 on the plan card)",
+            });
+            assert.ok(!cjkRe.test(planReqErr), "Unexpected CJK in PLAN_APPROVAL_REQUIRED error: " + planReqErr);
+            assert.ok(planReqErr.includes('click "Allow" on the plan card'), planReqErr);
+
+            const defCritEn = i18n.localizeDaemonMessage("完成用户对话目标并经 Lead 验收");
+            assert.ok(!cjkRe.test(defCritEn), "Unexpected CJK in default criterion: " + defCritEn);
+            assert.ok(defCritEn.includes("Lead"), defCritEn);
             """
         )
 

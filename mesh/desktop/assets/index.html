@@ -29,17 +29,20 @@
         <span class="titlebar-ver mono" id="sidebarVersion">--</span>
       </div>
       <div class="titlebar-right">
-        <button class="icon-btn titlebar-tool-btn" id="btnQuickTheme" type="button" title="切换深浅主题">
+        <button class="icon-btn titlebar-tool-btn titlebar-lang-btn" id="btnQuickLang" type="button" title="切换界面语言 (中文 / English)" data-i18n-title="titlebar.langTitle" data-i18n-aria-label="titlebar.langTitle" aria-label="切换界面语言 (中文 / English)">
+          <span class="mono" data-i18n="titlebar.langBtn">EN</span>
+        </button>
+        <button class="icon-btn titlebar-tool-btn" id="btnQuickTheme" type="button" title="切换深浅主题" data-i18n-title="titlebar.theme">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M6.3 17.7l-1.4 1.4M19.1 4.9l-1.4 1.4"></path></svg>
         </button>
         <div class="window-controls" id="windowControls">
-          <button class="win-ctrl-btn" id="btnWinMin" type="button" title="最小化" aria-label="最小化">
+          <button class="win-ctrl-btn" id="btnWinMin" type="button" title="最小化" aria-label="最小化" data-i18n-title="titlebar.min" data-i18n-aria-label="titlebar.min">
             <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="5" y1="12" x2="19" y2="12"></line></svg>
           </button>
-          <button class="win-ctrl-btn" id="btnWinMax" type="button" title="最大化 / 还原" aria-label="最大化或还原">
+          <button class="win-ctrl-btn" id="btnWinMax" type="button" title="最大化 / 还原" aria-label="最大化或还原" data-i18n-title="titlebar.max" data-i18n-aria-label="titlebar.maxAria">
             <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="14" height="14" rx="2"></rect></svg>
           </button>
-          <button class="win-ctrl-btn win-ctrl-close" id="btnWinClose" type="button" title="关闭窗口" aria-label="关闭窗口">
+          <button class="win-ctrl-btn win-ctrl-close" id="btnWinClose" type="button" title="关闭窗口" aria-label="关闭窗口" data-i18n-title="titlebar.close" data-i18n-aria-label="titlebar.close">
             <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"></path></svg>
           </button>
         </div>
@@ -50,21 +53,21 @@
       <!-- 1. LEFT PROJECT CHATS SIDEBAR (280px expanded / 88px icon rail collapsed) -->
       <aside class="sidebar" id="leftSidebar">
         <div class="sidebar-top-bar">
-          <button class="round-icon-btn quiet" id="btnCollapseSidebar" type="button" title="收起 / 展开侧边栏 (Ctrl+B)">
+          <button class="round-icon-btn quiet" id="btnCollapseSidebar" type="button" title="收起 / 展开侧边栏 (Ctrl+B)" data-i18n-title="sidebar.collapseTitle">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="3"></rect><path d="M9 4v16"></path></svg>
           </button>
           <div class="sidebar-top-actions">
-            <button class="round-icon-btn" id="btnToggleSearch" type="button" title="搜索项目对话">
+            <button class="round-icon-btn" id="btnToggleSearch" type="button" title="搜索项目对话" data-i18n-title="sidebar.searchTitle">
               <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"></circle><path d="m21 21-4.3-4.3"></path></svg>
             </button>
-            <button class="round-icon-btn" id="btnNewChat" type="button" data-requires-auth="1" title="新建项目对话">
+            <button class="round-icon-btn" id="btnNewChat" type="button" data-requires-auth="1" title="新建项目对话" data-i18n-title="sidebar.newChatTitle">
               <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"></path></svg>
             </button>
           </div>
         </div>
 
         <div class="sidebar-search-wrap hidden" id="sidebarSearchWrap">
-          <input class="compact-input" id="projectSearchInput" type="text" aria-label="搜索项目名称或 Lead" placeholder="搜索项目名称或 Lead..." />
+          <input class="compact-input" id="projectSearchInput" type="text" aria-label="搜索项目名称或 Lead" placeholder="搜索项目名称或 Lead..." data-i18n-aria-label="sidebar.searchAria" data-i18n-placeholder="sidebar.searchPlaceholder" />
         </div>
 
         <!-- Scrollable Project Chats List -->
@@ -72,35 +75,35 @@
 
         <!-- Sidebar Footer: Advanced (AI Tools / Settings) + User & Daemon Status -->
         <div class="sidebar-bottom-nav">
-          <button class="sidebar-nav-pill active" data-nav="tasks" type="button" title="项目对话">
+          <button class="sidebar-nav-pill active" data-nav="tasks" type="button" title="项目对话" data-i18n-title="sidebar.navChatsTitle">
             <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
-            <span class="sidebar-label">对话</span>
+            <span class="sidebar-label" data-i18n="sidebar.navChats">对话</span>
             <span class="nav-count mono sidebar-label" id="navProjectCount">0</span>
           </button>
-          <button class="sidebar-nav-pill" data-nav="cli" type="button" title="高级：AI 工具（CLIs）与 Agent 管理">
+          <button class="sidebar-nav-pill" data-nav="cli" type="button" title="高级：AI 工具（CLIs）与 Agent 管理" data-i18n-title="sidebar.navCliTitle">
             <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="14" rx="2"></rect><path d="M8 21h8M12 18v3"></path></svg>
-            <span class="sidebar-label">AI 工具</span>
+            <span class="sidebar-label" data-i18n="sidebar.navCli">AI 工具</span>
             <span class="nav-count mono sidebar-label" id="navCliCount">0</span>
           </button>
-          <button class="sidebar-nav-pill" data-nav="settings" id="btnFooterSettings" type="button" title="系统设置与诊断">
+          <button class="sidebar-nav-pill" data-nav="settings" id="btnFooterSettings" type="button" title="系统设置与诊断" data-i18n-title="sidebar.navSettingsTitle">
             <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l-.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
-            <span class="sidebar-label">设置</span>
+            <span class="sidebar-label" data-i18n="sidebar.navSettings">设置</span>
           </button>
         </div>
 
         <div class="sidebar-footer">
-          <button class="user-footer-btn" id="btnDaemonMenu" type="button" title="当前账号与后台服务状态">
+          <button class="user-footer-btn" id="btnDaemonMenu" type="button" title="当前账号与后台服务状态" data-i18n-title="sidebar.daemonMenuTitle">
             <span class="avatar avatar-user" id="footerUserAvatar" aria-hidden="true">AM</span>
             <span class="user-footer-text sidebar-label">
-              <span class="user-footer-name" id="footerUserName">未解锁</span>
+              <span class="user-footer-name" id="footerUserName" data-i18n="sidebar.lockedUser">未解锁</span>
               <span class="user-footer-daemon">
                 <span class="dot dot-neutral" id="footerDaemonDot"></span>
-                <span id="footerDaemonLabel">检测后台服务...</span>
+                <span id="footerDaemonLabel" data-i18n="sidebar.checkingDaemon">检测后台服务...</span>
               </span>
             </span>
           </button>
           <div class="sidebar-footer-actions sidebar-label">
-            <button class="icon-btn" id="btnDaemonMenuDots" type="button" title="后台服务菜单">
+            <button class="icon-btn" id="btnDaemonMenuDots" type="button" title="后台服务菜单" data-i18n-title="sidebar.daemonMenuDotsTitle">
               <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="5" cy="12" r="1"></circle><circle cx="12" cy="12" r="1"></circle><circle cx="19" cy="12" r="1"></circle></svg>
             </button>
           </div>
@@ -122,17 +125,17 @@
           </div>
 
           <div class="center-header-right">
-            <select class="compact-select header-mode-select hidden" id="projectPermissionModeSelect" data-requires-auth="1" title="切换当前项目权限模式">
-              <option value="supervised">每步问我 (supervised)</option>
-              <option value="plan">计划批了就放手 (plan)</option>
-              <option value="auto">全自动 (auto)</option>
+            <select class="compact-select header-mode-select hidden" id="projectPermissionModeSelect" data-requires-auth="1" title="切换当前项目权限模式" data-i18n-title="header.permModeTitle">
+              <option value="supervised" data-i18n="header.permSupervised">每步问我 (supervised)</option>
+              <option value="plan" data-i18n="header.permPlan">计划批了就放手 (plan)</option>
+              <option value="auto" data-i18n="header.permAuto">全自动 (auto)</option>
             </select>
-            <button class="btn btn-sm btn-pill hidden" id="btnDeliverBase" type="button" data-requires-auth="1" title="将集成分支本地快进合并至基准分支">交付到本地分支</button>
-            <button class="round-icon-btn quiet" id="btnProjectActions" type="button" title="项目操作与高级菜单">
+            <button class="btn btn-sm btn-pill hidden" id="btnDeliverBase" type="button" data-requires-auth="1" title="将集成分支本地快进合并至基准分支" data-i18n-title="header.deliverBaseTitle" data-i18n="header.deliverBase">交付到本地分支</button>
+            <button class="round-icon-btn quiet" id="btnProjectActions" type="button" title="项目操作与高级菜单" data-i18n-title="header.projectActionsTitle">
               <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="5" cy="12" r="1"></circle><circle cx="12" cy="12" r="1"></circle><circle cx="19" cy="12" r="1"></circle></svg>
             </button>
             <div class="popover-menu hidden" id="projectActionPopover"></div>
-            <button class="round-icon-btn quiet" id="btnToggleInspector" type="button" title="展开 / 收起右侧检查器与高级面板">
+            <button class="round-icon-btn quiet" id="btnToggleInspector" type="button" title="展开 / 收起右侧检查器与高级面板" data-i18n-title="header.toggleInspectorTitle">
               <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="3"></rect><path d="M15 4v16"></path></svg>
             </button>
           </div>
@@ -143,14 +146,14 @@
           <div class="daemon-inline-bar-left">
             <span class="dot dot-red" id="daemonStatusDot"></span>
             <div class="daemon-inline-bar-text">
-              <div id="daemonDisconnectedText">后台服务已断开 — 当前为只读查看模式</div>
+              <div id="daemonDisconnectedText" data-i18n="daemon.disconnected">后台服务已断开 — 当前为只读查看模式</div>
               <div class="daemon-inline-bar-detail hidden" id="daemonDisconnectedDetail"></div>
             </div>
           </div>
           <div class="inline-bar-actions">
-            <button class="btn btn-sm" id="btnInlineViewLog" type="button" title="查看启动诊断与日志路径">查看日志</button>
-            <button class="btn btn-sm" id="btnInlineReconnect" type="button" title="立即尝试重新连接">重试连接</button>
-            <button class="btn btn-sm btn-primary" id="btnInlineStartDaemon" type="button" title="启动本地后台服务">启动服务</button>
+            <button class="btn btn-sm" id="btnInlineViewLog" type="button" title="查看启动诊断与日志路径" data-i18n-title="daemon.viewLogTitle" data-i18n="daemon.viewLog">查看日志</button>
+            <button class="btn btn-sm" id="btnInlineReconnect" type="button" title="立即尝试重新连接" data-i18n-title="daemon.reconnectTitle" data-i18n="daemon.reconnect">重试连接</button>
+            <button class="btn btn-sm btn-primary" id="btnInlineStartDaemon" type="button" title="启动本地后台服务" data-i18n-title="daemon.startTitle" data-i18n="daemon.start">启动服务</button>
           </div>
         </div>
 
@@ -159,19 +162,19 @@
           <div class="auth-inline-row">
             <div class="inline-bar-msg">
               <span class="dot dot-amber"></span>
-              <span id="authUnlockMsg">请输入口令解锁工作台（口令仅保存在当前进程内存中）</span>
+              <span id="authUnlockMsg" data-i18n="auth.unlockMsg">请输入口令解锁工作台（口令仅保存在当前进程内存中）</span>
             </div>
             <form class="auth-inline-form" id="authInlineForm" autocomplete="off">
-              <input class="compact-input" id="authInlineInput" type="password" autocomplete="off" placeholder="输入用户口令..." />
-              <label class="inline-check hidden" id="authInlineRememberWrap" title="默认关闭（仅保存在内存中）；勾选后由 Windows 凭据管理器（DPAPI）托管，同一 Windows 用户下的其他进程可读取">
+              <input class="compact-input" id="authInlineInput" type="password" autocomplete="off" placeholder="输入用户口令..." data-i18n-placeholder="auth.passPlaceholder" />
+              <label class="inline-check hidden" id="authInlineRememberWrap" title="默认关闭（仅保存在内存中）；勾选后由 Windows 凭据管理器（DPAPI）托管，同一 Windows 用户下的其他进程可读取" data-i18n-title="auth.rememberTitle">
                 <input id="authInlineRemember" type="checkbox" />
-                <span>记住本机解锁</span>
+                <span data-i18n="auth.rememberLabel">记住本机解锁</span>
               </label>
-              <button class="btn btn-sm btn-primary" id="btnAuthInlineUnlock" type="submit">解锁</button>
+              <button class="btn btn-sm btn-primary" id="btnAuthInlineUnlock" type="submit" data-i18n="auth.unlockBtn">解锁</button>
             </form>
           </div>
           <div class="auth-inline-warning hidden" id="authInlineRememberWarning">
-            <strong>安全边界提示：</strong>勾选「记住本机解锁」后，口令将由 Windows 凭据管理器（DPAPI）按当前 Windows 用户加密托管（不写入明文文件、环境变量或 localStorage）；但同一 Windows 用户账户下运行的其他进程（含本机 Agent）可以读取该凭据，运行不可信 Agent 时请勿启用。
+            <strong data-i18n="auth.rememberWarnStrong">安全边界提示：</strong><span data-i18n="auth.rememberWarnBody">勾选「记住本机解锁」后，口令将由 Windows 凭据管理器（DPAPI）按当前 Windows 用户加密托管（不写入明文文件、环境变量或 localStorage）；但同一 Windows 用户账户下运行的其他进程（含本机 Agent）可以读取该凭据，运行不可信 Agent 时请勿启用。</span>
           </div>
         </div>
 
@@ -192,51 +195,51 @@
               <!-- Optional Repo Attachment Strip (only for new chat draft, S4 folder picker & auto-detect) -->
               <div class="composer-repo-drawer hidden" id="composerRepoDrawer">
                 <div class="composer-repo-head">
-                  <span class="composer-repo-title">绑定本地 Git 代码仓库（可选，留空则为通用对话项目）</span>
-                  <button class="icon-btn" id="btnCloseRepoDrawer" type="button" title="收起代码仓库设置">
+                  <span class="composer-repo-title" data-i18n="repo.drawerTitle">绑定本地 Git 代码仓库（可选，留空则为通用对话项目）</span>
+                  <button class="icon-btn" id="btnCloseRepoDrawer" type="button" title="收起代码仓库设置" data-i18n-title="repo.closeTitle">
                     <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 6 6 18M6 6l12 12"></path></svg>
                   </button>
                 </div>
                 <div class="repo-picker-row">
-                  <input class="compact-input mono" id="newPrjRepo" type="text" placeholder="点击右侧选择文件夹，或粘贴本地仓库绝对路径..." />
-                  <button class="btn btn-sm btn-primary" id="btnPickRepoFolder" type="button" title="打开系统文件夹选择器并自动识别分支与测试命令">选择文件夹...</button>
-                  <button class="btn btn-sm" id="btnInspectRepoFolder" type="button" title="重新检测所填路径的 Git 分支与测试命令">检测</button>
+                  <input class="compact-input mono" id="newPrjRepo" type="text" placeholder="点击右侧选择文件夹，或粘贴本地仓库绝对路径..." data-i18n-placeholder="repo.pathPlaceholder" />
+                  <button class="btn btn-sm btn-primary" id="btnPickRepoFolder" type="button" title="打开系统文件夹选择器并自动识别分支与测试命令" data-i18n-title="repo.pickTitle" data-i18n="repo.pickBtn">选择文件夹...</button>
+                  <button class="btn btn-sm" id="btnInspectRepoFolder" type="button" title="重新检测所填路径的 Git 分支与测试命令" data-i18n-title="repo.inspectTitle" data-i18n="repo.inspectBtn">检测</button>
                 </div>
                 <div class="recent-folders-row hidden" id="recentFoldersBar"></div>
                 <div class="repo-inspect-card hidden" id="repoInspectStatus"></div>
                 <div class="composer-repo-grid">
                   <div class="composer-field">
-                    <label class="composer-field-label" for="newPrjBaseBranch">基准分支（已自动识别，可切换）</label>
-                    <input class="compact-input mono" id="newPrjBaseBranch" type="text" value="" list="repoBranchDatalist" placeholder="选择仓库后自动识别" />
+                    <label class="composer-field-label" for="newPrjBaseBranch" data-i18n="repo.baseBranchLabel">基准分支（已自动识别，可切换）</label>
+                    <input class="compact-input mono" id="newPrjBaseBranch" type="text" value="" list="repoBranchDatalist" placeholder="选择仓库后自动识别" data-i18n-placeholder="repo.baseBranchPlaceholder" />
                     <datalist id="repoBranchDatalist"></datalist>
                     <div class="repo-quick-chips hidden" id="repoBranchChips"></div>
                   </div>
                   <div class="composer-field">
-                    <label class="composer-field-label" for="newPrjTestCmd">自动测试命令（默认 none，可一键选择）</label>
-                    <input class="compact-input mono" id="newPrjTestCmd" type="text" placeholder='none 或 ["pytest"]' />
+                    <label class="composer-field-label" for="newPrjTestCmd" data-i18n="repo.testCmdLabel">自动测试命令（默认 none，可一键选择）</label>
+                    <input class="compact-input mono" id="newPrjTestCmd" type="text" placeholder='none 或 ["pytest"]' data-i18n-placeholder="repo.testCmdPlaceholder" />
                     <div class="repo-quick-chips hidden" id="repoTestCmdChips"></div>
                   </div>
                 </div>
               </div>
 
               <div class="composer-box" id="composerBox">
-                <textarea class="composer-textarea" id="composerInput" rows="1" aria-label="输入消息给 Lead" placeholder="告诉 Lead 你想完成什么... (Enter 发送，Shift+Enter 换行)"></textarea>
+                <textarea class="composer-textarea" id="composerInput" rows="1" aria-label="输入消息给 Lead" placeholder="告诉 Lead 你想完成什么... (Enter 发送，Shift+Enter 换行)" data-i18n-aria-label="composer.aria" data-i18n-placeholder="composer.placeholder"></textarea>
                 <div class="composer-actions-row">
                   <div class="composer-left-controls">
-                    <button class="composer-circle-btn" id="btnToggleRepoDrawer" type="button" title="绑定或查看本地代码仓库">
+                    <button class="composer-circle-btn" id="btnToggleRepoDrawer" type="button" title="绑定或查看本地代码仓库" data-i18n-title="composer.repoBtnTitle">
                       <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
                     </button>
                     <span class="composer-repo-chip hidden" id="composerRepoChip"></span>
-                    <span class="composer-queue-pill hidden" id="composerQueueBadge">排队发送 · 等待当前回合完成</span>
+                    <span class="composer-queue-pill hidden" id="composerQueueBadge" data-i18n="composer.queueBadge">排队发送 · 等待当前回合完成</span>
                   </div>
                   <div class="composer-right-controls">
-                    <button class="pill-btn lead-pill-btn" id="btnLeadPill" type="button" data-requires-auth="1" title="查看或切换当前项目 Lead">
+                    <button class="pill-btn lead-pill-btn" id="btnLeadPill" type="button" data-requires-auth="1" title="查看或切换当前项目 Lead" data-i18n-title="composer.leadPillTitle">
                       <span id="leadPillLabel">Lead: --</span>
                       <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="m6 9 6 6 6-6"></path></svg>
                     </button>
-                    <button class="btn btn-sm steer-lead-btn hidden" id="btnSteerLeadTurn" type="button" data-requires-auth="1" title="打断当前只读 Lead 回合并立即按新消息改向 (Ctrl+Enter)">改向发送</button>
-                    <button class="btn btn-sm stop-lead-btn hidden" id="btnStopLeadTurn" type="button" data-requires-auth="1" title="停止当前运行中的 Lead 回合">停止</button>
-                    <button class="send-btn" id="btnSendComposer" type="button" data-requires-auth="1" title="发送消息 (Enter)">
+                    <button class="btn btn-sm steer-lead-btn hidden" id="btnSteerLeadTurn" type="button" data-requires-auth="1" title="打断当前只读 Lead 回合并立即按新消息改向 (Ctrl+Enter)" data-i18n-title="composer.steerTitle" data-i18n="composer.steerBtn">改向发送</button>
+                    <button class="btn btn-sm stop-lead-btn hidden" id="btnStopLeadTurn" type="button" data-requires-auth="1" title="停止当前运行中的 Lead 回合" data-i18n-title="composer.stopTitle" data-i18n="composer.stopBtn">停止</button>
+                    <button class="send-btn" id="btnSendComposer" type="button" data-requires-auth="1" title="发送消息 (Enter)" data-i18n-title="composer.sendTitle">
                       <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"></path></svg>
                     </button>
                   </div>
@@ -267,11 +270,11 @@
         <div class="inspector-top" id="inspectorTop"></div>
         <div class="inspector-tabs">
           <div class="inspector-tabs-pill">
-            <button class="tab-btn active" data-tab="task" type="button">任务详情</button>
-            <button class="tab-btn" data-tab="diff" type="button">差异</button>
-            <button class="tab-btn" data-tab="outline" type="button">执行大纲</button>
-            <button class="tab-btn" data-tab="running" type="button">运行中</button>
-            <button class="tab-btn" data-tab="advanced" type="button">高级</button>
+            <button class="tab-btn active" data-tab="task" type="button" data-i18n="inspector.tabTask">任务详情</button>
+            <button class="tab-btn" data-tab="diff" type="button" data-i18n="inspector.tabDiff">差异</button>
+            <button class="tab-btn" data-tab="outline" type="button" data-i18n="inspector.tabOutline">执行大纲</button>
+            <button class="tab-btn" data-tab="running" type="button" data-i18n="inspector.tabRunning">运行中</button>
+            <button class="tab-btn" data-tab="advanced" type="button" data-i18n="inspector.tabAdvanced">高级</button>
           </div>
         </div>
         <div class="inspector-scroll" id="inspectorBody"></div>
@@ -286,34 +289,37 @@
         <div class="wizard-brand-row">
           <span class="avatar avatar-wizard" aria-hidden="true">AM</span>
           <div>
-            <h1 class="wizard-title" id="wizardTitle">欢迎使用 Agent Mesh</h1>
-            <p class="wizard-subtitle" id="wizardSubtitle">几秒钟完成本机初始化，选一个 Lead 就能开始对话协作</p>
+            <h1 class="wizard-title" id="wizardTitle" data-i18n="wizard.title">欢迎使用 Agent Mesh</h1>
+            <p class="wizard-subtitle" id="wizardSubtitle" data-i18n="wizard.subtitle">几秒钟完成本机初始化，选一个 Lead 就能开始对话协作</p>
           </div>
         </div>
-        <div class="wizard-steps" id="wizardSteps">
-          <span class="wizard-step-pill active" id="wizardStepPill1">1. 设置口令</span>
-          <span class="wizard-step-sep">→</span>
-          <span class="wizard-step-pill" id="wizardStepPill2">2. 选择你的 Lead</span>
+        <div class="wizard-head-right">
+          <button class="btn btn-sm wizard-lang-btn" id="btnWizardLang" type="button" title="切换界面语言 (中文 / English)" data-i18n-title="titlebar.langTitle" data-i18n="titlebar.langBtn">EN</button>
+          <div class="wizard-steps" id="wizardSteps">
+            <span class="wizard-step-pill active" id="wizardStepPill1" data-i18n="wizard.step1Pill">1. 设置口令</span>
+            <span class="wizard-step-sep">→</span>
+            <span class="wizard-step-pill" id="wizardStepPill2" data-i18n="wizard.step2Pill">2. 选择你的 Lead</span>
+          </div>
         </div>
       </div>
 
       <!-- Step 1: Passphrase & Initialize Home -->
       <form class="wizard-body" id="wizardStep1Form" autocomplete="off">
         <div class="wizard-info-box">
-          <strong>本地安全口令</strong>
-          <p>Agent Mesh 仅在本机运行，所有审批签名均依赖你的口令。口令只在当前进程内存中保存，绝不写入磁盘、环境变量或浏览器存储。</p>
+          <strong data-i18n="wizard.passTitle">本地安全口令</strong>
+          <p data-i18n="wizard.passDesc">Agent Mesh 仅在本机运行，所有审批签名均依赖你的口令。口令只在当前进程内存中保存，绝不写入磁盘、环境变量或浏览器存储。</p>
           <div class="wizard-home-path mono" id="wizardHomePath"></div>
         </div>
 
         <div class="form-row">
-          <label class="form-label" for="wizardPassInput">设置口令（至少 12 个字符）</label>
-          <input class="compact-input" id="wizardPassInput" type="password" autocomplete="new-password" placeholder="输入至少 12 位安全口令..." />
-          <div class="wizard-field-hint" id="wizardPassLenHint">当前长度：0 / 12</div>
+          <label class="form-label" for="wizardPassInput" data-i18n="wizard.passInputLabel">设置口令（至少 12 个字符）</label>
+          <input class="compact-input" id="wizardPassInput" type="password" autocomplete="new-password" placeholder="输入至少 12 位安全口令..." data-i18n-placeholder="wizard.passInputPlaceholder" />
+          <div class="wizard-field-hint" id="wizardPassLenHint" data-i18n="wizard.passLenZero">当前长度：0 / 12</div>
         </div>
 
         <div class="form-row">
-          <label class="form-label" for="wizardPassConfirm">再次确认口令</label>
-          <input class="compact-input" id="wizardPassConfirm" type="password" autocomplete="new-password" placeholder="再次输入同一口令..." />
+          <label class="form-label" for="wizardPassConfirm" data-i18n="wizard.passConfirmLabel">再次确认口令</label>
+          <input class="compact-input" id="wizardPassConfirm" type="password" autocomplete="new-password" placeholder="再次输入同一口令..." data-i18n-placeholder="wizard.passConfirmPlaceholder" />
           <div class="wizard-field-hint" id="wizardPassMatchHint"></div>
         </div>
 
@@ -321,10 +327,10 @@
 
         <div class="wizard-foot">
           <div class="wizard-foot-left">
-            <button class="btn btn-sm" id="btnWizardRecheck" type="button">重新检测</button>
-            <button class="btn btn-sm" id="btnWizardDoctor" type="button">环境诊断</button>
+            <button class="btn btn-sm" id="btnWizardRecheck" type="button" data-i18n="wizard.recheckBtn">重新检测</button>
+            <button class="btn btn-sm" id="btnWizardDoctor" type="button" data-i18n="wizard.doctorBtn">环境诊断</button>
           </div>
-          <button class="btn btn-primary" id="btnWizardInit" type="submit">初始化并继续</button>
+          <button class="btn btn-primary" id="btnWizardInit" type="submit" data-i18n="wizard.initBtn">初始化并继续</button>
         </div>
       </form>
 
@@ -332,18 +338,18 @@
       <div class="wizard-body hidden" id="wizardStep2Pane">
         <div class="wizard-lead-head">
           <div>
-            <div class="wizard-lead-title">选择你的项目总管（Lead）</div>
-            <div class="wizard-lead-desc">在对话中由它制定计划，经你在审批卡片上点击确认后派发任务；系统会自动为你配好独立执行者（Worker）。选择本机 AI CLI 作为 Lead 时，将自动开启本机 CLI Lead 调度（<span class="mono">lead.vendor_leads</span>）。</div>
+            <div class="wizard-lead-title" data-i18n="wizard.leadTitle">选择你的项目总管（Lead）</div>
+            <div class="wizard-lead-desc"><span data-i18n="wizard.leadDescPre">在对话中由它制定计划，经你在审批卡片上点击确认后派发任务；系统会自动为你配好独立执行者（Worker）。选择本机 AI CLI 作为 Lead 时，将自动开启本机 CLI Lead 调度（</span><span class="mono">lead.vendor_leads</span><span data-i18n="wizard.leadDescPost">）。</span></div>
           </div>
-          <button class="btn btn-sm" id="btnWizardRescanClis" type="button">重新扫描</button>
+          <button class="btn btn-sm" id="btnWizardRescanClis" type="button" data-i18n="wizard.rescanBtn">重新扫描</button>
         </div>
 
         <div class="wizard-cli-list" id="wizardCliList"></div>
         <div class="wizard-error hidden" id="wizardStep2Error"></div>
 
         <div class="wizard-foot">
-          <button class="btn btn-sm btn-ghost hidden" id="btnWizardSkip" type="button">跳过，稍后配置</button>
-          <button class="btn btn-primary" id="btnWizardFinish" type="button">开始对话</button>
+          <button class="btn btn-sm btn-ghost hidden" id="btnWizardSkip" type="button" data-i18n="wizard.skipBtn">跳过，稍后配置</button>
+          <button class="btn btn-primary" id="btnWizardFinish" type="button" data-i18n="wizard.finishBtn">开始对话</button>
         </div>
       </div>
     </div>
@@ -353,8 +359,8 @@
   <div class="modal-backdrop hidden" id="modalBackdrop">
     <div class="modal-panel" role="dialog" aria-modal="true">
       <div class="modal-head">
-        <span class="modal-title" id="modalTitle">详情</span>
-        <button class="icon-btn" id="btnModalClose" type="button" title="关闭">
+        <span class="modal-title" id="modalTitle" data-i18n="modal.defaultTitle">详情</span>
+        <button class="icon-btn" id="btnModalClose" type="button" title="关闭" data-i18n-title="modal.closeTitle">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M18 6 6 18M6 6l12 12"></path></svg>
         </button>
       </div>
@@ -367,8 +373,8 @@
   <div class="modal-backdrop confirm-modal-backdrop hidden" id="confirmModalBackdrop">
     <div class="modal-panel" role="alertdialog" aria-modal="true">
       <div class="modal-head">
-        <span class="modal-title" id="confirmModalTitle">确认操作</span>
-        <button class="icon-btn" id="btnConfirmModalClose" type="button" title="关闭">
+        <span class="modal-title" id="confirmModalTitle" data-i18n="confirmModal.defaultTitle">确认操作</span>
+        <button class="icon-btn" id="btnConfirmModalClose" type="button" title="关闭" data-i18n-title="modal.closeTitle">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M18 6 6 18M6 6l12 12"></path></svg>
         </button>
       </div>
@@ -377,6 +383,7 @@
     </div>
   </div>
 
+  <script src="i18n.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

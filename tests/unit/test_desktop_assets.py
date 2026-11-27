@@ -355,6 +355,65 @@ class TestDesktopStaticAssetsSmoke(unittest.TestCase):
         self.assertIn("easy_drag=False", app_src)
         self.assertIn("DesktopJsApi(bridge)", app_src)
 
+    def test_i18n_assets_completeness_and_dom_key_coverage(self) -> None:
+        assets_dir = REPO_ROOT / "mesh" / "desktop" / "assets"
+        i18n_path = assets_dir / "i18n.js"
+        self.assertTrue(i18n_path.is_file(), "mesh/desktop/assets/i18n.js must exist")
+        html = (assets_dir / "index.html").read_text(encoding="utf-8")
+        i18n_js = i18n_path.read_text(encoding="utf-8")
+        app_py = (REPO_ROOT / "mesh" / "desktop" / "app.py").read_text(encoding="utf-8")
+
+        # i18n.js is required in packaging and loaded before app.js
+        self.assertIn('"i18n.js"', app_py)
+        i18n_pos = html.find('<script src="i18n.js"></script>')
+        app_pos = html.find('<script src="app.js"></script>')
+        self.assertGreater(i18n_pos, 0, "index.html must include i18n.js")
+        self.assertLess(i18n_pos, app_pos, "i18n.js must load before app.js")
+
+        # Quick language switch buttons exist in titlebar and wizard
+        self.assertIn('id="btnQuickLang"', html)
+        self.assertIn('id="btnWizardLang"', html)
+
+        # Every data-i18n* key in index.html must exist in DOM_STRINGS with non-empty zh and en
+        html_keys = set(re.findall(r'data-i18n(?:-[a-z]+)?="([^"]+)"', html))
+        self.assertGreaterEqual(len(html_keys), 80)
+        dom_entries = {}
+        for m in re.finditer(
+            r'"([^"]+)"\s*:\s*\{\s*zh\s*:\s*(?:"((?:[^"\\]|\\.)*)"|\'((?:[^\'\\]|\\.)*)\')\s*,\s*en\s*:\s*(?:"((?:[^"\\]|\\.)*)"|\'((?:[^\'\\]|\\.)*)\')\s*\}',
+            i18n_js,
+            flags=re.DOTALL,
+        ):
+            zh_val = m.group(2) if m.group(2) is not None else m.group(3)
+            en_val = m.group(4) if m.group(4) is not None else m.group(5)
+            dom_entries[m.group(1)] = (zh_val, en_val)
+
+        missing = sorted(html_keys - set(dom_entries.keys()))
+        self.assertEqual(missing, [], f"Missing DOM_STRINGS keys in i18n.js: {missing}")
+        for key in html_keys:
+            zh_val, en_val = dom_entries[key]
+            self.assertTrue(zh_val.strip(), f"Empty zh string for {key}")
+            self.assertTrue(en_val.strip(), f"Empty en string for {key}")
+            if key not in ("titlebar.langBtn", "titlebar.langTitle"):
+                self.assertIsNone(
+                    re.search(r"[\u4e00-\u9fff]", en_val),
+                    f"Unexpected CJK in English value for {key}: {en_val!r}",
+                )
+
+        # Every non-comment line in index.html containing CJK must carry a data-i18n* attribute
+        untagged = []
+        for idx, line in enumerate(html.splitlines(), 1):
+            stripped = line.strip()
+            if stripped.startswith("<!--"):
+                continue
+            if re.search(r"[\u4e00-\u9fff]", line) and "data-i18n" not in line:
+                untagged.append((idx, stripped))
+        self.assertEqual(untagged, [], f"Untagged static CJK lines in index.html: {untagged}")
+
+        # applyToDom must never assign or read .innerHTML
+        self.assertIsNone(re.search(r"\.innerHTML\b", i18n_js))
+        self.assertNotIn("insertAdjacentHTML", i18n_js)
+        self.assertNotIn("outerHTML", i18n_js)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -91,7 +91,10 @@ class TestDesktopStateStore(unittest.TestCase):
 
             store_a = DesktopStateStore(home_a, path=state_path)
             self.assertIsNone(store_a.load_window_bounds())
-            self.assertEqual(store_a.load_prefs(), {"close_to_tray": True, "tray_hint_shown": False})
+            self.assertEqual(
+                store_a.load_prefs(),
+                {"close_to_tray": True, "tray_hint_shown": False, "language": "auto"},
+            )
 
             ok = store_a.save_window_bounds(x=120, y=80, width=1400, height=900, maximized=False)
             self.assertTrue(ok)
@@ -104,11 +107,20 @@ class TestDesktopStateStore(unittest.TestCase):
             prefs = store_a.update_prefs(
                 {"close_to_tray": False, "passphrase": "super-secret-value", "token": "tok_123"}
             )
-            self.assertEqual(prefs, {"close_to_tray": False, "tray_hint_shown": False})
+            self.assertEqual(
+                prefs,
+                {"close_to_tray": False, "tray_hint_shown": False, "language": "auto"},
+            )
+            prefs = store_a.update_prefs({"language": "en"})
+            self.assertEqual(prefs["language"], "en")
+            # Invalid language values must be ignored
+            prefs = store_a.update_prefs({"language": "secret-passphrase-123"})
+            self.assertEqual(prefs["language"], "en")
             raw_text = Path(state_path).read_text(encoding="utf-8")
             self.assertNotIn("super-secret-value", raw_text)
             self.assertNotIn("passphrase", raw_text)
             self.assertNotIn("tok_123", raw_text)
+            self.assertNotIn("secret-passphrase-123", raw_text)
 
             # Scoped per home
             store_b = DesktopStateStore(home_b, path=state_path)
@@ -252,6 +264,62 @@ class TestWindowsTrayAndSingleInstance(unittest.TestCase):
         self.assertFalse(g2.acquire())
         self.assertEqual(closed, [999])
         self.assertEqual(posted, [(777, WM_APP_ACTIVATE, 0, 0)])
+
+    def test_i18n_helpers_and_bilingual_tray_specs(self) -> None:
+        import re
+        from unittest import mock
+        from mesh.desktop.i18n import (
+            detect_system_language,
+            normalize_language_pref,
+            resolve_effective_language,
+            tr,
+        )
+
+        self.assertEqual(normalize_language_pref("en"), "en")
+        self.assertEqual(normalize_language_pref("en_US.UTF-8"), "en")
+        self.assertEqual(normalize_language_pref("zh"), "zh-CN")
+        self.assertEqual(normalize_language_pref("zh-TW"), "zh-CN")
+        self.assertEqual(normalize_language_pref("auto"), "auto")
+        self.assertIsNone(normalize_language_pref("invalid"))
+        self.assertIsNone(normalize_language_pref(123))
+
+        with mock.patch.dict(os.environ, {"MESH_UI_LANG": "en"}, clear=False):
+            self.assertEqual(detect_system_language(), "en")
+            self.assertEqual(resolve_effective_language("auto"), "en")
+            self.assertEqual(resolve_effective_language("zh-CN"), "zh-CN")
+        with mock.patch.dict(os.environ, {"MESH_UI_LANG": "zh-CN"}, clear=False):
+            self.assertEqual(detect_system_language(), "zh-CN")
+            self.assertEqual(resolve_effective_language("auto"), "zh-CN")
+            self.assertEqual(resolve_effective_language("en"), "en")
+
+        self.assertEqual(tr("en", "中文", "English"), "English")
+        self.assertEqual(tr("zh-CN", "中文", "English"), "中文")
+
+        # English tray tooltip and menu specs must have zero CJK and fit <= 126 chars
+        for status in (
+            {"connected": True, "auth_verified": True, "pid": 4321, "window_visible": True, "language": "en"},
+            {"connected": True, "auth_verified": False, "pid": 4321, "window_visible": False, "language": "en"},
+            {"connected": False, "auth_verified": False, "window_visible": False, "language": "en"},
+        ):
+            tip = format_tray_tooltip(status)
+            self.assertLessEqual(len(tip), 126)
+            self.assertIsNone(re.search(r"[\u4e00-\u9fff]", tip), f"CJK in EN tooltip: {tip!r}")
+            menu = build_tray_menu_spec(status)
+            for item in menu:
+                lbl = item.get("label", "")
+                self.assertIsNone(re.search(r"[\u4e00-\u9fff]", lbl), f"CJK in EN tray label: {lbl!r}")
+
+        en_menu_by_id = {
+            item["id"]: item
+            for item in build_tray_menu_spec(
+                {"connected": True, "auth_verified": True, "window_visible": True, "language": "en"}
+            )
+            if "id" in item
+        }
+        self.assertEqual(en_menu_by_id[CMD_TOGGLE_SHOW]["label"], "Hide Window")
+        self.assertEqual(en_menu_by_id[CMD_QUIT_ONLY]["label"], "Quit UI (Keep Daemon Running)")
+        self.assertIn("Quit", en_menu_by_id[CMD_QUIT_AND_STOP]["label"])
+        self.assertIn("Stop", en_menu_by_id[CMD_QUIT_AND_STOP]["label"])
 
 
 if __name__ == "__main__":

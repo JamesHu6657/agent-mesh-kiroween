@@ -526,6 +526,29 @@ class RunHandlerWinPortTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_workspace_delete_denied_parent_acl_raises_permission_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.realpath(tmp)
+            ws_root = os.path.join(home, "workspaces")
+            ws_dir = os.path.join(ws_root, "prj_1", "tasks", "tsk_1")
+            os.makedirs(ws_dir)
+            parent_dir = os.path.dirname(ws_dir)
+
+            with (
+                mock.patch.object(run_handler.sys, "platform", "win32"),
+                mock.patch.object(run_handler.os, "name", "nt"),
+                mock.patch.object(run_handler, "_validate_delete_target_ancestors", return_value=ws_dir),
+                mock.patch.object(run_handler, "make_owned_ancestors_writable", return_value=False),
+                mock.patch.object(run_handler._plat_perms, "_win_dir_has_owner_rw_acl", return_value=False),
+                mock.patch.object(run_handler, "rmtree_allow_readonly") as m_rmtree,
+            ):
+                with self.assertRaises(PermissionError) as cm:
+                    run_handler._delete_workspace_dir_impl(ws_dir, ws_dir, ws_root, "prj_1", "tsk_1", None)
+
+            self.assertEqual(cm.exception.errno, errno.EACCES)
+            self.assertEqual(cm.exception.filename, parent_dir)
+            m_rmtree.assert_not_called()
+
 
 class AdapterWinPortTests(unittest.TestCase):
     def test_vibe_redact_output_dir_removes_junctions_and_uses_platform_fs(self) -> None:

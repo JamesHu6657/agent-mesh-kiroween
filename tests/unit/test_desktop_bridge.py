@@ -2225,6 +2225,7 @@ class TestDesktopBridgeSecurityAndLifecycleRegressions(unittest.TestCase):
             client_factory=self.ctrl.make_client,
             subprocess_runner=fake_fail_run,
             push_enabled=False,
+            language="zh-CN",
         )
         self.addCleanup(bridge.close)
 
@@ -2238,6 +2239,14 @@ class TestDesktopBridgeSecurityAndLifecycleRegressions(unittest.TestCase):
         self.assertNotIn("mesh init", res_uninit["error"]["message"])
         self.assertIn("尚未初始化", res_uninit["error"]["message"])
         self.assertEqual(res_uninit["error"]["details"]["hint"], expected_hint)
+
+        # 1b. Switching language to English returns English hint
+        bridge.set_desktop_prefs({"language": "en"})
+        res_uninit_en = bridge.start_daemon()
+        self.assertFalse(res_uninit_en["ok"])
+        self.assertEqual(res_uninit_en["error"]["code"], "HOME_NOT_INITIALIZED")
+        self.assertIn("not initialized", res_uninit_en["error"]["message"])
+        self.assertIn(expected_hint, res_uninit_en["error"]["message"])
 
         # 2. When mesh.db exists, preserve the underlying CLI error unchanged
         with open(os.path.join(self.home, "mesh.db"), "wb") as fp:
@@ -5101,6 +5110,69 @@ class TestDesktopBridgeBatch3S4S6Tray(unittest.TestCase):
         self.assertTrue(quit_stop_res["ok"], quit_stop_res)
         self.assertTrue(quit_stop_res["data"]["daemon_stopped"])
         self.assertFalse(ctrl.online, "Explicit quit_app(True) should stop meshd via RPC")
+
+    def test_desktop_language_prefs_and_english_bridge_messages(self) -> None:
+        import re
+        from mesh.desktop.state import DesktopStateStore
+
+        state_path = os.path.join(self.tmp, "lang_state.json")
+        store = DesktopStateStore(self.home, path=state_path)
+        ctrl = _FakeDaemonController()
+        bridge = DesktopBridge(
+            home=self.home,
+            client_factory=ctrl.make_client,
+            push_enabled=False,
+            state_store=store,
+            language="zh-CN",
+        )
+        self.addCleanup(bridge.close)
+
+        class _FakeTray:
+            def __init__(self) -> None:
+                self.active = True
+                self.statuses: List[Dict[str, Any]] = []
+
+            def update_status(self, st: Dict[str, Any]) -> None:
+                self.statuses.append(st)
+
+            def stop(self) -> None:
+                self.active = False
+
+        tray = _FakeTray()
+        bridge.attach_tray(tray)
+
+        # Default explicit zh-CN override
+        prefs0 = bridge.desktop_prefs()
+        self.assertTrue(prefs0["ok"])
+        self.assertEqual(prefs0["data"]["effective_language"], "zh-CN")
+        self.assertEqual(bridge.tray_status_snapshot()["language"], "zh-CN")
+
+        # Switching to English persists and notifies tray
+        set_en = bridge.set_desktop_prefs({"language": "en"})
+        self.assertTrue(set_en["ok"], set_en)
+        self.assertEqual(set_en["data"]["language"], "en")
+        self.assertEqual(set_en["data"]["effective_language"], "en")
+        self.assertEqual(store.load_prefs()["language"], "en")
+        self.assertEqual(bridge.tray_status_snapshot()["language"], "en")
+        self.assertTrue(any(st.get("language") == "en" for st in tray.statuses))
+
+        # Invalid language value is rejected with English error message
+        bad_lang = bridge.set_desktop_prefs({"language": "klingon"})
+        self.assertFalse(bad_lang["ok"])
+        self.assertIsNone(re.search(r"[\u4e00-\u9fff]", bad_lang["error"]["message"]))
+
+        # English validation messages from initialize_home, inspect_repo_folder, and call()
+        short_pw = bridge.initialize_home("short")
+        self.assertFalse(short_pw["ok"])
+        self.assertIsNone(re.search(r"[\u4e00-\u9fff]", short_pw["error"]["message"]))
+
+        bad_repo = bridge.inspect_repo_folder("")
+        self.assertFalse(bad_repo["ok"])
+        self.assertIsNone(re.search(r"[\u4e00-\u9fff]", bad_repo["error"]["message"]))
+
+        bad_method = bridge.call("not.allowed", {})
+        self.assertFalse(bad_method["ok"])
+        self.assertIsNone(re.search(r"[\u4e00-\u9fff]", bad_method["error"]["message"]))
 
 
 if __name__ == "__main__":

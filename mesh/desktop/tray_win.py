@@ -109,20 +109,29 @@ def resolve_app_icon_path() -> Optional[str]:
     return None
 
 
+def _is_tray_en(status: Dict[str, Any]) -> bool:
+    lang = status.get("language")
+    return isinstance(lang, str) and lang.strip().lower().startswith("en")
+
+
 def format_tray_tooltip(status: Dict[str, Any]) -> str:
     """Build a concise Win32 tray tooltip (<= 127 chars) reflecting daemon & auth state."""
     connected = bool(status.get("connected"))
     starting = bool(status.get("daemon_starting"))
     stopping = bool(status.get("daemon_stopping"))
     auth_verified = bool(status.get("auth_verified"))
+    is_en = _is_tray_en(status)
     if starting:
-        tip = "Agent Mesh — 正在启动后台服务..."
+        tip = "Agent Mesh — Starting daemon..." if is_en else "Agent Mesh — 正在启动后台服务..."
     elif stopping:
-        tip = "Agent Mesh — 后台服务正在停止..."
+        tip = "Agent Mesh — Stopping daemon..." if is_en else "Agent Mesh — 后台服务正在停止..."
     elif connected:
-        tip = "Agent Mesh — 后台运行中（已解锁）" if auth_verified else "Agent Mesh — 后台运行中（未解锁）"
+        if is_en:
+            tip = "Agent Mesh — Running (Unlocked)" if auth_verified else "Agent Mesh — Running (Locked)"
+        else:
+            tip = "Agent Mesh — 后台运行中（已解锁）" if auth_verified else "Agent Mesh — 后台运行中（未解锁）"
     else:
-        tip = "Agent Mesh — 后台服务已断开"
+        tip = "Agent Mesh — Daemon disconnected" if is_en else "Agent Mesh — 后台服务已断开"
     return tip[:126]
 
 
@@ -134,17 +143,22 @@ def build_tray_menu_spec(status: Dict[str, Any]) -> List[Dict[str, Any]]:
     auth_verified = bool(status.get("auth_verified"))
     window_visible = bool(status.get("window_visible", True))
     pid = status.get("pid")
+    is_en = _is_tray_en(status)
 
     if starting:
-        status_label = "后台服务: 正在启动..."
+        status_label = "Daemon: Starting..." if is_en else "后台服务: 正在启动..."
     elif stopping:
-        status_label = "后台服务: 正在停止..."
+        status_label = "Daemon: Stopping..." if is_en else "后台服务: 正在停止..."
     elif connected:
         pid_part = f" (PID {pid})" if pid else ""
-        auth_part = "已解锁" if auth_verified else "未解锁"
-        status_label = f"后台服务: 运行中{pid_part} · {auth_part}"
+        if is_en:
+            auth_part = "Unlocked" if auth_verified else "Locked"
+            status_label = f"Daemon: Running{pid_part} · {auth_part}"
+        else:
+            auth_part = "已解锁" if auth_verified else "未解锁"
+            status_label = f"后台服务: 运行中{pid_part} · {auth_part}"
     else:
-        status_label = "后台服务: 未连接"
+        status_label = "Daemon: Disconnected" if is_en else "后台服务: 未连接"
 
     items: List[Dict[str, Any]] = [
         {"kind": "item", "id": CMD_STATUS, "label": status_label, "enabled": False},
@@ -152,13 +166,17 @@ def build_tray_menu_spec(status: Dict[str, Any]) -> List[Dict[str, Any]]:
         {
             "kind": "item",
             "id": CMD_TOGGLE_SHOW,
-            "label": "隐藏主窗口" if window_visible else "显示主窗口",
+            "label": (
+                ("Hide Window" if window_visible else "Show Window")
+                if is_en
+                else ("隐藏主窗口" if window_visible else "显示主窗口")
+            ),
             "enabled": True,
         },
         {
             "kind": "item",
             "id": CMD_LOCK,
-            "label": "锁定工作台（清除内存口令）",
+            "label": "Lock Workspace (Clear Passphrase)" if is_en else "锁定工作台（清除内存口令）",
             "enabled": auth_verified,
         },
         {"kind": "separator"},
@@ -169,7 +187,7 @@ def build_tray_menu_spec(status: Dict[str, Any]) -> List[Dict[str, Any]]:
             {
                 "kind": "item",
                 "id": CMD_STOP_DAEMON,
-                "label": "停止后台服务 (meshd)",
+                "label": "Stop Daemon (meshd)" if is_en else "停止后台服务 (meshd)",
                 "enabled": auth_verified,
             }
         )
@@ -178,7 +196,7 @@ def build_tray_menu_spec(status: Dict[str, Any]) -> List[Dict[str, Any]]:
             {
                 "kind": "item",
                 "id": CMD_START_DAEMON,
-                "label": "启动后台服务 (meshd)",
+                "label": "Start Daemon (meshd)" if is_en else "启动后台服务 (meshd)",
                 "enabled": not starting and not stopping,
             }
         )
@@ -189,13 +207,13 @@ def build_tray_menu_spec(status: Dict[str, Any]) -> List[Dict[str, Any]]:
             {
                 "kind": "item",
                 "id": CMD_QUIT_ONLY,
-                "label": "退出界面（保持后台服务运行）",
+                "label": "Quit UI (Keep Daemon Running)" if is_en else "退出界面（保持后台服务运行）",
                 "enabled": True,
             },
             {
                 "kind": "item",
                 "id": CMD_QUIT_AND_STOP,
-                "label": "退出并停止后台服务",
+                "label": "Quit and Stop Daemon" if is_en else "退出并停止后台服务",
                 "enabled": bool(connected and auth_verified),
             },
         ]
@@ -372,7 +390,14 @@ class WindowsTrayController:
         self._hicon: Any = None
         self._icon_owned = False
         self._taskbar_created_msg: int = 0
-        self._pending_tip: str = format_tray_tooltip({})
+        init_status: Dict[str, Any] = {}
+        try:
+            st = self._get_status()
+            if isinstance(st, dict):
+                init_status = st
+        except Exception:
+            init_status = {}
+        self._pending_tip: str = format_tray_tooltip(init_status)
         self._pending_balloon: Optional[tuple[str, str]] = None
         self._user32: Any = None
         self._shell32: Any = None

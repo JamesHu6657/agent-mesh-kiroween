@@ -2,6 +2,238 @@
   "use strict";
 
   // =========================================================================
+  // i18n Wiring (zh-CN / en, loaded via i18n.js in browser or require in Node)
+  // =========================================================================
+  const I18N =
+    typeof window !== "undefined" && window.MeshI18n
+      ? window.MeshI18n
+      : typeof module !== "undefined" && typeof require === "function"
+        ? require("./i18n.js")
+        : null;
+
+  function getLanguagePref() {
+    return I18N ? I18N.getPref() : "auto";
+  }
+
+  function getLanguage() {
+    return I18N ? I18N.getLang() : "zh-CN";
+  }
+
+  function isEnglish() {
+    return I18N ? I18N.isEn() : false;
+  }
+
+  function tr(zh, en) {
+    return I18N ? I18N.tr(zh, en) : zh;
+  }
+
+  let languageSyncSeq = 0;
+  let languageSyncPromise = Promise.resolve(true);
+
+  function notifyLanguageSyncFailure() {
+    if (typeof document === "undefined") return;
+    toast(tr(
+      "界面语言已切换，但同步到桌面后端失败；托盘语言可能不会更新",
+      "Interface language changed locally, but syncing to the desktop backend failed; tray language may not update"
+    ), "warn");
+  }
+
+  function trackLanguageSync(promise, syncSeq) {
+    languageSyncPromise = promise;
+    promise.then(ok => {
+      if (!ok && syncSeq === languageSyncSeq) notifyLanguageSyncFailure();
+    });
+  }
+
+  function applyI18nToDom() {
+    if (I18N && typeof document !== "undefined") {
+      I18N.applyToDom(document);
+      if (typeof document.querySelectorAll === "function") {
+        document.querySelectorAll("[data-i18n-title][data-orig-title]").forEach(el => {
+          el.removeAttribute("data-orig-title");
+        });
+      }
+    }
+  }
+
+  function getApprovalPolicyLabel(cat, fallbackLabel) {
+    if (isEnglish() && I18N && I18N.APPROVAL_POLICY_LABELS_EN && I18N.APPROVAL_POLICY_LABELS_EN[cat]) {
+      return I18N.APPROVAL_POLICY_LABELS_EN[cat];
+    }
+    return fallbackLabel || cat;
+  }
+
+  function getGateCategoryLabel(cat) {
+    if (isEnglish() && I18N && I18N.GATE_CATEGORY_LABELS_EN && I18N.GATE_CATEGORY_LABELS_EN[cat]) {
+      return I18N.GATE_CATEGORY_LABELS_EN[cat];
+    }
+    return GATE_CATEGORY_LABELS[cat] || cat || tr("审批门控", "Approval Gate");
+  }
+
+  function getPermissionModeMeta(mode) {
+    const key = mode || "plan";
+    if (isEnglish() && I18N && I18N.PERMISSION_MODE_META_EN && I18N.PERMISSION_MODE_META_EN[key]) {
+      return I18N.PERMISSION_MODE_META_EN[key];
+    }
+    return PERMISSION_MODE_META[key] || (isEnglish() && I18N ? I18N.PERMISSION_MODE_META_EN.plan : PERMISSION_MODE_META.plan);
+  }
+
+  function getTaskStateLabel(status) {
+    if (isEnglish() && I18N && I18N.TASK_STATE_LABELS_EN && I18N.TASK_STATE_LABELS_EN[status]) {
+      return I18N.TASK_STATE_LABELS_EN[status];
+    }
+    return TASK_STATE_LABELS[status] || status || "";
+  }
+
+  function getPlanStatusMeta(status) {
+    const base = PLAN_STATUS_META[status] || { label: status || "--", cls: "neutral" };
+    if (isEnglish() && I18N && I18N.PLAN_STATUS_LABELS_EN && I18N.PLAN_STATUS_LABELS_EN[status]) {
+      return { label: I18N.PLAN_STATUS_LABELS_EN[status], cls: base.cls };
+    }
+    return base;
+  }
+
+  function getErrorLabel(code) {
+    if (isEnglish() && I18N && I18N.ERROR_LABELS_EN && I18N.ERROR_LABELS_EN[code]) {
+      return I18N.ERROR_LABELS_EN[code];
+    }
+    return ERROR_LABELS[code] || "";
+  }
+
+  function getProfileLabel(profile) {
+    if (isEnglish() && I18N && I18N.PROFILE_LABELS_EN && I18N.PROFILE_LABELS_EN[profile]) {
+      return I18N.PROFILE_LABELS_EN[profile];
+    }
+    return PROFILE_LABELS[profile] || profile || "";
+  }
+
+  function getActivityKindLabel(kind) {
+    if (isEnglish() && I18N && I18N.ACTIVITY_KIND_LABELS_EN && I18N.ACTIVITY_KIND_LABELS_EN[kind]) {
+      return I18N.ACTIVITY_KIND_LABELS_EN[kind];
+    }
+    return ACTIVITY_KIND_LABELS[kind] || tr("工具", "Tool");
+  }
+
+  function getVendorAuthHint(adapterId) {
+    const base = VENDOR_AUTH_HINTS[adapterId] || null;
+    if (!base) return null;
+    if (isEnglish() && I18N && I18N.VENDOR_AUTH_HINTS_EN && I18N.VENDOR_AUTH_HINTS_EN[adapterId]) {
+      return Object.assign({}, base, I18N.VENDOR_AUTH_HINTS_EN[adapterId]);
+    }
+    return base;
+  }
+
+  function localizeAdapterModelNote(adapterId, rawNote) {
+    return I18N && typeof I18N.localizeAdapterModelNote === "function"
+      ? I18N.localizeAdapterModelNote(adapterId, rawNote)
+      : String(rawNote || "");
+  }
+
+  function localizeDaemonCardBody(apr, rawBody) {
+    return I18N && typeof I18N.localizeDaemonCardBody === "function"
+      ? I18N.localizeDaemonCardBody(apr, rawBody)
+      : String(rawBody || "");
+  }
+
+  function localizeDaemonMessage(msg) {
+    return I18N && typeof I18N.localizeDaemonMessage === "function"
+      ? I18N.localizeDaemonMessage(msg)
+      : String(msg || "");
+  }
+
+  function setLanguage(pref, { persist = true, syncBridge = true, rerender = true } = {}) {
+    if (I18N) {
+      I18N.setPref(pref, { persist });
+    }
+    const nextPref = getLanguagePref();
+    if (STATE && STATE.desktopPrefs) {
+      STATE.desktopPrefs.language = nextPref;
+      STATE.desktopPrefs.effective_language = getLanguage();
+    }
+    if (STATE && STATE.ui) {
+      STATE.ui.composerInlineNote = null;
+    }
+    applyI18nToDom();
+    const rerenderActiveUi = () => {
+      if (typeof document === "undefined") return;
+      updateWindowMaxButton(STATE.ui.windowMaximized);
+      renderAll({ forceSettings: true });
+      if (STATE.wizard && STATE.wizard.active) {
+        const passInp = $("wizardPassInput");
+        const confInp = $("wizardPassConfirm");
+        const lenHint = $("wizardPassLenHint");
+        const matchHint = $("wizardPassMatchHint");
+        if (passInp && lenHint) {
+          const n = passInp.value.length;
+          lenHint.textContent = tr(
+            `当前长度：${n} / 12${n >= 12 ? " ✓" : ""}`,
+            `Length: ${n} / 12${n >= 12 ? " ✓" : ""}`
+          );
+        }
+        if (passInp && confInp && matchHint) {
+          if (!confInp.value) {
+            matchHint.textContent = "";
+          } else if (passInp.value === confInp.value) {
+            matchHint.textContent = tr("口令一致 ✓", "Passphrases match ✓");
+          } else {
+            matchHint.textContent = tr("两次输入的口令不一致", "Passphrases do not match");
+          }
+        }
+      }
+    };
+    if (rerender) {
+      rerenderActiveUi();
+    }
+    if (syncBridge) {
+      const syncSeq = ++languageSyncSeq;
+      if (hasApi() && STATE.bridgeReady && typeof window.pywebview.api.set_desktop_prefs === "function") {
+        try {
+          const beforeEffective = getLanguage();
+          trackLanguageSync(
+            Promise.resolve(window.pywebview.api.set_desktop_prefs({ language: nextPref }))
+              .then(res => {
+                if (syncSeq !== languageSyncSeq) return true;
+                let synced = false;
+                if (res && res.ok && res.data) {
+                  synced = true;
+                  STATE.desktopPrefs = Object.assign({}, STATE.desktopPrefs, res.data);
+                  if (I18N && typeof I18N.setSystemLang === "function" && res.data.effective_language) {
+                    I18N.setSystemLang(res.data.effective_language);
+                  }
+                  if (getLanguage() !== beforeEffective) {
+                    applyI18nToDom();
+                    if (rerender) rerenderActiveUi();
+                  }
+                }
+                if (rerender) {
+                  if (STATE.wizard && STATE.wizard.active && STATE.wizard.step === 2) {
+                    scanWizardClis().catch(() => {});
+                  }
+                  if (STATE.ui.repoDrawerOpen && STATE.ui.repoInspection && STATE.ui.repoInspection.path) {
+                    handleInspectRepoPath(STATE.ui.repoInspection.path, { autoFillDefaults: false }).catch(() => {});
+                  }
+                }
+                return synced;
+              })
+              .catch(() => false),
+            syncSeq
+          );
+        } catch (_err) {
+          trackLanguageSync(Promise.resolve(false), syncSeq);
+        }
+      } else {
+        trackLanguageSync(Promise.resolve(false), syncSeq);
+      }
+    }
+    return getLanguage();
+  }
+
+  function toggleLanguage() {
+    const next = isEnglish() ? "zh-CN" : "en";
+    return setLanguage(next, { persist: true, syncBridge: true, rerender: true });
+  }
+
+  // =========================================================================
   // Constants & Authoritative Contracts
   // =========================================================================
   const ALL_TASK_STATES = [
@@ -249,6 +481,7 @@
       step: 1, // 1 = init passphrase, 2 = pick your lead
       skipped: false,
       scanningClis: false,
+      scanQueued: false,
       submitting: false,
       clis: [],
       cliModels: {},       // adapter_id -> string[] from adapter.models
@@ -535,10 +768,10 @@
     nowMs = Date.now()
   } = {}) {
     if (!approvalId) {
-      return { ok: false, reason: "missing_approval_id", message: "未找到审批卡片标识，请刷新后重试" };
+      return { ok: false, reason: "missing_approval_id", message: tr("未找到审批卡片标识，请刷新后重试", "Approval card ID not found — refresh and retry") };
     }
     if (recentlyResolvedApprovals.has(approvalId)) {
-      return { ok: false, reason: "recently_resolved", message: "该审批卡片已完成处理" };
+      return { ok: false, reason: "recently_resolved", message: tr("该审批卡片已完成处理", "This approval card has already been processed") };
     }
     if (surface && approvalSurfaceGuards[surface]) {
       const guard = approvalSurfaceGuards[surface];
@@ -547,7 +780,7 @@
           ok: false,
           reason: "layout_shift_guard",
           remainingMs: APPROVAL_SURFACE_SETTLE_MS - (nowMs - guard.changedAt),
-          message: "卡片列表刚刚变化，请核对内容后再次点击"
+          message: tr("卡片列表刚刚变化，请核对内容后再次点击", "Approval list just shifted — review the card and click again")
         };
       }
     }
@@ -555,25 +788,25 @@
     const effCategory = category || (hydrated && hydrated.category) || "";
     if (effCategory === "plan_dispatch") {
       if (!planHash) {
-        return { ok: false, reason: "missing_plan_hash", message: "审批按钮缺少计划校验摘要 (plan_hash)，请刷新后重试" };
+        return { ok: false, reason: "missing_plan_hash", message: tr("审批按钮缺少计划校验摘要 (plan_hash)，请刷新后重试", "Approval button is missing plan digest (plan_hash) — refresh and retry") };
       }
       const matchedPlan = STATE.plans.find(p => p && p.approval_id === approvalId) ||
         Object.values(STATE.chatPlansById).find(p => p && p.approval_id === approvalId) || null;
       const livePlanHash = (matchedPlan && matchedPlan.plan_hash) || (hydrated && hydrated.plan_hash) || "";
       if (livePlanHash && livePlanHash !== planHash) {
-        return { ok: false, reason: "plan_hash_mismatch", message: "计划内容已变化，请核对最新计划卡片后再操作" };
+        return { ok: false, reason: "plan_hash_mismatch", message: tr("计划内容已变化，请核对最新计划卡片后再操作", "Plan content changed — review the latest plan card before deciding") };
       }
     } else {
       if (!opHash) {
-        return { ok: false, reason: "missing_op_hash", message: "审批按钮缺少校验摘要 (op_hash)，请刷新后重试" };
+        return { ok: false, reason: "missing_op_hash", message: tr("审批按钮缺少校验摘要 (op_hash)，请刷新后重试", "Approval button is missing verification digest (op_hash) — refresh and retry") };
       }
       const liveOpHash = (hydrated && hydrated.op_hash) || "";
       if (liveOpHash && liveOpHash !== opHash) {
-        return { ok: false, reason: "op_hash_mismatch", message: "审批载荷已变化，请刷新核对后再操作" };
+        return { ok: false, reason: "op_hash_mismatch", message: tr("审批载荷已变化，请刷新核对后再操作", "Approval payload changed — refresh and review before deciding") };
       }
     }
     if (hydrated && Array.isArray(hydrated.available_actions) && action && !hydrated.available_actions.includes(action)) {
-      return { ok: false, reason: "action_not_available", message: "该审批卡片状态已更新，当前操作已不可用" };
+      return { ok: false, reason: "action_not_available", message: tr("该审批卡片状态已更新，当前操作已不可用", "This approval card status changed; this action is no longer available") };
     }
     return { ok: true, reason: null, message: "" };
   }
@@ -585,7 +818,7 @@
     if (existing && existing.timer && typeof window !== "undefined") {
       window.clearTimeout(existing.timer);
     }
-    const statusLabel = label || (action === "reject" ? "已拒绝" : "已允许");
+    const statusLabel = label || (action === "reject" ? tr("已拒绝", "Rejected") : tr("已允许", "Allowed"));
     const entry = {
       id: aid,
       apr: Object.assign({}, apr),
@@ -812,7 +1045,7 @@
   }
 
   function hasApi() {
-    return Boolean(window.pywebview && window.pywebview.api);
+    return Boolean(typeof window !== "undefined" && window && window.pywebview && window.pywebview.api);
   }
 
   function canMutate() {
@@ -820,29 +1053,29 @@
   }
 
   function disabledReason() {
-    if (!STATE.bridgeReady) return "桌面桥接尚未就绪";
-    if (!STATE.connected) return "后台服务已断开 — 只读模式下无法修改";
-    if (!STATE.auth.auth_verified) return "请先输入口令解锁";
+    if (!STATE.bridgeReady) return tr("桌面桥接尚未就绪", "Desktop bridge is not ready yet");
+    if (!STATE.connected) return tr("后台服务已断开 — 只读模式下无法修改", "Daemon disconnected — read-only mode");
+    if (!STATE.auth.auth_verified) return tr("请先输入口令解锁", "Enter your passphrase to unlock first");
     return "";
   }
 
   function formatErrorMessage(err) {
-    if (!err) return "发生未知错误";
+    if (!err) return tr("发生未知错误", "An unknown error occurred");
     const code = err.code || "INTERNAL_ERROR";
     if (code === "INVALID_TRANSITION" && err.details && err.details.reason === "task_terminal") {
       const ts = err.details.task_status;
-      const tsLabel = ts ? (TASK_STATE_LABELS[ts] || (ts === "missing" ? "不存在" : ts)) : "已终止";
-      return `关联任务已终止（${tsLabel}），无法批准该失效的审批卡片`;
+      const tsLabel = ts ? (getTaskStateLabel(ts) || (ts === "missing" ? tr("不存在", "missing") : ts)) : tr("已终止", "terminated");
+      return tr(`关联任务已终止（${tsLabel}），无法批准该失效的审批卡片`, `Linked task is terminal (${tsLabel}); cannot approve this stale card`);
     }
     if (code === "INVALID_TRANSITION" && err.details && err.details.reason === "task_progressed") {
       const ts = err.details.task_status;
-      const tsLabel = ts ? (TASK_STATE_LABELS[ts] || ts) : "后续阶段";
-      return `关联任务已推进至「${tsLabel}」阶段，该审批卡片已过时失效`;
+      const tsLabel = ts ? (getTaskStateLabel(ts) || ts) : tr("后续阶段", "a later stage");
+      return tr(`关联任务已推进至「${tsLabel}」阶段，该审批卡片已过时失效`, `Linked task already progressed to "${tsLabel}"; this approval card is stale`);
     }
-    const hint = ERROR_LABELS[code];
-    const raw = err.message || "";
+    const hint = getErrorLabel(code);
+    const raw = localizeDaemonMessage(err.message || "");
     if (hint && raw && !raw.includes(hint)) {
-      return `${hint}：${raw}`;
+      return isEnglish() ? `${hint}: ${raw}` : `${hint}：${raw}`;
     }
     return hint || raw || code;
   }
@@ -868,14 +1101,14 @@
     const ms = Date.parse(isoStr);
     if (Number.isNaN(ms)) return String(isoStr).slice(0, 16);
     const d = new Date(ms);
-    return d.toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit" });
+    return d.toLocaleTimeString(isEnglish() ? "en-US" : "zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit" });
   }
 
   function formatDateTime(isoStr) {
     if (!isoStr) return "--";
     const ms = Date.parse(isoStr);
     if (Number.isNaN(ms)) return String(isoStr);
-    return new Date(ms).toLocaleString("zh-CN", { hour12: false });
+    return new Date(ms).toLocaleString(isEnglish() ? "en-US" : "zh-CN", { hour12: false });
   }
 
   function formatDuration(secTotal) {
@@ -1037,18 +1270,19 @@
       counts[k] += 1;
     });
     const parts = [];
-    if (counts.read) parts.push(`读取 ${counts.read} 项`);
-    if (counts.edit) parts.push(`编辑 ${counts.edit} 处`);
-    if (counts.command) parts.push(`执行 ${counts.command} 条命令`);
-    if (counts.search) parts.push(`搜索 ${counts.search} 次`);
-    if (counts["mesh-action"]) parts.push(`${counts["mesh-action"]} 个协调动作`);
-    if (counts.thought) parts.push(`${counts.thought} 条思考`);
-    if (counts.other) parts.push(`${counts.other} 个工具调用`);
+    if (counts.read) parts.push(tr(`读取 ${counts.read} 项`, `${counts.read} read${counts.read === 1 ? "" : "s"}`));
+    if (counts.edit) parts.push(tr(`编辑 ${counts.edit} 处`, `${counts.edit} edit${counts.edit === 1 ? "" : "s"}`));
+    if (counts.command) parts.push(tr(`执行 ${counts.command} 条命令`, `${counts.command} command${counts.command === 1 ? "" : "s"}`));
+    if (counts.search) parts.push(tr(`搜索 ${counts.search} 次`, `${counts.search} search${counts.search === 1 ? "" : "es"}`));
+    if (counts["mesh-action"]) parts.push(tr(`${counts["mesh-action"]} 个协调动作`, `${counts["mesh-action"]} mesh action${counts["mesh-action"] === 1 ? "" : "s"}`));
+    if (counts.thought) parts.push(tr(`${counts.thought} 条思考`, `${counts.thought} thought${counts.thought === 1 ? "" : "s"}`));
+    if (counts.other) parts.push(tr(`${counts.other} 个工具调用`, `${counts.other} tool call${counts.other === 1 ? "" : "s"}`));
     return parts.join(" · ");
   }
 
   function renderGroupedActivityHtml(rawText, detailsPrefix, { emptyText = "(暂无输出)", showRawToggle = true } = {}) {
     const text = typeof rawText === "string" ? rawText : "";
+    const effEmptyText = emptyText === "(暂无输出)" ? tr("(暂无输出)", "(No output yet)") : emptyText;
     const optBag = arguments[2] && typeof arguments[2] === "object" ? arguments[2] : {};
     const structured = optBag.structuredActivity && typeof optBag.structuredActivity === "object" ? optBag.structuredActivity : null;
     const hasStructured = Boolean(structured && Array.isArray(structured.entries) && structured.entries.length > 0);
@@ -1057,10 +1291,10 @@
     const mode = STATE.ui.logViewMode === "raw" ? "raw" : "grouped";
     const toggleHtml = showRawToggle ? `
       <div class="activity-summary-head">
-        <span style="font-size:11.5px;color:var(--text-secondary);">${entries.length ? esc(summarizeActivityEntries(entries)) : "纯文本输出"}${isTruncated ? " · 已截断" : ""}</span>
+        <span style="font-size:11.5px;color:var(--text-secondary);">${entries.length ? esc(summarizeActivityEntries(entries)) : tr("纯文本输出", "Plain text output")}${isTruncated ? tr(" · 已截断", " · truncated") : ""}</span>
         <div class="segmented">
-          <button type="button" class="${mode === "grouped" ? "active" : ""}" data-log-view-mode="grouped">活动摘要</button>
-          <button type="button" class="${mode === "raw" ? "active" : ""}" data-log-view-mode="raw">原始日志 (Raw)</button>
+          <button type="button" class="${mode === "grouped" ? "active" : ""}" data-log-view-mode="grouped">${tr("活动摘要", "Activity")}</button>
+          <button type="button" class="${mode === "raw" ? "active" : ""}" data-log-view-mode="raw">${tr("原始日志 (Raw)", "Raw Log")}</button>
         </div>
       </div>` : "";
 
@@ -1068,17 +1302,17 @@
       return `
         <div class="activity-summary-box">
           ${toggleHtml}
-          <pre class="log-box" style="max-height:220px;">${esc(text || emptyText)}</pre>
+          <pre class="log-box" style="max-height:220px;">${esc(text || effEmptyText)}</pre>
         </div>`;
     }
 
     const summaryText = summarizeActivityEntries(entries);
     const rowsHtml = entries.map((en, idx) => {
-      const kLabel = ACTIVITY_KIND_LABELS[en.kind] || "工具";
+      const kLabel = getActivityKindLabel(en.kind);
       const label = en.target ? `${en.name}: ${en.target}` : en.name;
       const statusBadge = en.status === "error"
-        ? `<span class="status-pill red" style="margin-left:auto;font-size:10px;padding:0 5px;">错误</span>`
-        : (en.status === "running" ? `<span class="status-pill blue" style="margin-left:auto;font-size:10px;padding:0 5px;">运行中</span>` : "");
+        ? `<span class="status-pill red" style="margin-left:auto;font-size:10px;padding:0 5px;">${tr("错误", "Error")}</span>`
+        : (en.status === "running" ? `<span class="status-pill blue" style="margin-left:auto;font-size:10px;padding:0 5px;">${tr("运行中", "Running")}</span>` : "");
       return `
         <details class="activity-entry-details" data-details-key="${esc(detailsPrefix)}:e:${idx}">
           <summary>
@@ -1094,7 +1328,7 @@
       <div class="activity-summary-box">
         ${toggleHtml}
         <details class="activity-group-details" data-details-key="${esc(detailsPrefix)}:grp">
-          <summary>${esc(summaryText)}（共 ${entries.length} 步${isTruncated ? "，已按上限截断" : ""}，点击展开工具调用）</summary>
+          <summary>${esc(summaryText)}${tr(`（共 ${entries.length} 步${isTruncated ? "，已按上限截断" : ""}，点击展开工具调用）`, ` (${entries.length} step${entries.length === 1 ? "" : "s"}${isTruncated ? ", truncated at limit" : ""} — click to expand tool calls)`)}</summary>
           <div class="activity-entry-list">${rowsHtml}</div>
         </details>
       </div>`;
@@ -1170,7 +1404,7 @@
         const m = part.match(/^```([\w-]*)\n([\s\S]*?)```$/);
         const lang = (m && m[1]) || "code";
         const body = (m && m[2]) || "";
-        return `<div class="md-code-wrap"><div class="md-code-head"><span class="mono">${esc(lang)}</span><button class="btn btn-sm btn-ghost" type="button" data-copy-code="${esc(body)}">复制</button></div><pre class="md-code-pre mono">${esc(body)}</pre></div>`;
+        return `<div class="md-code-wrap"><div class="md-code-head"><span class="mono">${esc(lang)}</span><button class="btn btn-sm btn-ghost" type="button" data-copy-code="${esc(body)}">${tr("复制", "Copy")}</button></div><pre class="md-code-pre mono">${esc(body)}</pre></div>`;
       }
       const lines = part.split("\n");
       const out = [];
@@ -1226,7 +1460,7 @@
     }
     const btn = $("btnWinMax");
     if (!btn) return;
-    btn.title = maxed ? "还原窗口" : "最大化窗口";
+    btn.title = maxed ? tr("还原窗口", "Restore window") : tr("最大化窗口", "Maximize window");
     btn.innerHTML = maxed
       ? `<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="4" width="12" height="12" rx="2"></rect><path d="M5 9v9a2 2 0 0 0 2 2h9"></path></svg>`
       : `<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="14" height="14" rx="2"></rect></svg>`;
@@ -1250,7 +1484,7 @@
   // =========================================================================
   async function apiCall(method, params) {
     if (!hasApi()) {
-      return { ok: false, error: { code: "NO_BRIDGE", message: "未检测到桌面桥接环境" } };
+      return { ok: false, error: { code: "NO_BRIDGE", message: tr("未检测到桌面桥接环境", "Desktop bridge environment not detected") } };
     }
     try {
       const res = await window.pywebview.api.call(method, params || {});
@@ -1277,7 +1511,7 @@
           renderAll();
         }
       }
-      return res || { ok: false, error: { code: "EMPTY_RESPONSE", message: "空响应" } };
+      return res || { ok: false, error: { code: "EMPTY_RESPONSE", message: tr("空响应", "Empty response") } };
     } catch (err) {
       return { ok: false, error: { code: "BRIDGE_ERROR", message: String(err) } };
     }
@@ -1331,6 +1565,28 @@
         const prefRes = await window.pywebview.api.desktop_prefs();
         if (prefRes && prefRes.ok && prefRes.data) {
           STATE.desktopPrefs = Object.assign({}, STATE.desktopPrefs, prefRes.data);
+          const beforeEffective = getLanguage();
+          if (I18N && typeof I18N.setSystemLang === "function" && prefRes.data.effective_language) {
+            I18N.setSystemLang(prefRes.data.effective_language);
+          }
+          const localPref = getLanguagePref();
+          const remotePref = prefRes.data.language;
+          if (remotePref === "en" || remotePref === "zh-CN") {
+            if (localPref !== remotePref) {
+              setLanguage(remotePref, { persist: true, syncBridge: false, rerender: false });
+            }
+          } else if ((localPref === "en" || localPref === "zh-CN") && remotePref === "auto" && typeof window.pywebview.api.set_desktop_prefs === "function") {
+            const syncRes = await window.pywebview.api.set_desktop_prefs({ language: localPref });
+            if (syncRes && syncRes.ok && syncRes.data) {
+              STATE.desktopPrefs = Object.assign({}, STATE.desktopPrefs, syncRes.data);
+              if (I18N && typeof I18N.setSystemLang === "function" && syncRes.data.effective_language) {
+                I18N.setSystemLang(syncRes.data.effective_language);
+              }
+            }
+          }
+          if (getLanguage() !== beforeEffective) {
+            applyI18nToDom();
+          }
         }
       } catch (_) {
         // Keep defaults
@@ -1340,6 +1596,7 @@
 
   async function bootstrapBridge() {
     applyTheme(STATE.ui.theme);
+    applyI18nToDom();
     if (!hasApi()) {
       renderAll();
       return;
@@ -2729,7 +2986,7 @@
       if (latest.payload && latest.payload.message) return String(latest.payload.message);
       if (latest.reason) return String(latest.reason);
       if (latest.to_state) {
-        return TASK_STATE_LABELS[latest.to_state] || latest.to_state;
+        return getTaskStateLabel(latest.to_state) || latest.to_state;
       }
     }
     if (task.spec) return String(task.spec).replace(/\s+/g, " ").trim().slice(0, 72);
@@ -2776,7 +3033,7 @@
   }
 
   function formatApprovalOpJson(apr) {
-    if (!apr || apr.op_json === undefined || apr.op_json === null) return "(无载荷)";
+    if (!apr || apr.op_json === undefined || apr.op_json === null) return tr("(无载荷)", "(No payload)");
     if (typeof apr.op_json === "string") return apr.op_json;
     try {
       return JSON.stringify(apr.op_json, null, 2);
@@ -2823,27 +3080,27 @@
     const run = resolveRunForTask(enriched.id, enriched.live_run);
     if (enriched.status === "running" && run && run.started_at) {
       const sec = (Date.now() - Date.parse(run.started_at)) / 1000;
-      return { text: formatDuration(sec), isLive: true, startIso: run.started_at, tip: `开始于 ${formatDateTime(run.started_at)}` };
+      return { text: formatDuration(sec), isLive: true, startIso: run.started_at, tip: tr(`开始于 ${formatDateTime(run.started_at)}`, `Started at ${formatDateTime(run.started_at)}`) };
     }
     if (run && run.started_at && run.ended_at) {
       const sec = (Date.parse(run.ended_at) - Date.parse(run.started_at)) / 1000;
-      return { text: formatDuration(sec), isLive: false, startIso: null, tip: `耗时 ${formatDuration(sec)}` };
+      return { text: formatDuration(sec), isLive: false, startIso: null, tip: tr(`耗时 ${formatDuration(sec)}`, `Duration ${formatDuration(sec)}`) };
     }
-    return { text: "--", isLive: false, startIso: null, tip: "尚无运行记录" };
+    return { text: "--", isLive: false, startIso: null, tip: tr("尚无运行记录", "No runs yet") };
   }
 
   function deriveOriginFromEvent(ev, fallbackActor) {
     if (!ev) {
-      return { kind: "direct", short: "桌面端", tip: `actor=${fallbackActor || "--"}` };
+      return { kind: "direct", short: tr("桌面端", "Desktop"), tip: `actor=${fallbackActor || "--"}` };
     }
     if (ev.via === "relayed") {
-      const who = ev.relayed_by || "外部转发";
+      const who = ev.relayed_by || tr("外部转发", "External relay");
       return { kind: "relayed", short: who, tip: `via=relayed · relayed_by=${who}` };
     }
     if (ev.via === "token" || ev.via === "run_token") {
       return { kind: "token", short: "Lead", tip: `via=${ev.via} · actor=${ev.actor_id || "--"}` };
     }
-    return { kind: "direct", short: "桌面端", tip: `via=${ev.via || "direct"} · actor=${ev.actor_id || "--"}` };
+    return { kind: "direct", short: tr("桌面端", "Desktop"), tip: `via=${ev.via || "direct"} · actor=${ev.actor_id || "--"}` };
   }
 
   function getStatusDotClass(enriched) {
@@ -2856,8 +3113,8 @@
   }
 
   function getTaskHumanStatus(enriched) {
-    if (enriched.pending_approval) return "待你确认";
-    return TASK_STATE_LABELS[enriched.status] || enriched.status;
+    if (enriched.pending_approval) return tr("待你确认", "Needs approval");
+    return getTaskStateLabel(enriched.status) || enriched.status;
   }
 
   function taskGroupKey(enriched) {
@@ -2870,27 +3127,27 @@
   function getLeadEligibility(agent, activeProjectId) {
     const reasons = [];
     let warn = null;
-    if (!agent.can_lead) reasons.push("未开启 Lead 资格");
-    if (agent.disabled) reasons.push("Agent 已禁用");
+    if (!agent.can_lead) reasons.push(tr("未开启 Lead 资格", "Lead capability is disabled"));
+    if (agent.disabled) reasons.push(tr("Agent 已禁用", "Agent is disabled"));
 
     if (agent.delivery === "launch") {
       if (!STATE.config["lead.vendor_leads"]) {
-        reasons.push("未开启本地 CLI Lead（lead.vendor_leads=false）");
+        reasons.push(tr("未开启本地 CLI Lead（lead.vendor_leads=false）", "Local CLI Leads disabled (lead.vendor_leads=false)"));
       }
       const adapter = STATE.adapters.find(a => a.id === agent.adapter);
       if (adapter) {
-        if (adapter.status === "not_installed") reasons.push("本机未安装该工具");
-        else if (adapter.status === "error" || adapter.status === "unverified") reasons.push(`工具状态异常 (${adapter.status})`);
+        if (adapter.status === "not_installed") reasons.push(tr("本机未安装该工具", "Tool not installed locally"));
+        else if (adapter.status === "error" || adapter.status === "unverified") reasons.push(tr(`工具状态异常 (${adapter.status})`, `Tool status issue (${adapter.status})`));
         if (adapter.launch_reason === "launch_held") {
-          reasons.push(`工具处于暂停阶段 (${adapter.launch_milestone || "M5"})`);
+          reasons.push(tr(`工具处于暂停阶段 (${adapter.launch_milestone || "M5"})`, `Tool on launch hold (${adapter.launch_milestone || "M5"})`));
         } else if (!adapter.launch_enabled) {
-          reasons.push(`工具暂不可启动 (${adapter.launch_reason || "--"})`);
+          reasons.push(tr(`工具暂不可启动 (${adapter.launch_reason || "--"})`, `Tool cannot be launched (${adapter.launch_reason || "--"})`));
         } else if (adapter.status === "partially_verified") {
-          warn = "当前版本尚未经过内置冒烟校验，可正常使用";
+          warn = tr("当前版本尚未经过内置冒烟校验，可正常使用", "Version not yet smoke-verified, usable");
         }
       }
       if (agent.options && agent.options.binary_path) {
-        warn = "自定义 binary_path";
+        warn = tr("自定义 binary_path", "Custom binary_path");
       }
     }
 
@@ -2899,7 +3156,7 @@
         t => t.project_id === activeProjectId && t.assignee === agent.name &&
           !["merged", "cancelled"].includes(t.status) && !(t.status === "accepted" && (t.kind || "general") === "general")
       );
-      if (hasOpen) reasons.push("LEAD_HAS_TASKS: 该 Agent 在此项目中有未完成任务");
+      if (hasOpen) reasons.push(tr("LEAD_HAS_TASKS: 该 Agent 在此项目中有未完成任务", "LEAD_HAS_TASKS: Agent has unfinished tasks in this project"));
     }
 
     return { eligible: reasons.length === 0, reasons, warn };
@@ -2987,7 +3244,7 @@
   }
 
   function getProjectRowMeta(prj) {
-    const tr = STATE.sidebarTracker;
+    const tracker = STATE.sidebarTracker;
     const nowMs = Date.now();
     const pendingAprs = getApprovalsForProject(prj.id).filter(a => a.status === "pending" && isApprovalActionableForProject(a, prj));
     const activeRuns = getActiveRunsForProject(prj.id);
@@ -2995,37 +3252,41 @@
     const isCur = prj.id === STATE.activeProjectId && !STATE.ui.draftNewChat;
     const hasFailedTask = isCur && STATE.tasks.some(t => ["failed", "escalated", "merge_failed"].includes(t.status));
     const hasLeadFailure = Boolean(STATE.leadFailureByProject[prj.id]);
-    const inGrace = Boolean(tr.graceUntil[prj.id] && nowMs < tr.graceUntil[prj.id]);
+    const inGrace = Boolean(tracker.graceUntil[prj.id] && nowMs < tracker.graceUntil[prj.id]);
     const isWorking = activeRuns.length > 0 || (isCur && Boolean(STATE.activeLeadRun)) || inGrace;
-    const returnedAt = tr.returnedAt[prj.id] || 0;
+    const returnedAt = tracker.returnedAt[prj.id] || 0;
     const isRecentlyFinished = !isWorking && returnedAt > 0 && pendingAprs.length === 0 && !hasFailedTask && !hasLeadFailure;
 
     let dotCls = "dot-neutral";
-    let preview = prj.lead ? `Lead：${prj.lead}` : "点击开始对话";
+    let preview = prj.lead ? tr(`Lead：${prj.lead}`, `Lead: ${prj.lead}`) : tr("点击开始对话", "Click to start chatting");
     let previewCls = "";
     let needsAttention = false;
 
     if (pendingAprs.length > 0) {
       const hasPlan = pendingAprs.some(a => a.category === "plan_dispatch");
       dotCls = "dot-amber";
-      preview = hasPlan ? "计划卡片待确认" : `有 ${pendingAprs.length} 项审批卡片待处理`;
+      preview = hasPlan
+        ? tr("计划卡片待确认", "Plan awaiting approval")
+        : tr(`有 ${pendingAprs.length} 项审批卡片待处理`, `${pendingAprs.length} approval${pendingAprs.length === 1 ? "" : "s"} pending`);
       previewCls = "is-attention";
       needsAttention = true;
     } else if (hasFailedTask || hasLeadFailure) {
       dotCls = "dot-red";
-      preview = hasLeadFailure ? "Lead 回合执行失败，需排查" : "有任务执行失败，需处理";
+      preview = hasLeadFailure
+        ? tr("Lead 回合执行失败，需排查", "Lead turn failed — needs attention")
+        : tr("有任务执行失败，需处理", "Task failed — needs attention");
       previewCls = "is-attention";
       needsAttention = true;
     } else if (isWorking) {
       const leadRun = activeRuns.find(r => r.kind === "lead_turn") || (isCur ? STATE.activeLeadRun : null);
       dotCls = "dot-green";
       preview = workerRuns.length > 0
-        ? `${workerRuns.length} 个 Worker 执行中…`
-        : (leadRun ? `${prj.lead || "Lead"} 正在规划与回复…` : "正在收尾…");
+        ? tr(`${workerRuns.length} 个 Worker 执行中…`, `${workerRuns.length} worker${workerRuns.length === 1 ? "" : "s"} running…`)
+        : (leadRun ? tr(`${prj.lead || "Lead"} 正在规划与回复…`, `${prj.lead || "Lead"} is planning & replying…`) : tr("正在收尾…", "Finishing up…"));
       previewCls = "is-active";
     } else if (isRecentlyFinished) {
       dotCls = "dot-green";
-      preview = "刚刚完成，点击查看结果";
+      preview = tr("刚刚完成，点击查看结果", "Just finished — click to inspect");
       previewCls = "is-active";
       needsAttention = true;
     } else if (isCur && STATE.chatMessages.length > 0) {
@@ -3065,7 +3326,7 @@
       pendingCount: pendingAprs.length,
       isRecentlyFinished,
       returnedAt,
-      sortTs: Math.max(updatedMs, latestRunMs, tr.workingSince[prj.id] || 0),
+      sortTs: Math.max(updatedMs, latestRunMs, tracker.workingSince[prj.id] || 0),
       timeText: formatClock(prj.updated_at || prj.created_at)
     };
   }
@@ -3113,8 +3374,17 @@
 
   async function scanWizardClis() {
     if (!hasApi() || typeof window.pywebview.api.detect_local_clis !== "function") return;
+    if (STATE.wizard.scanningClis) {
+      STATE.wizard.scanQueued = true;
+      return;
+    }
     STATE.wizard.scanningClis = true;
     renderWizard();
+    const restartIfQueued = () => {
+      if (!STATE.wizard.scanQueued) return;
+      STATE.wizard.scanQueued = false;
+      scanWizardClis().catch(() => {});
+    };
     try {
       const res = await window.pywebview.api.detect_local_clis();
       if (res && res.ok && res.data) {
@@ -3151,6 +3421,7 @@
           );
           renderWizard();
         }
+        restartIfQueued();
         return;
       }
     } catch (_) {
@@ -3158,6 +3429,7 @@
     }
     STATE.wizard.scanningClis = false;
     renderWizard();
+    restartIfQueued();
   }
 
   function renderWizard() {
@@ -3188,14 +3460,16 @@
     if (homeEl) {
       const hint = STATE.pipe.setup_hint || "mesh setup";
       homeEl.textContent = STATE.pipe.home
-        ? `数据目录：${STATE.pipe.home} · CLI 初始化：${hint}`
-        : `CLI 初始化：${hint}`;
+        ? tr(`数据目录：${STATE.pipe.home} · CLI 初始化：${hint}`, `Data dir: ${STATE.pipe.home} · CLI setup: ${hint}`)
+        : tr(`CLI 初始化：${hint}`, `CLI setup: ${hint}`);
     }
 
     const initBtn = $("btnWizardInit");
     if (initBtn) {
       initBtn.disabled = STATE.wizard.submitting;
-      initBtn.textContent = STATE.wizard.submitting ? "正在初始化并启动服务..." : "初始化并继续";
+      initBtn.textContent = STATE.wizard.submitting
+        ? tr("正在初始化并启动服务...", "Initializing & starting daemon...")
+        : tr("初始化并继续", "Initialize & Continue");
     }
 
     if (step !== 2) return;
@@ -3210,7 +3484,7 @@
     if (!listEl) return;
 
     if (STATE.wizard.scanningClis) {
-      listEl.innerHTML = `<div class="empty-state">正在扫描本机已安装的 AI CLI 工具（claude / codex / agy / droid / kiro / vibe）...</div>`;
+      listEl.innerHTML = `<div class="empty-state">${tr("正在扫描本机已安装的 AI CLI 工具（claude / codex / agy / droid / kiro / vibe）...", "Scanning installed local AI CLIs (claude / codex / agy / droid / kiro / vibe)...")}</div>`;
       if (finishBtn) finishBtn.disabled = true;
       return;
     }
@@ -3221,7 +3495,7 @@
 
     const cards = [];
     if (eligible.length) {
-      cards.push(`<div class="wizard-section-heading">已就绪的本机 AI CLI (${eligible.length})</div>`);
+      cards.push(`<div class="wizard-section-heading">${tr(`已就绪的本机 AI CLI (${eligible.length})`, `Ready Local AI CLIs (${eligible.length})`)}</div>`);
     }
     eligible.forEach(c => {
       const selected = STATE.wizard.selectedLeadCli === c.id;
@@ -3236,18 +3510,22 @@
       const chipsHtml = chipPool.length
         ? `<div class="model-chips-row">${chipPool.map(m => `<button class="model-chip ${curList.includes(m) ? "active" : ""}" type="button" data-wizard-model-chip="${esc(c.id)}" data-model="${esc(m)}">${esc(m)}</button>`).join("")}</div>`
         : "";
-      const noteText = (presets && presets.note) ? presets.note : (chipPool.length ? "点击上方模型标签选择，或直接输入模型 ID" : "请输入该 CLI 可用的模型 ID（例如官方模型名）");
-      const authHint = VENDOR_AUTH_HINTS[c.id];
+      const noteText = (presets && presets.note)
+        ? localizeAdapterModelNote(c.id, presets.note)
+        : (chipPool.length
+          ? tr("点击上方模型标签选择，或直接输入模型 ID", "Click a model chip above or type a model ID")
+          : tr("请输入该 CLI 可用的模型 ID（例如官方模型名）", "Enter an available model ID for this CLI"));
+      const authHint = getVendorAuthHint(c.id);
       const authStatus = (c.auth_status && typeof c.auth_status === "object") ? c.auth_status : null;
       const authState = authStatus ? authStatus.state : "unknown";
       const authDetail = (authStatus && authStatus.detail) ? authStatus.detail : "";
       const pillClass = selected ? "blue" : (authState === "needs_login" ? "amber" : "green");
       const pillLabel = selected
-        ? "已选为 Lead"
-        : (authState === "ready" ? "已登录就绪" : (authState === "needs_login" ? "需登录" : "已就绪"));
+        ? tr("已选为 Lead", "Selected Lead")
+        : (authState === "ready" ? tr("已登录就绪", "Signed In") : (authState === "needs_login" ? tr("需登录", "Sign-in Needed") : tr("已就绪", "Ready")));
       const showInlineLoginRow = Boolean(authHint && (selected || authState === "needs_login"));
       const loginHintHtml = showInlineLoginRow
-        ? `<div class="wizard-auth-cmd-row" style="margin-top:4px;"><span>${authState === "needs_login" ? "检测到尚未登录，请在终端执行：" : "如尚未登录，可在终端执行："}<code class="mono">${esc(authHint.login)}</code></span><button class="btn btn-sm btn-ghost" type="button" data-copy-code="${esc(authHint.login)}">复制登录命令</button></div>`
+        ? `<div class="wizard-auth-cmd-row" style="margin-top:4px;"><span>${authState === "needs_login" ? tr("检测到尚未登录，请在终端执行：", "Not signed in yet — run in terminal: ") : tr("如尚未登录，可在终端执行：", "If not signed in yet, run in terminal: ")}<code class="mono">${esc(authHint.login)}</code></span><button class="btn btn-sm btn-ghost" type="button" data-copy-code="${esc(authHint.login)}">${tr("复制登录命令", "Copy login cmd")}</button></div>`
         : "";
       cards.push(`
         <div class="wizard-cli-option ${selected ? "selected" : ""}" data-wizard-pick-cli="${esc(c.id)}">
@@ -3256,7 +3534,7 @@
               <span class="avatar avatar-row" style="background-color:${esc(color)};" aria-hidden="true">${esc(avatarInitials(c.id, "AI"))}</span>
               <div>
                 <div class="wizard-cli-name">${esc(c.id)} ${c.version ? `<span class="mono" style="font-size:11.5px;color:var(--text-muted);">v${esc(c.version)}</span>` : ""}</div>
-                <div class="wizard-cli-meta">Lead 只读规划 (<span class="mono">readonly</span>) · Worker 自动配好 (<span class="mono">${esc(workerProfile)}</span>)${authDetail ? ` · ${esc(authDetail)}` : ""}</div>
+                <div class="wizard-cli-meta">${tr("Lead 只读规划", "Read-only Lead")} (<span class="mono">readonly</span>) · ${tr("Worker 自动配好", "Auto-paired Worker")} (<span class="mono">${esc(workerProfile)}</span>)${authDetail ? ` · ${esc(authDetail)}` : ""}</div>
               </div>
             </div>
             <span class="status-pill ${pillClass}">${esc(pillLabel)}</span>
@@ -3264,8 +3542,8 @@
           ${(!selected && authState === "needs_login" && loginHintHtml) ? `<div style="margin-top:6px;">${loginHintHtml}</div>` : ""}
           ${selected ? `
             <div class="wizard-cli-model-row">
-              <label class="form-label" for="wizardModelInput_${esc(c.id)}">模型设置（可多选，逗号分隔）</label>
-              <input class="compact-input mono" id="wizardModelInput_${esc(c.id)}" data-wizard-model-input="${esc(c.id)}" type="text" value="${esc(modelVal)}" placeholder="输入可用模型 ID..." />
+              <label class="form-label" for="wizardModelInput_${esc(c.id)}">${tr("模型设置（可多选，逗号分隔）", "Allowed models (comma-separated)")}</label>
+              <input class="compact-input mono" id="wizardModelInput_${esc(c.id)}" data-wizard-model-input="${esc(c.id)}" type="text" value="${esc(modelVal)}" placeholder="${esc(tr("输入可用模型 ID...", "Enter model ID(s)..."))}" />
               ${chipsHtml}
               <div style="font-size:11.5px;color:var(--text-muted);">${esc(noteText)}</div>
               ${loginHintHtml}
@@ -3277,19 +3555,19 @@
       const inboxSel = STATE.wizard.selectedLeadCli === "__inbox__";
       cards.push(`
         <div class="wizard-info-box">
-          <strong>未在本机 PATH 中检测到已安装的 AI CLI</strong>
-          <p>请先在终端安装并登录任一 AI CLI 后点击「重新扫描」，或先启用收件箱模式进入对话（稍后在「AI 工具」中添加）。</p>
+          <strong>${tr("未在本机 PATH 中检测到已安装的 AI CLI", "No installed AI CLI detected on local PATH")}</strong>
+          <p>${tr("请先在终端安装并登录任一 AI CLI 后点击「重新扫描」，或先启用收件箱模式进入对话（稍后在「AI 工具」中添加）。", "Install and sign in to any AI CLI in your terminal and click \"Rescan\", or start with Inbox Lead mode and add CLIs later under \"AI Tools\".")}</p>
         </div>
         <div class="wizard-cli-option ${inboxSel ? "selected" : ""}" data-wizard-pick-cli="__inbox__">
           <div class="wizard-cli-top">
             <div class="wizard-cli-left">
               <span class="avatar avatar-row" style="background-color:#475569;" aria-hidden="true">IN</span>
               <div>
-                <div class="wizard-cli-name">内置收件箱协调模式（Inbox Lead）</div>
-                <div class="wizard-cli-meta">创建 <span class="mono">mesh-lead</span>（外部代理或脚本通过收件箱接入）</div>
+                <div class="wizard-cli-name">${tr("内置收件箱协调模式（Inbox Lead）", "Built-in Inbox Coordinator (Inbox Lead)")}</div>
+                <div class="wizard-cli-meta">${tr("创建", "Creates")} <span class="mono">mesh-lead</span> ${tr("（外部代理或脚本通过收件箱接入）", "(for external agents or scripts polling the inbox)")}</div>
               </div>
             </div>
-            <span class="status-pill ${inboxSel ? "blue" : "neutral"}">${inboxSel ? "已选择" : "可选"}</span>
+            <span class="status-pill ${inboxSel ? "blue" : "neutral"}">${inboxSel ? tr("已选择", "Selected") : tr("可选", "Available")}</span>
           </div>
         </div>`);
     }
@@ -3301,16 +3579,18 @@
       if (chosenObj) {
         const wProf = chosenObj.default_safe_profile || "edit";
         const otherReady = eligible.filter(c => c.id !== chosenId).map(c => `${c.id}-worker (${c.default_safe_profile || "edit"})`);
-        const extraTxt = otherReady.length ? `，并同步注册 ${otherReady.join("、")}` : "";
+        const extraTxt = otherReady.length
+          ? tr(`，并同步注册 ${otherReady.join("、")}`, `, plus ${otherReady.join(", ")}`)
+          : "";
         cards.push(`
           <div class="wizard-preview-box">
-            <strong>将为你创建：</strong><span class="mono">${esc(chosenId)}-lead (readonly)</span> + <span class="mono">${esc(chosenId)}-worker (${esc(wProf)})</span>${esc(extraTxt)}。Lead 与 Worker 角色分离，确保所有派发均受审批卡片保护。
+            <strong>${tr("将为你创建：", "Will create: ")}</strong><span class="mono">${esc(chosenId)}-lead (readonly)</span> + <span class="mono">${esc(chosenId)}-worker (${esc(wProf)})</span>${esc(extraTxt)}${tr("。Lead 与 Worker 角色分离，确保所有派发均受审批卡片保护。", ". Lead and Worker roles stay separated so all dispatches remain guarded by approval cards.")}
           </div>`);
       }
     } else if (chosenId === "__inbox__") {
       cards.push(`
         <div class="wizard-preview-box">
-          <strong>将为你创建：</strong><span class="mono">mesh-lead (inbox)</span>，用于接入外部代理或脚本协调。
+          <strong>${tr("将为你创建：", "Will create: ")}</strong><span class="mono">mesh-lead (inbox)</span>${tr("，用于接入外部代理或脚本协调。", " for external agent or script coordination.")}
         </div>`);
     }
 
@@ -3318,19 +3598,19 @@
     if (unavailable.length) {
       cards.push(`
         <details class="config-raw-details" ${!eligible.length ? "open" : ""}>
-          <summary>未安装或需登录的工具 (${esc(unavailable.length)} 项 · 点击复制安装 / 登录命令)</summary>
+          <summary>${tr(`未安装或需登录的工具 (${unavailable.length} 项 · 点击复制安装 / 登录命令)`, `Not installed / Unavailable CLIs (${unavailable.length} · click to copy install / login commands)`)}</summary>
           <div style="margin-top:8px;display:flex;flex-direction:column;gap:6px;">
             ${unavailable.map(c => {
-              const hint = VENDOR_AUTH_HINTS[c.id];
+              const hint = getVendorAuthHint(c.id);
               const cmd = hint ? hint.login : "";
               const inst = hint ? hint.install : "";
               return `
                 <div class="wizard-auth-cmd-row">
                   <div style="min-width:0;">
-                    <div><span class="mono" style="color:var(--text-primary);font-weight:600;">${esc(c.id)}</span> · <span style="color:var(--text-secondary);">${esc(c.ineligible_reason || "未安装 / 暂不可用")}</span></div>
-                    ${inst ? `<div style="font-size:11.5px;color:var(--text-muted);margin-top:2px;">安装：<code class="mono">${esc(inst)}</code>${cmd ? ` · 登录：<code class="mono">${esc(cmd)}</code>` : ""}</div>` : ""}
+                    <div><span class="mono" style="color:var(--text-primary);font-weight:600;">${esc(c.id)}</span> · <span style="color:var(--text-secondary);">${esc(c.ineligible_reason || tr("未安装 / 暂不可用", "Not installed / unavailable"))}</span></div>
+                    ${inst ? `<div style="font-size:11.5px;color:var(--text-muted);margin-top:2px;">${tr("安装：", "Install: ")}<code class="mono">${esc(inst)}</code>${cmd ? `${tr(" · 登录：", " · Login: ")}<code class="mono">${esc(cmd)}</code>` : ""}</div>` : ""}
                   </div>
-                  ${cmd ? `<button class="btn btn-sm btn-ghost" type="button" data-copy-code="${esc(cmd)}">复制登录</button>` : ""}
+                  ${cmd ? `<button class="btn btn-sm btn-ghost" type="button" data-copy-code="${esc(cmd)}">${tr("复制登录", "Copy login")}</button>` : ""}
                 </div>`;
             }).join("")}
           </div>
@@ -3340,7 +3620,9 @@
     listEl.innerHTML = cards.join("");
     if (finishBtn) {
       finishBtn.disabled = STATE.wizard.submitting || !STATE.wizard.selectedLeadCli;
-      finishBtn.textContent = STATE.wizard.submitting ? "正在配置 Lead 与 Worker..." : "开始对话";
+      finishBtn.textContent = STATE.wizard.submitting
+        ? tr("正在配置 Lead 与 Worker...", "Configuring Lead & Workers...")
+        : tr("开始对话", "Start Chatting");
     }
   }
 
@@ -3362,15 +3644,15 @@
     const confirmPw = confInp ? confInp.value : "";
 
     if (pw.length < 12) {
-      showErr("口令长度至少需要 12 个字符");
+      showErr(tr("口令长度至少需要 12 个字符", "Passphrase must be at least 12 characters long"));
       return;
     }
     if (pw !== confirmPw) {
-      showErr("两次输入的口令不一致，请检查后重试");
+      showErr(tr("两次输入的口令不一致，请检查后重试", "Passphrases do not match — please check and retry"));
       return;
     }
     if (!hasApi() || typeof window.pywebview.api.initialize_home !== "function") {
-      showErr("当前桌面桥接不支持图形化初始化");
+      showErr(tr("当前桌面桥接不支持图形化初始化", "Desktop bridge does not support graphical initialization"));
       return;
     }
 
@@ -3406,13 +3688,13 @@
       if (res.data && res.data.auth) STATE.auth = res.data.auth;
       STATE.pipe.home_initialized = true;
       await refreshConnectionAndAuth();
-      toast("初始化成功，后台服务已启动并解锁", "ok");
+      toast(tr("初始化成功，后台服务已启动并解锁", "Initialized — daemon started and workspace unlocked"), "ok");
       STATE.wizard.step = 2;
       renderWizard();
       await scanWizardClis();
     } catch (err) {
       STATE.wizard.submitting = false;
-      showErr(`初始化失败：${err && err.message ? err.message : String(err)}`);
+      showErr(tr(`初始化失败：${err && err.message ? err.message : String(err)}`, `Initialization failed: ${err && err.message ? err.message : String(err)}`));
       renderWizard();
     }
   }
@@ -3429,12 +3711,12 @@
     if (errEl) errEl.classList.add("hidden");
 
     if (!canMutate()) {
-      showErr(disabledReason() || "请先完成解锁");
+      showErr(disabledReason() || tr("请先完成解锁", "Please unlock first"));
       return;
     }
     const chosen = STATE.wizard.selectedLeadCli;
     if (!chosen) {
-      showErr("请选择一个 Lead");
+      showErr(tr("请选择一个 Lead", "Please choose a Lead"));
       return;
     }
 
@@ -3461,11 +3743,11 @@
       } else {
         const cliObj = STATE.wizard.clis.find(c => c.id === chosen);
         if (!cliObj || !cliObj.can_lead_eligible) {
-          throw new Error("所选 CLI 不可作为 Lead，请重新选择");
+          throw new Error(tr("所选 CLI 不可作为 Lead，请重新选择", "Selected CLI is not eligible as Lead — choose another"));
         }
         const models = getWizardResolvedModels(cliObj);
         if (!models.length) {
-          throw new Error(`请为 ${chosen} 输入至少一个可用模型 ID`);
+          throw new Error(tr(`请为 ${chosen} 输入至少一个可用模型 ID`, `Enter at least one model ID for ${chosen}`));
         }
 
         const leadName = `${chosen}-lead`;
@@ -3520,7 +3802,7 @@
             }
           }
           if (!otherModels.length) {
-            skippedWorkers.push({ id: other.id, reason: "未检测到可用模型" });
+            skippedWorkers.push({ id: other.id, reason: tr("未检测到可用模型", "no resolvable models detected") });
             continue;
           }
           const otherSafe = other.default_safe_profile || getAdapterDefaultSafeProfile(other.id) || "edit";
@@ -3553,13 +3835,13 @@
       STATE.ui.draftNewChat = STATE.projects.length === 0;
       await loadAllWorkspaceData();
       if (chosen === "__inbox__") {
-        toast("已启用内置收件箱模式（mesh-lead）：发送的消息将进入收件箱等待外部代理领取，也可随时重新扫描连接本机 CLI", "info");
+        toast(tr("已启用内置收件箱模式（mesh-lead）：发送的消息将进入收件箱等待外部代理领取，也可随时重新扫描连接本机 CLI", "Inbox Lead mode enabled (mesh-lead): messages queue in the inbox for an external agent/script, or rescan anytime to attach a local CLI"), "info");
       } else {
-        toast("配置完成，直接开始对话吧！", "ok");
+        toast(tr("配置完成，直接开始对话吧！", "All set — start chatting!"), "ok");
       }
       if (skippedWorkers.length) {
-        const skippedSummary = skippedWorkers.map(s => `${s.id}（${s.reason}）`).join("、");
-        toast(`已跳过自动创建 Worker：${skippedSummary}，可稍后在「AI 工具」中配置模型并添加`, "warn");
+        const skippedSummary = skippedWorkers.map(s => isEnglish() ? `${s.id} (${s.reason})` : `${s.id}（${s.reason}）`).join(isEnglish() ? ", " : "、");
+        toast(tr(`已跳过自动创建 Worker：${skippedSummary}，可稍后在「AI 工具」中配置模型并添加`, `Skipped auto-creating worker(s): ${skippedSummary}. Configure models later under "AI Tools"`), "warn");
       }
       if ($("composerInput")) $("composerInput").focus();
     } catch (err) {
@@ -3596,18 +3878,20 @@
       if (dot) dot.className = "dot dot-green";
       if (titleDot) titleDot.className = "dot dot-green";
       const runs = STATE.pipe.daemon_status ? STATE.pipe.daemon_status.active_runs : 0;
-      if (label) label.textContent = runs > 0 ? `运行中 · ${runs} 个活跃任务` : "后台服务在线";
+      if (label) label.textContent = runs > 0
+        ? tr(`运行中 · ${runs} 个活跃任务`, `Running · ${runs} active run${runs === 1 ? "" : "s"}`)
+        : tr("后台服务在线", "Daemon online");
       if (disBar) disBar.classList.add("hidden");
     } else if (STATE.pipe.home_initialized === false) {
       if (dot) dot.className = "dot dot-amber";
       if (titleDot) titleDot.className = "dot dot-amber";
-      if (label) label.textContent = "等待首次初始化";
+      if (label) label.textContent = tr("等待首次初始化", "Waiting for setup");
       if (disBar) disBar.classList.add("hidden");
     } else if (disBar) {
       disBar.classList.remove("hidden");
       disBar.classList.remove("is-starting", "is-stopping");
       const retryNote = STATE.pipe.reconnect_attempt > 0
-        ? `重连 #${STATE.pipe.reconnect_attempt}，${STATE.pipe.next_retry_s}s 后重试`
+        ? tr(`重连 #${STATE.pipe.reconnect_attempt}，${STATE.pipe.next_retry_s}s 后重试`, `Retry #${STATE.pipe.reconnect_attempt} in ${STATE.pipe.next_retry_s}s`)
         : "";
 
       if (STATE.daemonStarting) {
@@ -3615,66 +3899,68 @@
         if (titleDot) titleDot.className = "dot dot-blue";
         if (disDot) disDot.className = "dot dot-blue";
         disBar.classList.add("is-starting");
-        if (label) label.textContent = "后台服务启动中...";
-        if (disText) disText.textContent = "正在启动并连接本地后台服务，请稍候...";
+        if (label) label.textContent = tr("后台服务启动中...", "Starting daemon...");
+        if (disText) disText.textContent = tr("正在启动并连接本地后台服务，请稍候...", "Starting and connecting to local daemon, please wait...");
         if (disDetail) {
-          disDetail.textContent = STATE.pipe.home ? `数据目录：${STATE.pipe.home}` : "";
+          disDetail.textContent = STATE.pipe.home ? tr(`数据目录：${STATE.pipe.home}`, `Data dir: ${STATE.pipe.home}`) : "";
           disDetail.classList.toggle("hidden", !STATE.pipe.home);
         }
-        if (btnStart) { btnStart.disabled = true; btnStart.textContent = "启动中..."; }
+        if (btnStart) { btnStart.disabled = true; btnStart.textContent = tr("启动中...", "Starting..."); }
         if (btnReconnect) btnReconnect.disabled = true;
       } else if (STATE.daemonStopping && !STATE.userStopped) {
         if (dot) dot.className = "dot dot-amber";
         if (titleDot) titleDot.className = "dot dot-amber";
         if (disDot) disDot.className = "dot dot-amber";
         disBar.classList.add("is-stopping");
-        if (label) label.textContent = "后台服务收尾中...";
-        if (disText) disText.textContent = "守护进程正在完成收尾，稍后自动重连";
+        if (label) label.textContent = tr("后台服务收尾中...", "Daemon draining...");
+        if (disText) disText.textContent = tr("守护进程正在完成收尾，稍后自动重连", "Daemon is finishing shutdown and will reconnect automatically");
         if (disDetail) {
           const detailText = retryNote
-            ? `守护进程正在排空进行中的合并任务或处理繁忙请求（持有 meshd.lock，${retryNote}）`
-            : "守护进程正在排空进行中的合并任务或处理繁忙请求（持有 meshd.lock），稍后将自动重连。";
+            ? tr(`守护进程正在排空进行中的合并任务或处理繁忙请求（持有 meshd.lock，${retryNote}）`, `Daemon is draining in-progress merges or busy requests (holding meshd.lock, ${retryNote})`)
+            : tr("守护进程正在排空进行中的合并任务或处理繁忙请求（持有 meshd.lock），稍后将自动重连。", "Daemon is draining in-progress merges or busy requests (holding meshd.lock) and will reconnect shortly.");
           disDetail.textContent = detailText;
           disDetail.classList.remove("hidden");
         }
-        if (btnStart) { btnStart.disabled = true; btnStart.textContent = "等待收尾..."; }
+        if (btnStart) { btnStart.disabled = true; btnStart.textContent = tr("等待收尾...", "Draining..."); }
         if (btnReconnect) btnReconnect.disabled = false;
       } else if (STATE.userStopped && !STATE.pipe.last_start_error) {
         if (dot) dot.className = "dot dot-neutral";
         if (titleDot) titleDot.className = "dot dot-neutral";
         if (disDot) disDot.className = "dot dot-neutral";
-        if (label) label.textContent = STATE.daemonStopping ? "后台服务停止中..." : "后台服务已停止";
-        if (disText) disText.textContent = "meshd 已按你的请求停止";
+        if (label) label.textContent = STATE.daemonStopping ? tr("后台服务停止中...", "Stopping daemon...") : tr("后台服务已停止", "Daemon stopped");
+        if (disText) disText.textContent = tr("meshd 已按你的请求停止", "meshd stopped as requested");
         if (disDetail) {
           disDetail.textContent = STATE.daemonStopping
-            ? "旧进程正在完成收尾并释放锁，不会自动重启；需要时可点击「启动服务」。"
-            : "后台服务已停止，不会自动重启；点击「启动服务」可随时重新启动。";
+            ? tr("旧进程正在完成收尾并释放锁，不会自动重启；需要时可点击「启动服务」。", "Previous process is finishing shutdown and releasing locks; click \"Start Daemon\" when needed.")
+            : tr("后台服务已停止，不会自动重启；点击「启动服务」可随时重新启动。", "Daemon is stopped and will not auto-restart; click \"Start Daemon\" anytime to restart.");
           disDetail.classList.remove("hidden");
         }
-        if (btnStart) { btnStart.disabled = false; btnStart.textContent = "启动服务"; }
+        if (btnStart) { btnStart.disabled = false; btnStart.textContent = tr("启动服务", "Start Daemon"); }
         if (btnReconnect) btnReconnect.disabled = false;
       } else {
         if (dot) dot.className = "dot dot-red";
         if (titleDot) titleDot.className = "dot dot-red";
         if (disDot) disDot.className = "dot dot-red";
-        if (label) label.textContent = "后台服务未连接";
+        if (label) label.textContent = tr("后台服务未连接", "Daemon disconnected");
         const startErr = STATE.pipe.last_start_error;
         if (startErr) {
-          const failHeading = startErr.auto === true ? "自动启动后台服务失败" : "启动后台服务失败";
-          if (disText) disText.textContent = `${failHeading} — 请查看日志或点击重试${retryNote ? ` (${retryNote})` : ""}`;
+          const failHeading = startErr.auto === true
+            ? tr("自动启动后台服务失败", "Failed to auto-start daemon")
+            : tr("启动后台服务失败", "Failed to start daemon");
+          if (disText) disText.textContent = tr(`${failHeading} — 请查看日志或点击重试${retryNote ? ` (${retryNote})` : ""}`, `${failHeading} — view logs or retry${retryNote ? ` (${retryNote})` : ""}`);
           if (disDetail) {
             disDetail.textContent = formatErrorMessage(startErr);
             disDetail.classList.remove("hidden");
           }
-          if (btnStart) { btnStart.disabled = false; btnStart.textContent = "重试启动"; }
+          if (btnStart) { btnStart.disabled = false; btnStart.textContent = tr("重试启动", "Retry Start"); }
         } else {
-          if (disText) disText.textContent = `后台服务已断开 — 当前为只读查看模式${retryNote ? ` (${retryNote})` : ""}`;
+          if (disText) disText.textContent = tr(`后台服务已断开 — 当前为只读查看模式${retryNote ? ` (${retryNote})` : ""}`, `Daemon disconnected — read-only mode${retryNote ? ` (${retryNote})` : ""}`);
           if (disDetail) {
             const errMsg = STATE.pipe.last_error ? formatErrorMessage(STATE.pipe.last_error) : "";
             disDetail.textContent = errMsg;
             disDetail.classList.toggle("hidden", !errMsg);
           }
-          if (btnStart) { btnStart.disabled = false; btnStart.textContent = "启动服务"; }
+          if (btnStart) { btnStart.disabled = false; btnStart.textContent = tr("启动服务", "Start Daemon"); }
         }
         if (btnReconnect) btnReconnect.disabled = false;
       }
@@ -3686,7 +3972,7 @@
         userNameEl.textContent = principalName;
         userAvatar.textContent = avatarInitials(principalName, "US");
       } else {
-        userNameEl.textContent = STATE.connected ? "未解锁" : "未连接";
+        userNameEl.textContent = STATE.connected ? tr("未解锁", "Locked") : tr("未连接", "Offline");
         userAvatar.textContent = "AM";
       }
     }
@@ -3697,7 +3983,7 @@
         if (authMsg) {
           authMsg.textContent = STATE.auth.last_auth_error
             ? formatErrorMessage(STATE.auth.last_auth_error)
-            : "请输入口令解锁工作台（默认仅保存在当前进程内存中）";
+            : tr("请输入口令解锁工作台（默认仅保存在当前进程内存中）", "Enter passphrase to unlock workspace (held in process memory by default)");
         }
         const remWrap = $("authInlineRememberWrap");
         const remCheck = $("authInlineRemember");
@@ -3722,7 +4008,7 @@
     const closeBtn = $("btnWinClose");
     if (closeBtn) {
       const hidesToTray = Boolean(STATE.desktopPrefs && STATE.desktopPrefs.tray_active && STATE.desktopPrefs.close_to_tray);
-      closeBtn.title = hidesToTray ? "最小化到系统托盘" : "关闭窗口";
+      closeBtn.title = hidesToTray ? tr("最小化到系统托盘", "Hide to system tray") : tr("关闭窗口", "Close window");
     }
 
     const allow = canMutate();
@@ -3770,11 +4056,11 @@
     if (!container) return;
 
     if (!STATE.connected || !STATE.auth.auth_verified) {
-      container.innerHTML = `<div class="empty-state sidebar-label">${STATE.connected ? "解锁后查看项目对话" : "等待后台服务连接"}</div>`;
+      container.innerHTML = `<div class="empty-state sidebar-label">${STATE.connected ? tr("解锁后查看项目对话", "Unlock to view project chats") : tr("等待后台服务连接", "Waiting for daemon connection")}</div>`;
       return;
     }
     if (STATE.loadingWorkspace || !STATE.hasLoadedWorkspace) {
-      container.innerHTML = `<div class="empty-state sidebar-label">正在加载项目对话...</div>`;
+      container.innerHTML = `<div class="empty-state sidebar-label">${tr("正在加载项目对话...", "Loading project chats...")}</div>`;
       return;
     }
 
@@ -3786,15 +4072,15 @@
     });
 
     if (!filtered.length) {
-      container.innerHTML = `<div class="empty-state sidebar-label">${STATE.projects.length ? "未找到匹配的项目对话" : "还没有项目对话，点右上角 + 开始"}</div>`;
+      container.innerHTML = `<div class="empty-state sidebar-label">${STATE.projects.length ? tr("未找到匹配的项目对话", "No matching project chats") : tr("还没有项目对话，点右上角 + 开始", "No project chats yet — click + above to start")}</div>`;
       return;
     }
 
     const groups = [
-      { key: "need_you", label: "需要你", items: [] },
-      { key: "working", label: "运行中 · Working", items: [] },
-      { key: "idle", label: "其他对话", items: [] },
-      { key: "completed", label: "已完成 / 暂停", items: [] }
+      { key: "need_you", label: tr("需要你", "Needs You"), items: [] },
+      { key: "working", label: tr("运行中 · Working", "Working"), items: [] },
+      { key: "idle", label: tr("其他对话", "Other Chats"), items: [] },
+      { key: "completed", label: tr("已完成 / 暂停", "Completed / Paused"), items: [] }
     ];
     const gmap = {
       need_you: groups[0].items,
@@ -3820,16 +4106,16 @@
 
       const rowsHtml = (collapsed && !STATE.ui.sidebarCollapsed) ? "" : grp.items.map(({ prj, meta }) => {
         const selected = !STATE.ui.draftNewChat && STATE.ui.nav === "tasks" && prj.id === STATE.activeProjectId ? "selected" : "";
-        const label = prj.name || "未命名项目";
+        const label = prj.name || tr("未命名项目", "Untitled Project");
         const avatarColor = avatarPaletteColor(prj.lead || label);
         const initials = avatarInitials(label, "PR");
         const returnBadge = (!meta.isWorking && meta.isRecentlyFinished)
-          ? `<span class="sidebar-return-badge">刚完成</span>`
+          ? `<span class="sidebar-return-badge">${tr("刚完成", "Done")}</span>`
           : "";
         const workerSubRowsHtml = (grp.key === "working" && meta.activeWorkerRuns.length > 0)
           ? `<div class="sidebar-worker-subrows">${meta.activeWorkerRuns.map(run => {
               const tObj = run.task_id ? STATE.tasks.find(t => t.id === run.task_id) : null;
-              const taskLabel = (tObj && tObj.title) || run.task_id || "任务执行中";
+              const taskLabel = (tObj && tObj.title) || run.task_id || tr("任务执行中", "Task running");
               const startIso = run.started_at || "";
               const elapsed = startIso ? formatDuration((Date.now() - Date.parse(startIso)) / 1000) : "00:00";
               const liveAttr = startIso ? `data-duration-start="${esc(startIso)}"` : "";
@@ -3889,18 +4175,18 @@
     const modeSel = $("projectPermissionModeSelect");
 
     if (nav === "cli") {
-      if (titleEl) titleEl.textContent = "AI 工具与 Agent 管理";
+      if (titleEl) titleEl.textContent = tr("AI 工具与 Agent 管理", "AI Tools & Agents");
       if (avatarEl) { avatarEl.textContent = "AI"; avatarEl.style.backgroundColor = "#2563eb"; }
-      if (metaEl) metaEl.textContent = `已配置 ${STATE.agents.length} 个 Agent`;
+      if (metaEl) metaEl.textContent = tr(`已配置 ${STATE.agents.length} 个 Agent`, `${STATE.agents.length} agent${STATE.agents.length === 1 ? "" : "s"} configured`);
       if (deliverBtn) deliverBtn.classList.add("hidden");
       if (actBtn) actBtn.classList.add("hidden");
       if (modeSel) modeSel.classList.add("hidden");
       return;
     }
     if (nav === "settings") {
-      if (titleEl) titleEl.textContent = "系统设置与安全策略";
-      if (avatarEl) { avatarEl.textContent = "设"; avatarEl.style.backgroundColor = "#475569"; }
-      if (metaEl) metaEl.textContent = STATE.pipe.home ? `数据目录：${STATE.pipe.home}` : "";
+      if (titleEl) titleEl.textContent = tr("系统设置与安全策略", "Settings & Security Policies");
+      if (avatarEl) { avatarEl.textContent = tr("设", "ST"); avatarEl.style.backgroundColor = "#475569"; }
+      if (metaEl) metaEl.textContent = STATE.pipe.home ? tr(`数据目录：${STATE.pipe.home}`, `Data dir: ${STATE.pipe.home}`) : "";
       if (deliverBtn) deliverBtn.classList.add("hidden");
       if (actBtn) actBtn.classList.add("hidden");
       if (modeSel) modeSel.classList.add("hidden");
@@ -3908,30 +4194,30 @@
     }
 
     if (prj) {
-      const label = prj.name || "项目对话";
+      const label = prj.name || tr("项目对话", "Project Chat");
       if (titleEl) titleEl.textContent = label;
       if (avatarEl) {
         avatarEl.textContent = avatarInitials(label, "PR");
         avatarEl.style.backgroundColor = avatarPaletteColor(prj.lead || label);
       }
       const runningCount = STATE.tasks.filter(t => ["running", "merging"].includes(t.status)).length;
-      const leadLabel = prj.lead || STATE.config["lead.default_agent"] || "未指定 Lead";
+      const leadLabel = prj.lead || STATE.config["lead.default_agent"] || tr("未指定 Lead", "No Lead set");
       const curMode = prj.permission_mode || STATE.chatPermissionMode || "plan";
-      const modeMeta = PERMISSION_MODE_META[curMode] || PERMISSION_MODE_META.plan;
+      const modeMeta = getPermissionModeMeta(curMode);
       const activityParts = [leadLabel];
       if (STATE.activeLeadRun) {
-        activityParts.push("正在思考与规划…");
+        activityParts.push(tr("正在思考与规划…", "Thinking & planning…"));
       } else if (runningCount > 0) {
-        activityParts.push(`${runningCount} 个任务执行中`);
+        activityParts.push(tr(`${runningCount} 个任务执行中`, `${runningCount} task${runningCount === 1 ? "" : "s"} running`));
       } else if (prj.status === "completed") {
-        activityParts.push("已完成");
+        activityParts.push(tr("已完成", "Completed"));
       } else if (prj.status === "paused") {
-        activityParts.push("已暂停");
+        activityParts.push(tr("已暂停", "Paused"));
       } else if (prj.status === "cancelled") {
-        activityParts.push("已取消");
+        activityParts.push(tr("已取消", "Cancelled"));
       }
       if (prj.repo && prj.base_branch) {
-        activityParts.push(`分支 ${prj.base_branch}`);
+        activityParts.push(tr(`分支 ${prj.base_branch}`, `branch ${prj.base_branch}`));
       }
       if (metaEl) {
         metaEl.textContent = activityParts.join(" · ");
@@ -3944,24 +4230,24 @@
         modeSel.value = curMode;
         modeSel.disabled = !canMutate() || !isPrjActive;
         modeSel.title = isPrjActive
-          ? `权限模式：${modeMeta.label} — ${modeMeta.desc}`
-          : `当前项目状态为 ${prj.status}，仅进行中项目可切换权限模式`;
+          ? tr(`权限模式：${modeMeta.label} — ${modeMeta.desc}`, `Permission mode: ${modeMeta.label} — ${modeMeta.desc}`)
+          : tr(`当前项目状态为 ${prj.status}，仅进行中项目可切换权限模式`, `Project is ${prj.status}; permission mode can only be changed on active projects`);
       }
       if (actBtn) actBtn.classList.remove("hidden");
       if (deliverBtn) {
         if (prj.repo && prj.base_branch) {
           deliverBtn.classList.remove("hidden");
-          deliverBtn.textContent = `交付至 ${prj.base_branch}`;
+          deliverBtn.textContent = tr(`交付至 ${prj.base_branch}`, `Deliver to ${prj.base_branch}`);
           deliverBtn.disabled = !canMutate() || prj.status === "cancelled";
         } else {
           deliverBtn.classList.add("hidden");
         }
       }
     } else {
-      const defLead = STATE.ui.selectedLeadDraft || STATE.config["lead.default_agent"] || "未指定 Lead";
-      if (titleEl) titleEl.textContent = "新建项目对话";
+      const defLead = STATE.ui.selectedLeadDraft || STATE.config["lead.default_agent"] || tr("未指定 Lead", "No Lead set");
+      if (titleEl) titleEl.textContent = tr("新建项目对话", "New Project Chat");
       if (avatarEl) { avatarEl.textContent = "AM"; avatarEl.style.backgroundColor = "#2563eb"; }
-      if (metaEl) metaEl.textContent = `默认 Lead：${defLead}`;
+      if (metaEl) metaEl.textContent = tr(`默认 Lead：${defLead}`, `Default Lead: ${defLead}`);
       if (actBtn) actBtn.classList.add("hidden");
       if (deliverBtn) deliverBtn.classList.add("hidden");
       if (modeSel) modeSel.classList.add("hidden");
@@ -3983,9 +4269,10 @@
   function formatRelayedBadgeText(msg) {
     if (!isRelayedChatMessage(msg)) return "";
     const meta = (msg && msg.meta && typeof msg.meta === "object") ? msg.meta : {};
-    const rawName = msg.relayed_by_name || meta.relayed_by_name || msg.relayed_by || meta.relayed_by || "外部转发器";
-    const name = sanitizeSingleLineText(rawName).trim() || "外部转发器";
-    return `经由 ${name} 转发`;
+    const fallbackName = tr("外部转发器", "External relay");
+    const rawName = msg.relayed_by_name || meta.relayed_by_name || msg.relayed_by || meta.relayed_by || fallbackName;
+    const name = sanitizeSingleLineText(rawName).trim() || fallbackName;
+    return tr(`经由 ${name} 转发`, `Relayed via ${name}`);
   }
 
   function renderUserChatMessageHtml(msg, opts = {}) {
@@ -4010,8 +4297,8 @@
     );
     const queueActionsHtml = allowQueueActions
       ? `<span class="queued-msg-actions">
-               <button class="btn btn-sm btn-ghost" type="button" data-edit-queued-msg="${esc(msg.id || "")}">编辑</button>
-               <button class="btn btn-sm btn-ghost" type="button" data-cancel-queued-msg="${esc(msg.id || "")}">取消</button>
+               <button class="btn btn-sm btn-ghost" type="button" data-edit-queued-msg="${esc(msg.id || "")}">${tr("编辑", "Edit")}</button>
+               <button class="btn btn-sm btn-ghost" type="button" data-cancel-queued-msg="${esc(msg.id || "")}">${tr("取消", "Cancel")}</button>
              </span>`
       : "";
     const bubbleStateCls = isCancelledQueued
@@ -4022,8 +4309,8 @@
             <div class="msg-user-bubble ${bubbleStateCls} ${isRelayed ? "is-relayed-msg" : ""}">${esc(safeBody)}</div>
             <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end;">
               ${relayedBadgeText ? `<span class="relayed-msg-badge">${esc(relayedBadgeText)}</span>` : ""}
-              ${isCancelledQueued ? `<span class="cancelled-turn-pill">已取消排队</span>` : (isQueued ? `<span class="queued-turn-pill">等待下回合处理</span>` : "")}
-              ${isEditedQueued && !isCancelledQueued ? `<span class="msg-meta-time">已编辑</span>` : ""}
+              ${isCancelledQueued ? `<span class="cancelled-turn-pill">${tr("已取消排队", "Cancelled")}</span>` : (isQueued ? `<span class="queued-turn-pill">${tr("等待下回合处理", "Queued for next turn")}</span>` : "")}
+              ${isEditedQueued && !isCancelledQueued ? `<span class="msg-meta-time">${tr("已编辑", "Edited")}</span>` : ""}
               ${queueActionsHtml}
               <div class="msg-meta-time mono">${esc(formatClock(msg.created_at))}</div>
             </div>
@@ -4186,12 +4473,12 @@
   }
 
   function formatApprovalReasonBadgeLabel(reason) {
-    if (reason === "expired") return "已过期";
-    if (reason === "task_terminal") return "任务已终止";
-    if (reason === "task_progressed") return "任务已推进";
-    if (reason === "project_not_active") return "项目非进行中";
-    if (reason && String(reason).startsWith("plan_")) return "计划已结束";
-    return "暂不可操作";
+    if (reason === "expired") return tr("已过期", "Expired");
+    if (reason === "task_terminal") return tr("任务已终止", "Task terminal");
+    if (reason === "task_progressed") return tr("任务已推进", "Task progressed");
+    if (reason === "project_not_active") return tr("项目非进行中", "Project inactive");
+    if (reason && String(reason).startsWith("plan_")) return tr("计划已结束", "Plan closed");
+    return tr("暂不可操作", "Unavailable");
   }
 
   function getApprovalUndecidableReason(apr, opts = {}) {
@@ -4218,28 +4505,28 @@
     if (!apr) return "";
     const reason = getApprovalUndecidableReason(apr, opts);
     if (!reason) return "";
-    if (reason === "expired") return "已过期（超过审批有效期，无法再操作）";
-    if (reason === "project_not_active") return "当前项目未处于进行中状态（已暂停/已完成/已取消），无法操作此审批卡片";
+    if (reason === "expired") return tr("已过期（超过审批有效期，无法再操作）", "Expired (approval window passed; no longer actionable)");
+    if (reason === "project_not_active") return tr("当前项目未处于进行中状态（已暂停/已完成/已取消），无法操作此审批卡片", "Project is not active (paused/completed/cancelled); this card cannot be decided");
     if (reason === "task_terminal") {
       const ts = (opts && opts.task && opts.task.status) || apr.task_status || "";
-      const tsLabel = ts ? (TASK_STATE_LABELS[ts] || (ts === "missing" ? "不存在" : ts)) : "已终止";
-      return `关联任务已终止（${tsLabel}），该审批卡片已失效`;
+      const tsLabel = ts ? (getTaskStateLabel(ts) || (ts === "missing" ? tr("不存在", "missing") : ts)) : tr("已终止", "terminated");
+      return tr(`关联任务已终止（${tsLabel}），该审批卡片已失效`, `Linked task is terminal (${tsLabel}); this approval card is stale`);
     }
     if (reason === "task_progressed") {
       const ts = (opts && opts.task && opts.task.status) || apr.task_status || "";
-      const tsLabel = ts ? (TASK_STATE_LABELS[ts] || ts) : "后续阶段";
-      return `关联任务已推进至「${tsLabel}」阶段，该审批卡片已过时失效`;
+      const tsLabel = ts ? (getTaskStateLabel(ts) || ts) : tr("后续阶段", "a later stage");
+      return tr(`关联任务已推进至「${tsLabel}」阶段，该审批卡片已过时失效`, `Linked task progressed to "${tsLabel}"; this approval card is obsolete`);
     }
-    if (reason === "already_auto_mode") return "项目已处于全自动 (auto) 模式，无需再切换";
+    if (reason === "already_auto_mode") return tr("项目已处于全自动 (auto) 模式，无需再切换", "Project is already in Auto (auto) mode");
     if (reason.startsWith("plan_")) {
       const pst = reason.slice("plan_".length);
-      const plLabel = (PLAN_STATUS_META[pst] && PLAN_STATUS_META[pst].label) || pst;
-      return `关联计划已${plLabel}，无需再操作`;
+      const plLabel = getPlanStatusMeta(pst).label || pst;
+      return tr(`关联计划已${plLabel}，无需再操作`, `Linked plan is ${plLabel}; no action needed`);
     }
-    if (reason === "consumed") return "该审批已被使用";
-    if (reason === "rejected") return "该审批已被拒绝";
-    if (reason === "cancelled") return "该审批已取消";
-    if (reason === "already_decided") return "已完成审批";
+    if (reason === "consumed") return tr("该审批已被使用", "Approval already consumed");
+    if (reason === "rejected") return tr("该审批已被拒绝", "Approval already rejected");
+    if (reason === "cancelled") return tr("该审批已取消", "Approval cancelled");
+    if (reason === "already_decided") return tr("已完成审批", "Already decided");
     return "";
   }
 
@@ -4250,32 +4537,53 @@
     }
     const reason = getApprovalUnapprovableReason(apr, opts);
     if (reason === "project_not_active") {
-      return "当前项目未处于进行中状态（已暂停/已完成/已取消），无法批准；可点击「拒绝 / 清除」移除此卡片";
+      return tr(
+        "当前项目未处于进行中状态（已暂停/已完成/已取消），无法批准；可点击「拒绝 / 清除」移除此卡片",
+        "Project is not active (paused/completed/cancelled) and cannot be approved; click \"Reject / Dismiss\" to clear this card"
+      );
     }
     if (reason === "task_terminal") {
       const ts = (opts && opts.task && opts.task.status) || apr.task_status || "";
-      const tsLabel = ts ? (TASK_STATE_LABELS[ts] || (ts === "missing" ? "不存在" : ts)) : "已终止";
-      return `关联任务已终止（${tsLabel}），无法批准；可点击「拒绝 / 清除」移除此卡片`;
+      const tsLabel = ts ? (getTaskStateLabel(ts) || (ts === "missing" ? tr("不存在", "missing") : ts)) : tr("已终止", "terminated");
+      return tr(
+        `关联任务已终止（${tsLabel}），无法批准；可点击「拒绝 / 清除」移除此卡片`,
+        `Linked task is terminal (${tsLabel}) and cannot be approved; click "Reject / Dismiss" to clear this card`
+      );
     }
     if (reason === "task_progressed") {
       const ts = (opts && opts.task && opts.task.status) || apr.task_status || "";
-      const tsLabel = ts ? (TASK_STATE_LABELS[ts] || ts) : "后续阶段";
-      return `关联任务已推进至「${tsLabel}」阶段，无法批准；可点击「拒绝 / 清除」移除此卡片`;
+      const tsLabel = ts ? (getTaskStateLabel(ts) || ts) : tr("后续阶段", "a later stage");
+      return tr(
+        `关联任务已推进至「${tsLabel}」阶段，无法批准；可点击「拒绝 / 清除」移除此卡片`,
+        `Linked task progressed to "${tsLabel}" and cannot be approved; click "Reject / Dismiss" to clear this card`
+      );
     }
-    return "该审批卡片已失效，无法批准；可点击「拒绝 / 清除」移除此卡片";
+    return tr(
+      "该审批卡片已失效，无法批准；可点击「拒绝 / 清除」移除此卡片",
+      "This approval card is stale and cannot be approved; click \"Reject / Dismiss\" to clear it"
+    );
   }
 
   function formatSweptApprovalsSuffix(cancelledSteps, cancelledPlans) {
     const sLen = Array.isArray(cancelledSteps) ? cancelledSteps.length : 0;
     const pLen = Array.isArray(cancelledPlans) ? cancelledPlans.length : 0;
     if (sLen > 0 && pLen > 0) {
-      return `（已自动取消 ${sLen} 张待处理单步审批卡片与 ${pLen} 张待处理计划审批卡片）`;
+      return tr(
+        `（已自动取消 ${sLen} 张待处理单步审批卡片与 ${pLen} 张待处理计划审批卡片）`,
+        ` (auto-cancelled ${sLen} pending step approval${sLen === 1 ? "" : "s"} and ${pLen} pending plan approval${pLen === 1 ? "" : "s"})`
+      );
     }
     if (sLen > 0) {
-      return `（已自动取消 ${sLen} 张待处理的单步审批卡片）`;
+      return tr(
+        `（已自动取消 ${sLen} 张待处理的单步审批卡片）`,
+        ` (auto-cancelled ${sLen} pending step approval${sLen === 1 ? "" : "s"})`
+      );
     }
     if (pLen > 0) {
-      return `（已自动取消 ${pLen} 张待处理的计划审批卡片，原计划可在全自动模式下直接派发）`;
+      return tr(
+        `（已自动取消 ${pLen} 张待处理的计划审批卡片，原计划可在全自动模式下直接派发）`,
+        ` (auto-cancelled ${pLen} pending plan approval${pLen === 1 ? "" : "s"}; the plan can now dispatch directly under Auto mode)`
+      );
     }
     return "";
   }
@@ -4383,16 +4691,16 @@
   function formatSingleGrantScope(sc) {
     if (!sc || typeof sc !== "object") return "";
     if (sc.category === "permission_escalation") {
-      const ag = sc.agent_name || sc.agent || sc.agent_id || "指定 Agent";
-      const prof = sc.profile || "指定档位";
+      const ag = sc.agent_name || sc.agent || sc.agent_id || tr("指定 Agent", "target agent");
+      const prof = sc.profile || tr("指定档位", "target profile");
       const keyPart = sc.scope_key ? ` (${sc.scope_key})` : "";
-      return `高危提权：${ag} · ${prof}${keyPart}`;
+      return tr(`高危提权：${ag} · ${prof}${keyPart}`, `Permission escalation: ${ag} · ${prof}${keyPart}`);
     }
     if (sc.category === "retry_over_limit") {
       const keyPart = sc.scope_key ? ` (${sc.scope_key})` : "";
-      return `超限重试（本项目）${keyPart}`;
+      return tr(`超限重试（本项目）${keyPart}`, `Retry over limit (this project)${keyPart}`);
     }
-    const label = GATE_CATEGORY_LABELS[sc.category] || sc.category || "授权";
+    const label = getGateCategoryLabel(sc.category) || sc.category || tr("授权", "Grant");
     const parts = [label];
     const ag = sc.agent_name || sc.agent || sc.agent_id;
     if (ag) parts.push(ag);
@@ -4410,24 +4718,36 @@
     const eff = apr.always_allow_effect;
     if (eff === null) return "";
     if (eff && eff.kind === "switch_permission_mode") {
-      return "「始终允许」会将本项目权限模式切换为「全自动 (auto)」（弹窗二次确认；高危提权仍会单独弹窗）。";
+      return tr(
+        "「始终允许」会将本项目权限模式切换为「全自动 (auto)」（弹窗二次确认；高危提权仍会单独弹窗）。",
+        "\"Always allow\" switches this project to Auto (auto) mode (requires confirmation; permission_escalation still prompts separately)."
+      );
     }
     if (eff && eff.kind === "standing_grant") {
       if (Array.isArray(eff.scopes) && eff.scopes.length > 0) {
         const items = eff.scopes.map(formatSingleGrantScope).filter(Boolean);
         if (!items.length) return "";
         if (items.length === 1) {
-          return `「始终允许」将创建永久授权：${items[0]}（绝不放宽更高档位，可在「设置 → 永久授权」随时撤销）。`;
+          return tr(
+            `「始终允许」将创建永久授权：${items[0]}（绝不放宽更高档位，可在「设置 → 永久授权」随时撤销）。`,
+            `"Always allow" will create a standing grant: ${items[0]} (never broadens higher profiles; revocable anytime under Settings → Standing Grants).`
+          );
         }
-        const numbered = items.map((item, idx) => `(${idx + 1}) ${item}`).join("；");
-        return `「始终允许」将同时创建 ${items.length} 项永久授权：${numbered}（绝不放宽更高档位，可在「设置 → 永久授权」随时撤销）。`;
+        const numbered = items.map((item, idx) => `(${idx + 1}) ${item}`).join(isEnglish() ? "; " : "；");
+        return tr(
+          `「始终允许」将同时创建 ${items.length} 项永久授权：${numbered}（绝不放宽更高档位，可在「设置 → 永久授权」随时撤销）。`,
+          `"Always allow" will create ${items.length} standing grants: ${numbered} (never broadens higher profiles; revocable anytime under Settings → Standing Grants).`
+        );
       }
       return "";
     }
     // Only plan_dispatch / step_dispatch have a safe unhydrated hint (the server's confirm_auto_mode
     // dialog previews the exact mode switch). Grant-minting categories never guess unhydrated scopes.
     if (cat === "plan_dispatch" || cat === "step_dispatch") {
-      return "「始终允许」会将本项目权限模式切换为「全自动 (auto)」（弹窗二次确认；高危提权仍会单独弹窗）。";
+      return tr(
+        "「始终允许」会将本项目权限模式切换为「全自动 (auto)」（弹窗二次确认；高危提权仍会单独弹窗）。",
+        "\"Always allow\" switches this project to Auto (auto) mode (requires confirmation; permission_escalation still prompts separately)."
+      );
     }
     return "";
   }
@@ -4621,7 +4941,7 @@
     if (!actions.length) return "";
     const cat = apr.category || (plan ? "plan_dispatch" : "");
     const allow = canMutate() && !STATE.ui.decidingApprovalIds.has(apr.id);
-    const disAttr = allow ? "" : `disabled title="${esc(STATE.ui.decidingApprovalIds.has(apr.id) ? "正在提交审批..." : disabledReason())}"`;
+    const disAttr = allow ? "" : `disabled title="${esc(STATE.ui.decidingApprovalIds.has(apr.id) ? tr("正在提交审批...", "Submitting decision...") : disabledReason())}"`;
     const hasAllow = actions.includes("allow");
     const hasAlways = actions.includes("always_allow");
     const hasReject = actions.includes("reject");
@@ -4643,16 +4963,17 @@
     ].filter(Boolean).join(" ");
 
     const allowLabel = (apr.status === "approved" && apr.decided_via === "relayed")
-      ? "升级为直连允许"
-      : "允许";
+      ? tr("升级为直连允许", "Upgrade to Direct Allow")
+      : tr("允许", "Allow");
     const isRelayedRejected = apr.status === "rejected" && apr.decided_via === "relayed";
     const isDismissOnly = isDismissOnlyApproval(apr, cardOpts);
     const rejectLabel = isRelayedRejected
-      ? "升级为直连拒绝"
-      : (isDismissOnly ? "拒绝 / 清除" : "拒绝");
+      ? tr("升级为直连拒绝", "Upgrade to Direct Reject")
+      : (isDismissOnly ? tr("拒绝 / 清除", "Reject / Dismiss") : tr("拒绝", "Reject"));
     const hintText = (!compact && hasAlways) ? formatAlwaysAllowEffectHint(apr, plan) : "";
+    const reasonAriaLabel = tr("拒绝原因或备注（可选）", "Rejection reason or note (optional)");
     const reasonInputHtml = (!compact && hasReject)
-      ? `<input class="compact-input approval-reason-input" type="text" data-decide-reason="${esc(apr.id)}" aria-label="拒绝原因或备注（可选）" placeholder="拒绝原因或备注（可选）..." ${allow ? "" : "disabled"} />`
+      ? `<input class="compact-input approval-reason-input" type="text" data-decide-reason="${esc(apr.id)}" aria-label="${esc(reasonAriaLabel)}" placeholder="${esc(tr("拒绝原因或备注（可选）...", "Rejection reason or note (optional)..."))}" ${allow ? "" : "disabled"} />`
       : "";
 
     return `
@@ -4660,7 +4981,7 @@
         ${hintText ? `<div class="approval-scope-hint">${esc(hintText)}</div>` : ""}
         ${compact ? "" : `<div class="approval-card-controls">${reasonInputHtml}<div class="approval-btn-group">`}
           ${hasAllow ? `<button class="btn btn-sm btn-primary" type="button" ${bindAttrs} data-decide-action="allow" ${disAttr}>${esc(allowLabel)}</button>` : ""}
-          ${hasAlways ? `<button class="btn btn-sm btn-always-allow" type="button" ${bindAttrs} data-decide-action="always_allow" ${disAttr}>始终允许</button>` : ""}
+          ${hasAlways ? `<button class="btn btn-sm btn-always-allow" type="button" ${bindAttrs} data-decide-action="always_allow" ${disAttr}>${tr("始终允许", "Always allow")}</button>` : ""}
           ${hasReject ? `<button class="btn btn-sm btn-danger-text" type="button" ${bindAttrs} data-decide-action="reject" ${compact ? 'data-decide-prompt-reason="1"' : ""} ${disAttr}>${esc(rejectLabel)}</button>` : ""}
         ${compact ? "" : `</div></div>`}
       </div>`;
@@ -4698,23 +5019,23 @@
       (effMode === "auto" || (planApr && planApr.status === "cancelled"))
     );
 
-    let stMeta = PLAN_STATUS_META[status] || { label: status, cls: "neutral" };
+    let stMeta = getPlanStatusMeta(status);
     if (allDone) {
-      stMeta = { label: `全部完成 (${doneTasks}/${totalTasks})`, cls: "green" };
+      stMeta = { label: tr(`全部完成 (${doneTasks}/${totalTasks})`, `All done (${doneTasks}/${totalTasks})`), cls: "green" };
     } else if (status === "dispatched" && totalTasks > 0) {
-      stMeta = { label: `执行中 (${doneTasks}/${totalTasks})`, cls: "blue" };
+      stMeta = { label: tr(`执行中 (${doneTasks}/${totalTasks})`, `Running (${doneTasks}/${totalTasks})`), cls: "blue" };
     } else if (isAutoSweptProposed) {
-      stMeta = { label: "全自动待派发", cls: "blue" };
+      stMeta = { label: tr("全自动待派发", "Auto-dispatching"), cls: "blue" };
     } else if (status === "proposed" && planApr && isApprovalExpiredLocally(planApr)) {
-      stMeta = { label: "审批已过期", cls: "neutral" };
+      stMeta = { label: tr("审批已过期", "Approval expired"), cls: "neutral" };
     } else if (
       status === "proposed" &&
       planApr &&
       (planApr.inactive_project || planUnapprovableReason === "project_not_active" || planApr.undecidable_reason === "project_not_active")
     ) {
-      stMeta = { label: "项目非进行中", cls: "neutral" };
+      stMeta = { label: tr("项目非进行中", "Project inactive"), cls: "neutral" };
     } else if (status === "rejected" && planApr && planApr.status === "rejected" && planApr.decided_via === "relayed" && planCanAct) {
-      stMeta = { label: "转发已拒绝", cls: "amber" };
+      stMeta = { label: tr("转发已拒绝", "Relayed: Rejected"), cls: "amber" };
     }
 
     const cardCls = allDone ? "status-done" : `status-${status}`;
@@ -4724,7 +5045,10 @@
     const stepsHtml = steps.map((st, idx) => {
       const stepKey = st.key || String(idx + 1);
       const deps = Array.isArray(st.depends_on) && st.depends_on.length
-        ? `依赖 ${st.depends_on.map(k => `#${stepIndexMap.get(k) || k}`).join("、")}`
+        ? tr(
+            `依赖 ${st.depends_on.map(k => `#${stepIndexMap.get(k) || k}`).join("、")}`,
+            `depends on ${st.depends_on.map(k => `#${stepIndexMap.get(k) || k}`).join(", ")}`
+          )
         : "";
       const workerChip = `${st.assignee || "Worker"}${st.profile ? ` · ${st.profile}` : ""}`;
       const metaChips = [`<span class="plan-worker-chip mono">${esc(workerChip)}</span>`];
@@ -4738,19 +5062,19 @@
         metaChips.push(`<span class="plan-worker-chip mono" data-step-effort="${esc(st.effort)}">effort: ${esc(st.effort)}</span>`);
       }
       if (typeof st.timeout_s === "number" && st.timeout_s > 0) {
-        metaChips.push(`<span class="plan-worker-chip mono">超时 ${esc(st.timeout_s)}s</span>`);
+        metaChips.push(`<span class="plan-worker-chip mono">${esc(tr(`超时 ${st.timeout_s}s`, `timeout ${st.timeout_s}s`))}</span>`);
       }
       if (typeof st.idle_timeout_s === "number" && st.idle_timeout_s > 0) {
-        metaChips.push(`<span class="plan-worker-chip mono">空闲超时 ${esc(st.idle_timeout_s)}s</span>`);
+        metaChips.push(`<span class="plan-worker-chip mono">${esc(tr(`空闲超时 ${st.idle_timeout_s}s`, `idle ${st.idle_timeout_s}s`))}</span>`);
       }
       if (typeof st.max_attempts === "number" && st.max_attempts > 0) {
-        metaChips.push(`<span class="plan-worker-chip mono">最多 ${esc(st.max_attempts)} 次</span>`);
+        metaChips.push(`<span class="plan-worker-chip mono">${esc(tr(`最多 ${st.max_attempts} 次`, `max ${st.max_attempts} tries`))}</span>`);
       }
       if (typeof st.priority === "number" && st.priority !== 0) {
-        metaChips.push(`<span class="plan-worker-chip mono">优先级 ${esc(st.priority)}</span>`);
+        metaChips.push(`<span class="plan-worker-chip mono">${esc(tr(`优先级 ${st.priority}`, `priority ${st.priority}`))}</span>`);
       }
       const escChip = st.requires_escalation
-        ? `<span class="plan-escalation-chip">需单独授权提权</span>`
+        ? `<span class="plan-escalation-chip">${tr("需单独授权提权", "Requires escalation approval")}</span>`
         : "";
       const rawSpec = typeof st.spec === "string" ? st.spec : "";
       const specLines = rawSpec ? rawSpec.split(/\r?\n/) : [];
@@ -4758,9 +5082,12 @@
       const specPreviewOneLine = rawSpec ? rawSpec.replace(/\s+/g, " ").trim().slice(0, 72) : "";
       const specSummaryLabel = rawSpec
         ? (isLongSpec
-          ? `查看完整步骤指令 (spec · ${rawSpec.length} 字)：${specPreviewOneLine}${rawSpec.length > 72 ? "…" : ""}`
-          : "步骤指令 (spec)")
-        : "步骤指令 (spec：空)";
+          ? tr(
+              `查看完整步骤指令 (spec · ${rawSpec.length} 字)：${specPreviewOneLine}${rawSpec.length > 72 ? "…" : ""}`,
+              `View full step spec (${rawSpec.length} chars): ${specPreviewOneLine}${rawSpec.length > 72 ? "…" : ""}`
+            )
+          : tr("步骤指令 (spec)", "Step instructions (spec)"))
+        : tr("步骤指令 (spec：空)", "Step instructions (spec: empty)");
       const specDetailsHtml = rawSpec
         ? `<details class="plan-step-spec-details" data-details-key="plan:${esc(plan.id)}:step:${esc(stepKey)}"${isLongSpec ? "" : " open"}>
             <summary>${esc(specSummaryLabel)}</summary>
@@ -4793,7 +5120,7 @@
     if (isFolded) {
       bodySection = `
         <details class="plan-folded-details" data-details-key="plan:${esc(plan.id)}">
-          <summary>查看计划步骤 (${steps.length} 步)</summary>
+          <summary>${tr(`查看计划步骤 (${steps.length} 步)`, `View plan steps (${steps.length} step${steps.length === 1 ? "" : "s"})`)}</summary>
           <div class="plan-steps-list" style="padding:10px 0 0;">${stepsHtml}</div>
         </details>`;
     } else if (status !== "dispatched" || !planTasks.length) {
@@ -4805,7 +5132,7 @@
     if (status === "proposed" && plan.approval_id) {
       if (planApr && planCanAct) {
         if (planDismissOnly) {
-          const dismissHint = formatUnapprovableReasonHint(planApr, planCardOpts) || "该计划审批卡片已失效，仅可拒绝 / 清除";
+          const dismissHint = formatUnapprovableReasonHint(planApr, planCardOpts) || tr("该计划审批卡片已失效，仅可拒绝 / 清除", "This plan approval card is stale and can only be rejected / dismissed");
           footerSection = `
             <div class="plan-card-notice" data-dismiss-only="1" data-unapprovable-reason="${esc(planUnapprovableReason || "dismiss_only")}">
               ${esc(dismissHint)}
@@ -4817,15 +5144,15 @@
       } else if (isAutoSweptProposed) {
         footerSection = `
           <div class="plan-card-notice">
-            当前项目已切换为「全自动 (auto)」模式，原计划审批卡片已自动取消，Lead 可直接派发执行该计划。
+            ${tr("当前项目已切换为「全自动 (auto)」模式，原计划审批卡片已自动取消，Lead 可直接派发执行该计划。", "Project is now in Auto (auto) mode — the plan approval card was auto-cancelled so the Lead can dispatch directly.")}
           </div>`;
       } else if (planApr && !Array.isArray(planApr.available_actions)) {
         footerSection = `
           <div class="plan-card-notice" data-unhydrated-approval="1">
-            审批状态加载中，请刷新加载后操作。
+            ${tr("审批状态加载中，请刷新加载后操作。", "Loading approval status — refresh before deciding.")}
           </div>`;
       } else if (planApr) {
-        const reasonHint = formatUndecidableReasonHint(planApr, planCardOpts) || "该计划审批卡片当前无法操作";
+        const reasonHint = formatUndecidableReasonHint(planApr, planCardOpts) || tr("该计划审批卡片当前无法操作", "This plan approval card is not currently actionable");
         footerSection = `
           <div class="plan-card-notice">
             ${esc(reasonHint)}
@@ -4833,24 +5160,24 @@
       } else {
         footerSection = `
           <div class="plan-card-notice" data-unhydrated-approval="1">
-            审批状态尚未同步，请刷新加载后操作。
+            ${tr("审批状态尚未同步，请刷新加载后操作。", "Approval state not yet synced — refresh before deciding.")}
           </div>`;
       }
     } else if (status === "proposed" && effMode === "auto") {
       footerSection = `
         <div class="plan-card-notice">
-          当前项目处于「全自动 (auto)」模式，无需确认计划卡片，Lead 可直接派发执行。
+          ${tr("当前项目处于「全自动 (auto)」模式，无需确认计划卡片，Lead 可直接派发执行。", "Project is in Auto (auto) mode — plan card approval is skipped and the Lead can dispatch directly.")}
         </div>`;
     } else if (status === "approved_pending_dispatch") {
       const upgradeFooter = planApr && shouldRenderApprovalActions(planApr, planCardOpts)
         ? renderApprovalButtonsFooterHtml(planApr, planCardOpts)
         : "";
-      let noticeText = "计划已通过审批，正在等待 Lead 自动派发任务…";
+      let noticeText = tr("计划已通过审批，正在等待 Lead 自动派发任务…", "Plan approved — waiting for Lead to dispatch tasks…");
       if (planApr && !upgradeFooter) {
         if (isApprovalExpiredLocally(planApr)) {
-          noticeText = "原计划审批已过期，无法继续派发。";
+          noticeText = tr("原计划审批已过期，无法继续派发。", "Original plan approval expired and cannot be dispatched.");
         } else if (planApr.inactive_project || planApr.undecidable_reason === "project_not_active" || (effProjectStatus && effProjectStatus !== "active")) {
-          noticeText = "计划已通过审批，但当前项目未处于进行中状态。";
+          noticeText = tr("计划已通过审批，但当前项目未处于进行中状态。", "Plan was approved, but the project is no longer active.");
         }
       }
       footerSection = `
@@ -4861,7 +5188,7 @@
     } else if (status === "rejected" && planApr && planApr.status === "rejected" && planApr.decided_via === "relayed" && planCanAct) {
       footerSection = `
         <div class="plan-card-notice">
-          该计划已被外部转发拒绝（待直连确认），可点击下方按钮升级为本机直连签名确认。
+          ${tr("该计划已被外部转发拒绝（待直连确认），可点击下方按钮升级为本机直连签名确认。", "This plan was rejected via external relay (pending direct confirmation). Click below to upgrade to a direct signed rejection.")}
         </div>
         ${renderApprovalButtonsFooterHtml(planApr, planCardOpts)}`;
     } else if (status === "dispatched") {
@@ -4884,7 +5211,7 @@
         const dur = getTaskDurationInfo(t);
         const liveAttr = dur.isLive && dur.startIso ? `data-duration-start="${esc(dur.startIso)}"` : "";
         const selected = !STATE.ui.inspectorCollapsed && STATE.activeTaskId === t.id ? "selected" : "";
-        const subText = getTaskLatestPreview(t) || `${t.assignee || "未指派"}`;
+        const subText = getTaskLatestPreview(t) || `${t.assignee || tr("未指派", "Unassigned")}`;
         return `
           <button class="plan-task-row ${selected}" type="button" data-select-task="${esc(t.id)}">
             <span class="plan-task-left">
@@ -4905,9 +5232,9 @@
       footerSection = `
         <div class="plan-progress-bar-wrap">
           <div class="plan-progress-track"><div class="plan-progress-fill ${allDone ? "done" : ""}" style="width:${pct}%;"></div></div>
-          <span class="plan-progress-label mono">${doneTasks}/${totalTasks} 已完成</span>
+          <span class="plan-progress-label mono">${tr(`${doneTasks}/${totalTasks} 已完成`, `${doneTasks}/${totalTasks} done`)}</span>
         </div>
-        <div class="plan-tasks-list">${taskRowsHtml || `<div class="empty-state" style="padding:10px;">任务正在同步...</div>`}</div>`;
+        <div class="plan-tasks-list">${taskRowsHtml || `<div class="empty-state" style="padding:10px;">${tr("任务正在同步...", "Syncing tasks...")}</div>`}</div>`;
     }
 
     return `
@@ -4915,10 +5242,10 @@
         <div class="plan-card-head">
           <div class="plan-card-title-wrap">
             <div class="plan-card-kicker">
-              <span class="plan-version-tag">计划 v${esc(plan.version || 1)}</span>
+              <span class="plan-version-tag">${esc(tr(`计划 v${plan.version || 1}`, `Plan v${plan.version || 1}`))}</span>
               <span class="status-pill ${esc(stMeta.cls)}"${planDismissOnly && planUnapprovableReason ? ` data-unapprovable-reason="${esc(planUnapprovableReason)}"` : ""}>${esc(stMeta.label)}</span>
             </div>
-            <div class="plan-card-title">${esc(plan.title || "执行计划")}</div>
+            <div class="plan-card-title">${esc(plan.title || tr("执行计划", "Execution Plan"))}</div>
           </div>
           <span class="msg-meta-time mono">${esc(formatClock(plan.created_at))}</span>
         </div>
@@ -4932,14 +5259,14 @@
     if (!apr) {
       return `
         <div class="gate-card">
-          <div class="gate-card-head"><span class="gate-card-title">审批卡片</span></div>
-          <div class="gate-card-body">${esc(fallbackBody || "")}</div>
+          <div class="gate-card-head"><span class="gate-card-title">${tr("审批卡片", "Approval Card")}</span></div>
+          <div class="gate-card-body">${esc(localizeDaemonCardBody(null, fallbackBody) || "")}</div>
         </div>`;
     }
-    const catLabel = GATE_CATEGORY_LABELS[apr.category] || apr.category || "安全确认";
+    const catLabel = getGateCategoryLabel(apr.category) || apr.category || tr("安全确认", "Approval");
     const isExternalOp = isExternalApprovalOp(apr);
     const externalBadgeHtml = isExternalOp
-      ? `<span class="status-pill neutral" data-external-op-badge="1">外部请求</span>`
+      ? `<span class="status-pill neutral" data-external-op-badge="1">${tr("外部请求", "External")}</span>`
       : "";
     const policy = resolveApprovalPolicy(apr);
     const isDanger = apr.category === "permission_escalation" || apr.category === "config" || policy === "direct_only";
@@ -4981,48 +5308,50 @@
     const isRelayedApproved = status === "approved" && apr.decided_via === "relayed" && !isExpired;
     const isRelayedRejected = status === "rejected" && apr.decided_via === "relayed" && !isExpired;
     const resolvedStatusLabel = isExpired
-      ? "已过期"
+      ? tr("已过期", "Expired")
       : (isUnhydrated
-        ? "待同步"
+        ? tr("待同步", "Syncing")
         : (isRelayedApproved
-          ? "已允许（经由转发，待直连确认）"
+          ? tr("已允许（经由转发，待直连确认）", "Allowed (via relay, pending direct confirmation)")
           : (isRelayedRejected
-            ? "已拒绝（经由转发，待直连确认）"
+            ? tr("已拒绝（经由转发，待直连确认）", "Rejected (via relay, pending direct confirmation)")
             : ((status === "approved" || status === "consumed")
-              ? "已允许"
+              ? tr("已允许", "Allowed")
               : (status === "rejected"
-                ? "已拒绝"
+                ? tr("已拒绝", "Rejected")
                 : (status === "cancelled"
-                  ? "已取消"
-                  : (status === "expired" ? "已过期" : "已结束")))))));
+                  ? tr("已取消", "Cancelled")
+                  : (status === "expired" ? tr("已过期", "Expired") : tr("已结束", "Closed"))))))));
 
     const suppressedBadgeLabel = formatApprovalReasonBadgeLabel(undecidableReason);
     const dismissBadgeLabel = formatApprovalReasonBadgeLabel(unapprovableReason);
 
     const statusBadge = isExpired
-      ? `<span class="status-pill neutral">已过期</span>`
+      ? `<span class="status-pill neutral">${tr("已过期", "Expired")}</span>`
       : (isUnhydrated
-        ? `<span class="status-pill neutral">加载中</span>`
+        ? `<span class="status-pill neutral">${tr("加载中", "Loading")}</span>`
         : (isDismissOnly
           ? `<span class="status-pill neutral" data-unapprovable-reason="${esc(unapprovableReason || "dismiss_only")}">${esc(dismissBadgeLabel)}</span>`
           : (isSuppressedPending
             ? `<span class="status-pill neutral">${esc(suppressedBadgeLabel)}</span>`
             : (status === "pending"
-              ? `<span class="status-pill ${isDanger ? "red" : "amber"}">待你审批</span>`
+              ? `<span class="status-pill ${isDanger ? "red" : "amber"}">${tr("待你审批", "Needs approval")}</span>`
               : (isRelayedApproved
-                ? `<span class="status-pill amber">转发已允许</span>`
+                ? `<span class="status-pill amber">${tr("转发已允许", "Relayed: Allowed")}</span>`
                 : (isRelayedRejected
-                  ? `<span class="status-pill amber">转发已拒绝</span>`
+                  ? `<span class="status-pill amber">${tr("转发已拒绝", "Relayed: Rejected")}</span>`
                   : ((status === "approved" || status === "consumed")
-                    ? `<span class="status-pill green">已允许</span>`
+                    ? `<span class="status-pill green">${tr("已允许", "Allowed")}</span>`
                     : `<span class="status-pill neutral">${esc(resolvedStatusLabel)}</span>`)))))));
 
     const effectiveTaskStatus = apr.task_status || (linkedTask && linkedTask.status) || null;
     const taskStatusSuffix = effectiveTaskStatus
-      ? ` · ${TASK_STATE_LABELS[effectiveTaskStatus] || (effectiveTaskStatus === "missing" ? "已不存在" : effectiveTaskStatus)}`
+      ? ` · ${getTaskStateLabel(effectiveTaskStatus) || (effectiveTaskStatus === "missing" ? tr("已不存在", "missing") : effectiveTaskStatus)}`
       : "";
     const taskInfo = apr.task_id
-      ? (linkedTask ? `关联任务：${linkedTask.title || linkedTask.id}${linkedTask.assignee ? ` (${linkedTask.assignee})` : ""}${taskStatusSuffix}` : `关联任务：${apr.task_id}${taskStatusSuffix}`)
+      ? (linkedTask
+        ? tr(`关联任务：${linkedTask.title || linkedTask.id}${linkedTask.assignee ? ` (${linkedTask.assignee})` : ""}${taskStatusSuffix}`, `Task: ${linkedTask.title || linkedTask.id}${linkedTask.assignee ? ` (${linkedTask.assignee})` : ""}${taskStatusSuffix}`)
+        : tr(`关联任务：${apr.task_id}${taskStatusSuffix}`, `Task: ${apr.task_id}${taskStatusSuffix}`))
       : "";
     const opObj = apr.op && apr.op._redacted === true ? apr.op.op : apr.op;
     const reqProfile =
@@ -5030,22 +5359,22 @@
       (opObj && opObj.params && typeof opObj.params.profile === "string" ? opObj.params.profile : "") ||
       (msgMeta && msgMeta.profile) ||
       "";
-    const profileInfo = reqProfile ? `请求权限档位：${reqProfile}` : "";
+    const profileInfo = reqProfile ? tr(`请求权限档位：${reqProfile}`, `Requested profile: ${reqProfile}`) : "";
 
     const undecidableHint = !canAct ? formatUndecidableReasonHint(apr, cardOpts) : "";
     const dismissHint = isDismissOnly ? formatUnapprovableReasonHint(apr, cardOpts) : "";
     let resolvedBarHtml = "";
     if (isUnhydrated) {
-      resolvedBarHtml = `<div class="gate-resolved-bar" data-unhydrated-approval="1">审批状态尚未加载，请刷新加载后操作</div>`;
+      resolvedBarHtml = `<div class="gate-resolved-bar" data-unhydrated-approval="1">${tr("审批状态尚未加载，请刷新加载后操作", "Approval state not loaded yet — refresh before deciding")}</div>`;
     } else if (isDismissOnly) {
-      resolvedBarHtml = `<div class="gate-resolved-bar" data-dismiss-only="1" data-unapprovable-reason="${esc(unapprovableReason || "dismiss_only")}">${esc(dismissHint || "该审批卡片已失效，仅可拒绝 / 清除")}</div>`;
+      resolvedBarHtml = `<div class="gate-resolved-bar" data-dismiss-only="1" data-unapprovable-reason="${esc(unapprovableReason || "dismiss_only")}">${esc(dismissHint || tr("该审批卡片已失效，仅可拒绝 / 清除", "This approval card is stale and can only be rejected / dismissed"))}</div>`;
     } else if (isSuppressedPending) {
-      resolvedBarHtml = `<div class="gate-resolved-bar" data-undecidable-reason="${esc(undecidableReason || "suppressed")}">${esc(undecidableHint || "该审批卡片当前不可操作")}</div>`;
+      resolvedBarHtml = `<div class="gate-resolved-bar" data-undecidable-reason="${esc(undecidableReason || "suppressed")}">${esc(undecidableHint || tr("该审批卡片当前不可操作", "This approval card is not currently actionable"))}</div>`;
     } else if (status !== "pending") {
       const extraHint = (status === "approved" && !canAct && undecidableHint && !["already_decided", "consumed"].includes(undecidableReason || ""))
         ? ` · ${undecidableHint}`
         : "";
-      resolvedBarHtml = `<div class="gate-resolved-bar"${undecidableReason ? ` data-undecidable-reason="${esc(undecidableReason)}"` : ""}>${esc(resolvedStatusLabel)}${esc(extraHint)}${apr.decision_note ? ` · 备注：「${esc(apr.decision_note)}」` : ""}</div>`;
+      resolvedBarHtml = `<div class="gate-resolved-bar"${undecidableReason ? ` data-undecidable-reason="${esc(undecidableReason)}"` : ""}>${esc(resolvedStatusLabel)}${esc(extraHint)}${apr.decision_note ? tr(` · 备注：「${esc(apr.decision_note)}」`, ` · Note: "${esc(apr.decision_note)}"`) : ""}</div>`;
     }
     const actionsFooterHtml = canAct
       ? renderApprovalButtonsFooterHtml(apr, cardOpts)
@@ -5068,12 +5397,12 @@
             ${statusBadge}
           </div>
           <div style="display:flex;align-items:center;gap:4px;">
-            ${apr.task_id ? `<button class="btn btn-sm btn-ghost" type="button" data-select-task="${esc(apr.task_id)}">打开 Worker 标签</button>` : ""}
-            <button class="btn btn-sm btn-ghost" type="button" data-open-advanced-gate="${esc(apr.id)}">载荷详情</button>
+            ${apr.task_id ? `<button class="btn btn-sm btn-ghost" type="button" data-select-task="${esc(apr.task_id)}">${tr("打开 Worker 标签", "Open Worker Tab")}</button>` : ""}
+            <button class="btn btn-sm btn-ghost" type="button" data-open-advanced-gate="${esc(apr.id)}">${tr("载荷详情", "Payload")}</button>
           </div>
         </div>
         <div class="gate-card-body">
-          <div class="gate-card-summary">${esc(apr.summary || fallbackBody || formatApprovalOpName(apr))}</div>
+          <div class="gate-card-summary">${esc(localizeDaemonCardBody(apr, apr.summary || fallbackBody) || formatApprovalOpName(apr))}</div>
           ${profileInfo ? `<div class="mono">${esc(profileInfo)}</div>` : ""}
           ${taskInfo ? `<div>${esc(taskInfo)}</div>` : ""}
         </div>
@@ -5128,33 +5457,43 @@
   function renderLeadFailureNoticeHtml(fail, leadName) {
     if (!fail) return "";
     if (fail.kind === "unreachable") {
-      const tries = fail.attempts ? `已连续重试 ${fail.attempts} 次` : "多次重试后";
+      const tries = fail.attempts
+        ? tr(`已连续重试 ${fail.attempts} 次`, `After ${fail.attempts} consecutive retries, `)
+        : tr("多次重试后", "After multiple retries, ");
       return `
         <div class="gate-card is-danger lead-failure-notice" data-lead-failure="unreachable">
           <div class="gate-card-head">
             <div class="gate-card-title">
               <span class="dot dot-red"></span>
-              <span>Lead 多次重试后仍无法响应</span>
+              <span>${tr("Lead 多次重试后仍无法响应", "Lead Unreachable After Multiple Retries")}</span>
             </div>
-            <button class="btn btn-sm btn-ghost" type="button" data-open-outline="1">查看执行大纲</button>
+            <button class="btn btn-sm btn-ghost" type="button" data-open-outline="1">${tr("查看执行大纲", "View Outline")}</button>
           </div>
           <div class="gate-card-body">
-            <div class="gate-card-summary">${esc(tries)}仍未能联系到 ${esc(leadName)}，后台已停止自动重试。请打开「执行大纲」查看原始输出（常见原因：CLI 未登录、额度不足或模型 ID 不可用），修复后重新发送消息即可。</div>
+            <div class="gate-card-summary">${esc(tr(
+              `${tries}仍未能联系到 ${leadName}，后台已停止自动重试。请打开「执行大纲」查看原始输出（常见原因：CLI 未登录、额度不足或模型 ID 不可用），修复后重新发送消息即可。`,
+              `${tries}${leadName} still could not be reached and automatic retries have paused. Open "Outline" to inspect raw CLI output (common causes: CLI not signed in, quota exceeded, or invalid model ID), then send a message to retry.`
+            ))}</div>
           </div>
         </div>`;
     }
-    const exitStr = fail.exit_code !== undefined && fail.exit_code !== null ? `退出码 ${fail.exit_code}` : "非正常退出";
+    const exitStr = fail.exit_code !== undefined && fail.exit_code !== null
+      ? tr(`退出码 ${fail.exit_code}`, `exit code ${fail.exit_code}`)
+      : tr("非正常退出", "abnormal exit");
     return `
       <div class="gate-card is-danger lead-failure-notice" data-lead-failure="turn_failed">
         <div class="gate-card-head">
           <div class="gate-card-title">
             <span class="dot dot-red"></span>
-            <span>Lead 回合执行失败（${esc(exitStr)}）</span>
+            <span>${esc(tr(`Lead 回合执行失败（${exitStr}）`, `Lead Turn Failed (${exitStr})`))}</span>
           </div>
-          <button class="btn btn-sm btn-ghost" type="button" data-open-outline="1">查看执行大纲</button>
+          <button class="btn btn-sm btn-ghost" type="button" data-open-outline="1">${tr("查看执行大纲", "View Outline")}</button>
         </div>
         <div class="gate-card-body">
-          <div class="gate-card-summary">${esc(leadName)} 未能正常返回回复（常见原因：CLI 未登录、API 额度不足或模型 ID 配置有误）。后台会按退避策略自动重试，可点击右侧「查看执行大纲」排查原始报错。</div>
+          <div class="gate-card-summary">${esc(tr(
+            `${leadName} 未能正常返回回复（常见原因：CLI 未登录、API 额度不足或模型 ID 配置有误）。后台会按退避策略自动重试，可点击右侧「查看执行大纲」排查原始报错。`,
+            `${leadName} did not return a reply (common causes: CLI not signed in, API quota exceeded, or invalid model ID). The daemon will retry with backoff — click "View Outline" to inspect the raw error.`
+          ))}</div>
         </div>
       </div>`;
   }
@@ -5259,16 +5598,22 @@
       const run = info.liveLeadRun;
       const lName = run.agent_name || run.agent || leadName;
       const runStatus = run.status === "starting" ? "starting" : "running";
-      const statusLabel = runStatus === "starting" ? "回合启动中" : "回合运行中";
-      const adapterSuffix = info.adapter && info.adapter !== "none" ? `（${info.adapter}）` : "";
+      const statusLabel = runStatus === "starting" ? tr("回合启动中", "Starting turn") : tr("回合运行中", "Running turn");
+      const adapterSuffix = info.adapter && info.adapter !== "none" ? (isEnglish() ? ` (${info.adapter})` : `（${info.adapter}）`) : "";
       const startIso = run.started_at || new Date().toISOString();
       const parsedMs = Date.parse(startIso);
       const elapsedS = Number.isNaN(parsedMs) ? 0 : Math.max(0, (Date.now() - parsedMs) / 1000);
       const elapsed = formatDuration(elapsedS);
       const stillWaitingHidden = elapsedS < LEAD_WAIT_NOTICE_TIMEOUT_S ? "hidden" : "";
       const desc = runStatus === "starting"
-        ? `消息已交给 ${lName}${adapterSuffix}，正在启动本机 CLI 进程并加载项目上下文…`
-        : `${lName}${adapterSuffix} 正在思考与规划，完成后将直接在对话中回复并给出计划。`;
+        ? tr(
+            `消息已交给 ${lName}${adapterSuffix}，正在启动本机 CLI 进程并加载项目上下文…`,
+            `Handed off to ${lName}${adapterSuffix} — starting local CLI process and loading project context…`
+          )
+        : tr(
+            `${lName}${adapterSuffix} 正在思考与规划，完成后将直接在对话中回复并给出计划。`,
+            `${lName}${adapterSuffix} is thinking and planning — it will reply directly in chat with a plan when ready.`
+          );
       return `
         <div class="lead-status-card is-running" id="leadTypingIndicator" data-lead-turn-status="${esc(runStatus)}">
           <div class="lead-status-head">
@@ -5283,12 +5628,15 @@
             </div>
             <div class="lead-status-head-right">
               <span class="msg-meta-time mono" data-duration-start="${esc(startIso)}">${esc(elapsed)}</span>
-              <button class="btn btn-sm btn-ghost" type="button" data-open-outline="1">查看执行大纲</button>
+              <button class="btn btn-sm btn-ghost" type="button" data-open-outline="1">${tr("查看执行大纲", "View Outline")}</button>
             </div>
           </div>
           <div class="lead-status-body">${esc(desc)}</div>
           <div class="lead-still-waiting-note ${stillWaitingHidden}" data-wait-start="${esc(startIso)}" data-wait-threshold-s="${LEAD_WAIT_NOTICE_TIMEOUT_S}">
-            仍在等待 ${esc(lName)} 返回回复（已运行超过 ${LEAD_WAIT_NOTICE_TIMEOUT_S} 秒）：本地 CLI 处理复杂任务可能需要更长时间，可点击「查看执行大纲」查看实时输出，或检查 CLI 登录与网络状态。
+            ${esc(tr(
+              `仍在等待 ${lName} 返回回复（已运行超过 ${LEAD_WAIT_NOTICE_TIMEOUT_S} 秒）：本地 CLI 处理复杂任务可能需要更长时间，可点击「查看执行大纲」查看实时输出，或检查 CLI 登录与网络状态。`,
+              `Still waiting for ${lName} (running > ${LEAD_WAIT_NOTICE_TIMEOUT_S}s): local CLIs may take longer on complex requests. Click "View Outline" to watch live output or check CLI sign-in/network status.`
+            ))}
           </div>
         </div>`;
     }
@@ -5313,21 +5661,28 @@
           <div class="lead-status-head">
             <div class="lead-status-title-row">
               <span class="dot dot-amber"></span>
-              <span class="lead-status-title">消息已排入 ${esc(leadName)} 收件箱，等待外部代理领取</span>
-              <span class="status-pill amber">收件箱模式</span>
+              <span class="lead-status-title">${esc(tr(`消息已排入 ${leadName} 收件箱，等待外部代理领取`, `Message queued in ${leadName}'s inbox — waiting for external agent`))}</span>
+              <span class="status-pill amber">${tr("收件箱模式", "Inbox Mode")}</span>
             </div>
             <span class="msg-meta-time mono" data-duration-start="${esc(sinceIso)}">${esc(elapsed)}</span>
           </div>
           <div class="lead-status-body">
-            <div>你的消息已入队给 <span class="mono">${esc(leadName)}</span>。当前为<strong>收件箱协调模式（Inbox Lead）</strong>，桌面端不会自动启动本机 AI CLI 回复或生成计划，需要外部代理或脚本领取并回复。</div>
-            <div class="lead-status-hint">外部代理接入命令：<span class="mono">mesh inbox wait --as ${esc(leadName)}</span>；或在本机安装任一 AI CLI（claude / codex / agy / droid / kiro / vibe）后点击下方按钮重新扫描并切换为自动 Lead。</div>
+            <div>${isEnglish()
+              ? `Your message is queued for <span class="mono">${esc(leadName)}</span>. You are in <strong>Inbox Coordinator mode (Inbox Lead)</strong> — the desktop app will not auto-launch a local AI CLI; an external agent or script must poll and reply.`
+              : `你的消息已入队给 <span class="mono">${esc(leadName)}</span>。当前为<strong>收件箱协调模式（Inbox Lead）</strong>，桌面端不会自动启动本机 AI CLI 回复或生成计划，需要外部代理或脚本领取并回复。`}</div>
+            <div class="lead-status-hint">${isEnglish()
+              ? `External agent command: <span class="mono">mesh inbox wait --as ${esc(leadName)}</span>; or install any local AI CLI (claude / codex / agy / droid / kiro / vibe) and click below to rescan and switch to an automatic Lead.`
+              : `外部代理接入命令：<span class="mono">mesh inbox wait --as ${esc(leadName)}</span>；或在本机安装任一 AI CLI（claude / codex / agy / droid / kiro / vibe）后点击下方按钮重新扫描并切换为自动 Lead。`}</div>
           </div>
           <div class="lead-still-waiting-note ${stillWaitingHidden}" data-wait-start="${esc(sinceIso)}" data-wait-threshold-s="${LEAD_WAIT_NOTICE_TIMEOUT_S}">
-            仍在等待回复（已等待超过 ${LEAD_WAIT_NOTICE_TIMEOUT_S} 秒）：尚未检测到外部代理领取 ${esc(leadName)} 的收件箱消息。请确认外部代理正在运行，或安装本机 AI CLI 后点击「重新扫描并连接本机 CLI」切换为自动 Lead。
+            ${esc(tr(
+              `仍在等待回复（已等待超过 ${LEAD_WAIT_NOTICE_TIMEOUT_S} 秒）：尚未检测到外部代理领取 ${leadName} 的收件箱消息。请确认外部代理正在运行，或安装本机 AI CLI 后点击「重新扫描并连接本机 CLI」切换为自动 Lead。`,
+              `Still waiting (>${LEAD_WAIT_NOTICE_TIMEOUT_S}s): no external agent has picked up ${leadName}'s inbox message yet. Ensure your external agent is running, or click "Rescan & Connect Local CLI" to switch to an automatic Lead.`
+            ))}
           </div>
           <div class="lead-status-actions">
-            <button class="btn btn-sm btn-primary" type="button" data-open-wizard-step2="1">重新扫描并连接本机 CLI</button>
-            <button class="btn btn-sm" type="button" data-nav-cli="1">打开 AI 工具</button>
+            <button class="btn btn-sm btn-primary" type="button" data-open-wizard-step2="1">${tr("重新扫描并连接本机 CLI", "Rescan & Connect Local CLI")}</button>
+            <button class="btn btn-sm" type="button" data-nav-cli="1">${tr("打开 AI 工具", "Open AI Tools")}</button>
           </div>
         </div>`;
     }
@@ -5339,14 +5694,16 @@
           <div class="lead-status-head">
             <div class="lead-status-title-row">
               <span class="dot dot-amber"></span>
-              <span class="lead-status-title">消息已入队，但 ${esc(leadName)} 当前已禁用</span>
-              <span class="status-pill amber">Lead 已禁用</span>
+              <span class="lead-status-title">${esc(tr(`消息已入队，但 ${leadName} 当前已禁用`, `Message queued, but ${leadName} is disabled`))}</span>
+              <span class="status-pill amber">${tr("Lead 已禁用", "Lead Disabled")}</span>
             </div>
             <span class="msg-meta-time mono" data-duration-start="${esc(sinceIso)}">${esc(elapsed)}</span>
           </div>
-          <div class="lead-status-body">请在「AI 工具」中重新启用 <span class="mono">${esc(leadName)}</span>，或在下方切换为其他可用的 Lead。</div>
+          <div class="lead-status-body">${isEnglish()
+            ? `Re-enable <span class="mono">${esc(leadName)}</span> under "AI Tools", or switch to another available Lead below.`
+            : `请在「AI 工具」中重新启用 <span class="mono">${esc(leadName)}</span>，或在下方切换为其他可用的 Lead。`}</div>
           <div class="lead-status-actions">
-            <button class="btn btn-sm btn-primary" type="button" data-nav-cli="1">打开 AI 工具</button>
+            <button class="btn btn-sm btn-primary" type="button" data-nav-cli="1">${tr("打开 AI 工具", "Open AI Tools")}</button>
           </div>
         </div>`;
     }
@@ -5359,15 +5716,17 @@
           <div class="lead-status-head">
             <div class="lead-status-title-row">
               <span class="dot dot-amber"></span>
-              <span class="lead-status-title">消息已入队，但本机 CLI Lead 调度未开启</span>
-              <span class="status-pill amber">未开启调度</span>
+              <span class="lead-status-title">${tr("消息已入队，但本机 CLI Lead 调度未开启", "Message queued, but local CLI Lead dispatch is off")}</span>
+              <span class="status-pill amber">${tr("未开启调度", "Dispatch Off")}</span>
             </div>
             <span class="msg-meta-time mono" data-duration-start="${esc(sinceIso)}">${esc(elapsed)}</span>
           </div>
-          <div class="lead-status-body">当前项目 Lead 为 <span class="mono">${esc(leadName)}</span>（${esc(info.adapter)}），但 <span class="mono">lead.vendor_leads</span> 尚未开启，后台不会自动拉起 CLI 回合。请前往「设置」开启「允许本地 AI CLI 担任 Lead」或重新运行选 Lead 向导。</div>
+          <div class="lead-status-body">${isEnglish()
+            ? `Current Lead is <span class="mono">${esc(leadName)}</span> (${esc(info.adapter)}), but <span class="mono">lead.vendor_leads</span> is disabled, so the daemon won't launch CLI turns automatically. Enable "Allow local AI CLIs as Lead" in Settings or re-run the Lead picker.`
+            : `当前项目 Lead 为 <span class="mono">${esc(leadName)}</span>（${esc(info.adapter)}），但 <span class="mono">lead.vendor_leads</span> 尚未开启，后台不会自动拉起 CLI 回合。请前往「设置」开启「允许本地 AI CLI 担任 Lead」或重新运行选 Lead 向导。`}</div>
           <div class="lead-status-actions">
-            <button class="btn btn-sm btn-primary" type="button" data-nav-settings="1">打开设置</button>
-            <button class="btn btn-sm" type="button" data-open-wizard-step2="1">重新选择 Lead</button>
+            <button class="btn btn-sm btn-primary" type="button" data-nav-settings="1">${tr("打开设置", "Open Settings")}</button>
+            <button class="btn btn-sm" type="button" data-open-wizard-step2="1">${tr("重新选择 Lead", "Choose Lead Again")}</button>
           </div>
         </div>`;
     }
@@ -5379,12 +5738,12 @@
           <div class="lead-status-head">
             <div class="lead-status-title-row">
               <span class="dot dot-amber"></span>
-              <span class="lead-status-title">${esc(leadName)} 上一回合已结束，但未返回可见回复</span>
-              <span class="status-pill neutral">无回复</span>
+              <span class="lead-status-title">${esc(tr(`${leadName} 上一回合已结束，但未返回可见回复`, `${leadName} finished its turn without a visible reply`))}</span>
+              <span class="status-pill neutral">${tr("无回复", "No Reply")}</span>
             </div>
-            <button class="btn btn-sm btn-ghost" type="button" data-open-outline="1">查看执行大纲</button>
+            <button class="btn btn-sm btn-ghost" type="button" data-open-outline="1">${tr("查看执行大纲", "View Outline")}</button>
           </div>
-          <div class="lead-status-body">请打开「执行大纲」查看本机 CLI 的原始输出，或补充一条消息再次唤醒 Lead。</div>
+          <div class="lead-status-body">${tr("请打开「执行大纲」查看本机 CLI 的原始输出，或补充一条消息再次唤醒 Lead。", "Open \"Outline\" to inspect raw local CLI output, or send a follow-up message to wake the Lead again.")}</div>
         </div>`;
     }
 
@@ -5398,21 +5757,24 @@
               <span class="typing-dot"></span>
               <span class="typing-dot"></span>
             </div>
-            <span class="lead-status-title">消息已排入队列，正在唤醒 ${esc(leadName)}…</span>
-            <span class="status-pill blue">排队中</span>
+            <span class="lead-status-title">${esc(tr(`消息已排入队列，正在唤醒 ${leadName}…`, `Queued — waking ${leadName}…`))}</span>
+            <span class="status-pill blue">${tr("排队中", "Queued")}</span>
           </div>
           <div class="lead-status-head-right">
             <span class="msg-meta-time mono" data-duration-start="${esc(sinceIso)}">${esc(elapsed)}</span>
-            <button class="btn btn-sm btn-ghost" type="button" data-open-outline="1">查看执行大纲</button>
+            <button class="btn btn-sm btn-ghost" type="button" data-open-outline="1">${tr("查看执行大纲", "View Outline")}</button>
           </div>
         </div>
-        <div class="lead-status-body">后台服务已收到你的消息并写入 Lead 调度队列，正在准备启动 ${esc(leadName)} 回合。</div>
+        <div class="lead-status-body">${esc(tr(`后台服务已收到你的消息并写入 Lead 调度队列，正在准备启动 ${leadName} 回合。`, `Daemon received your message and queued it for ${leadName} — preparing to start the Lead turn.`))}</div>
         <div class="lead-still-waiting-note ${stillWaitingHidden}" data-wait-start="${esc(sinceIso)}" data-wait-threshold-s="${LEAD_WAIT_NOTICE_TIMEOUT_S}">
-          仍在等待 ${esc(leadName)} 响应（已等待超过 ${LEAD_WAIT_NOTICE_TIMEOUT_S} 秒）：Lead 回合尚未开始或尚未返回回复，请点击「查看执行大纲」或「查看日志」检查本机 CLI 状态与后台调度日志。
+          ${esc(tr(
+            `仍在等待 ${leadName} 响应（已等待超过 ${LEAD_WAIT_NOTICE_TIMEOUT_S} 秒）：Lead 回合尚未开始或尚未返回回复，请点击「查看执行大纲」或「查看日志」检查本机 CLI 状态与后台调度日志。`,
+            `Still waiting for ${leadName} (>${LEAD_WAIT_NOTICE_TIMEOUT_S}s): turn has not started or replied yet. Click "View Outline" or "View Logs" to check local CLI and daemon scheduler logs.`
+          ))}
         </div>
         <div class="lead-status-actions">
-          <button class="btn btn-sm" type="button" data-open-outline="1">查看执行大纲</button>
-          <button class="btn btn-sm" type="button" data-open-daemon-log="1">查看日志</button>
+          <button class="btn btn-sm" type="button" data-open-outline="1">${tr("查看执行大纲", "View Outline")}</button>
+          <button class="btn btn-sm" type="button" data-open-daemon-log="1">${tr("查看日志", "View Logs")}</button>
         </div>
       </div>`;
   }
@@ -5543,11 +5905,11 @@
     };
 
     if (!STATE.connected || !STATE.auth.auth_verified) {
-      commitThreadHtml(`<div class="empty-state">${STATE.connected ? "请在上方输入口令解锁，开始与你的 Lead 对话" : "后台服务未连接，请先启动或等待自动重连"}</div>`);
+      commitThreadHtml(`<div class="empty-state">${STATE.connected ? tr("请在上方输入口令解锁，开始与你的 Lead 对话", "Enter your passphrase above to unlock and start chatting with your Lead") : tr("后台服务未连接，请先启动或等待自动重连", "Daemon disconnected — start the service or wait for auto-reconnect")}</div>`);
       return;
     }
     if (STATE.loadingWorkspace || !STATE.hasLoadedWorkspace) {
-      commitThreadHtml(`<div class="empty-state">正在加载项目对话...</div>`);
+      commitThreadHtml(`<div class="empty-state">${tr("正在加载项目对话...", "Loading project chats...")}</div>`);
       return;
     }
 
@@ -5557,33 +5919,45 @@
       const defLeadAgent = defLead ? getAgentByName(defLead) : null;
       const isInboxDefault = Boolean(defLeadAgent ? defLeadAgent.delivery === "inbox" : defLead === "mesh-lead");
       const workerCount = STATE.agents.filter(a => !a.disabled && a.name !== defLead).length;
-      const starters = [
-        "帮我梳理这个代码仓库的核心架构，并给出两步重构计划",
-        "为登录接口补充单元测试和边界用例，先给执行计划再派发",
-        "排查最近失败的测试并修复，先列出排查与修改方案"
-      ];
+      const starters = isEnglish()
+        ? [
+            "Map out the core architecture of this repository and propose a 2-step refactoring plan",
+            "Add unit tests and edge-case coverage for the login endpoint — propose a plan before dispatching",
+            "Investigate recent failing tests and fix them — outline the diagnosis and fix plan first"
+          ]
+        : [
+            "帮我梳理这个代码仓库的核心架构，并给出两步重构计划",
+            "为登录接口补充单元测试和边界用例，先给执行计划再派发",
+            "排查最近失败的测试并修复，先列出排查与修改方案"
+          ];
       commitThreadHtml(`
         <div class="chat-welcome">
           <span class="avatar avatar-wizard" aria-hidden="true">AM</span>
-          <div class="chat-welcome-title">今天想让 AI 团队完成什么？</div>
+          <div class="chat-welcome-title">${tr("今天想让 AI 团队完成什么？", "What would you like your AI team to build today?")}</div>
           <div class="chat-welcome-desc">
             ${isInboxDefault
-              ? "当前使用内置收件箱模式（Inbox Lead）：首条消息会进入收件箱，由外部代理领取并回复。如需桌面端自动调用本机 AI CLI 规划执行，请安装 CLI 后点击下方重新扫描。"
-              : "直接在下方说出你的想法，首条消息将自动创建项目对话。Lead 会先给出清晰计划卡片，经你点击「允许 / 始终允许 / 拒绝」后再派发给 Worker 执行。"}
+              ? tr(
+                  "当前使用内置收件箱模式（Inbox Lead）：首条消息会进入收件箱，由外部代理领取并回复。如需桌面端自动调用本机 AI CLI 规划执行，请安装 CLI 后点击下方重新扫描。",
+                  "Using built-in Inbox Lead mode: your first message enters the inbox for an external agent to pick up. To automatically launch local AI CLIs, install a CLI and rescan below."
+                )
+              : tr(
+                  "直接在下方说出你的想法，首条消息将自动创建项目对话。Lead 会先给出清晰计划卡片，经你点击「允许 / 始终允许 / 拒绝」后再派发给 Worker 执行。",
+                  "Describe your goal below — your first message creates a project chat automatically. Your Lead proposes a clear plan card and waits for you to click Allow / Always allow / Reject before dispatching to Workers."
+                )}
           </div>
           <div class="chat-welcome-badges">
-            <span class="status-pill ${isInboxDefault ? "amber" : "blue"}">当前 Lead：${esc(defLead || "尚未设置")}${isInboxDefault ? "（收件箱模式）" : ""}</span>
-            <span class="status-pill neutral">可用 Worker：${esc(workerCount)} 个</span>
+            <span class="status-pill ${isInboxDefault ? "amber" : "blue"}">${tr("当前 Lead：", "Current Lead: ")}${esc(defLead || tr("尚未设置", "Not set"))}${isInboxDefault ? tr("（收件箱模式）", " (Inbox mode)") : ""}</span>
+            <span class="status-pill neutral">${tr(`可用 Worker：${workerCount} 个`, `Available Workers: ${workerCount}`)}</span>
           </div>
           <div class="welcome-starters">
             ${starters.map(sp => `<button class="welcome-starter-chip" type="button" data-starter-prompt="${esc(sp)}">${esc(sp)}</button>`).join("")}
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:4px;">
-            <button class="btn btn-sm" type="button" data-open-repo-drawer="1">绑定本地 Git 代码仓库</button>
+            <button class="btn btn-sm" type="button" data-open-repo-drawer="1">${tr("绑定本地 Git 代码仓库", "Attach Local Git Repository")}</button>
             ${!defLead
-              ? `<button class="btn btn-sm btn-primary" id="btnWelcomePickLead" type="button">选择我的 Lead</button>`
+              ? `<button class="btn btn-sm btn-primary" id="btnWelcomePickLead" type="button">${tr("选择我的 Lead", "Choose My Lead")}</button>`
               : (isInboxDefault
-                ? `<button class="btn btn-sm btn-primary" type="button" data-open-wizard-step2="1">重新扫描并连接本机 CLI</button>`
+                ? `<button class="btn btn-sm btn-primary" type="button" data-open-wizard-step2="1">${tr("重新扫描并连接本机 CLI", "Rescan & Connect Local CLI")}</button>`
                 : "")}
           </div>
         </div>`);
@@ -5603,7 +5977,7 @@
     if (STATE.chatHasMore) {
       blocks.push(`
         <div class="chat-load-more-wrap">
-          <button class="btn btn-sm" id="btnLoadOlderChat" type="button" ${STATE.chatLoadingOlder ? "disabled" : ""}>${STATE.chatLoadingOlder ? "正在加载更早消息..." : "加载更早的对话记录"}</button>
+          <button class="btn btn-sm" id="btnLoadOlderChat" type="button" ${STATE.chatLoadingOlder ? "disabled" : ""}>${STATE.chatLoadingOlder ? tr("正在加载更早消息...", "Loading older messages...") : tr("加载更早的对话记录", "Load older messages")}</button>
         </div>`);
     }
 
@@ -5696,11 +6070,11 @@
         blocks.push(`
           <div class="gate-card is-danger">
             <div class="gate-card-head">
-              <div class="gate-card-title"><span class="dot dot-red"></span><span>任务需要你介入</span></div>
-              ${t ? `<button class="btn btn-sm btn-ghost" type="button" data-select-task="${esc(t.id)}">打开 Worker 标签</button>` : ""}
+              <div class="gate-card-title"><span class="dot dot-red"></span><span>${tr("任务需要你介入", "Task Needs Your Attention")}</span></div>
+              ${t ? `<button class="btn btn-sm btn-ghost" type="button" data-select-task="${esc(t.id)}">${tr("打开 Worker 标签", "Open Worker Tab")}</button>` : ""}
             </div>
             <div class="gate-card-body">
-              <div class="gate-card-summary">${esc(msg.body || (t && t.title) || "任务执行遇到阻塞")}</div>
+              <div class="gate-card-summary">${esc(msg.body || (t && t.title) || tr("任务执行遇到阻塞", "Task execution is blocked"))}</div>
             </div>
           </div>`);
         return;
@@ -5723,8 +6097,8 @@
       const isClarify = msg.kind === "clarification";
       const bubbleCls = isDispatch ? "msg-dispatch-notice" : (isClarify ? "msg-clarification" : "");
       const kindTag = isDispatch
-        ? `<div class="msg-kind-tag">已开始派发执行</div>`
-        : (isClarify ? `<div class="msg-kind-tag">需要你补充信息</div>` : "");
+        ? `<div class="msg-kind-tag">${tr("已开始派发执行", "Dispatch Started")}</div>`
+        : (isClarify ? `<div class="msg-kind-tag">${tr("需要你补充信息", "Needs Clarification")}</div>` : "");
       const leadLogText = msg.run_id ? STATE.leadTurnLogs[msg.run_id] : "";
       const leadStructuredAct = msg.run_id ? STATE.runActivities[msg.run_id] : null;
       const leadActivityEntries = (leadStructuredAct && Array.isArray(leadStructuredAct.entries) && leadStructuredAct.entries.length)
@@ -5732,7 +6106,7 @@
         : (leadLogText ? parseActivityFromLogText(leadLogText) : []);
       const leadActivitySummary = leadActivityEntries.length ? summarizeActivityEntries(leadActivityEntries) : "";
       const activityChipHtml = msg.run_id
-        ? `<button class="lead-msg-activity-chip" type="button" data-open-outline="1">${esc(leadActivitySummary ? `${leadActivitySummary} · 展开大纲` : "查看本回合执行大纲")}</button>`
+        ? `<button class="lead-msg-activity-chip" type="button" data-open-outline="1">${esc(leadActivitySummary ? tr(`${leadActivitySummary} · 展开大纲`, `${leadActivitySummary} · Open Outline`) : tr("查看本回合执行大纲", "View Turn Outline"))}</button>`
         : "";
       blocks.push(`
         <div class="msg-lead-wrap" data-msg-id="${esc(msg.id)}">
@@ -5802,7 +6176,7 @@
                 <span class="dot ${getStatusDotClass(t)}" style="margin-top:6px;"></span>
                 <span class="plan-task-info">
                   <span class="plan-task-title">#${idx + 1} ${esc(t.title || t.id)}</span>
-                  <span class="plan-task-sub">${esc(getTaskHumanStatus(t))} · ${esc(t.assignee || "未指派")}</span>
+                  <span class="plan-task-sub">${esc(getTaskHumanStatus(t))} · ${esc(t.assignee || tr("未指派", "Unassigned"))}</span>
                 </span>
               </span>
               <span class="plan-task-right"><span class="mono">${esc(dur.text)}</span></span>
@@ -5813,11 +6187,11 @@
         <div class="plan-card">
           <div class="plan-card-head">
             <div class="plan-card-title-wrap">
-              <div class="plan-card-title">${esc(prj.name || "项目")}</div>
+              <div class="plan-card-title">${esc(prj.name || tr("项目", "Project"))}</div>
             </div>
             <span class="status-pill neutral">${esc(prj.status)}</span>
           </div>
-          <div class="plan-card-summary" style="padding-bottom:12px;">${esc(prj.goal || "直接输入消息与 Lead 对话开始协作")}</div>
+          <div class="plan-card-summary" style="padding-bottom:12px;">${esc(prj.goal || tr("直接输入消息与 Lead 对话开始协作", "Type a message below to start collaborating with your Lead"))}</div>
           ${legacyTasksHtml}
         </div>`);
     }
@@ -5849,7 +6223,7 @@
     if (recentEl) {
       const recents = Array.isArray(STATE.ui.recentFolders) ? STATE.ui.recentFolders : [];
       if (recents.length) {
-        recentEl.innerHTML = `<span class="recent-folders-label">最近目录：</span>` + recents.map(p => {
+        recentEl.innerHTML = `<span class="recent-folders-label">${esc(tr("最近目录：", "Recent folders:"))}</span>` + recents.map(p => {
           const base = p.split(/[\\/]+/).filter(Boolean).pop() || p;
           return `<button class="recent-folder-chip" type="button" data-recent-folder="${esc(p)}" title="${esc(p)}" ${allow ? "" : "disabled"}>${esc(base)}</button>`;
         }).join("");
@@ -5864,36 +6238,40 @@
     if (statusEl) {
       if (STATE.ui.repoInspecting) {
         statusEl.className = "repo-inspect-card";
-        statusEl.innerHTML = `<span>正在只读检测仓库与测试配置...</span>`;
+        statusEl.innerHTML = `<span>${esc(tr("正在只读检测仓库与测试配置...", "Inspecting repository and test config (read-only)..."))}</span>`;
         statusEl.classList.remove("hidden");
       } else if (!insp) {
         statusEl.innerHTML = "";
         statusEl.classList.add("hidden");
       } else if (insp.path_conflict) {
         statusEl.className = "repo-inspect-card err";
-        statusEl.innerHTML = `<span>${esc(insp.path_conflict)}</span>`;
+        statusEl.innerHTML = `<span>${esc(localizeDaemonMessage(insp.path_conflict))}</span>`;
         statusEl.classList.remove("hidden");
       } else if (!insp.git_available) {
         statusEl.className = "repo-inspect-card warn";
-        statusEl.innerHTML = `<span>${esc(insp.git_error || "未检测到 Git，请安装 Git 或使用含内置 MinGit 的发行包")}</span>`;
+        statusEl.innerHTML = `<span>${esc(insp.git_error ? localizeDaemonMessage(insp.git_error) : tr("未检测到 Git，请安装 Git 或使用含内置 MinGit 的发行包", "Git not found. Please install Git or use a release bundle with embedded MinGit."))}</span>`;
         statusEl.classList.remove("hidden");
       } else if (!insp.is_git_repo) {
         statusEl.className = "repo-inspect-card warn";
-        statusEl.innerHTML = `<span>${esc(insp.git_error || "所选目录不是 Git 仓库（留空路径可创建通用对话项目）")}</span>`;
+        statusEl.innerHTML = `<span>${esc(insp.git_error ? localizeDaemonMessage(insp.git_error) : tr("所选目录不是 Git 仓库（留空路径可创建通用对话项目）", "Selected directory is not a Git repository (leave path empty for a general chat project)"))}</span>`;
         statusEl.classList.remove("hidden");
       } else if (!insp.is_toplevel && insp.toplevel) {
         statusEl.className = "repo-inspect-card warn";
-        statusEl.innerHTML = `<span>当前所选为 Git 子目录，仓库根目录为 <code class="mono">${esc(insp.toplevel)}</code></span><button class="btn btn-sm btn-primary" id="btnUseRepoToplevel" type="button" data-use-toplevel="${esc(insp.toplevel)}" ${allow ? "" : "disabled"}>切换为仓库根目录</button>`;
+        statusEl.innerHTML = isEnglish()
+          ? `<span>Selected path is a Git subdirectory; repo root is <code class="mono">${esc(insp.toplevel)}</code></span><button class="btn btn-sm btn-primary" id="btnUseRepoToplevel" type="button" data-use-toplevel="${esc(insp.toplevel)}" ${allow ? "" : "disabled"}>Use repo root</button>`
+          : `<span>当前所选为 Git 子目录，仓库根目录为 <code class="mono">${esc(insp.toplevel)}</code></span><button class="btn btn-sm btn-primary" id="btnUseRepoToplevel" type="button" data-use-toplevel="${esc(insp.toplevel)}" ${allow ? "" : "disabled"}>切换为仓库根目录</button>`;
         statusEl.classList.remove("hidden");
       } else if (insp.unborn_head && (!insp.branches || !insp.branches.length)) {
         statusEl.className = "repo-inspect-card warn";
-        statusEl.innerHTML = `<span>该 Git 仓库尚无任何本地提交（unborn HEAD），请先完成至少一次初始 commit。</span>`;
+        statusEl.innerHTML = `<span>${esc(tr("该 Git 仓库尚无任何本地提交（unborn HEAD），请先完成至少一次初始 commit。", "This Git repository has no local commits yet (unborn HEAD). Please create at least one initial commit first."))}</span>`;
         statusEl.classList.remove("hidden");
       } else {
         const bCount = Array.isArray(insp.branches) ? insp.branches.length : 0;
         const recB = insp.recommended_base_branch || "--";
         statusEl.className = "repo-inspect-card ok";
-        statusEl.innerHTML = `<span>已识别 Git 仓库 <strong class="mono">${esc(insp.suggested_title || "")}</strong> · 检测到 ${bCount} 个本地分支，已自动选中 <code class="mono">${esc(recB)}</code></span>`;
+        statusEl.innerHTML = isEnglish()
+          ? `<span>Detected Git repo <strong class="mono">${esc(insp.suggested_title || "")}</strong> · ${bCount} local ${bCount === 1 ? "branch" : "branches"}, auto-selected <code class="mono">${esc(recB)}</code></span>`
+          : `<span>已识别 Git 仓库 <strong class="mono">${esc(insp.suggested_title || "")}</strong> · 检测到 ${bCount} 个本地分支，已自动选中 <code class="mono">${esc(recB)}</code></span>`;
         statusEl.classList.remove("hidden");
       }
     }
@@ -5921,12 +6299,12 @@
       const cands = (insp && Array.isArray(insp.test_candidates)) ? insp.test_candidates : [];
       if (repoVal) {
         const chips = [
-          `<button class="repo-quick-chip ${curTestVal === "none" ? "active" : ""}" type="button" data-pick-test-cmd="none" title="合并阶段不运行自动测试" ${allow ? "" : "disabled"}>暂不测试 (none)</button>`
+          `<button class="repo-quick-chip ${curTestVal === "none" ? "active" : ""}" type="button" data-pick-test-cmd="none" title="${esc(tr("合并阶段不运行自动测试", "Skip automated tests during merge"))}" ${allow ? "" : "disabled"}>${esc(tr("暂不测试 (none)", "Skip tests (none)"))}</button>`
         ];
         cands.forEach(cand => {
           const jsonStr = JSON.stringify(cand.argv);
           chips.push(
-            `<button class="repo-quick-chip ${curTestVal === jsonStr ? "active" : ""}" type="button" data-pick-test-cmd="${esc(jsonStr)}" title="${esc(cand.reason || jsonStr)}" ${allow ? "" : "disabled"}>${esc(cand.label)}</button>`
+            `<button class="repo-quick-chip ${curTestVal === jsonStr ? "active" : ""}" type="button" data-pick-test-cmd="${esc(jsonStr)}" title="${esc(cand.reason ? localizeDaemonMessage(cand.reason) : jsonStr)}" ${allow ? "" : "disabled"}>${esc(cand.label)}</button>`
           );
         });
         testChipsEl.innerHTML = chips.join("");
@@ -6002,7 +6380,7 @@
 
   async function handlePickRepoFolder({ repoInputId = "newPrjRepo", branchInputId = "newPrjBaseBranch", testInputId = "newPrjTestCmd", titleInputId = null } = {}) {
     if (!hasApi() || typeof window.pywebview.api.pick_folder !== "function") {
-      toast("当前环境不支持原生文件夹选择器，请手动粘贴绝对路径", "warn");
+      toast(tr("当前环境不支持原生文件夹选择器，请手动粘贴绝对路径", "Native folder picker is unavailable in this environment. Please paste an absolute path manually."), "warn");
       return;
     }
     const curVal = ($(repoInputId) && $(repoInputId).value.trim()) || "";
@@ -6036,13 +6414,13 @@
           if (titleInputId && $(titleInputId) && !$(titleInputId).value.trim() && insp.suggested_title) {
             $(titleInputId).value = insp.suggested_title;
           }
-          if (insp.path_conflict) toast(insp.path_conflict, "err");
+          if (insp.path_conflict) toast(localizeDaemonMessage(insp.path_conflict), "err");
         } else if (insp && insp.git_error) {
-          toast(insp.git_error, "warn");
+          toast(localizeDaemonMessage(insp.git_error), "warn");
         }
       }
     } catch (err) {
-      toast(`选择文件夹失败: ${String(err)}`, "err");
+      toast(tr(`选择文件夹失败: ${String(err)}`, `Failed to pick folder: ${String(err)}`), "err");
     }
   }
 
@@ -6137,10 +6515,15 @@
     const itemsHtml = displayItems.map(({ apr, plan, resolvedPlaceholder }) => {
       if (resolvedPlaceholder) {
         layoutTokens.push(`${apr.id}:resolved`);
+        const stepCount = plan && Array.isArray(plan.steps) ? plan.steps.length : 0;
         const summary = plan
-          ? `${plan.title || "执行计划"} (${Array.isArray(plan.steps) ? plan.steps.length : 0} 步)`
-          : (apr.summary || formatApprovalOpName(apr));
-        const resolvedLabel = resolvedPlaceholder.label || "已处理";
+          ? `${plan.title || tr("执行计划", "Execution Plan")} (${isEnglish() ? `${stepCount} ${stepCount === 1 ? "step" : "steps"}` : `${stepCount} 步`})`
+          : (apr.summary ? localizeDaemonCardBody(apr, apr.summary) : formatApprovalOpName(apr));
+        const resolvedLabel = resolvedPlaceholder.action === "reject"
+          ? tr("已拒绝", "Rejected")
+          : resolvedPlaceholder.action
+            ? tr("已允许", "Allowed")
+            : (resolvedPlaceholder.label || tr("已处理", "Handled"));
         return `
           <div class="composer-approval-item is-resolved-placeholder" data-strip-approval-id="${esc(apr.id)}" data-resolved-placeholder="1">
             <div class="composer-approval-item-top">
@@ -6160,7 +6543,7 @@
             </div>
           </div>`;
       }
-      const catLabel = GATE_CATEGORY_LABELS[apr.category] || apr.category || "待审批";
+      const catLabel = getGateCategoryLabel(apr.category) || tr("待审批", "Pending");
       const taskObj = apr.task_id ? STATE.tasks.find(t => t.id === apr.task_id) : null;
       const cardOpts = {
         plan,
@@ -6174,18 +6557,19 @@
       const isExternalOp = isExternalApprovalOp(apr);
       const unapprovableReason = isDismissOnly ? getApprovalUnapprovableReason(apr, cardOpts) : null;
       const sourceBadge = plan
-        ? `计划 v${plan.version || 1}`
-        : (taskObj ? (taskObj.assignee || taskObj.title || taskObj.id) : (isExternalOp ? "外部请求" : catLabel));
+        ? tr(`计划 v${plan.version || 1}`, `Plan v${plan.version || 1}`)
+        : (taskObj ? (taskObj.assignee || taskObj.title || taskObj.id) : (isExternalOp ? tr("外部请求", "External Request") : catLabel));
+      const stepCount = plan && Array.isArray(plan.steps) ? plan.steps.length : 0;
       const summary = plan
-        ? `${plan.title || "执行计划"} (${Array.isArray(plan.steps) ? plan.steps.length : 0} 步)`
-        : (apr.summary || formatApprovalOpName(apr));
+        ? `${plan.title || tr("执行计划", "Execution Plan")} (${isEnglish() ? `${stepCount} ${stepCount === 1 ? "step" : "steps"}` : `${stepCount} 步`})`
+        : (apr.summary ? localizeDaemonCardBody(apr, apr.summary) : formatApprovalOpName(apr));
       const isDanger = !isDismissOnly && (apr.category === "permission_escalation" || apr.category === "config");
       const dotCls = isDismissOnly ? "dot-neutral" : (isDanger ? "dot-red" : "dot-amber");
       const pillHtml = isDismissOnly
         ? `<span class="status-pill neutral" data-unapprovable-reason="${esc(unapprovableReason || "dismiss_only")}">${esc(formatApprovalReasonBadgeLabel(unapprovableReason))}</span>`
         : `<span class="status-pill ${isDanger ? "red" : "amber"}">${esc(catLabel)}</span>`;
       const externalTagHtml = isExternalOp
-        ? `<span class="status-pill neutral" data-external-op-badge="1">外部请求</span>`
+        ? `<span class="status-pill neutral" data-external-op-badge="1">${esc(tr("外部请求", "External Request"))}</span>`
         : "";
       return `
         <div class="composer-approval-item" data-strip-approval-id="${esc(apr.id)}"${isDismissOnly ? ' data-dismiss-only="1"' : ""}${isExternalOp ? ' data-external-op="1"' : ""}>
@@ -6198,8 +6582,8 @@
               <span class="composer-approval-item-summary" title="${esc(summary)}">${esc(summary)}</span>
             </div>
             <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;">
-              <button class="btn btn-sm btn-ghost" type="button" data-jump-approval-card="${esc(apr.id)}">定位卡片</button>
-              ${apr.task_id ? `<button class="btn btn-sm btn-ghost" type="button" data-select-task="${esc(apr.task_id)}">打开 Worker</button>` : ""}
+              <button class="btn btn-sm btn-ghost" type="button" data-jump-approval-card="${esc(apr.id)}">${esc(tr("定位卡片", "Jump to Card"))}</button>
+              ${apr.task_id ? `<button class="btn btn-sm btn-ghost" type="button" data-select-task="${esc(apr.task_id)}">${esc(tr("打开 Worker", "Open Worker"))}</button>` : ""}
             </div>
           </div>
           <div class="composer-approval-item-actions">
@@ -6215,8 +6599,8 @@
 
     strip.innerHTML = `
       <div class="composer-approval-strip-title">
-        <span>待审批卡片 (${pendingItems.length})</span>
-        <span style="font-size:11.5px;font-weight:400;color:var(--text-secondary);">请使用按钮审批（聊天文本不会批准操作）</span>
+        <span>${esc(tr(`待审批卡片 (${pendingItems.length})`, `Pending Approvals (${pendingItems.length})`))}</span>
+        <span style="font-size:11.5px;font-weight:400;color:var(--text-secondary);">${esc(tr("请使用按钮审批（聊天文本不会批准操作）", "Use the buttons to approve (chat text cannot authorize actions)"))}</span>
       </div>
       ${itemsHtml}`;
   }
@@ -6230,7 +6614,7 @@
     const leadModel = (leadDetail && leadDetail.default_model) || (leadAgent && leadAgent.default_model) || "";
     const leadPillText = leadName
       ? (leadModel ? `${leadName} · ${leadModel}` : `Lead: ${leadName}`)
-      : "Lead: 未设置";
+      : tr("Lead: 未设置", "Lead: Not set");
     if ($("leadPillLabel")) $("leadPillLabel").textContent = leadPillText;
 
     renderComposerApprovalStrip();
@@ -6243,7 +6627,9 @@
     }
     if (repoBtn) {
       repoBtn.classList.toggle("active", isNewDraft && STATE.ui.repoDrawerOpen);
-      repoBtn.title = isNewDraft ? "绑定本地 Git 代码仓库（可选）" : (prj && prj.repo ? `已绑定仓库：${prj.repo}` : "当前为通用对话项目");
+      repoBtn.title = isNewDraft
+        ? tr("绑定本地 Git 代码仓库（可选）", "Bind a local Git repository (optional)")
+        : (prj && prj.repo ? tr(`已绑定仓库：${prj.repo}`, `Bound repo: ${prj.repo}`) : tr("当前为通用对话项目", "General chat project"));
     }
     if (repoChip) {
       const draftRepo = ($("newPrjRepo") && $("newPrjRepo").value.trim()) || "";
@@ -6269,13 +6655,13 @@
     const ta = $("composerInput");
     if (ta) {
       if (isNewDraft) {
-        ta.placeholder = "告诉 Lead 你想完成什么... (Enter 发送，首条消息将自动创建项目)";
+        ta.placeholder = tr("告诉 Lead 你想完成什么... (Enter 发送，首条消息将自动创建项目)", "Tell your Lead what you want to build... (Enter to send; first message creates a project)");
       } else if (isLeadBusy) {
-        ta.placeholder = "Lead 正在执行当前回合；Enter 排队发送，Ctrl+Enter 立即打断并改向...";
+        ta.placeholder = tr("Lead 正在执行当前回合；Enter 排队发送，Ctrl+Enter 立即打断并改向...", "Lead is busy; Enter to queue, Ctrl+Enter to interrupt & steer...");
       } else if (pendingCards.length > 0) {
-        ta.placeholder = "请点击上方审批卡片的「允许 / 始终允许 / 拒绝」按钮处理授权，或继续发消息与 Lead 沟通...";
+        ta.placeholder = tr("请点击上方审批卡片的「允许 / 始终允许 / 拒绝」按钮处理授权，或继续发消息与 Lead 沟通...", "Click Allow / Always Allow / Reject on the approval cards above, or continue chatting with Lead...");
       } else {
-        ta.placeholder = `给 ${prj.name || "Lead"} 发消息... (Enter 发送，Shift+Enter 换行)`;
+        ta.placeholder = tr(`给 ${prj.name || "Lead"} 发消息... (Enter 发送，Shift+Enter 换行)`, `Message ${prj.name || "Lead"}... (Enter to send, Shift+Enter for newline)`);
       }
     }
 
@@ -6292,13 +6678,15 @@
     const sendBtn = $("btnSendComposer");
     if (sendBtn) {
       sendBtn.disabled = !allow;
-      sendBtn.title = isLeadBusy ? "排队发送（等待当前 Lead 回合结束后处理；Ctrl+Enter 可立即改向）" : "发送消息 (Enter)";
+      sendBtn.title = isLeadBusy
+        ? tr("排队发送（等待当前 Lead 回合结束后处理；Ctrl+Enter 可立即改向）", "Queue message (processed after current Lead turn; Ctrl+Enter to steer immediately)")
+        : tr("发送消息 (Enter)", "Send message (Enter)");
     }
     const stopBtn = $("btnStopLeadTurn");
     if (stopBtn) {
       stopBtn.classList.toggle("hidden", !isLeadBusy);
       stopBtn.disabled = !canMutate() || STATE.ui.interruptingLead;
-      stopBtn.textContent = STATE.ui.interruptingLead ? "正在停止..." : "停止";
+      stopBtn.textContent = STATE.ui.interruptingLead ? tr("正在停止...", "Stopping...") : tr("停止", "Stop");
     }
     const steerBtn = $("btnSteerLeadTurn");
     if (steerBtn) {
@@ -6430,6 +6818,7 @@
       return;
     }
     strip.classList.remove("hidden");
+    const closeTabTitle = tr("关闭标签", "Close tab");
     strip.innerHTML = tabIds.map(tid => {
       const raw = STATE.tasks.find(x => x.id === tid);
       const t = raw ? enrichTask(raw) : { id: tid, title: tid, status: "created" };
@@ -6441,7 +6830,7 @@
             <span class="dot ${getStatusDotClass(t)}"></span>
             <span class="worker-tab-label">${esc(label)}</span>
           </button>
-          <button class="worker-tab-close" type="button" data-close-worker-tab="${esc(tid)}" title="关闭标签" aria-label="关闭标签">×</button>
+          <button class="worker-tab-close" type="button" data-close-worker-tab="${esc(tid)}" title="${esc(closeTabTitle)}" aria-label="${esc(closeTabTitle)}">×</button>
         </div>`;
     }).join("");
   }
@@ -6462,13 +6851,19 @@
     const rawTask = getActiveTask();
     const allow = canMutate();
     const disAttr = allow ? "" : `disabled title="${esc(disabledReason())}"`;
+    const collapseInspectorTitle = tr("收起右侧检查器", "Collapse right inspector");
 
     if (tab !== "task") {
-      const headingMap = { diff: "代码差异 (Diff)", outline: "执行大纲", running: "运行中的 Worker", advanced: "高级工具与手动兜底" };
+      const headingMap = {
+        diff: tr("代码差异 (Diff)", "Code Diff"),
+        outline: tr("执行大纲", "Execution Outline"),
+        running: tr("运行中的 Worker", "Running Workers"),
+        advanced: tr("高级工具与手动兜底", "Advanced Tools & Manual Fallback")
+      };
       topEl.innerHTML = `
         <div class="inspector-top-tools">
-          <span class="inspector-top-heading">${esc(headingMap[tab] || "检查器")}</span>
-          <button class="icon-btn" id="btnInspectorClose" type="button" title="收起右侧检查器">
+          <span class="inspector-top-heading">${esc(headingMap[tab] || tr("检查器", "Inspector"))}</span>
+          <button class="icon-btn" id="btnInspectorClose" type="button" title="${esc(collapseInspectorTitle)}">
             <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 6 6 18M6 6l12 12"></path></svg>
           </button>
         </div>`;
@@ -6484,14 +6879,14 @@
       const taskOptions = STATE.tasks.map(t => `<button class="plan-task-row" type="button" data-select-task="${esc(t.id)}"><span class="plan-task-left"><span class="dot ${getStatusDotClass(enrichTask(t))}" style="margin-top:6px;"></span><span class="plan-task-info"><span class="plan-task-title">${esc(t.title || t.id)}</span><span class="plan-task-sub">${esc(getTaskHumanStatus(enrichTask(t)))}</span></span></span></button>`).join("");
       topEl.innerHTML = `
         <div class="inspector-top-tools">
-          <span class="inspector-top-heading">任务详情</span>
-          <button class="icon-btn" id="btnInspectorClose" type="button" title="收起右侧检查器">
+          <span class="inspector-top-heading">${esc(tr("任务详情", "Task Details"))}</span>
+          <button class="icon-btn" id="btnInspectorClose" type="button" title="${esc(collapseInspectorTitle)}">
             <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 6 6 18M6 6l12 12"></path></svg>
           </button>
         </div>`;
       bodyEl.innerHTML = taskOptions
-        ? `<div class="inspector-sec-label">选择当前项目的任务</div>${taskOptions}`
-        : `<div class="empty-state">点击计划卡下的任意任务即可查看实时日志、变更文件与人工操作。</div>`;
+        ? `<div class="inspector-sec-label">${esc(tr("选择当前项目的任务", "Select a task in this project"))}</div>${taskOptions}`
+        : `<div class="empty-state">${esc(tr("点击计划卡下的任意任务即可查看实时日志、变更文件与人工操作。", "Click any task in a plan card to view live logs, changed files, and manual actions."))}</div>`;
       return;
     }
 
@@ -6504,34 +6899,34 @@
     const buttons = [];
     const taskKind = t.kind || "general";
     if (t.status === "submitted") {
-      buttons.push(`<button class="inspector-action-row ok" type="button" data-task-op="accept" ${disAttr}><span class="inspector-action-left"><span>验收通过</span></span>${chevSvg}</button>`);
-      buttons.push(`<button class="inspector-action-row danger" type="button" data-task-op="reject_task" ${disAttr}><span class="inspector-action-left"><span>打回返工</span></span>${chevSvg}</button>`);
+      buttons.push(`<button class="inspector-action-row ok" type="button" data-task-op="accept" ${disAttr}><span class="inspector-action-left"><span>${esc(tr("验收通过", "Accept"))}</span></span>${chevSvg}</button>`);
+      buttons.push(`<button class="inspector-action-row danger" type="button" data-task-op="reject_task" ${disAttr}><span class="inspector-action-left"><span>${esc(tr("打回返工", "Request Rework"))}</span></span>${chevSvg}</button>`);
     } else if (t.status === "merge_failed") {
       if (taskKind === "code") {
-        buttons.push(`<button class="inspector-action-row accent" type="button" data-task-op="merge" ${disAttr}><span class="inspector-action-left"><span>重试合并</span></span>${chevSvg}</button>`);
+        buttons.push(`<button class="inspector-action-row accent" type="button" data-task-op="merge" ${disAttr}><span class="inspector-action-left"><span>${esc(tr("重试合并", "Retry Merge"))}</span></span>${chevSvg}</button>`);
       }
-      buttons.push(`<button class="inspector-action-row danger" type="button" data-task-op="reject_task" ${disAttr}><span class="inspector-action-left"><span>打回返工</span></span>${chevSvg}</button>`);
+      buttons.push(`<button class="inspector-action-row danger" type="button" data-task-op="reject_task" ${disAttr}><span class="inspector-action-left"><span>${esc(tr("打回返工", "Request Rework"))}</span></span>${chevSvg}</button>`);
     } else if (t.status === "accepted" && taskKind === "code") {
-      buttons.push(`<button class="inspector-action-row accent" type="button" data-task-op="merge" ${disAttr}><span class="inspector-action-left"><span>合并分支</span></span>${chevSvg}</button>`);
+      buttons.push(`<button class="inspector-action-row accent" type="button" data-task-op="merge" ${disAttr}><span class="inspector-action-left"><span>${esc(tr("合并分支", "Merge Branch"))}</span></span>${chevSvg}</button>`);
     }
     if (t.status === "failed") {
-      buttons.push(`<button class="inspector-action-row" type="button" data-task-op="escalate" ${disAttr}><span class="inspector-action-left"><span>升级异常</span></span>${chevSvg}</button>`);
+      buttons.push(`<button class="inspector-action-row" type="button" data-task-op="escalate" ${disAttr}><span class="inspector-action-left"><span>${esc(tr("升级异常", "Escalate"))}</span></span>${chevSvg}</button>`);
     }
     if (["failed", "escalated"].includes(t.status)) {
-      buttons.push(`<button class="inspector-action-row accent" type="button" data-task-op="retry" ${disAttr}><span class="inspector-action-left"><span>重试任务</span></span>${chevSvg}</button>`);
+      buttons.push(`<button class="inspector-action-row accent" type="button" data-task-op="retry" ${disAttr}><span class="inspector-action-left"><span>${esc(tr("重试任务", "Retry Task"))}</span></span>${chevSvg}</button>`);
     }
     if (["created", "assigned", "queued", "rework", "failed", "escalated", "merge_failed"].includes(t.status)) {
-      buttons.push(`<button class="inspector-action-row" type="button" data-task-op="assign" ${disAttr}><span class="inspector-action-left"><span>${t.status === "created" ? "指派执行者" : "改派执行者"}</span></span>${chevSvg}</button>`);
+      buttons.push(`<button class="inspector-action-row" type="button" data-task-op="assign" ${disAttr}><span class="inspector-action-left"><span>${esc(t.status === "created" ? tr("指派执行者", "Assign Worker") : tr("改派执行者", "Reassign Worker"))}</span></span>${chevSvg}</button>`);
     }
     if (taskKind === "code" && ["accepted", "merge_failed", "failed", "cancelled"].includes(t.status) && !t.superseded_by) {
-      buttons.push(`<button class="inspector-action-row" type="button" data-task-op="close" ${disAttr}><span class="inspector-action-left"><span>替代关闭</span></span>${chevSvg}</button>`);
+      buttons.push(`<button class="inspector-action-row" type="button" data-task-op="close" ${disAttr}><span class="inspector-action-left"><span>${esc(tr("替代关闭", "Close as Superseded"))}</span></span>${chevSvg}</button>`);
     }
     const openTaskRun = STATE.runs.find(r => r.task_id === t.id && (r.status === "starting" || r.status === "running"));
     if (openTaskRun) {
-      buttons.push(`<button class="inspector-action-row" type="button" data-task-op="release_run" ${disAttr}><span class="inspector-action-left"><span>释放运行锁</span></span>${chevSvg}</button>`);
+      buttons.push(`<button class="inspector-action-row" type="button" data-task-op="release_run" ${disAttr}><span class="inspector-action-left"><span>${esc(tr("释放运行锁", "Release Run Lock"))}</span></span>${chevSvg}</button>`);
     }
     if (!["merging", "merged", "cancelled", "cancelling"].includes(t.status) && !(t.status === "accepted" && taskKind === "general")) {
-      buttons.push(`<button class="inspector-action-row danger" type="button" data-task-op="cancel" ${disAttr}><span class="inspector-action-left"><span>取消任务</span></span>${chevSvg}</button>`);
+      buttons.push(`<button class="inspector-action-row danger" type="button" data-task-op="cancel" ${disAttr}><span class="inspector-action-left"><span>${esc(tr("取消任务", "Cancel Task"))}</span></span>${chevSvg}</button>`);
     }
 
     const humanStatus = getTaskHumanStatus(t);
@@ -6541,12 +6936,12 @@
 
     topEl.innerHTML = `
       <div class="inspector-top-tools">
-        <span class="inspector-top-heading">Worker 标签 · 任务详情</span>
+        <span class="inspector-top-heading">${esc(tr("Worker 标签 · 任务详情", "Worker Tab · Task Details"))}</span>
         <div style="display:flex;align-items:center;gap:4px;">
-          <button class="icon-btn" id="btnRefreshTask" type="button" ${disAttr} title="刷新任务详情">
+          <button class="icon-btn" id="btnRefreshTask" type="button" ${disAttr} title="${esc(tr("刷新任务详情", "Refresh task details"))}">
             <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M21 12a9 9 0 1 1-2.64-6.36"></path><path d="M21 3v6h-6"></path></svg>
           </button>
-          <button class="icon-btn" id="btnInspectorClose" type="button" title="收起右侧检查器">
+          <button class="icon-btn" id="btnInspectorClose" type="button" title="${esc(collapseInspectorTitle)}">
             <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 6 6 18M6 6l12 12"></path></svg>
           </button>
         </div>
@@ -6555,9 +6950,9 @@
       <div class="worker-subagent-bar">
         <div class="worker-subagent-bar-left">
           <span class="dot ${getStatusDotClass(t)}"></span>
-          <strong class="mono">${esc(t.assignee || "未指派")}</strong>
-          <span class="mono">${esc(t.model || "默认模型")}</span>
-          <span class="mono">${esc(t.profile || "默认档位")}</span>
+          <strong class="mono">${esc(t.assignee || tr("未指派", "Unassigned"))}</strong>
+          <span class="mono">${esc(t.model || tr("默认模型", "Default model"))}</span>
+          <span class="mono">${esc(t.profile || tr("默认档位", "Default profile"))}</span>
           <span class="status-pill ${t.status === "merged" ? "green" : (["failed", "escalated", "merge_failed"].includes(t.status) ? "red" : (["running", "merging"].includes(t.status) ? "blue" : "neutral"))}">${esc(humanStatus)}</span>
         </div>
         <span class="mono" ${liveAttr}>${esc(dur.text)}</span>
@@ -6579,14 +6974,15 @@
 
     if (t.pending_approval && t.pending_approval.category !== "plan_dispatch") {
       const apr = resolveHydratedApproval(t.pending_approval.id) || t.pending_approval;
-      const catLabel = GATE_CATEGORY_LABELS[apr.category] || apr.category || "安全审批";
+      const catLabel = getGateCategoryLabel(apr.category) || tr("安全审批", "Security Approval");
+      const aprSummary = apr.summary ? localizeDaemonCardBody(apr, apr.summary) : formatApprovalOpName(apr);
       blocks.push(`
         <div class="inspector-note-box amber">
-          <strong>待审批 · ${esc(catLabel)}</strong>
-          <div style="margin-top:4px;">${esc(apr.summary || formatApprovalOpName(apr))}</div>
+          <strong>${esc(tr(`待审批 · ${catLabel}`, `Pending · ${catLabel}`))}</strong>
+          <div style="margin-top:4px;">${esc(aprSummary)}</div>
           <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
-            <button class="btn btn-sm btn-primary" type="button" data-jump-approval-card="${esc(apr.id)}">定位左侧审批卡片</button>
-            <button class="btn btn-sm btn-ghost" type="button" data-open-advanced-gate="${esc(apr.id)}">查看载荷详情</button>
+            <button class="btn btn-sm btn-primary" type="button" data-jump-approval-card="${esc(apr.id)}">${esc(tr("定位左侧审批卡片", "Jump to Approval Card"))}</button>
+            <button class="btn btn-sm btn-ghost" type="button" data-open-advanced-gate="${esc(apr.id)}">${esc(tr("查看载荷详情", "View Payload"))}</button>
           </div>
         </div>`);
     }
@@ -6594,7 +6990,7 @@
     if (t.failure) {
       blocks.push(`
         <div class="inspector-note-box red">
-          <strong>最近失败原因</strong>
+          <strong>${esc(tr("最近失败原因", "Latest Failure"))}</strong>
           <pre class="log-box" style="margin-top:6px;max-height:140px;">${esc(typeof t.failure === "string" ? t.failure : JSON.stringify(t.failure, null, 2))}</pre>
         </div>`);
     }
@@ -6602,7 +6998,7 @@
     if (actionButtons.length) {
       blocks.push(`
         <div class="inspector-card-group">
-          <div class="inspector-sec-label">任务操作</div>
+          <div class="inspector-sec-label">${esc(tr("任务操作", "Task Actions"))}</div>
           <div class="inspector-card">${actionButtons.join("")}</div>
         </div>`);
     }
@@ -6611,26 +7007,26 @@
     const depsList = depData.depends_on || t.depends_on || [];
     const depsText = Array.isArray(depsList) && depsList.length
       ? depsList.map(d => typeof d === "string" ? d : `${d.id}`).join(", ")
-      : "无";
+      : tr("无", "None");
 
     blocks.push(`
       <div class="inspector-card-group">
-        <div class="inspector-sec-label">执行信息</div>
+        <div class="inspector-sec-label">${esc(tr("执行信息", "Execution Info"))}</div>
         <div class="inspector-card">
-          <div class="param-row"><span class="param-k">执行 Agent</span><span class="param-v">${esc(t.assignee || "未指派")}</span></div>
-          <div class="param-row"><span class="param-k">模型 / 强度</span><span class="param-v mono">${esc(t.model || "默认")} · ${esc(t.effort || "默认")}</span></div>
-          <div class="param-row"><span class="param-k">权限档位</span><span class="param-v mono">${esc(t.profile || "默认")}</span></div>
-          <div class="param-row"><span class="param-k">类型 / 尝试</span><span class="param-v mono">${esc(t.kind || "general")} · ${esc(t.attempt || 0)}/${esc(t.max_attempts || "--")}</span></div>
-          <div class="param-row"><span class="param-k">来源</span><span class="param-v muted">${esc(origin.short)}</span></div>
-          <div class="param-row"><span class="param-k">依赖任务</span><span class="param-v mono muted">${esc(depsText)}</span></div>
-          ${t.branch ? `<div class="param-row"><span class="param-k">工作分支</span><span class="param-v mono muted">${esc(t.branch)}</span></div>` : ""}
+          <div class="param-row"><span class="param-k">${esc(tr("执行 Agent", "Worker Agent"))}</span><span class="param-v">${esc(t.assignee || tr("未指派", "Unassigned"))}</span></div>
+          <div class="param-row"><span class="param-k">${esc(tr("模型 / 强度", "Model / Effort"))}</span><span class="param-v mono">${esc(t.model || tr("默认", "Default"))} · ${esc(t.effort || tr("默认", "Default"))}</span></div>
+          <div class="param-row"><span class="param-k">${esc(tr("权限档位", "Permission Profile"))}</span><span class="param-v mono">${esc(t.profile || tr("默认", "Default"))}</span></div>
+          <div class="param-row"><span class="param-k">${esc(tr("类型 / 尝试", "Kind / Attempts"))}</span><span class="param-v mono">${esc(t.kind || "general")} · ${esc(t.attempt || 0)}/${esc(t.max_attempts || "--")}</span></div>
+          <div class="param-row"><span class="param-k">${esc(tr("来源", "Origin"))}</span><span class="param-v muted">${esc(origin.short)}</span></div>
+          <div class="param-row"><span class="param-k">${esc(tr("依赖任务", "Dependencies"))}</span><span class="param-v mono muted">${esc(depsText)}</span></div>
+          ${t.branch ? `<div class="param-row"><span class="param-k">${esc(tr("工作分支", "Working Branch"))}</span><span class="param-v mono muted">${esc(t.branch)}</span></div>` : ""}
         </div>
       </div>`);
 
     blocks.push(`
       <div class="inspector-section">
-        <div class="inspector-sec-label">任务说明</div>
-        <pre class="log-box" style="max-height:180px;">${esc(t.spec || "(无说明)")}</pre>
+        <div class="inspector-sec-label">${esc(tr("任务说明", "Task Specification"))}</div>
+        <pre class="log-box" style="max-height:180px;">${esc(t.spec || tr("(无说明)", "(No specification)"))}</pre>
       </div>`);
 
     // Git Diff Summary (with direct jump to B1 Diff tab)
@@ -6641,16 +7037,16 @@
       blocks.push(`
         <div class="inspector-section">
           <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;">
-            <span class="inspector-sec-label">代码变更摘要</span>
-            ${(t.kind || "general") === "code" ? `<button class="btn btn-sm btn-ghost" type="button" data-open-diff-tab="task">查看实时 Diff →</button>` : ""}
+            <span class="inspector-sec-label">${esc(tr("代码变更摘要", "Code Changes Summary"))}</span>
+            ${(t.kind || "general") === "code" ? `<button class="btn btn-sm btn-ghost" type="button" data-open-diff-tab="task">${esc(tr("查看实时 Diff →", "View Live Diff →"))}</button>` : ""}
           </div>
           ${git ? `
             <div class="kv-list">
-              <div class="kv-row"><span class="kv-k">分支</span><span class="kv-v mono">${esc(git.branch || t.branch || "--")}</span></div>
-              <div class="kv-row"><span class="kv-k">提交数</span><span class="kv-v mono">${esc(git.commit_count ?? 0)}</span></div>
+              <div class="kv-row"><span class="kv-k">${esc(tr("分支", "Branch"))}</span><span class="kv-v mono">${esc(git.branch || t.branch || "--")}</span></div>
+              <div class="kv-row"><span class="kv-k">${esc(tr("提交数", "Commits"))}</span><span class="kv-v mono">${esc(git.commit_count ?? 0)}</span></div>
             </div>
             ${git.diff_stat ? `<pre class="log-box" style="max-height:160px;">${esc(git.diff_stat)}</pre>` : ""}` : ""}
-          ${ws && Array.isArray(ws.files) && ws.files.length ? `<details class="config-raw-details" data-details-key="ws:${esc(t.id)}"><summary>工作区文件 (${ws.files.length}${ws.files_truncated ? "+" : ""})</summary><div class="file-list" style="margin-top:6px;">${ws.files.map(f => `<div class="file-row">${esc(typeof f === "string" ? f : (f.path || ""))}</div>`).join("")}</div></details>` : ""}
+          ${ws && Array.isArray(ws.files) && ws.files.length ? `<details class="config-raw-details" data-details-key="ws:${esc(t.id)}"><summary>${esc(tr(`工作区文件 (${ws.files.length}${ws.files_truncated ? "+" : ""})`, `Workspace files (${ws.files.length}${ws.files_truncated ? "+" : ""})`))}</summary><div class="file-list" style="margin-top:6px;">${ws.files.map(f => `<div class="file-row">${esc(typeof f === "string" ? f : (f.path || ""))}</div>`).join("")}</div></details>` : ""}
         </div>`);
     }
 
@@ -6658,20 +7054,20 @@
     const taskRuns = STATE.runs.filter(r => r.task_id === t.id).sort((a, b) => (a.attempt || 0) - (b.attempt || 0));
     const stream = STATE.ui.logStreamFilter;
     const runId = STATE.ui.logRunId;
-    const runOptions = [`<option value="">最新一次运行</option>`].concat(
-      taskRuns.map(r => `<option value="${esc(r.id)}" ${runId === r.id ? "selected" : ""}>第 ${esc(r.attempt || 1)} 次 · ${esc(r.status)}</option>`)
+    const runOptions = [`<option value="">${esc(tr("最新一次运行", "Latest run"))}</option>`].concat(
+      taskRuns.map(r => `<option value="${esc(r.id)}" ${runId === r.id ? "selected" : ""}>${esc(tr(`第 ${r.attempt || 1} 次 · ${r.status}`, `Attempt #${r.attempt || 1} · ${r.status}`))}</option>`)
     );
     blocks.push(`
       <div class="inspector-section">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap;">
-          <span class="inspector-sec-label">运行日志</span>
+          <span class="inspector-sec-label">${esc(tr("运行日志", "Run Logs"))}</span>
           <div style="display:flex;align-items:center;gap:6px;">
             <div class="segmented">
-              <button type="button" class="${stream === "all" ? "active" : ""}" data-log-stream="all">全部</button>
-              <button type="button" class="${stream === "stdout" ? "active" : ""}" data-log-stream="stdout">标准输出</button>
-              <button type="button" class="${stream === "stderr" ? "active" : ""}" data-log-stream="stderr">错误输出</button>
+              <button type="button" class="${stream === "all" ? "active" : ""}" data-log-stream="all">${esc(tr("全部", "All"))}</button>
+              <button type="button" class="${stream === "stdout" ? "active" : ""}" data-log-stream="stdout">${esc(tr("标准输出", "stdout"))}</button>
+              <button type="button" class="${stream === "stderr" ? "active" : ""}" data-log-stream="stderr">${esc(tr("错误输出", "stderr"))}</button>
             </div>
-            <button class="btn btn-sm" id="btnReloadLogs" type="button">刷新</button>
+            <button class="btn btn-sm" id="btnReloadLogs" type="button">${esc(tr("刷新", "Refresh"))}</button>
           </div>
         </div>
         ${taskRuns.length > 1 ? `<select class="compact-select" id="selectLogRun" style="min-height:28px;font-size:12px;">${runOptions.join("")}</select>` : ""}
@@ -6689,7 +7085,7 @@
     const logData = STATE.taskLogs[cacheKey];
     const structuredAct = STATE.taskActivities[actCacheKey] || (logData && logData.run_id ? STATE.runActivities[logData.run_id] : null);
 
-    if (!logData) return `<div class="empty-state" style="padding:12px;">正在读取日志...</div>`;
+    if (!logData) return `<div class="empty-state" style="padding:12px;">${esc(tr("正在读取日志...", "Loading logs..."))}</div>`;
     if (logData.error) return `<div class="inspector-note-box red">${esc(formatErrorMessage(logData.error))}</div>`;
     if (logData.streams) {
       const chunks = [];
@@ -6699,26 +7095,26 @@
         const lines = Array.isArray(sObj.lines) ? sObj.lines.join("\n") : "";
         if (sname === "stdout") {
           chunks.push(renderGroupedActivityHtml(lines, `tasklog:${t.id}:${runId || "latest"}`, {
-            emptyText: sObj.available ? "(暂无输出)" : "(无日志文件)",
+            emptyText: sObj.available ? tr("(暂无输出)", "(No output yet)") : tr("(无日志文件)", "(No log file)"),
             showRawToggle: true,
             structuredActivity: structuredAct
           }));
         } else if (lines.trim()) {
           chunks.push(`<div class="inspector-sec-label" style="margin-top:6px;">stderr</div><pre class="log-box" style="max-height:180px;">${esc(lines)}</pre>`);
         } else if (stream === "stderr") {
-          chunks.push(`<pre class="log-box" style="max-height:180px;">${esc(sObj.available ? "(暂无错误输出)" : "(无日志文件)")}</pre>`);
+          chunks.push(`<pre class="log-box" style="max-height:180px;">${esc(sObj.available ? tr("(暂无错误输出)", "(No stderr output)") : tr("(无日志文件)", "(No log file)"))}</pre>`);
         }
       }
-      return chunks.length ? chunks.join("") : `<div class="empty-state" style="padding:12px;">暂无日志内容</div>`;
+      return chunks.length ? chunks.join("") : `<div class="empty-state" style="padding:12px;">${esc(tr("暂无日志内容", "No log output"))}</div>`;
     }
-    return `<div class="empty-state" style="padding:12px;">暂无日志内容</div>`;
+    return `<div class="empty-state" style="padding:12px;">${esc(tr("暂无日志内容", "No log output"))}</div>`;
   }
 
   // B1: Pure vanilla JS opaque unified diff renderer and file tree viewer
   function renderUnifiedPatchHtml(patchText) {
     const raw = typeof patchText === "string" ? patchText : "";
     if (!raw.trim()) {
-      return `<div class="empty-state" style="padding:10px;">(无差异内容)</div>`;
+      return `<div class="empty-state" style="padding:10px;">${esc(tr("(无差异内容)", "(No diff content)"))}</div>`;
     }
     const lines = raw.split(/\r?\n/);
     const htmlLines = lines.map(line => {
@@ -6740,11 +7136,11 @@
   function renderInspectorDiff(bodyEl) {
     const prj = getActiveProject();
     if (!prj) {
-      bodyEl.innerHTML = `<div class="empty-state">打开一个绑定本地 Git 仓库的项目后可查看只读代码差异。</div>`;
+      bodyEl.innerHTML = `<div class="empty-state">${esc(tr("打开一个绑定本地 Git 仓库的项目后可查看只读代码差异。", "Open a project bound to a local Git repo to view read-only code diffs."))}</div>`;
       return;
     }
     if (!prj.repo) {
-      bodyEl.innerHTML = `<div class="empty-state">当前项目未绑定本地 Git 代码仓库，暂无代码差异。</div>`;
+      bodyEl.innerHTML = `<div class="empty-state">${esc(tr("当前项目未绑定本地 Git 代码仓库，暂无代码差异。", "This project is not bound to a local Git repository, so no code diff is available."))}</div>`;
       return;
     }
 
@@ -6759,18 +7155,18 @@
     blocks.push(`
       <div class="diff-toolbar">
         <div class="segmented">
-          <button type="button" class="${scope === "task" ? "active" : ""}" data-diff-scope="task" ${hasCodeTask ? "" : "disabled title=\"请先在任务列表中选择一个代码任务\""}>当前任务</button>
-          <button type="button" class="${scope === "project" ? "active" : ""}" data-diff-scope="project">项目集成</button>
+          <button type="button" class="${scope === "task" ? "active" : ""}" data-diff-scope="task" ${hasCodeTask ? "" : `disabled title="${esc(tr("请先在任务列表中选择一个代码任务", "Select a code task first"))}"`}>${esc(tr("当前任务", "Current Task"))}</button>
+          <button type="button" class="${scope === "project" ? "active" : ""}" data-diff-scope="project">${esc(tr("项目集成", "Project Integration"))}</button>
         </div>
         <div style="display:flex;align-items:center;gap:4px;">
-          <button class="btn btn-sm btn-ghost" type="button" data-diff-expand-all="1">展开全部</button>
-          <button class="btn btn-sm btn-ghost" type="button" data-diff-collapse-all="1">折叠全部</button>
-          <button class="btn btn-sm" type="button" data-diff-refresh="1">刷新</button>
+          <button class="btn btn-sm btn-ghost" type="button" data-diff-expand-all="1">${esc(tr("展开全部", "Expand All"))}</button>
+          <button class="btn btn-sm btn-ghost" type="button" data-diff-collapse-all="1">${esc(tr("折叠全部", "Collapse All"))}</button>
+          <button class="btn btn-sm" type="button" data-diff-refresh="1">${esc(tr("刷新", "Refresh"))}</button>
         </div>
       </div>`);
 
     if (!diffData) {
-      blocks.push(`<div class="empty-state" style="padding:16px;">正在读取只读 Git 差异...</div>`);
+      blocks.push(`<div class="empty-state" style="padding:16px;">${esc(tr("正在读取只读 Git 差异...", "Loading read-only Git diff..."))}</div>`);
       bodyEl.innerHTML = blocks.join("");
       return;
     }
@@ -6784,17 +7180,19 @@
     const files = Array.isArray(diffData.files) ? diffData.files : [];
     const wtPath = diffData.worktree_path || "";
     const reasonMap = {
-      not_code_task: "当前任务不是代码任务（general），无 Git 工作树差异。",
-      no_repo: "项目未绑定 Git 仓库。",
-      repo_missing: "项目绑定的本地 Git 仓库目录不存在。",
-      workspace_missing: "任务工作树尚未创建或已被清理，且未找到可比较的分支。",
-      untrusted_worktree: "任务工作树路径校验未通过，已拒绝读取。",
-      integration_branch_missing: "项目集成分支尚未创建。",
-      base_branch_missing: "项目基准分支不存在。",
-      diff_timeout: "读取只读 Git 差异超时，请稍后重试。",
-      git_diff_failed: "执行只读 Git 差异命令失败，请稍后重试。"
+      not_code_task: tr("当前任务不是代码任务（general），无 Git 工作树差异。", "This task is not a code task (general), so it has no Git worktree diff."),
+      no_repo: tr("项目未绑定 Git 仓库。", "Project is not bound to a Git repository."),
+      repo_missing: tr("项目绑定的本地 Git 仓库目录不存在。", "Bound local Git repository directory does not exist."),
+      workspace_missing: tr("任务工作树尚未创建或已被清理，且未找到可比较的分支。", "Task worktree is not created or has been cleaned up, and no comparable branch was found."),
+      untrusted_worktree: tr("任务工作树路径校验未通过，已拒绝读取。", "Task worktree path verification failed; read rejected."),
+      integration_branch_missing: tr("项目集成分支尚未创建。", "Project integration branch has not been created yet."),
+      base_branch_missing: tr("项目基准分支不存在。", "Project base branch does not exist."),
+      diff_timeout: tr("读取只读 Git 差异超时，请稍后重试。", "Timed out reading read-only Git diff. Please retry."),
+      git_diff_failed: tr("执行只读 Git 差异命令失败，请稍后重试。", "Failed to run read-only Git diff command. Please retry.")
     };
 
+    const filesChangedCount = stat.files_changed || 0;
+    const commitsAheadCount = typeof diffData.commits_ahead === "number" ? diffData.commits_ahead : null;
     blocks.push(`
       <div class="diff-header-card">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap;">
@@ -6804,32 +7202,32 @@
         ${wtPath ? `
           <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;">
             <span class="mono" style="font-size:11px;color:var(--text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(wtPath)}">${esc(wtPath)}</span>
-            <button class="btn btn-sm btn-ghost" type="button" data-copy-code="${esc(wtPath)}">复制路径</button>
+            <button class="btn btn-sm btn-ghost" type="button" data-copy-code="${esc(wtPath)}">${esc(tr("复制路径", "Copy Path"))}</button>
           </div>` : ""}
         <div class="diff-stat-row">
-          <span class="diff-stat-pill">${esc(stat.files_changed || 0)} 个文件</span>
+          <span class="diff-stat-pill">${esc(isEnglish() ? `${filesChangedCount} ${filesChangedCount === 1 ? "file" : "files"}` : `${filesChangedCount} 个文件`)}</span>
           <span class="diff-stat-pill add">+${esc(stat.additions || 0)}</span>
           <span class="diff-stat-pill del">-${esc(stat.deletions || 0)}</span>
-          ${typeof diffData.commits_ahead === "number" ? `<span class="diff-stat-pill">${esc(diffData.commits_ahead)} 个领先提交</span>` : ""}
-          ${diffData.dirty ? `<span class="status-pill amber">含未提交变更</span>` : ""}
-          ${diffData.available && diffData.truncated ? `<span class="status-pill amber">已按大小上限截断</span>` : ""}
+          ${commitsAheadCount !== null ? `<span class="diff-stat-pill">${esc(isEnglish() ? `${commitsAheadCount} ${commitsAheadCount === 1 ? "commit" : "commits"} ahead` : `${commitsAheadCount} 个领先提交`)}</span>` : ""}
+          ${diffData.dirty ? `<span class="status-pill amber">${esc(tr("含未提交变更", "Uncommitted changes"))}</span>` : ""}
+          ${diffData.available && diffData.truncated ? `<span class="status-pill amber">${esc(tr("已按大小上限截断", "Truncated by size limit"))}</span>` : ""}
         </div>
         ${scope === "project" && prj.repo && prj.status !== "cancelled" && (stat.files_changed > 0 || (diffData.commits_ahead || 0) > 0) ? `
           <div style="display:flex;justify-content:flex-end;margin-top:2px;">
-            <button class="btn btn-sm btn-primary" type="button" data-prj-op="deliver" ${canMutate() ? "" : "disabled"}>交付到本地分支 (快进)</button>
+            <button class="btn btn-sm btn-primary" type="button" data-prj-op="deliver" ${canMutate() ? "" : "disabled"}>${esc(tr("交付到本地分支 (快进)", "Deliver to Local Branch (FF)"))}</button>
           </div>` : ""}
       </div>`);
 
     if (!diffData.available) {
-      blocks.push(`<div class="empty-state" style="padding:14px;">${esc(reasonMap[diffData.reason] || diffData.reason || "暂无可展示的代码差异")}</div>`);
+      blocks.push(`<div class="empty-state" style="padding:14px;">${esc(reasonMap[diffData.reason] || diffData.reason || tr("暂无可展示的代码差异", "No code diff available"))}</div>`);
       bodyEl.innerHTML = blocks.join("");
       return;
     }
 
     if (!files.length) {
       const emptyMsg = diffData.truncated
-        ? "读取代码差异未完成或已达到上限，请点击「刷新」重试。"
-        : "当前工作树与基准相比无代码差异。";
+        ? tr("读取代码差异未完成或已达到上限，请点击「刷新」重试。", "Diff loading incomplete or reached limit. Click Refresh to retry.")
+        : tr("当前工作树与基准相比无代码差异。", "No code differences compared to the base ref.");
       blocks.push(`<div class="empty-state" style="padding:14px;">${esc(emptyMsg)}</div>`);
       bodyEl.innerHTML = blocks.join("");
       return;
@@ -6862,14 +7260,14 @@
       const openByDefault = idx < 3 ? "open" : "";
       let bodyHtml;
       if (f.binary) {
-        bodyHtml = `<div class="empty-state" style="padding:10px;">二进制文件变更（未展示文本补丁）</div>`;
+        bodyHtml = `<div class="empty-state" style="padding:10px;">${esc(tr("二进制文件变更（未展示文本补丁）", "Binary file changed (text patch omitted)"))}</div>`;
       } else if (f.error && !(f.patch || "").trim()) {
         const errNote = f.error === "timeout"
-          ? "已达到差异读取时间上限，未加载此文件补丁。"
-          : "读取此文件补丁失败。";
+          ? tr("已达到差异读取时间上限，未加载此文件补丁。", "Diff read timeout reached; patch omitted for this file.")
+          : tr("读取此文件补丁失败。", "Failed to load patch for this file.");
         bodyHtml = `<div class="empty-state" style="padding:10px;">${esc(errNote)}</div>`;
       } else if (f.truncated && !(f.patch || "").trim()) {
-        bodyHtml = `<div class="empty-state" style="padding:10px;">已达到差异大小上限，未加载此文件补丁。</div>`;
+        bodyHtml = `<div class="empty-state" style="padding:10px;">${esc(tr("已达到差异大小上限，未加载此文件补丁。", "Diff size limit reached; patch omitted for this file."))}</div>`;
       } else {
         bodyHtml = renderUnifiedPatchHtml(f.patch || "");
       }
@@ -6879,7 +7277,7 @@
             <span class="diff-file-row-left">
               <span class="diff-status-badge st-${esc(st)}">${esc(f.status || "M")}</span>
               <span class="diff-file-path" title="${esc(label)}">${esc(label)}</span>
-              ${f.truncated ? `<span class="status-pill amber" style="font-size:10px;padding:0 5px;">已截断</span>` : ""}
+              ${f.truncated ? `<span class="status-pill amber" style="font-size:10px;padding:0 5px;">${esc(tr("已截断", "Truncated"))}</span>` : ""}
             </span>
             <span class="mono" style="font-size:11px;flex-shrink:0;">+${esc(f.additions || 0)} -${esc(f.deletions || 0)}</span>
           </summary>
@@ -6914,20 +7312,20 @@
   function renderInspectorOutline(bodyEl) {
     const prj = getActiveProject();
     if (!prj) {
-      bodyEl.innerHTML = `<div class="empty-state">打开一个项目对话后可查看 Lead 推理与执行大纲。</div>`;
+      bodyEl.innerHTML = `<div class="empty-state">${esc(tr("打开一个项目对话后可查看 Lead 推理与执行大纲。", "Open a project chat to view Lead reasoning and execution outline."))}</div>`;
       return;
     }
     const blocks = [];
     const leadRuns = STATE.runs.filter(r => r.project_id === prj.id && r.kind === "lead_turn").slice(-10).reverse();
     if (leadRuns.length) {
-      blocks.push(`<div class="inspector-sec-label">Lead 思考与回合记录 (${leadRuns.length})</div>`);
+      blocks.push(`<div class="inspector-sec-label">${esc(tr(`Lead 思考与回合记录 (${leadRuns.length})`, `Lead Turns & Reasoning (${leadRuns.length})`))}</div>`);
       leadRuns.forEach(run => {
         const stdout = STATE.leadTurnLogs[run.id] || "";
         const dur = run.ended_at && run.started_at
           ? formatDuration((Date.parse(run.ended_at) - Date.parse(run.started_at)) / 1000)
-          : (run.status === "running" ? "运行中" : "--");
+          : (run.status === "running" ? tr("运行中", "Running") : "--");
         const actHtml = renderGroupedActivityHtml(stdout, `outline:${run.id}`, {
-          emptyText: run.status === "running" ? "正在执行中..." : "(无原始输出)",
+          emptyText: run.status === "running" ? tr("正在执行中...", "Running...") : tr("(无原始输出)", "(No raw output)"),
           showRawToggle: true,
           structuredActivity: STATE.runActivities[run.id] || null
         });
@@ -6945,7 +7343,7 @@
     }
 
     const recentEvents = STATE.events.slice(-40).reverse();
-    blocks.push(`<div class="inspector-sec-label" style="margin-top:4px;">最近项目事件 (${recentEvents.length})</div>`);
+    blocks.push(`<div class="inspector-sec-label" style="margin-top:4px;">${esc(tr(`最近项目事件 (${recentEvents.length})`, `Recent Project Events (${recentEvents.length})`))}</div>`);
     if (recentEvents.length) {
       blocks.push(`<div class="inspector-card">${recentEvents.map(ev => `
         <div class="timeline-row">
@@ -6953,10 +7351,10 @@
             <span class="mono" style="font-size:11.5px;color:var(--text-primary);">${esc(ev.type)}</span>
             <span class="mono" style="font-size:11px;color:var(--text-muted);">${esc(formatClock(ev.ts))}</span>
           </div>
-          ${ev.reason ? `<div style="font-size:11.5px;color:var(--text-secondary);margin-top:2px;">${esc(ev.reason)}</div>` : ""}
+          ${ev.reason ? `<div style="font-size:11.5px;color:var(--text-secondary);margin-top:2px;">${esc(localizeDaemonMessage(ev.reason))}</div>` : ""}
         </div>`).join("")}</div>`);
     } else {
-      blocks.push(`<div class="empty-state">暂无事件记录</div>`);
+      blocks.push(`<div class="empty-state">${esc(tr("暂无事件记录", "No events yet"))}</div>`);
     }
     bodyEl.innerHTML = blocks.join("");
   }
@@ -6969,7 +7367,7 @@
     const activeTasks = STATE.tasks.filter(t => ["running", "merging", "queued", "assigned"].includes(t.status));
 
     const blocks = [];
-    blocks.push(`<div class="inspector-sec-label">正在运行的 Worker (${activeRuns.length})</div>`);
+    blocks.push(`<div class="inspector-sec-label">${esc(tr(`正在运行的 Worker (${activeRuns.length})`, `Running Workers (${activeRuns.length})`))}</div>`);
     if (activeRuns.length) {
       blocks.push(`<div class="inspector-card">${activeRuns.map(r => {
         const elapsed = r.started_at ? formatDuration((Date.now() - Date.parse(r.started_at)) / 1000) : "00:00";
@@ -6979,17 +7377,17 @@
           <button class="param-row" type="button" ${clickAttr}>
             <span style="display:flex;align-items:center;gap:7px;min-width:0;">
               <span class="dot dot-blue"></span>
-              <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(r.agent || "--")} · ${esc(r.kind === "lead_turn" ? "Lead 回合" : (r.task_id || r.kind))}</span>
+              <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(r.agent || "--")} · ${esc(r.kind === "lead_turn" ? tr("Lead 回合", "Lead turn") : (r.task_id || r.kind))}</span>
             </span>
             <span class="param-v mono" ${liveAttr}>${esc(elapsed)}</span>
           </button>`;
       }).join("")}</div>`);
     } else {
-      blocks.push(`<div class="empty-state">当前没有正在运行的进程</div>`);
+      blocks.push(`<div class="empty-state">${esc(tr("当前没有正在运行的进程", "No active processes running"))}</div>`);
     }
 
     if (activeTasks.length) {
-      blocks.push(`<div class="inspector-sec-label" style="margin-top:4px;">进行中的任务 (${activeTasks.length})</div>`);
+      blocks.push(`<div class="inspector-sec-label" style="margin-top:4px;">${esc(tr(`进行中的任务 (${activeTasks.length})`, `Active Tasks (${activeTasks.length})`))}</div>`);
       blocks.push(activeTasks.map(rawT => {
         const t = enrichTask(rawT);
         const dur = getTaskDurationInfo(t);
@@ -7047,15 +7445,17 @@
       ? renderItems.map(({ raw, resolvedPlaceholder }) => {
         if (resolvedPlaceholder) {
           inspLayoutTokens.push(`${raw.id}:resolved`);
+          const resolvedSummary = raw.summary ? localizeDaemonCardBody(raw, raw.summary) : formatApprovalOpName(raw);
+          const resolvedLbl = resolvedPlaceholder.label || tr("已处理", "Handled");
           return `
             <div class="inspector-note-box is-resolved-placeholder" data-advanced-approval-id="${esc(raw.id)}" data-resolved-placeholder="1">
               <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;">
-                <strong>${esc(GATE_CATEGORY_LABELS[raw.category] || raw.category || "审批")}</strong>
-                <span class="status-pill neutral">${esc(resolvedPlaceholder.label || "已处理")}</span>
+                <strong>${esc(getGateCategoryLabel(raw.category) || tr("审批", "Approval"))}</strong>
+                <span class="status-pill neutral">${esc(resolvedLbl)}</span>
               </div>
-              <div style="margin-top:4px;">${esc(raw.summary || formatApprovalOpName(raw))}</div>
+              <div style="margin-top:4px;">${esc(resolvedSummary)}</div>
               <div style="margin-top:8px;">
-                <button class="btn btn-sm" type="button" disabled>${esc(resolvedPlaceholder.label || "已处理")}</button>
+                <button class="btn btn-sm" type="button" disabled>${esc(resolvedLbl)}</button>
               </div>
             </div>`;
         }
@@ -7066,15 +7466,15 @@
         const linkedTask = apr.task_id ? STATE.tasks.find(t => t && t.id === apr.task_id) : null;
         const aprPrj = apr.project_id ? (STATE.projects.find(p => p && p.id === apr.project_id) || (prj && prj.id === apr.project_id ? prj : null)) : null;
         const projectBadgeLabel = apr.project_id
-          ? `项目：${(aprPrj && aprPrj.name) || apr.project_id}`
-          : "全局配置";
+          ? tr(`项目：${(aprPrj && aprPrj.name) || apr.project_id}`, `Project: ${(aprPrj && aprPrj.name) || apr.project_id}`)
+          : tr("全局配置", "Global Config");
         const cardOpts = {
           plan: matchedPlan,
           projectStatus: aprPrj && aprPrj.status,
           permissionMode: aprPrj && aprPrj.permission_mode,
           task: linkedTask
         };
-        const catLabel = GATE_CATEGORY_LABELS[apr.category] || apr.category;
+        const catLabel = getGateCategoryLabel(apr.category);
         const isExternalOp = isExternalApprovalOp(apr);
         const isUnhydrated = !Array.isArray(apr.available_actions);
         const actions = getApprovalCardActions(apr, cardOpts);
@@ -7086,18 +7486,19 @@
         const undecidableHint = !canAct ? formatUndecidableReasonHint(apr, cardOpts) : "";
         const dismissHint = isDismissOnly ? formatUnapprovableReasonHint(apr, cardOpts) : "";
         const externalTagHtml = isExternalOp
-          ? `<span class="status-pill neutral" data-external-op-badge="1">外部请求</span>`
+          ? `<span class="status-pill neutral" data-external-op-badge="1">${esc(tr("外部请求", "External Request"))}</span>`
           : "";
         const extraBadgeHtml = isDismissOnly
           ? `<span class="status-pill neutral" data-unapprovable-reason="${esc(unapprovableReason || "dismiss_only")}">${esc(formatApprovalReasonBadgeLabel(unapprovableReason))}</span>`
           : (isRelayedRejected
-            ? `<span class="status-pill amber">转发已拒绝</span>`
+            ? `<span class="status-pill amber">${esc(tr("转发已拒绝", "Relayed Reject"))}</span>`
             : "");
         const effPolicy = resolveApprovalPolicy(apr, {
           planGateMode: aprPrj && aprPrj.plan_gate_mode,
           permissionMode: aprPrj && aprPrj.permission_mode
         });
         const isFocused = Boolean(focusAprId && focusAprId === apr.id);
+        const aprSummary = apr.summary ? localizeDaemonCardBody(apr, apr.summary) : formatApprovalOpName(apr);
         return `
           <div class="inspector-note-box ${canAct && !isDismissOnly ? "amber" : ""}${isFocused ? " approval-card-highlight" : ""}" data-advanced-approval-id="${esc(apr.id)}"${isDismissOnly ? ' data-dismiss-only="1"' : ""}${isExternalOp ? ' data-external-op="1"' : ""}>
             <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;">
@@ -7109,35 +7510,35 @@
               </div>
               <span class="mono" style="font-size:11px;color:var(--text-muted);">${esc(effPolicy)}</span>
             </div>
-            <div style="margin-top:4px;">${esc(apr.summary || formatApprovalOpName(apr))}</div>
+            <div style="margin-top:4px;">${esc(aprSummary)}</div>
             <details data-details-key="apr:${esc(apr.id)}"${isFocused ? " open" : ""} style="margin-top:5px;">
-              <summary style="cursor:pointer;font-size:12px;">查看操作载荷 JSON</summary>
+              <summary style="cursor:pointer;font-size:12px;">${esc(tr("查看操作载荷 JSON", "View Operation Payload JSON"))}</summary>
               <pre class="log-box" style="margin-top:4px;max-height:130px;">${esc(formatApprovalOpJson(apr))}</pre>
             </details>
             ${dismissHint ? `<div class="gate-resolved-bar" data-dismiss-only="1" data-unapprovable-reason="${esc(unapprovableReason || "dismiss_only")}" style="margin-top:6px;">${esc(dismissHint)}</div>` : ""}
             <div style="margin-top:8px;">
               ${canAct
                 ? renderApprovalButtonsFooterHtml(apr, Object.assign({ compact: true }, cardOpts))
-                : `<div class="gate-resolved-bar">${esc(isUnhydrated ? "审批状态加载中，请刷新加载后操作" : (undecidableHint || "该审批卡片当前不可操作"))}</div>`}
+                : `<div class="gate-resolved-bar">${esc(isUnhydrated ? tr("审批状态加载中，请刷新加载后操作", "Loading approval state; refresh before taking action") : (undecidableHint || tr("该审批卡片当前不可操作", "This approval card is currently not actionable")))}</div>`}
             </div>
           </div>`;
       }).join("")
-      : `<div class="empty-state" style="padding:12px;">当前项目没有待处理的审批卡片</div>`;
+      : `<div class="empty-state" style="padding:12px;">${esc(tr("当前项目没有待处理的审批卡片", "No pending approval cards for this project"))}</div>`;
 
     const cancellablePlans = prj
       ? STATE.plans.filter(p => ["proposed", "approved_pending_dispatch", "revising"].includes(p.status))
       : [];
     const cancellablePlansHtml = cancellablePlans.length
       ? `<div class="inspector-card-group">
-          <div class="inspector-sec-label">未派发计划管理 (${cancellablePlans.length})</div>
+          <div class="inspector-sec-label">${esc(tr(`未派发计划管理 (${cancellablePlans.length})`, `Undispatched Plans (${cancellablePlans.length})`))}</div>
           ${cancellablePlans.map(p => `
             <div class="inspector-note-box">
               <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
                 <div>
-                  <strong>计划 v${esc(p.version || 1)} · ${esc(p.title || "执行计划")}</strong>
-                  <div style="font-size:12px;color:var(--text-secondary);margin-top:2px;">状态：${esc((PLAN_STATUS_META[p.status] && PLAN_STATUS_META[p.status].label) || p.status)}</div>
+                  <strong>${esc(tr(`计划 v${p.version || 1}`, `Plan v${p.version || 1}`))} · ${esc(p.title || tr("执行计划", "Execution Plan"))}</strong>
+                  <div style="font-size:12px;color:var(--text-secondary);margin-top:2px;">${esc(tr("状态：", "Status: "))}${esc(getPlanStatusMeta(p.status).label)}</div>
                 </div>
-                <button class="btn btn-sm btn-danger-text" type="button" data-cancel-plan-id="${esc(p.id)}" ${disAttr}>取消计划</button>
+                <button class="btn btn-sm btn-danger-text" type="button" data-cancel-plan-id="${esc(p.id)}" ${disAttr}>${esc(tr("取消计划", "Cancel Plan"))}</button>
               </div>
             </div>`).join("")}
         </div>`
@@ -7152,32 +7553,32 @@
               <span class="dot ${getStatusDotClass(t)}" style="margin-top:6px;"></span>
               <span class="plan-task-info">
                 <span class="plan-task-title">${esc(t.title || t.id)}</span>
-                <span class="plan-task-sub">${esc(getTaskHumanStatus(t))} · ${esc(t.assignee || "未指派")}</span>
+                <span class="plan-task-sub">${esc(getTaskHumanStatus(t))} · ${esc(t.assignee || tr("未指派", "Unassigned"))}</span>
               </span>
             </span>
             <span class="plan-task-right mono">${esc(t.id.slice(-6))}</span>
           </button>`;
       }).join("")
-      : `<div class="empty-state" style="padding:10px;">当前项目暂无任务</div>`;
+      : `<div class="empty-state" style="padding:10px;">${esc(tr("当前项目暂无任务", "No tasks in this project yet"))}</div>`;
 
     bodyEl.innerHTML = `
       <div class="inspector-card-group">
-        <div class="inspector-sec-label">手工操作入口（日常建议直接使用对话）</div>
+        <div class="inspector-sec-label">${esc(tr("手工操作入口（日常建议直接使用对话）", "Manual Actions (chat is recommended for daily use)"))}</div>
         <div class="inspector-card">
           <button class="inspector-action-row" id="btnNewTaskModal" type="button" ${disAttr}>
-            <span class="inspector-action-left"><span>手工创建任务</span></span>
+            <span class="inspector-action-left"><span>${esc(tr("手工创建任务", "Create Task Manually"))}</span></span>
             <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="m9 18 6-6-6-6"></path></svg>
           </button>
           <button class="inspector-action-row" id="btnManualNewProject" type="button" ${disAttr}>
-            <span class="inspector-action-left"><span>完整表单新建项目</span></span>
+            <span class="inspector-action-left"><span>${esc(tr("完整表单新建项目", "New Project (Full Form)"))}</span></span>
             <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="m9 18 6-6-6-6"></path></svg>
           </button>
           <button class="inspector-action-row" id="btnAdvancedOpenCli" type="button">
-            <span class="inspector-action-left"><span>管理 AI 工具与 Agent</span></span>
+            <span class="inspector-action-left"><span>${esc(tr("管理 AI 工具与 Agent", "Manage AI Tools & Agents"))}</span></span>
             <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="m9 18 6-6-6-6"></path></svg>
           </button>
           <button class="inspector-action-row" id="btnAdvancedAudit" type="button" ${disAttr}>
-            <span class="inspector-action-left"><span>校验审计哈希链</span></span>
+            <span class="inspector-action-left"><span>${esc(tr("校验审计哈希链", "Verify Audit Hash Chain"))}</span></span>
             <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="m9 18 6-6-6-6"></path></svg>
           </button>
         </div>
@@ -7186,13 +7587,13 @@
       ${cancellablePlansHtml}
 
       <div class="inspector-card-group" data-approval-surface="inspector">
-        <div class="inspector-sec-label">${prj ? `当前项目待处理审批卡片 (${allPendingAprs.length})` : `待处理审批卡片 (${allPendingAprs.length})`}</div>
+        <div class="inspector-sec-label">${esc(prj ? tr(`当前项目待处理审批卡片 (${allPendingAprs.length})`, `Pending Approvals for Project (${allPendingAprs.length})`) : tr(`待处理审批卡片 (${allPendingAprs.length})`, `Pending Approvals (${allPendingAprs.length})`))}</div>
         ${aprListHtml}
       </div>
 
       ${prj ? `
         <div class="inspector-card-group">
-          <div class="inspector-sec-label">本项目全部任务 (${STATE.tasks.length})</div>
+          <div class="inspector-sec-label">${esc(tr(`本项目全部任务 (${STATE.tasks.length})`, `All Project Tasks (${STATE.tasks.length})`))}</div>
           ${allTasksHtml}
         </div>` : ""}`;
 
@@ -7225,20 +7626,20 @@
   // Render: AI Tools (CLI Adapters & Agents) + Settings
   // =========================================================================
   function formatAdapterFriendlyStatus(a) {
-    if (a.status === "not_installed") return { text: "未安装", cls: "muted" };
-    if (a.status === "error") return { text: "探测异常", cls: "red" };
-    if (a.launch_reason === "launch_held") return { text: `暂停 (${a.launch_milestone || "M5"})`, cls: "amber" };
-    if (a.launch_enabled && a.status === "verified") return { text: "已就绪", cls: "green" };
-    if (a.launch_enabled && a.status === "partially_verified") return { text: "已就绪（新版本）", cls: "green" };
-    if (a.launch_enabled) return { text: "已就绪", cls: "green" };
-    return { text: "暂不可用", cls: "amber" };
+    if (a.status === "not_installed") return { text: tr("未安装", "Not installed"), cls: "muted" };
+    if (a.status === "error") return { text: tr("探测异常", "Probe error"), cls: "red" };
+    if (a.launch_reason === "launch_held") return { text: tr(`暂停 (${a.launch_milestone || "M5"})`, `Held (${a.launch_milestone || "M5"})`), cls: "amber" };
+    if (a.launch_enabled && a.status === "verified") return { text: tr("已就绪", "Ready"), cls: "green" };
+    if (a.launch_enabled && a.status === "partially_verified") return { text: tr("已就绪（新版本）", "Ready (newer version)"), cls: "green" };
+    if (a.launch_enabled) return { text: tr("已就绪", "Ready"), cls: "green" };
+    return { text: tr("暂不可用", "Unavailable"), cls: "amber" };
   }
 
   function renderCliView() {
     const root = $("cliPageScroll");
     if (!root) return;
     if (!STATE.connected || !STATE.auth.auth_verified) {
-      root.innerHTML = `<div class="page-container"><div class="empty-state">${STATE.connected ? "解锁后管理本机 AI 工具与 Agent" : "等待后台服务连接"}</div></div>`;
+      root.innerHTML = `<div class="page-container"><div class="empty-state">${esc(STATE.connected ? tr("解锁后管理本机 AI 工具与 Agent", "Unlock to manage local AI tools & agents") : tr("等待后台服务连接", "Waiting for background service connection"))}</div></div>`;
       return;
     }
     const allow = canMutate();
@@ -7255,26 +7656,30 @@
       const ags = STATE.agents.filter(ag => ag.adapter === a.id);
       const busy = ags.reduce((sum, ag) => sum + (activeRunsByAgent[ag.name] || 0), 0);
       const cap = ags.reduce((sum, ag) => sum + (ag.max_concurrency || 1), 0);
+      const agCountText = ags.length
+        ? (isEnglish() ? `${busy} / ${cap} (${ags.length})` : `${busy} / ${cap} (${ags.length} 个)`)
+        : tr("0 个", "0");
       return `
         <tr>
           <td class="mono">${esc(a.id)}</td>
           <td class="mono">${esc(a.version || "--")}</td>
           <td><span class="status-inline ${st.cls}"><span class="dot dot-${st.cls === "muted" ? "neutral" : st.cls}"></span>${esc(st.text)}</span></td>
-          <td class="mono">${ags.length ? `${esc(busy)} / ${esc(cap)} (${esc(ags.length)} 个)` : "0 个"}</td>
+          <td class="mono">${esc(agCountText)}</td>
           <td style="text-align:right;">
-            <button class="btn btn-sm" data-adapter-probe="${esc(a.id)}" ${disAttr}>探测</button>
-            <button class="btn btn-sm btn-ghost" data-adapter-show="${esc(a.id)}">详情</button>
+            <button class="btn btn-sm" data-adapter-probe="${esc(a.id)}" ${disAttr}>${esc(tr("探测", "Probe"))}</button>
+            <button class="btn btn-sm btn-ghost" data-adapter-show="${esc(a.id)}">${esc(tr("详情", "Details"))}</button>
           </td>
         </tr>`;
     };
 
     const availableAdapters = STATE.adapters.filter(a => !isUnavailableAdapter(a));
     const unavailableAdapters = STATE.adapters.filter(a => isUnavailableAdapter(a));
+    const adapterTheadHtml = `<thead><tr><th>${esc(tr("工具", "Tool"))}</th><th>${esc(tr("版本", "Version"))}</th><th>${esc(tr("状态", "Status"))}</th><th>${esc(tr("关联 Agent", "Linked Agents"))}</th><th style="text-align:right;">${esc(tr("操作", "Actions"))}</th></tr></thead>`;
     const unavailableAdapterSection = unavailableAdapters.length ? `
       <details class="config-raw-details" style="margin-top:12px;">
-        <summary>暂不可用 / 高级 Adapter (${esc(unavailableAdapters.length)} 项 · held / stub)</summary>
+        <summary>${esc(tr(`暂不可用 / 高级 Adapter (${unavailableAdapters.length} 项 · held / stub)`, `Unavailable / Advanced Adapters (${unavailableAdapters.length} · held / stub)`))}</summary>
         <table class="clean-table" style="margin-top:8px;">
-          <thead><tr><th>工具</th><th>版本</th><th>状态</th><th>关联 Agent</th><th style="text-align:right;">操作</th></tr></thead>
+          ${adapterTheadHtml}
           <tbody>${unavailableAdapters.map(renderAdapterRow).join("")}</tbody>
         </table>
       </details>` : "";
@@ -7287,14 +7692,14 @@
           <td class="mono">${esc(ag.adapter)}</td>
           <td class="mono">${esc(ag.delivery)}</td>
           <td class="mono">${esc(ag.default_profile || "--")}</td>
-          <td><button class="btn btn-sm" data-agent-toggle-lead="${esc(ag.name)}" ${disAttr}>${ag.can_lead ? "Lead: 开" : "Lead: 关"}</button></td>
+          <td><button class="btn btn-sm" data-agent-toggle-lead="${esc(ag.name)}" ${disAttr}>${esc(ag.can_lead ? tr("Lead: 开", "Lead: On") : tr("Lead: 关", "Lead: Off"))}</button></td>
           <td class="mono">${esc(ag.default_model || "--")}</td>
           <td class="mono">${esc(activeCnt)}/${esc(ag.max_concurrency)}</td>
-          <td>${ag.disabled ? `<span class="status-inline red">已禁用</span>` : `<span class="status-inline green">启用</span>`}</td>
+          <td>${ag.disabled ? `<span class="status-inline red">${esc(tr("已禁用", "Disabled"))}</span>` : `<span class="status-inline green">${esc(tr("启用", "Enabled"))}</span>`}</td>
           <td style="text-align:right;">
-            <button class="btn btn-sm" data-agent-edit="${esc(ag.name)}" ${disAttr}>编辑</button>
-            <button class="btn btn-sm" data-agent-toggle-disabled="${esc(ag.name)}" ${disAttr}>${ag.disabled ? "启用" : "禁用"}</button>
-            <button class="btn btn-sm btn-ghost" data-agent-show="${esc(ag.name)}">详情</button>
+            <button class="btn btn-sm" data-agent-edit="${esc(ag.name)}" ${disAttr}>${esc(tr("编辑", "Edit"))}</button>
+            <button class="btn btn-sm" data-agent-toggle-disabled="${esc(ag.name)}" ${disAttr}>${esc(ag.disabled ? tr("启用", "Enable") : tr("禁用", "Disable"))}</button>
+            <button class="btn btn-sm btn-ghost" data-agent-show="${esc(ag.name)}">${esc(tr("详情", "Details"))}</button>
           </td>
         </tr>`;
     }).join("");
@@ -7303,30 +7708,30 @@
       <div class="page-container">
         <div class="section-head">
           <div>
-            <div class="section-title">本机 AI 工具（CLIs）</div>
-            <div class="section-desc">自动识别已安装的命令行编程工具；如需重新走「选择 Lead」引导，可点右侧快捷入口。</div>
+            <div class="section-title">${esc(tr("本机 AI 工具（CLIs）", "Local AI Tools (CLIs)"))}</div>
+            <div class="section-desc">${esc(tr("自动识别已安装的命令行编程工具；如需重新走「选择 Lead」引导，可点右侧快捷入口。", "Automatically detects installed coding CLIs. Use the button on the right to re-run the Lead Setup Wizard."))}</div>
           </div>
           <div style="display:flex;gap:8px;">
-            <button class="btn btn-sm" id="btnCliOpenWizard" type="button" ${disAttr}>打开选 Lead 向导</button>
-            <button class="btn btn-sm btn-primary" id="btnProbeAllAdapters" type="button" ${disAttr}>重新探测全部</button>
+            <button class="btn btn-sm" id="btnCliOpenWizard" type="button" ${disAttr}>${esc(tr("打开选 Lead 向导", "Open Lead Wizard"))}</button>
+            <button class="btn btn-sm btn-primary" id="btnProbeAllAdapters" type="button" ${disAttr}>${esc(tr("重新探测全部", "Re-probe All"))}</button>
           </div>
         </div>
         <table class="clean-table">
-          <thead><tr><th>工具</th><th>版本</th><th>状态</th><th>关联 Agent</th><th style="text-align:right;">操作</th></tr></thead>
-          <tbody>${availableAdapters.map(renderAdapterRow).join("") || `<tr><td colspan="5" style="text-align:center;color:var(--text-muted);">暂无可用工具</td></tr>`}</tbody>
+          ${adapterTheadHtml}
+          <tbody>${availableAdapters.map(renderAdapterRow).join("") || `<tr><td colspan="5" style="text-align:center;color:var(--text-muted);">${esc(tr("暂无可用工具", "No available tools"))}</td></tr>`}</tbody>
         </table>
         ${unavailableAdapterSection}
 
         <div class="section-head" style="margin-top:26px;">
           <div>
-            <div class="section-title">已注册 Agent (${esc(STATE.agents.length)})</div>
-            <div class="section-desc">Lead 负责规划与验收，Worker 负责具体任务执行（两者自动隔离以保障审计安全）。</div>
+            <div class="section-title">${esc(tr(`已注册 Agent (${STATE.agents.length})`, `Registered Agents (${STATE.agents.length})`))}</div>
+            <div class="section-desc">${esc(tr("Lead 负责规划与验收，Worker 负责具体任务执行（两者自动隔离以保障审计安全）。", "Lead handles planning and acceptance; Workers execute individual tasks (isolated for audit integrity)."))}</div>
           </div>
-          <button class="btn btn-sm btn-primary" id="btnCreateAgentModal" type="button" ${disAttr}>新建 Agent</button>
+          <button class="btn btn-sm btn-primary" id="btnCreateAgentModal" type="button" ${disAttr}>${esc(tr("新建 Agent", "New Agent"))}</button>
         </div>
         <table class="clean-table">
-          <thead><tr><th>名称</th><th>工具</th><th>模式</th><th>默认档位</th><th>Lead 资格</th><th>默认模型</th><th>并发</th><th>状态</th><th style="text-align:right;">操作</th></tr></thead>
-          <tbody>${agentRows || `<tr><td colspan="9" style="text-align:center;color:var(--text-muted);">暂无已注册 Agent</td></tr>`}</tbody>
+          <thead><tr><th>${esc(tr("名称", "Name"))}</th><th>${esc(tr("工具", "Adapter"))}</th><th>${esc(tr("模式", "Delivery"))}</th><th>${esc(tr("默认档位", "Default Profile"))}</th><th>${esc(tr("Lead 资格", "Lead Role"))}</th><th>${esc(tr("默认模型", "Default Model"))}</th><th>${esc(tr("并发", "Concurrency"))}</th><th>${esc(tr("状态", "Status"))}</th><th style="text-align:right;">${esc(tr("操作", "Actions"))}</th></tr></thead>
+          <tbody>${agentRows || `<tr><td colspan="9" style="text-align:center;color:var(--text-muted);">${esc(tr("暂无已注册 Agent", "No registered agents"))}</td></tr>`}</tbody>
         </table>
       </div>`;
   }
@@ -7357,21 +7762,21 @@
 
     const leadCandidates = STATE.agents.filter(a => a.can_lead && !a.disabled);
     const curDefaultLead = STATE.config["lead.default_agent"] || "";
-    const leadOpts = [`<option value="">(未设置默认 Lead)</option>`].concat(
+    const leadOpts = [`<option value="">${esc(tr("(未设置默认 Lead)", "(No default Lead)"))}</option>`].concat(
       leadCandidates.map(a => `<option value="${esc(a.name)}" ${curDefaultLead === a.name ? "selected" : ""}>${esc(a.name)} (${esc(a.adapter)})</option>`)
     );
 
-    const labelMap = Object.fromEntries(APPROVAL_POLICY_META.map(([cat, label, defVal, ro]) => [cat, { label, defVal, ro }]));
+    const labelMap = Object.fromEntries(APPROVAL_POLICY_META.map(([cat, label, defVal, ro]) => [cat, { label: getApprovalPolicyLabel(cat, label), defVal, ro }]));
     const policyItemsFromConfig = STATE.configItems
       .filter(it => it && typeof it.key === "string" && it.key.startsWith("approval.policy."))
       .map(it => {
         const cat = it.key.slice("approval.policy.".length);
-        const meta = labelMap[cat] || { label: cat, defVal: "direct_or_relayed", ro: cat === "config" || cat === "plan_dispatch" || cat === "step_dispatch" };
+        const meta = labelMap[cat] || { label: getApprovalPolicyLabel(cat, cat), defVal: "direct_or_relayed", ro: cat === "config" || cat === "plan_dispatch" || cat === "step_dispatch" };
         return [it.key, cat, meta.label, it.value || meta.defVal, meta.ro];
       });
     const policyRowsData = policyItemsFromConfig.length
       ? policyItemsFromConfig
-      : APPROVAL_POLICY_META.map(([cat, label, defVal, ro]) => [`approval.policy.${cat}`, cat, label, STATE.config[`approval.policy.${cat}`] || defVal, ro]);
+      : APPROVAL_POLICY_META.map(([cat, label, defVal, ro]) => [`approval.policy.${cat}`, cat, getApprovalPolicyLabel(cat, label), STATE.config[`approval.policy.${cat}`] || defVal, ro]);
 
     const policyRows = policyRowsData.map(([k, cat, label, val, isReadOnly]) => {
       const isDeliverBase = cat === "deliver_to_base";
@@ -7379,10 +7784,10 @@
       const ctrlDis = (isReadOnly || !allow) ? "disabled" : "";
       const titleAttr = isReadOnly
         ? (cat === "plan_dispatch"
-          ? `title="计划派发确认固定为 direct_only，不可更改"`
+          ? `title="${esc(tr("计划派发确认固定为 direct_only，不可更改", "Plan dispatch approval is fixed to direct_only and cannot be changed"))}"`
           : (cat === "step_dispatch"
-            ? `title="单步派发确认固定为 direct_only，不可更改"`
-            : `title="系统配置策略固定为 direct_only，不可更改"`))
+            ? `title="${esc(tr("单步派发确认固定为 direct_only，不可更改", "Step dispatch approval is fixed to direct_only and cannot be changed"))}"`
+            : `title="${esc(tr("系统配置策略固定为 direct_only，不可更改", "System config policy is fixed to direct_only and cannot be changed"))}"`))
         : (!allow ? `title="${esc(disabledReason())}"` : "");
       return `
         <div class="setting-row">
@@ -7392,9 +7797,9 @@
           </div>
           <div class="setting-control">
             <select class="compact-select" data-config-key="${esc(k)}" ${ctrlDis} ${titleAttr}>
-              <option value="direct_only" ${val === "direct_only" ? "selected" : ""}>仅本机口令直连 (direct_only)</option>
-              ${isDirectOnlyFixed ? "" : `<option value="direct_or_relayed" ${val === "direct_or_relayed" ? "selected" : ""}>直连或转发 (direct_or_relayed)</option>`}
-              ${isDeliverBase ? `<option value="not_required" ${val === "not_required" ? "selected" : ""}>无需审批 (not_required)</option>` : ""}
+              <option value="direct_only" ${val === "direct_only" ? "selected" : ""}>${esc(tr("仅本机口令直连 (direct_only)", "Direct passphrase only (direct_only)"))}</option>
+              ${isDirectOnlyFixed ? "" : `<option value="direct_or_relayed" ${val === "direct_or_relayed" ? "selected" : ""}>${esc(tr("直连或转发 (direct_or_relayed)", "Direct or relayed (direct_or_relayed)"))}</option>`}
+              ${isDeliverBase ? `<option value="not_required" ${val === "not_required" ? "selected" : ""}>${esc(tr("无需审批 (not_required)", "No approval required (not_required)"))}</option>` : ""}
             </select>
           </div>
         </div>`;
@@ -7404,19 +7809,19 @@
     const activePrjMode = (activePrj && (activePrj.permission_mode || STATE.chatPermissionMode)) || "plan";
     const activePrjActive = !activePrj || !activePrj.status || activePrj.status === "active";
     const activePrjModeDisAttr = (!allow || !activePrjActive)
-      ? `disabled title="${esc(!allow ? disabledReason() : `当前项目状态为 ${activePrj.status}，仅进行中项目可切换权限模式`)}"`
+      ? `disabled title="${esc(!allow ? disabledReason() : tr(`当前项目状态为 ${activePrj.status}，仅进行中项目可切换权限模式`, `Project status is ${activePrj.status}; only active projects can change permission mode`))}"`
       : "";
     const activePrjModeRow = activePrj ? `
         <div class="setting-row">
           <div class="setting-info">
-            <div class="setting-name">当前项目权限模式（${esc(activePrj.name || activePrj.id)}）</div>
-            <div class="setting-hint">${esc((PERMISSION_MODE_META[activePrjMode] && PERMISSION_MODE_META[activePrjMode].desc) || "")}</div>
+            <div class="setting-name">${esc(tr(`当前项目权限模式（${activePrj.name || activePrj.id}）`, `Current Project Permission Mode (${activePrj.name || activePrj.id})`))}</div>
+            <div class="setting-hint">${esc(getPermissionModeMeta(activePrjMode).desc || "")}</div>
           </div>
           <div class="setting-control">
             <select class="compact-select" id="settingsProjectPermissionMode" data-project-mode-id="${esc(activePrj.id)}" ${activePrjModeDisAttr}>
-              <option value="supervised" ${activePrjMode === "supervised" ? "selected" : ""}>每步问我 (supervised)</option>
-              <option value="plan" ${activePrjMode === "plan" ? "selected" : ""}>计划批了就放手 (plan · 默认)</option>
-              <option value="auto" ${activePrjMode === "auto" ? "selected" : ""}>全自动 (auto)</option>
+              <option value="supervised" ${activePrjMode === "supervised" ? "selected" : ""}>${esc(tr("每步问我 (supervised)", "Ask each step (supervised)"))}</option>
+              <option value="plan" ${activePrjMode === "plan" ? "selected" : ""}>${esc(tr("计划批了就放手 (plan · 默认)", "Approve plan then run (plan · default)"))}</option>
+              <option value="auto" ${activePrjMode === "auto" ? "selected" : ""}>${esc(tr("全自动 (auto)", "Full Auto (auto)"))}</option>
             </select>
           </div>
         </div>` : "";
@@ -7429,14 +7834,14 @@
         return `${g.scope_agent_name || g.scope_agent_id || "--"} · ${g.scope_profile || "--"}`;
       }
       if (g.category === "retry_over_limit") {
-        return "本项目超限重试";
+        return tr("本项目超限重试", "Over-limit retries in this project");
       }
       return g.scope_key || "--";
     };
     const grantsRowsHtml = grantsList.length
       ? grantsList.map(g => {
-        const catLabel = GATE_CATEGORY_LABELS[g.category] || g.category || "--";
-        const prjLabel = g.project_id ? (projNameById[g.project_id] || g.project_id) : "全局";
+        const catLabel = getGateCategoryLabel(g.category) || "--";
+        const prjLabel = g.project_id ? (projNameById[g.project_id] || g.project_id) : tr("全局", "Global");
         const isActive = g.active !== false && !g.revoked_at;
         return `
           <tr>
@@ -7444,32 +7849,33 @@
             <td>${esc(prjLabel)}</td>
             <td class="grant-scope-code">${esc(formatGrantScope(g))}</td>
             <td class="mono">${esc(formatDateTime(g.created_at))}</td>
-            <td>${isActive ? `<span class="status-pill green">生效中</span>` : `<span class="status-pill neutral">已撤销</span>`}</td>
+            <td>${isActive ? `<span class="status-pill green">${esc(tr("生效中", "Active"))}</span>` : `<span class="status-pill neutral">${esc(tr("已撤销", "Revoked"))}</span>`}</td>
             <td style="text-align:right;">
               ${isActive
-                ? `<button class="btn btn-sm btn-danger-text" type="button" data-revoke-grant-id="${esc(g.id)}" ${disAttr}>撤销</button>`
-                : `<span style="font-size:11.5px;color:var(--text-muted);">${esc(g.revoked_reason || "已撤销")}</span>`}
+                ? `<button class="btn btn-sm btn-danger-text" type="button" data-revoke-grant-id="${esc(g.id)}" ${disAttr}>${esc(tr("撤销", "Revoke"))}</button>`
+                : `<span style="font-size:11.5px;color:var(--text-muted);">${esc(g.revoked_reason ? localizeDaemonMessage(g.revoked_reason) : tr("已撤销", "Revoked"))}</span>`}
             </td>
           </tr>`;
       }).join("")
-      : `<tr><td colspan="6" style="text-align:center;color:var(--text-muted);">暂无永久授权记录（点击审批卡片的「始终允许」后将在此列出，随时可撤销）</td></tr>`;
+      : `<tr><td colspan="6" style="text-align:center;color:var(--text-muted);">${esc(tr("暂无永久授权记录（点击审批卡片的「始终允许」后将在此列出，随时可撤销）", "No standing grants yet (clicking \"Always Allow\" on an approval card lists them here, and they can be revoked anytime)"))}</td></tr>`;
 
+    const activeGrantsCount = grantsList.filter(g => g.active !== false && !g.revoked_at).length;
     const grantsSectionHtml = allow ? `
         <div class="section-head" style="margin-top:22px;">
           <div>
-            <div class="section-title">永久授权（Standing Grants · ${grantsList.filter(g => g.active !== false && !g.revoked_at).length} 项生效）</div>
-            <div class="section-desc">所有通过审批卡片「始终允许」创建的窄范围授权均记录在审计链中，可随时撤销。</div>
+            <div class="section-title">${esc(tr(`永久授权（Standing Grants · ${activeGrantsCount} 项生效）`, `Standing Grants (${activeGrantsCount} active)`))}</div>
+            <div class="section-desc">${esc(tr("所有通过审批卡片「始终允许」创建的窄范围授权均记录在审计链中，可随时撤销。", "All narrowly scoped grants created via \"Always Allow\" are recorded in the audit chain and can be revoked anytime."))}</div>
           </div>
           <div class="grants-toolbar">
             <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary);cursor:pointer;">
               <input id="toggleIncludeRevokedGrants" type="checkbox" ${STATE.grantsIncludeRevoked ? "checked" : ""} />
-              <span>显示已撤销</span>
+              <span>${esc(tr("显示已撤销", "Show revoked"))}</span>
             </label>
-            <button class="btn btn-sm" id="btnRefreshGrants" type="button">刷新</button>
+            <button class="btn btn-sm" id="btnRefreshGrants" type="button">${esc(tr("刷新", "Refresh"))}</button>
           </div>
         </div>
         <table class="clean-table" id="standingGrantsTable">
-          <thead><tr><th>类型</th><th>项目</th><th>精确范围</th><th>授权时间</th><th>状态</th><th style="text-align:right;">操作</th></tr></thead>
+          <thead><tr><th>${esc(tr("类型", "Category"))}</th><th>${esc(tr("项目", "Project"))}</th><th>${esc(tr("精确范围", "Scope"))}</th><th>${esc(tr("授权时间", "Granted At"))}</th><th>${esc(tr("状态", "Status"))}</th><th style="text-align:right;">${esc(tr("操作", "Actions"))}</th></tr></thead>
           <tbody>${grantsRowsHtml}</tbody>
         </table>` : "";
 
@@ -7484,7 +7890,7 @@
     const doc = STATE.doctor;
     const doctorHtml = doc ? `
       <div class="inspector-note-box ${doc.status === "healthy" ? "" : "amber"}" style="margin-top:8px;">
-        <div><strong>诊断状态：</strong><span class="mono">${esc(doc.status)}</span></div>
+        <div><strong>${esc(tr("诊断状态：", "Diagnostics Status: "))}</strong><span class="mono">${esc(doc.status)}</span></div>
         ${Array.isArray(doc.checks) ? `<div style="margin-top:6px;">${doc.checks.map(ch => `<div class="mono" style="font-size:11.5px;">${ch.ok ? "[OK]" : "[WARN]"} ${esc(ch.name)}: ${esc(ch.detail || "")}</div>`).join("")}</div>` : ""}
       </div>` : "";
 
@@ -7493,64 +7899,81 @@
     const closeToTray = Boolean(STATE.desktopPrefs && STATE.desktopPrefs.close_to_tray);
     const trayActive = Boolean(STATE.desktopPrefs && STATE.desktopPrefs.tray_active);
     const traySupported = Boolean(STATE.desktopPrefs && STATE.desktopPrefs.tray_supported);
+    const langPref = getLanguagePref();
+    const effLangLabel = isEnglish() ? "English" : "简体中文";
 
     const nextHtml = `
       <div class="page-container narrow">
         <div class="section-head">
           <div>
-            <div class="section-title">身份认证与口令（默认仅内存保存）</div>
-            <div class="section-desc">口令默认仅保存在当前进程内存中，绝不写入明文文件、环境变量或浏览器存储；关闭窗口最小化到托盘期间无需重复输入。</div>
+            <div class="section-title">${esc(tr("身份认证与口令（默认仅内存保存）", "Authentication & Passphrase (Memory-Only by Default)"))}</div>
+            <div class="section-desc">${esc(tr("口令默认仅保存在当前进程内存中，绝不写入明文文件、环境变量或浏览器存储；关闭窗口最小化到托盘期间无需重复输入。", "Your passphrase is kept in process memory only by default — never written to plaintext files, env vars, or browser storage. Minimizing to tray preserves your session."))}</div>
           </div>
         </div>
         <div class="setting-row">
           <div class="setting-info">
-            <div class="setting-name">当前解锁状态</div>
-            <div class="setting-hint">${STATE.auth.auth_verified ? `已认证：${esc((STATE.auth.principal && STATE.auth.principal.name) || "user")}` : "未解锁"}${credPresent ? " · 已启用 Windows 凭据托管" : ""}</div>
+            <div class="setting-name">${esc(tr("当前解锁状态", "Unlock Status"))}</div>
+            <div class="setting-hint">${esc(STATE.auth.auth_verified ? tr(`已认证：${(STATE.auth.principal && STATE.auth.principal.name) || "user"}`, `Authenticated: ${(STATE.auth.principal && STATE.auth.principal.name) || "user"}`) : tr("未解锁", "Locked"))}${esc(credPresent ? tr(" · 已启用 Windows 凭据托管", " · Windows Credential Vault active") : "")}</div>
           </div>
           <div class="setting-control">
-            <input class="compact-input" id="settingsPassInput" type="password" autocomplete="off" placeholder="输入口令..." style="width:180px;" />
-            ${credSupported ? `<label class="inline-check" title="使用 Windows 凭据管理器加密保存（同用户信任边界）"><input id="settingsRememberCred" type="checkbox" /><span>记住解锁</span></label>` : ""}
-            <button class="btn btn-sm btn-primary" id="btnSettingsUnlock" type="button">解锁</button>
-            <button class="btn btn-sm" id="btnSettingsLock" type="button" ${(STATE.auth.auth_configured || credPresent) ? "" : "disabled"}>锁定并清除</button>
+            <input class="compact-input" id="settingsPassInput" type="password" autocomplete="off" placeholder="${esc(tr("输入口令...", "Enter passphrase..."))}" style="width:180px;" />
+            ${credSupported ? `<label class="inline-check" title="${esc(tr("使用 Windows 凭据管理器加密保存（同用户信任边界）", "Encrypt and store in Windows Credential Manager (same-user trust boundary)"))}"><input id="settingsRememberCred" type="checkbox" /><span>${esc(tr("记住解锁", "Remember"))}</span></label>` : ""}
+            <button class="btn btn-sm btn-primary" id="btnSettingsUnlock" type="button">${esc(tr("解锁", "Unlock"))}</button>
+            <button class="btn btn-sm" id="btnSettingsLock" type="button" ${(STATE.auth.auth_configured || credPresent) ? "" : "disabled"}>${esc(tr("锁定并清除", "Lock & Clear"))}</button>
           </div>
         </div>
         ${credSupported ? `
           <div class="settings-security-note" id="settingsCredVaultWarning">
-            <strong>安全边界提示（Windows 凭据托管为可选项，默认关闭）：</strong>勾选「记住解锁」后，口令将交由 Windows 凭据管理器（DPAPI）按当前 Windows 用户加密托管，不会写入明文文件、命令行参数、环境变量或 localStorage。但同一 Windows 用户账户下运行的其他进程（含本机 Agent）可以读取该凭据；运行不可信 Agent 时请勿启用，并可随时点击「锁定并清除」立即删除。
+            ${isEnglish()
+              ? `<strong>Security boundary notice (Windows Credential Vault is opt-in, off by default):</strong> When "Remember" is checked, your passphrase is encrypted by Windows Credential Manager (DPAPI) under the current Windows user and is never written to plaintext files, CLI args, env vars, or localStorage. However, other processes running as the same Windows user (including local agents) can read it; do not enable when running untrusted agents, and click "Lock & Clear" anytime to delete it immediately.`
+              : `<strong>安全边界提示（Windows 凭据托管为可选项，默认关闭）：</strong>勾选「记住解锁」后，口令将交由 Windows 凭据管理器（DPAPI）按当前 Windows 用户加密托管，不会写入明文文件、命令行参数、环境变量或 localStorage。但同一 Windows 用户账户下运行的其他进程（含本机 Agent）可以读取该凭据；运行不可信 Agent 时请勿启用，并可随时点击「锁定并清除」立即删除。`}
           </div>` : ""}
 
         <div class="section-head" style="margin-top:22px;">
-          <div><div class="section-title">外观、托盘与协作设置</div></div>
+          <div><div class="section-title">${esc(tr("外观、托盘与协作设置", "Appearance, Tray & Collaboration"))}</div></div>
         </div>
         <div class="setting-row">
           <div class="setting-info">
-            <div class="setting-name">界面主题</div>
-            <div class="setting-hint">100% 不透明高对比度配色（深色 / 浅色）</div>
+            <div class="setting-name">${esc(tr("界面语言 (Language)", "Interface Language"))}</div>
+            <div class="setting-hint">${esc(langPref === "auto" ? tr(`跟随系统语言自动检测（当前：${effLangLabel}）`, `Follows system locale automatically (current: ${effLangLabel})`) : tr("支持英文与简体中文即时切换，并同步更新系统托盘与提示文案", "Switch immediately between English and Simplified Chinese, including system tray and desktop messages"))}</div>
+          </div>
+          <div class="setting-control">
+            <select class="compact-select" id="selectUiLanguage">
+              <option value="auto" ${langPref === "auto" ? "selected" : ""}>${esc(tr("跟随系统 (自动)", "Follow System (Auto)"))}</option>
+              <option value="en" ${langPref === "en" ? "selected" : ""}>English</option>
+              <option value="zh-CN" ${langPref === "zh-CN" ? "selected" : ""}>简体中文</option>
+            </select>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <div class="setting-name">${esc(tr("界面主题", "Theme"))}</div>
+            <div class="setting-hint">${esc(tr("100% 不透明高对比度配色（深色 / 浅色）", "100% opaque high-contrast palette (Dark / Light)"))}</div>
           </div>
           <div class="setting-control">
             <div class="segmented">
-              <button type="button" id="btnThemeDark" class="${STATE.ui.theme === "dark" ? "active" : ""}">深色</button>
-              <button type="button" id="btnThemeLight" class="${STATE.ui.theme === "light" ? "active" : ""}">浅色</button>
+              <button type="button" id="btnThemeDark" class="${STATE.ui.theme === "dark" ? "active" : ""}">${esc(tr("深色", "Dark"))}</button>
+              <button type="button" id="btnThemeLight" class="${STATE.ui.theme === "light" ? "active" : ""}">${esc(tr("浅色", "Light"))}</button>
             </div>
           </div>
         </div>
         <div class="setting-row">
           <div class="setting-info">
-            <div class="setting-name">关闭窗口时最小化到系统托盘</div>
-            <div class="setting-hint">${trayActive ? "托盘图标运行中：点击右上角 × 将隐藏窗口并保持登录态与后台服务在线" : (traySupported ? "仅在系统托盘激活时生效；退出界面不会停止后台服务，除非你明确选择停止" : "当前系统未启用 Windows 系统托盘（关闭窗口不会停止后台服务）")}</div>
+            <div class="setting-name">${esc(tr("关闭窗口时最小化到系统托盘", "Minimize to System Tray on Close"))}</div>
+            <div class="setting-hint">${esc(trayActive ? tr("托盘图标运行中：点击右上角 × 将隐藏窗口并保持登录态与后台服务在线", "Tray icon active: closing the window hides it while keeping your session and daemon online") : (traySupported ? tr("仅在系统托盘激活时生效；退出界面不会停止后台服务，除非你明确选择停止", "Applies only while system tray is active; exiting the UI keeps the background service running unless you choose to stop it") : tr("当前系统未启用 Windows 系统托盘（关闭窗口不会停止后台服务）", "Windows system tray is not active on this system (closing the window will not stop the background service)")))}</div>
           </div>
           <div class="setting-control">
             <select class="compact-select" id="selectCloseToTray" ${traySupported ? "" : "disabled"}>
-              <option value="true" ${closeToTray ? "selected" : ""}>最小化到托盘 (推荐)</option>
-              <option value="false" ${!closeToTray ? "selected" : ""}>直接退出界面</option>
+              <option value="true" ${closeToTray ? "selected" : ""}>${esc(tr("最小化到托盘 (推荐)", "Minimize to tray (recommended)"))}</option>
+              <option value="false" ${!closeToTray ? "selected" : ""}>${esc(tr("直接退出界面", "Quit UI directly"))}</option>
             </select>
-            <button class="btn btn-sm" id="btnSettingsQuitApp" type="button">退出桌面端...</button>
+            <button class="btn btn-sm" id="btnSettingsQuitApp" type="button">${esc(tr("退出桌面端...", "Quit Desktop..."))}</button>
           </div>
         </div>
         <div class="setting-row">
           <div class="setting-info">
-            <div class="setting-name">默认项目 Lead</div>
-            <div class="setting-hint">新建项目对话时默认负责规划和调度的 Lead Agent</div>
+            <div class="setting-name">${esc(tr("默认项目 Lead", "Default Project Lead"))}</div>
+            <div class="setting-hint">${esc(tr("新建项目对话时默认负责规划和调度的 Lead Agent", "Default Lead agent for planning and orchestration in new project chats"))}</div>
           </div>
           <div class="setting-control">
             <select class="compact-select" id="selectDefaultLead" ${disAttr}>${leadOpts.join("")}</select>
@@ -7558,74 +7981,74 @@
         </div>
         <div class="setting-row">
           <div class="setting-info">
-            <div class="setting-name">允许本地 AI CLI 担任 Lead</div>
-            <div class="setting-hint">开启后允许使用本地安装的 claude / codex / agy / droid / kiro / vibe 作为项目总管</div>
+            <div class="setting-name">${esc(tr("允许本地 AI CLI 担任 Lead", "Allow Local AI CLIs as Lead"))}</div>
+            <div class="setting-hint">${esc(tr("开启后允许使用本地安装的 claude / codex / agy / droid / kiro / vibe 作为项目总管", "Allow locally installed claude / codex / agy / droid / kiro / vibe to act as project Lead"))}</div>
           </div>
           <div class="setting-control">
             <select class="compact-select" data-config-key="lead.vendor_leads" data-config-type="bool" ${disAttr}>
-              <option value="false" ${!vendorLeadsVal ? "selected" : ""}>关闭 (false)</option>
-              <option value="true" ${vendorLeadsVal ? "selected" : ""}>开启 (true)</option>
+              <option value="false" ${!vendorLeadsVal ? "selected" : ""}>${esc(tr("关闭 (false)", "Off (false)"))}</option>
+              <option value="true" ${vendorLeadsVal ? "selected" : ""}>${esc(tr("开启 (true)", "On (true)"))}</option>
             </select>
           </div>
         </div>
         <div class="setting-row">
           <div class="setting-info">
-            <div class="setting-name">工具版本校验模式</div>
-            <div class="setting-hint">默认仅提示不拦截（warn）；严格模式仅放行通过内置冒烟验证的版本（strict）</div>
+            <div class="setting-name">${esc(tr("工具版本校验模式", "CLI Version Verification Mode"))}</div>
+            <div class="setting-hint">${esc(tr("默认仅提示不拦截（warn）；严格模式仅放行通过内置冒烟验证的版本（strict）", "Warn-only by default (warn); strict mode only permits versions passing built-in smoke checks (strict)"))}</div>
           </div>
           <div class="setting-control">
             <select class="compact-select" data-config-key="adapter.evidence_mode" ${disAttr}>
-              <option value="warn" ${evidenceModeVal === "warn" ? "selected" : ""}>警告放行 (warn)</option>
-              <option value="strict" ${evidenceModeVal === "strict" ? "selected" : ""}>严格门控 (strict)</option>
+              <option value="warn" ${evidenceModeVal === "warn" ? "selected" : ""}>${esc(tr("警告放行 (warn)", "Warn & allow (warn)"))}</option>
+              <option value="strict" ${evidenceModeVal === "strict" ? "selected" : ""}>${esc(tr("严格门控 (strict)", "Strict gate (strict)"))}</option>
             </select>
           </div>
         </div>
         ${activePrjModeRow}
         <div class="setting-row">
           <div class="setting-info">
-            <div class="setting-name">审批模式</div>
-            <div class="setting-hint">passphrase 仅允许本机口令直连确认；delegated 允许收件箱 Lead 代录非高危确认</div>
+            <div class="setting-name">${esc(tr("审批模式", "Approval Mode"))}</div>
+            <div class="setting-hint">${esc(tr("passphrase 仅允许本机口令直连确认；delegated 允许收件箱 Lead 代录非高危确认", "passphrase allows direct local passphrase confirmation only; delegated allows inbox Lead to relay non-high-risk approvals"))}</div>
           </div>
           <div class="setting-control">
             <select class="compact-select" data-config-key="approval.mode" ${disAttr}>
-              <option value="passphrase" ${approvalModeVal === "passphrase" ? "selected" : ""}>口令直连 (passphrase)</option>
-              <option value="delegated" ${approvalModeVal === "delegated" ? "selected" : ""}>委派模式 (delegated)</option>
+              <option value="passphrase" ${approvalModeVal === "passphrase" ? "selected" : ""}>${esc(tr("口令直连 (passphrase)", "Direct passphrase (passphrase)"))}</option>
+              <option value="delegated" ${approvalModeVal === "delegated" ? "selected" : ""}>${esc(tr("委派模式 (delegated)", "Delegated (delegated)"))}</option>
             </select>
           </div>
         </div>
 
         ${grantsSectionHtml}
-        ${allow ? `<div class="section-head" style="margin-top:22px;"><div><div class="section-title">安全审批策略</div></div></div>${policyRows}` : ""}
+        ${allow ? `<div class="section-head" style="margin-top:22px;"><div><div class="section-title">${esc(tr("安全审批策略", "Security Approval Policies"))}</div></div></div>${policyRows}` : ""}
 
         <div class="section-head" style="margin-top:22px;">
-          <div><div class="section-title">后台服务与维护</div></div>
+          <div><div class="section-title">${esc(tr("后台服务与维护", "Background Service & Maintenance"))}</div></div>
         </div>
         <div class="setting-row">
           <div class="setting-info">
-            <div class="setting-name">本地后台服务 (meshd)</div>
+            <div class="setting-name">${esc(tr("本地后台服务 (meshd)", "Local Background Service (meshd)"))}</div>
             <div class="setting-hint mono">${esc(STATE.pipe.endpoint || STATE.pipe.home || "--")}</div>
           </div>
           <div class="setting-control">
-            <button class="btn btn-sm" id="btnSettingsStartDaemon" type="button" ${STATE.connected ? "disabled" : ""}>启动服务</button>
-            <button class="btn btn-sm btn-danger-text" id="btnSettingsStopDaemon" type="button" ${allow ? "" : "disabled"}>停止服务</button>
+            <button class="btn btn-sm" id="btnSettingsStartDaemon" type="button" ${STATE.connected ? "disabled" : ""}>${esc(tr("启动服务", "Start Service"))}</button>
+            <button class="btn btn-sm btn-danger-text" id="btnSettingsStopDaemon" type="button" ${allow ? "" : "disabled"}>${esc(tr("停止服务", "Stop Service"))}</button>
           </div>
         </div>
         <div class="setting-row">
           <div class="setting-info">
-            <div class="setting-name">环境诊断、日志与工作区清理</div>
-            <div class="setting-hint">查看后台服务与桌面端日志路径（meshd.log / desktop.log），检查工具状态，校验事件哈希链或清理工作区</div>
+            <div class="setting-name">${esc(tr("环境诊断、日志与工作区清理", "Diagnostics, Logs & Workspace Cleanup"))}</div>
+            <div class="setting-hint">${esc(tr("查看后台服务与桌面端日志路径（meshd.log / desktop.log），检查工具状态，校验事件哈希链或清理工作区", "Inspect meshd.log / desktop.log paths, check CLI health, verify audit hash chain, or prune old workspaces"))}</div>
           </div>
           <div class="setting-control">
-            <button class="btn btn-sm" id="btnSettingsViewLog" type="button">查看日志</button>
-            <button class="btn btn-sm" id="btnSettingsDoctor" type="button">环境诊断</button>
-            <button class="btn btn-sm" id="btnSettingsAudit" type="button" ${disAttr}>审计校验</button>
-            <button class="btn btn-sm" id="btnSettingsPruneWs" type="button" ${disAttr}>清理工作区</button>
+            <button class="btn btn-sm" id="btnSettingsViewLog" type="button">${esc(tr("查看日志", "View Logs"))}</button>
+            <button class="btn btn-sm" id="btnSettingsDoctor" type="button">${esc(tr("环境诊断", "Diagnostics"))}</button>
+            <button class="btn btn-sm" id="btnSettingsAudit" type="button" ${disAttr}>${esc(tr("审计校验", "Verify Audit"))}</button>
+            <button class="btn btn-sm" id="btnSettingsPruneWs" type="button" ${disAttr}>${esc(tr("清理工作区", "Prune Workspaces"))}</button>
           </div>
         </div>
         ${doctorHtml}
 
         <details class="config-raw-details" data-details-key="settings:dev-diag" style="margin-top:16px;">
-          <summary>开发者诊断（能力状态与全部配置项）</summary>
+          <summary>${esc(tr("开发者诊断（能力状态与全部配置项）", "Developer Diagnostics (Capabilities & Full Config)"))}</summary>
           <div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px;">${capBadges}</div>
           ${STATE.configItems.length ? `
             <table class="clean-table" style="margin-top:10px;">
@@ -7734,18 +8157,18 @@
     if (!wasHidden) return;
     const allowStop = canMutate();
     pop.innerHTML = `
-      <div class="popover-label">后台服务控制</div>
+      <div class="popover-label">${esc(tr("后台服务控制", "Background Service Control"))}</div>
       <div style="padding:4px 8px;font-size:11.5px;color:var(--text-muted);" class="mono">
-        ${STATE.connected ? "在线" : "离线"} · ${esc(STATE.pipe.home)}
+        ${esc(STATE.connected ? tr("在线", "Online") : tr("离线", "Offline"))} · ${esc(STATE.pipe.home)}
       </div>
       <div class="popover-divider"></div>
-      <button class="popover-item" type="button" id="popDaemonStatus">查看服务状态详情</button>
-      <button class="popover-item" type="button" id="popDaemonLogs">查看日志与诊断</button>
-      <button class="popover-item" type="button" id="popDaemonStart" ${STATE.connected ? "disabled" : ""}>启动后台服务</button>
-      <button class="popover-item" type="button" id="popDaemonReconnect">立即重连</button>
-      <button class="popover-item" type="button" id="popDaemonStop" ${allowStop ? "" : "disabled"}>停止后台服务</button>
+      <button class="popover-item" type="button" id="popDaemonStatus">${esc(tr("查看服务状态详情", "Service Status Details"))}</button>
+      <button class="popover-item" type="button" id="popDaemonLogs">${esc(tr("查看日志与诊断", "View Logs & Diagnostics"))}</button>
+      <button class="popover-item" type="button" id="popDaemonStart" ${STATE.connected ? "disabled" : ""}>${esc(tr("启动后台服务", "Start Background Service"))}</button>
+      <button class="popover-item" type="button" id="popDaemonReconnect">${esc(tr("立即重连", "Reconnect Now"))}</button>
+      <button class="popover-item" type="button" id="popDaemonStop" ${allowStop ? "" : "disabled"}>${esc(tr("停止后台服务", "Stop Background Service"))}</button>
       <div class="popover-divider"></div>
-      <button class="popover-item" type="button" id="popQuitDesktop">退出桌面端...</button>`;
+      <button class="popover-item" type="button" id="popQuitDesktop">${esc(tr("退出桌面端...", "Quit Desktop..."))}</button>`;
     pop.classList.remove("hidden");
   }
 
@@ -7753,15 +8176,17 @@
     closeAllPopovers();
     const canStop = canMutate();
     openModal(
-      "退出 Agent Mesh 桌面端",
+      tr("退出 Agent Mesh 桌面端", "Quit Agent Mesh Desktop"),
       `<div class="form-stack">
         <div style="font-size:13px;color:var(--text-secondary);line-height:1.6;">
-          默认退出桌面界面<strong>不会停止后台服务 (meshd)</strong>，正在执行的 Agent 任务会继续在后台完成。如需同时优雅停止后台服务，请明确选择下方右侧按钮。
+          ${isEnglish()
+            ? `Quitting the desktop UI <strong>does not stop the background service (meshd)</strong> by default; running agent tasks will continue to finish in the background. To stop the daemon gracefully at the same time, click the button below.`
+            : `默认退出桌面界面<strong>不会停止后台服务 (meshd)</strong>，正在执行的 Agent 任务会继续在后台完成。如需同时优雅停止后台服务，请明确选择下方右侧按钮。`}
         </div>
       </div>`,
-      `<button class="btn" id="modalQuitCancel" type="button">取消</button>
-       <button class="btn btn-danger-text" id="modalQuitAndStop" type="button" ${canStop ? "" : "disabled title=\"需先解锁且后台服务在线\""}>退出并停止后台服务</button>
-       <button class="btn btn-primary" id="modalQuitOnly" type="button">仅退出界面（保持后台运行）</button>`
+      `<button class="btn" id="modalQuitCancel" type="button">${esc(tr("取消", "Cancel"))}</button>
+       <button class="btn btn-danger-text" id="modalQuitAndStop" type="button" ${canStop ? "" : `disabled title="${esc(tr("需先解锁且后台服务在线", "Requires unlocked session and online daemon"))}"`}>${esc(tr("退出并停止后台服务", "Quit & Stop Service"))}</button>
+       <button class="btn btn-primary" id="modalQuitOnly" type="button">${esc(tr("仅退出界面（保持后台运行）", "Quit UI Only (Keep Service Running)"))}</button>`
     );
     $("modalQuitCancel").onclick = closeModal;
     $("modalQuitOnly").onclick = async () => {
@@ -7794,7 +8219,7 @@
     const activePid = (!isNewDraft && prj) ? prj.id : null;
 
     if (!STATE.agents.length) {
-      pop.innerHTML = `<div class="popover-label">暂无已配置 Agent（请前往「AI 工具」或选 Lead 向导）</div>`;
+      pop.innerHTML = `<div class="popover-label">${esc(tr("暂无已配置 Agent（请前往「AI 工具」或选 Lead 向导）", "No agents configured yet (open AI Tools or Lead Setup Wizard)"))}</div>`;
       pop.classList.remove("hidden");
       return;
     }
@@ -7810,18 +8235,18 @@
 
       const groupBlocks = [];
       Array.from(grouped.entries()).forEach(([grpKey, agents]) => {
-        const grpTitle = grpKey === "inbox" ? "收件箱协调 (Inbox)" : grpKey;
+        const grpTitle = grpKey === "inbox" ? tr("收件箱协调 (Inbox)", "Inbox Orchestration (Inbox)") : grpKey;
         const rows = [];
         agents.forEach(ag => {
           const elig = getLeadEligibility(ag, activePid);
           const det = STATE.agentDetails[ag.name] || null;
           const badges = [];
-          if (ag.name === defaultLead) badges.push("默认");
-          if (prj && ag.name === prj.lead) badges.push("当前项目");
+          if (ag.name === defaultLead) badges.push(tr("默认", "Default"));
+          if (prj && ag.name === prj.lead) badges.push(tr("当前项目", "Current"));
           const curModel = (det && det.default_model) || ag.default_model || "";
           const curEffort = (det && det.default_effort) || ag.default_effort || "";
           const reasonStr = elig.reasons.length
-            ? elig.reasons.join("；")
+            ? elig.reasons.join(tr("；", "; "))
             : (elig.warn || `${ag.adapter} · ${ag.delivery}${curModel ? ` · ${curModel}` : ""}`);
 
           const allowedModels = Array.isArray((det && det.allowed_models) || ag.allowed_models)
@@ -7854,7 +8279,7 @@
                 <div>${esc(ag.name)} ${badges.length ? `<span class="mono" style="font-size:10.5px;color:var(--text-muted);">[${esc(badges.join(" · "))}]</span>` : ""}</div>
                 <div class="popover-sub">${esc(reasonStr)}</div>
               </button>
-              ${ag.can_lead && !ag.disabled && canMutate() ? `<button class="btn btn-sm btn-ghost" type="button" data-set-default-lead="${esc(ag.name)}">设为默认</button>` : ""}
+              ${ag.can_lead && !ag.disabled && canMutate() ? `<button class="btn btn-sm btn-ghost" type="button" data-set-default-lead="${esc(ag.name)}">${esc(tr("设为默认", "Set Default"))}</button>` : ""}
             </div>
             ${modelChipsHtml}`);
         });
@@ -7865,23 +8290,23 @@
 
       return groupBlocks.length
         ? groupBlocks.join("")
-        : `<div class="empty-state" style="padding:12px;">未找到匹配的 Lead 或模型</div>`;
+        : `<div class="empty-state" style="padding:12px;">${esc(tr("未找到匹配的 Lead 或模型", "No matching Lead or model found"))}</div>`;
     };
 
     STATE.ui.leadPopoverQuery = "";
     const workers = STATE.agents.filter(a => !a.can_lead && !a.disabled);
     const workerSummary = workers.length
-      ? workers.slice(0, 3).map(w => `${w.name}${w.default_model ? `(${w.default_model})` : ""}`).join("、") + (workers.length > 3 ? ` 等 ${workers.length} 个` : "")
-      : "暂无启用 Worker";
+      ? workers.slice(0, 3).map(w => `${w.name}${w.default_model ? `(${w.default_model})` : ""}`).join(tr("、", ", ")) + (workers.length > 3 ? tr(` 等 ${workers.length} 个`, ` (+${workers.length - 3} more)`) : "")
+      : tr("暂无启用 Worker", "No enabled Workers");
     pop.innerHTML = `
-      <div class="popover-label">${isNewDraft ? "选择新对话的 Lead 与模型" : "切换当前项目 Lead 或 Lead 模型"}</div>
+      <div class="popover-label">${esc(isNewDraft ? tr("选择新对话的 Lead 与模型", "Select Lead & Model for New Chat") : tr("切换当前项目 Lead 或 Lead 模型", "Switch Project Lead or Model"))}</div>
       <div class="lead-pop-search-wrap">
-        <input class="compact-input" id="leadPopoverSearch" type="text" placeholder="搜索 Lead 或模型名称..." autocomplete="off" />
+        <input class="compact-input" id="leadPopoverSearch" type="text" placeholder="${esc(tr("搜索 Lead 或模型名称...", "Search Lead or model name..."))}" autocomplete="off" />
       </div>
       <div id="leadPopoverGroups">${renderGroups("")}</div>
       <div class="lead-pop-worker-hint">
-        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(workerSummary)}">Worker 模型：${esc(workerSummary)}</span>
-        <button class="btn btn-sm btn-ghost" type="button" data-nav-goto="cli" style="flex-shrink:0;">管理 Worker</button>
+        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(workerSummary)}">${esc(tr("Worker 模型：", "Worker models: "))}${esc(workerSummary)}</span>
+        <button class="btn btn-sm btn-ghost" type="button" data-nav-goto="cli" style="flex-shrink:0;">${esc(tr("管理 Worker", "Manage Workers"))}</button>
       </div>`;
     pop.classList.remove("hidden");
     const searchInp = $("leadPopoverSearch");
@@ -7908,15 +8333,15 @@
     const readDis = STATE.connected && STATE.auth.auth_verified ? "" : "disabled";
     const isTerminal = prj.status === "completed" || prj.status === "cancelled";
     pop.innerHTML = `
-      <div class="popover-label">项目操作</div>
-      <button class="popover-item" type="button" data-prj-op="leads" ${readDis}>Lead 交接历史</button>
-      ${!isTerminal ? `<button class="popover-item" type="button" data-prj-op="new_task" ${dis}>高级：手工创建任务</button>` : ""}
-      ${prj.status === "active" ? `<button class="popover-item" type="button" data-prj-op="pause" ${dis}>暂停项目</button>` : ""}
-      ${prj.status === "paused" ? `<button class="popover-item" type="button" data-prj-op="resume" ${dis}>恢复项目</button>` : ""}
-      ${!isTerminal ? `<button class="popover-item" type="button" data-prj-op="update" ${dis}>更新目标与验收标准</button>` : ""}
-      ${prj.status === "active" ? `<button class="popover-item" type="button" data-prj-op="complete" ${dis}>提交完成报告</button>` : ""}
-      ${prj.repo && prj.status !== "cancelled" ? `<button class="popover-item" type="button" data-prj-op="deliver" ${dis}>交付到本地分支</button>` : ""}
-      ${!isTerminal ? `<button class="popover-item" type="button" data-prj-op="cancel" ${dis}>取消项目</button>` : ""}`;
+      <div class="popover-label">${esc(tr("项目操作", "Project Actions"))}</div>
+      <button class="popover-item" type="button" data-prj-op="leads" ${readDis}>${esc(tr("Lead 交接历史", "Lead Handoff History"))}</button>
+      ${!isTerminal ? `<button class="popover-item" type="button" data-prj-op="new_task" ${dis}>${esc(tr("高级：手工创建任务", "Advanced: Create Task Manually"))}</button>` : ""}
+      ${prj.status === "active" ? `<button class="popover-item" type="button" data-prj-op="pause" ${dis}>${esc(tr("暂停项目", "Pause Project"))}</button>` : ""}
+      ${prj.status === "paused" ? `<button class="popover-item" type="button" data-prj-op="resume" ${dis}>${esc(tr("恢复项目", "Resume Project"))}</button>` : ""}
+      ${!isTerminal ? `<button class="popover-item" type="button" data-prj-op="update" ${dis}>${esc(tr("更新目标与验收标准", "Update Goal & Acceptance Criteria"))}</button>` : ""}
+      ${prj.status === "active" ? `<button class="popover-item" type="button" data-prj-op="complete" ${dis}>${esc(tr("提交完成报告", "Submit Completion Report"))}</button>` : ""}
+      ${prj.repo && prj.status !== "cancelled" ? `<button class="popover-item" type="button" data-prj-op="deliver" ${dis}>${esc(tr("交付到本地分支", "Deliver to Local Branch"))}</button>` : ""}
+      ${!isTerminal ? `<button class="popover-item" type="button" data-prj-op="cancel" ${dis}>${esc(tr("取消项目", "Cancel Project"))}</button>` : ""}`;
     pop.classList.remove("hidden");
   }
 
@@ -7934,13 +8359,13 @@
     }
     const ds = STATE.pipe.daemon_status;
     const rows = [
-      ["状态", STATE.connected ? "运行中" : "离线"],
-      ["版本", STATE.pipe.daemon_version || "--"],
-      ["通信通道", STATE.pipe.transport || "--"],
-      ["端点", STATE.pipe.endpoint || "--"],
-      ["数据目录", (ds && ds.home) || STATE.pipe.home || "--"],
+      [tr("状态", "Status"), STATE.connected ? tr("运行中", "Running") : tr("离线", "Offline")],
+      [tr("版本", "Version"), STATE.pipe.daemon_version || "--"],
+      [tr("通信通道", "Transport"), STATE.pipe.transport || "--"],
+      [tr("端点", "Endpoint"), STATE.pipe.endpoint || "--"],
+      [tr("数据目录", "Data Directory"), (ds && ds.home) || STATE.pipe.home || "--"],
       ["PID", ds && ds.pid !== undefined ? String(ds.pid) : "--"],
-      ["运行时长 (s)", ds && ds.uptime_s !== undefined ? String(ds.uptime_s) : "--"],
+      [tr("运行时长 (s)", "Uptime (s)"), ds && ds.uptime_s !== undefined ? String(ds.uptime_s) : "--"],
       ["boot_id", (ds && ds.boot_id) || "--"],
       ["testing_mode", ds && ds.testing_mode !== undefined ? String(Boolean(ds.testing_mode)) : "--"],
       ["active_runs", ds && ds.active_runs !== undefined ? String(ds.active_runs) : "--"],
@@ -7950,19 +8375,19 @@
     const killFailed = ds && ds.kill_failed_runs !== undefined ? ds.kill_failed_runs : [];
     const scheduler = ds && ds.scheduler !== undefined ? ds.scheduler : {};
     openModal(
-      "后台服务状态详情",
+      tr("后台服务状态详情", "Background Service Status"),
       `<div class="form-stack">
         <div class="kv-list">${rows.map(([k, v]) => `<div class="kv-row"><span class="kv-k">${esc(k)}</span><span class="kv-v mono">${esc(v)}</span></div>`).join("")}</div>
         <div class="inspector-section"><div class="inspector-sec-label">kill_failed_runs</div><pre class="log-box" style="max-height:110px;">${esc(JSON.stringify(killFailed, null, 2))}</pre></div>
         <div class="inspector-section"><div class="inspector-sec-label">scheduler</div><pre class="log-box" style="max-height:130px;">${esc(JSON.stringify(scheduler, null, 2))}</pre></div>
       </div>`,
-      `<button class="btn" type="button" data-close-modal="1">关闭</button>`
+      `<button class="btn" type="button" data-close-modal="1">${esc(tr("关闭", "Close"))}</button>`
     );
   }
 
   async function handleUnlockPassphrase(pw, remember = false) {
     if (!pw) {
-      toast("请输入口令", "warn");
+      toast(tr("请输入口令", "Please enter passphrase"), "warn");
       return;
     }
     const res = remember
@@ -7976,7 +8401,7 @@
         STATE.hasLoadedWorkspace = false;
         renderAll();
       }
-      toast("口令已解锁", "ok");
+      toast(tr("口令已解锁", "Unlocked"), "ok");
       await refreshConnectionAndAuth();
       if (STATE.connected && STATE.auth.auth_verified) {
         await loadAllWorkspaceData();
@@ -8001,38 +8426,38 @@
     const lastErr = STATE.pipe.last_start_error || STATE.pipe.last_error;
     const logLines = diagLog.length
       ? diagLog.map(item => `[${item.at || "--"}] [${(item.level || "info").toUpperCase()}] ${item.code || ""}: ${item.message || ""}`).join("\n")
-      : "暂无本次会话的启动诊断记录。";
-    const errJson = lastErr ? JSON.stringify(lastErr, null, 2) : "无";
+      : tr("暂无本次会话的启动诊断记录。", "No startup diagnostic entries for this session yet.");
+    const errJson = lastErr ? JSON.stringify(lastErr, null, 2) : tr("无", "None");
     openModal(
-      "后台服务与桌面端诊断日志",
+      tr("后台服务与桌面端诊断日志", "Background Service & Desktop Diagnostics"),
       `<div class="form-stack">
         <div class="kv-list">
-          <div class="kv-row"><span class="kv-k">数据目录</span><span class="kv-v mono">${esc(STATE.pipe.home || "--")}</span></div>
-          <div class="kv-row"><span class="kv-k">已初始化</span><span class="kv-v mono">${esc(String(STATE.pipe.home_initialized))}</span></div>
-          <div class="kv-row"><span class="kv-k">后台服务日志 (meshd.log)</span><span class="kv-v mono">${esc(STATE.pipe.daemon_log_path || "--")}</span></div>
-          <div class="kv-row"><span class="kv-k">桌面端日志 (desktop.log)</span><span class="kv-v mono">${esc(STATE.pipe.desktop_log_path || "--")}</span></div>
+          <div class="kv-row"><span class="kv-k">${esc(tr("数据目录", "Data Directory"))}</span><span class="kv-v mono">${esc(STATE.pipe.home || "--")}</span></div>
+          <div class="kv-row"><span class="kv-k">${esc(tr("已初始化", "Initialized"))}</span><span class="kv-v mono">${esc(String(STATE.pipe.home_initialized))}</span></div>
+          <div class="kv-row"><span class="kv-k">${esc(tr("后台服务日志 (meshd.log)", "Daemon Log (meshd.log)"))}</span><span class="kv-v mono">${esc(STATE.pipe.daemon_log_path || "--")}</span></div>
+          <div class="kv-row"><span class="kv-k">${esc(tr("桌面端日志 (desktop.log)", "Desktop Log (desktop.log)"))}</span><span class="kv-v mono">${esc(STATE.pipe.desktop_log_path || "--")}</span></div>
         </div>
-        <div class="inspector-section"><div class="inspector-sec-label">最近错误详情（已脱敏）</div><pre class="log-box" style="max-height:130px;">${esc(errJson)}</pre></div>
-        <div class="inspector-section"><div class="inspector-sec-label">启动与桥接诊断记录（同时轮转写入 desktop.log，绝不记录口令或密钥）</div><pre class="log-box" style="max-height:150px;">${esc(logLines)}</pre></div>
+        <div class="inspector-section"><div class="inspector-sec-label">${esc(tr("最近错误详情（已脱敏）", "Latest Error Details (Sanitized)"))}</div><pre class="log-box" style="max-height:130px;">${esc(errJson)}</pre></div>
+        <div class="inspector-section"><div class="inspector-sec-label">${esc(tr("启动与桥接诊断记录（同时轮转写入 desktop.log，绝不记录口令或密钥）", "Startup & Bridge Diagnostics (rotated to desktop.log; never records passphrases or secrets)"))}</div><pre class="log-box" style="max-height:150px;">${esc(logLines)}</pre></div>
         <div id="daemonLogDoctorBox"></div>
       </div>`,
-      `<button class="btn" id="btnModalRunDoctor" type="button">运行环境诊断</button><button class="btn btn-primary" id="btnModalRetryStart" type="button" ${STATE.connected || STATE.daemonStarting ? "disabled" : ""}>重试启动</button><button class="btn" type="button" data-close-modal="1">关闭</button>`
+      `<button class="btn" id="btnModalRunDoctor" type="button">${esc(tr("运行环境诊断", "Run Diagnostics"))}</button><button class="btn btn-primary" id="btnModalRetryStart" type="button" ${STATE.connected || STATE.daemonStarting ? "disabled" : ""}>${esc(tr("重试启动", "Retry Start"))}</button><button class="btn" type="button" data-close-modal="1">${esc(tr("关闭", "Close"))}</button>`
     );
     if ($("btnModalRunDoctor")) {
       $("btnModalRunDoctor").onclick = async () => {
         if (!hasApi()) return;
         const box = $("daemonLogDoctorBox");
-        if (box) box.innerHTML = `<div class="empty-state">正在运行环境诊断...</div>`;
+        if (box) box.innerHTML = `<div class="empty-state">${esc(tr("正在运行环境诊断...", "Running diagnostics..."))}</div>`;
         try {
           const res = await window.pywebview.api.doctor_report();
           if (res && res.ok) {
             STATE.doctor = res.data;
-            if (box) box.innerHTML = `<div class="inspector-section"><div class="inspector-sec-label">诊断报告 (${esc(res.data.status || "--")})</div><pre class="log-box" style="max-height:170px;">${esc(JSON.stringify(res.data, null, 2))}</pre></div>`;
+            if (box) box.innerHTML = `<div class="inspector-section"><div class="inspector-sec-label">${esc(tr(`诊断报告 (${res.data.status || "--"})`, `Diagnostics Report (${res.data.status || "--"})`))}</div><pre class="log-box" style="max-height:170px;">${esc(JSON.stringify(res.data, null, 2))}</pre></div>`;
           } else if (box) {
             box.innerHTML = `<div class="inspector-note-box red">${esc(formatErrorMessage(res && res.error))}</div>`;
           }
         } catch (err) {
-          if (box) box.innerHTML = `<div class="inspector-note-box red">环境诊断失败: ${esc(String(err))}</div>`;
+          if (box) box.innerHTML = `<div class="inspector-note-box red">${esc(tr(`环境诊断失败: ${String(err)}`, `Diagnostics failed: ${String(err)}`))}</div>`;
         }
       };
     }
@@ -8052,7 +8477,7 @@
     STATE.daemonStarting = false;
     await refreshConnectionAndAuth();
     if (res && res.ok) {
-      if (!(res.data && res.data.in_progress)) toast("后台服务已启动", "ok");
+      if (!(res.data && res.data.in_progress)) toast(tr("后台服务已启动", "Background service started"), "ok");
       if (STATE.connected && STATE.auth.auth_verified) {
         if (!STATE.hasLoadedWorkspace) {
           STATE.loadingWorkspace = true;
@@ -8074,7 +8499,7 @@
   async function handleStopDaemon() {
     const res = await window.pywebview.api.stop_daemon();
     if (res && res.ok) {
-      toast("后台服务正在停止", "info");
+      toast(tr("后台服务正在停止", "Stopping background service"), "info");
       STATE.connected = false;
       STATE.userStopped = true;
       STATE.daemonStopping = true;
@@ -8087,17 +8512,17 @@
 
   function validateRepoInputs(repo, baseBranch, rawTestCmd) {
     if (!repo) return { ok: true, parsedTestCmd: null };
-    if (!baseBranch) return { ok: false, error: "绑定 Git 仓库时必须填写基准分支（如 main 或 master）" };
-    if (!rawTestCmd) return { ok: false, error: "绑定 Git 仓库时必须填写测试命令（JSON 数组或 \"none\"）" };
+    if (!baseBranch) return { ok: false, error: tr("绑定 Git 仓库时必须填写基准分支（如 main 或 master）", "Base branch is required when binding a Git repository (e.g., main or master)") };
+    if (!rawTestCmd) return { ok: false, error: tr("绑定 Git 仓库时必须填写测试命令（JSON 数组或 \"none\"）", "Test command is required when binding a Git repository (JSON array or \"none\")") };
     if (rawTestCmd === "none") return { ok: true, parsedTestCmd: "none" };
     let parsed;
     try {
       parsed = JSON.parse(rawTestCmd);
     } catch (_) {
-      return { ok: false, error: "测试命令必须是合法的 JSON 字符串数组（如 [\"pytest\"]）或 \"none\"" };
+      return { ok: false, error: tr("测试命令必须是合法的 JSON 字符串数组（如 [\"pytest\"]）或 \"none\"", "Test command must be a valid JSON string array (e.g., [\"pytest\"]) or \"none\"") };
     }
     if (!Array.isArray(parsed) || !parsed.length || parsed.some(x => typeof x !== "string" || !x)) {
-      return { ok: false, error: "测试命令必须是非空字符串数组或 \"none\"" };
+      return { ok: false, error: tr("测试命令必须是非空字符串数组或 \"none\"", "Test command must be a non-empty string array or \"none\"") };
     }
     return { ok: true, parsedTestCmd: parsed };
   }
@@ -8134,7 +8559,7 @@
         return;
       }
       if (contextChanged) {
-        toast(payload.steer_text ? "已打断原项目 Lead 回合并发送改向消息" : "已请求停止原项目 Lead 回合", "info");
+        toast(payload.steer_text ? tr("已打断原项目 Lead 回合并发送改向消息", "Interrupted previous project's Lead turn and sent steer message") : tr("已请求停止原项目 Lead 回合", "Requested stop for previous project's Lead turn"), "info");
         if (STATE.connected && STATE.auth.auth_verified) scheduleRefresh({ full: true });
         return;
       }
@@ -8150,7 +8575,7 @@
       if (res.data && Object.prototype.hasOwnProperty.call(res.data, "lead_status")) {
         STATE.chatLeadStatus = res.data.lead_status || null;
       }
-      toast(payload.steer_text ? "已打断当前 Lead 回合并发送改向消息" : "已请求停止当前 Lead 回合", "info");
+      toast(payload.steer_text ? tr("已打断当前 Lead 回合并发送改向消息", "Interrupted current Lead turn and sent steer message") : tr("已请求停止当前 Lead 回合", "Requested stop for current Lead turn"), "info");
       await loadActiveProjectLight();
       if (projectSwitchGen === sentGen && STATE.activeProjectId === sentPid) {
         scrollChatToBottom();
@@ -8169,7 +8594,7 @@
     if (cancellingQueuedMsgIds.has(messageId)) return;
     const msg = STATE.chatMessages.find(m => m && m.id === messageId);
     if (msg && (isRelayedChatMessage(msg) || msg.approval_id || msg.plan_id || msg.task_id || msg.consumed_by_approval_id)) {
-      toast("该消息不可取消", "err");
+      toast(tr("该消息不可取消", "This message cannot be cancelled"), "err");
       return;
     }
     const sentPid = prj.id;
@@ -8187,7 +8612,7 @@
       if (STATE.connected && STATE.auth.auth_verified && STATE.queuedUserMsgIdsByProject[sentPid]) {
         STATE.queuedUserMsgIdsByProject[sentPid].delete(messageId);
       }
-      toast("已取消该排队消息", "ok");
+      toast(tr("已取消该排队消息", "Queued message cancelled"), "ok");
       if (sameContext) await loadActiveProjectLight();
       else if (STATE.connected && STATE.auth.auth_verified) scheduleRefresh({ full: true });
     } finally {
@@ -8203,28 +8628,28 @@
     const msg = STATE.chatMessages.find(m => m && m.id === messageId);
     if (!msg) return;
     if (isRelayedChatMessage(msg) || msg.approval_id || msg.plan_id || msg.task_id || msg.consumed_by_approval_id) {
-      toast("该消息不可编辑", "err");
+      toast(tr("该消息不可编辑", "This message cannot be edited"), "err");
       return;
     }
     const sentPid = prj.id;
     const sentGen = projectSwitchGen;
     openModal(
-      "编辑排队中的消息",
+      tr("编辑排队中的消息", "Edit Queued Message"),
       `<div class="form-stack">
         <div class="form-row">
-          <label class="form-label" for="editQueuedMsgText">仅在 Lead 尚未读取该消息前可编辑（不会修改历史审计事件）</label>
+          <label class="form-label" for="editQueuedMsgText">${esc(tr("仅在 Lead 尚未读取该消息前可编辑（不会修改历史审计事件）", "Editable only before Lead consumes this message (historical audit events are never modified)"))}</label>
           <textarea class="compact-textarea" id="editQueuedMsgText" rows="4">${esc(msg.body || "")}</textarea>
         </div>
       </div>`,
-      `<button class="btn" id="modalEditQueuedCancel" type="button">取消</button>
-       <button class="btn btn-primary" id="modalEditQueuedSave" type="button">保存修改</button>`
+      `<button class="btn" id="modalEditQueuedCancel" type="button">${esc(tr("取消", "Cancel"))}</button>
+       <button class="btn btn-primary" id="modalEditQueuedSave" type="button">${esc(tr("保存修改", "Save Changes"))}</button>`
     );
     $("modalEditQueuedCancel").onclick = closeModal;
     let editQueuedSubmitting = false;
     $("modalEditQueuedSave").onclick = async () => {
       if (editQueuedSubmitting) return;
       const nextText = ($("editQueuedMsgText") && $("editQueuedMsgText").value || "").trim();
-      if (!nextText) { toast("消息内容不能为空", "warn"); return; }
+      if (!nextText) { toast(tr("消息内容不能为空", "Message cannot be empty"), "warn"); return; }
       editQueuedSubmitting = true;
       const saveBtn = $("modalEditQueuedSave");
       if (saveBtn) saveBtn.disabled = true;
@@ -8242,7 +8667,7 @@
           return;
         }
         closeModal();
-        toast("排队消息已更新", "ok");
+        toast(tr("排队消息已更新", "Queued message updated"), "ok");
         if (sameContext) await loadActiveProjectLight();
         else if (STATE.connected && STATE.auth.auth_verified) scheduleRefresh({ full: true });
       } finally {
@@ -8282,7 +8707,7 @@
       baseBranch = ($("newPrjBaseBranch") && $("newPrjBaseBranch").value.trim()) || "";
       const rawTestCmd = ($("newPrjTestCmd") && $("newPrjTestCmd").value.trim()) || "";
       if (repo && STATE.ui.repoInspection && STATE.ui.repoInspection.path_conflict) {
-        STATE.ui.composerInlineNote = { level: "err", text: STATE.ui.repoInspection.path_conflict };
+        STATE.ui.composerInlineNote = { level: "err", text: localizeDaemonMessage(STATE.ui.repoInspection.path_conflict) };
         STATE.ui.repoDrawerOpen = true;
         renderComposer();
         return;
@@ -8335,7 +8760,7 @@
           }
           const targetPrj = newPid ? STATE.projects.find(p => p && p.id === newPid) : null;
           const targetLabel = (targetPrj && targetPrj.name) || newPid || "";
-          toast(targetLabel ? `已发送至项目「${targetLabel}」` : "已发送", "ok");
+          toast(targetLabel ? tr(`已发送至项目「${targetLabel}」`, `Sent to project "${targetLabel}"`) : tr("已发送", "Sent"), "ok");
           scheduleRefresh({ full: true });
           return;
         }
@@ -8411,7 +8836,7 @@
               STATE.queuedUserMsgIdsByProject[newPid] = new Set();
             }
             STATE.queuedUserMsgIdsByProject[newPid].add(res.data.message.id);
-            toast("消息已排入队列，将在当前 Lead 回合结束后处理", "info");
+            toast(tr("消息已排入队列，将在当前 Lead 回合结束后处理", "Message queued; will be processed after the current Lead turn finishes"), "info");
           }
           if (!STATE.chatMessages.some(m => m && m.id === res.data.message.id)) {
             STATE.chatMessages = STATE.chatMessages.concat([res.data.message]);
@@ -8436,17 +8861,17 @@
 
     if (isNewDraft && repo && Array.isArray(parsedTestCmd)) {
       openModal(
-        "确认仓库自动测试命令",
+        tr("确认仓库自动测试命令", "Confirm Repository Test Command"),
         `<div class="form-stack">
-          <div style="font-size:13px;color:var(--text-secondary);">合并验证阶段将直接按以下参数数组执行测试（不经过 shell）：</div>
+          <div style="font-size:13px;color:var(--text-secondary);">${esc(tr("合并验证阶段将直接按以下参数数组执行测试（不经过 shell）：", "During merge verification, tests will run directly with this exact argument array (no shell):"))}</div>
           <div class="kv-list">
-            <div class="kv-row"><span class="kv-k">仓库</span><span class="kv-v mono">${esc(repo)}</span></div>
-            <div class="kv-row"><span class="kv-k">基准分支</span><span class="kv-v mono">${esc(baseBranch)}</span></div>
+            <div class="kv-row"><span class="kv-k">${esc(tr("仓库", "Repo"))}</span><span class="kv-v mono">${esc(repo)}</span></div>
+            <div class="kv-row"><span class="kv-k">${esc(tr("基准分支", "Base Branch"))}</span><span class="kv-v mono">${esc(baseBranch)}</span></div>
           </div>
-          <div class="inspector-sec-label">待执行参数数组 (exact argv)</div>
+          <div class="inspector-sec-label">${esc(tr("待执行参数数组 (exact argv)", "Exact argv array"))}</div>
           <pre class="log-box">${esc(JSON.stringify(parsedTestCmd, null, 2))}</pre>
         </div>`,
-        `<button class="btn" id="modalCancel" type="button">取消</button><button class="btn btn-primary" id="modalConfirmTestCmd" type="button">确认并发送</button>`
+        `<button class="btn" id="modalCancel" type="button">${esc(tr("取消", "Cancel"))}</button><button class="btn btn-primary" id="modalConfirmTestCmd" type="button">${esc(tr("确认并发送", "Confirm & Send"))}</button>`
       );
       $("modalCancel").onclick = closeModal;
       $("modalConfirmTestCmd").onclick = async () => {
@@ -8462,41 +8887,41 @@
   function openManualNewProjectModal() {
     if (!canMutate()) { toast(disabledReason(), "err"); return; }
     openModal(
-      "完整表单新建项目（高级）",
+      tr("完整表单新建项目（高级）", "New Project (Full Form)"),
       `<div class="form-stack">
-        <div class="form-row"><label class="form-label" for="manPrjTitle">项目标题 (必填)</label><input class="compact-input" id="manPrjTitle" type="text" placeholder="例如：优化登录接口限流" /></div>
-        <div class="form-row"><label class="form-label" for="manPrjGoal">项目目标 (必填)</label><textarea class="compact-input" id="manPrjGoal" rows="3" placeholder="描述希望完成的目标..."></textarea></div>
-        <div class="form-row"><label class="form-label" for="manPrjCriterion">验收标准 (必填，每行一条或分号分隔)</label><textarea class="compact-input" id="manPrjCriterion" rows="2" placeholder="例如：全部单元测试通过"></textarea></div>
+        <div class="form-row"><label class="form-label" for="manPrjTitle">${esc(tr("项目标题 (必填)", "Project Title (required)"))}</label><input class="compact-input" id="manPrjTitle" type="text" placeholder="${esc(tr("例如：优化登录接口限流", "e.g., Add rate limiting to login API"))}" /></div>
+        <div class="form-row"><label class="form-label" for="manPrjGoal">${esc(tr("项目目标 (必填)", "Project Goal (required)"))}</label><textarea class="compact-input" id="manPrjGoal" rows="3" placeholder="${esc(tr("描述希望完成的目标...", "Describe what you want to achieve..."))}"></textarea></div>
+        <div class="form-row"><label class="form-label" for="manPrjCriterion">${esc(tr("验收标准 (必填，每行一条或分号分隔)", "Acceptance Criteria (required, one per line or semicolon-separated)"))}</label><textarea class="compact-input" id="manPrjCriterion" rows="2" placeholder="${esc(tr("例如：全部单元测试通过", "e.g., All unit tests pass"))}"></textarea></div>
         <div class="form-row-grid">
           <div class="form-row">
-            <label class="form-label" for="manPrjRepo">Git 仓库路径 (可选)</label>
+            <label class="form-label" for="manPrjRepo">${esc(tr("Git 仓库路径 (可选)", "Git Repository Path (optional)"))}</label>
             <div style="display:flex;gap:6px;">
               <input class="compact-input mono" id="manPrjRepo" type="text" placeholder="/path/to/repo" style="flex:1;" />
-              <button class="btn btn-sm" id="btnManPickRepoFolder" type="button">选择...</button>
+              <button class="btn btn-sm" id="btnManPickRepoFolder" type="button">${esc(tr("选择...", "Browse..."))}</button>
             </div>
           </div>
-          <div class="form-row"><label class="form-label" for="manPrjBaseBranch">基准分支 (填仓库时必填)</label><input class="compact-input mono" id="manPrjBaseBranch" type="text" value="" placeholder="选择仓库后自动识别" /></div>
+          <div class="form-row"><label class="form-label" for="manPrjBaseBranch">${esc(tr("基准分支 (填仓库时必填)", "Base Branch (required with repo)"))}</label><input class="compact-input mono" id="manPrjBaseBranch" type="text" value="" placeholder="${esc(tr("选择仓库后自动识别", "Auto-detected after picking repo"))}" /></div>
         </div>
-        <div class="form-row"><label class="form-label" for="manPrjTestCmd">测试命令 (填仓库时必填，JSON 数组或 none)</label><input class="compact-input mono" id="manPrjTestCmd" type="text" placeholder='例如：none 或 ["pytest"]' /></div>
+        <div class="form-row"><label class="form-label" for="manPrjTestCmd">${esc(tr("测试命令 (填仓库时必填，JSON 数组或 none)", "Test Command (required with repo, JSON array or none)"))}</label><input class="compact-input mono" id="manPrjTestCmd" type="text" placeholder='${esc(tr('例如：none 或 ["pytest"]', 'e.g., none or ["pytest"]'))}' /></div>
         <div class="form-row-grid">
           <div class="form-row">
-            <label class="form-label" for="manPrjGateMode">计划审批门控</label>
+            <label class="form-label" for="manPrjGateMode">${esc(tr("计划审批门控", "Plan Approval Gate"))}</label>
             <select class="compact-select" id="manPrjGateMode">
-              <option value="require_approval" selected>先出计划，卡片确认后再派发（推荐）</option>
-              <option value="off">关闭计划门控（传统直派模式）</option>
+              <option value="require_approval" selected>${esc(tr("先出计划，卡片确认后再派发（推荐）", "Propose plan, dispatch after card approval (recommended)"))}</option>
+              <option value="off">${esc(tr("关闭计划门控（传统直派模式）", "Disable plan gate (legacy direct dispatch)"))}</option>
             </select>
           </div>
           <div class="form-row">
-            <label class="form-label" for="manPrjPermMode">权限模式</label>
+            <label class="form-label" for="manPrjPermMode">${esc(tr("权限模式", "Permission Mode"))}</label>
             <select class="compact-select" id="manPrjPermMode">
-              <option value="supervised">每步问我 (supervised)</option>
-              <option value="plan" selected>计划批了就放手 (plan · 默认)</option>
-              <option value="auto">全自动 (auto)</option>
+              <option value="supervised">${esc(tr("每步问我 (supervised)", "Ask each step (supervised)"))}</option>
+              <option value="plan" selected>${esc(tr("计划批了就放手 (plan · 默认)", "Approve plan then run (plan · default)"))}</option>
+              <option value="auto">${esc(tr("全自动 (auto)", "Full Auto (auto)"))}</option>
             </select>
           </div>
         </div>
       </div>`,
-      `<button class="btn" id="modalCancel" type="button">取消</button><button class="btn btn-primary" id="modalSaveManualProject" type="button">创建项目</button>`
+      `<button class="btn" id="modalCancel" type="button">${esc(tr("取消", "Cancel"))}</button><button class="btn btn-primary" id="modalSaveManualProject" type="button">${esc(tr("创建项目", "Create Project"))}</button>`
     );
     $("modalCancel").onclick = closeModal;
     if ($("btnManPickRepoFolder")) {
@@ -8520,7 +8945,7 @@
       const gateMode = ($("manPrjGateMode").value || "require_approval");
       const permMode = ($("manPrjPermMode") && $("manPrjPermMode").value) || "plan";
       if (!title || !goal || !criteria.length) {
-        toast("请填写标题、目标和至少一条验收标准", "warn");
+        toast(tr("请填写标题、目标和至少一条验收标准", "Please fill in title, goal, and at least one acceptance criterion"), "warn");
         return;
       }
       const check = validateRepoInputs(repo, baseBranch, rawTestCmd);
@@ -8543,23 +8968,35 @@
         if (permMode === "auto" || gateMode === "off") {
           const warnLines = [];
           if (permMode === "auto") {
-            warnLines.push("- 权限模式为「全自动 (auto)」：后续计划派发与超限重试将自动放行（高危提权 permission_escalation 仍需单独授权）。");
+            warnLines.push(tr(
+              "- 权限模式为「全自动 (auto)」：后续计划派发与超限重试将自动放行（高危提权 permission_escalation 仍需单独授权）。",
+              "- Permission mode is Full Auto (auto): future plan dispatches and over-limit retries will be auto-allowed (permission_escalation still requires explicit approval)."
+            ));
           }
           if (gateMode === "off") {
-            warnLines.push("- 计划审批门控为「关闭 (off)」：Lead 将跳过计划确认卡片直接派发任务。");
+            warnLines.push(tr(
+              "- 计划审批门控为「关闭 (off)」：Lead 将跳过计划确认卡片直接派发任务。",
+              "- Plan approval gate is Off: Lead will skip plan approval cards and dispatch tasks directly."
+            ));
           }
           const okMode = await showConfirmDialog(
-            "确认以高自动化模式创建项目？",
-            `即将为项目「${title}」启用以下设置：\n${warnLines.join("\n")}\n\n确认继续创建吗？`,
-            "确认并继续"
+            tr("确认以高自动化模式创建项目？", "Create project with high-automation settings?"),
+            tr(
+              `即将为项目「${title}」启用以下设置：\n${warnLines.join("\n")}\n\n确认继续创建吗？`,
+              `The following settings will be enabled for "${title}":\n${warnLines.join("\n")}\n\nContinue creating project?`
+            ),
+            tr("确认并继续", "Confirm & Continue")
           );
           if (!okMode) return;
         }
         if (repo && Array.isArray(check.parsedTestCmd)) {
           const ok = await showConfirmDialog(
-            "确认仓库测试命令",
-            `合并阶段将按精确参数数组执行（无 shell）：\n${JSON.stringify(check.parsedTestCmd, null, 2)}`,
-            "确认并创建"
+            tr("确认仓库测试命令", "Confirm Repository Test Command"),
+            tr(
+              `合并阶段将按精确参数数组执行（无 shell）：\n${JSON.stringify(check.parsedTestCmd, null, 2)}`,
+              `Tests will run during merge with this exact argv array (no shell):\n${JSON.stringify(check.parsedTestCmd, null, 2)}`
+            ),
+            tr("确认并创建", "Confirm & Create")
           );
           if (!ok) return;
         }
@@ -8570,7 +9007,7 @@
         bumpProjectSwitchGen();
         STATE.ui.draftNewChat = false;
         if (newId) STATE.activeProjectId = newId;
-        toast("项目创建成功", "ok");
+        toast(tr("项目创建成功", "Project created"), "ok");
         await loadAllWorkspaceData();
       } finally {
         manualProjectSubmitting = false;
@@ -8579,13 +9016,13 @@
     };
   }
 
-  function showConfirmDialog(title, message, confirmLabel = "确认") {
+  function showConfirmDialog(title, message, confirmLabel = tr("确认", "Confirm")) {
     return new Promise(resolve => {
       closeConfirmModal(false);
       confirmModalResolver = resolve;
       $("confirmModalTitle").textContent = title;
       $("confirmModalBody").innerHTML = `<pre class="log-box" style="white-space:pre-wrap;">${esc(message)}</pre>`;
-      $("confirmModalFoot").innerHTML = `<button class="btn" id="btnConfirmNo" type="button">取消</button><button class="btn btn-primary" id="btnConfirmYes" type="button">${esc(confirmLabel)}</button>`;
+      $("confirmModalFoot").innerHTML = `<button class="btn" id="btnConfirmNo" type="button">${esc(tr("取消", "Cancel"))}</button><button class="btn btn-primary" id="btnConfirmYes" type="button">${esc(confirmLabel)}</button>`;
       $("confirmModalBackdrop").classList.remove("hidden");
       $("btnConfirmNo").onclick = () => closeConfirmModal(false);
       $("btnConfirmYes").onclick = () => closeConfirmModal(true);
@@ -8605,16 +9042,16 @@
       : "";
     return new Promise(resolve => {
       openModal(
-        title || "拒绝该审批请求",
+        title || tr("拒绝该审批请求", "Reject Approval Request"),
         `<div class="form-stack">
           ${targetBlock}
-          <div style="font-size:13px;color:var(--text-secondary);">可填写拒绝原因或调整建议（留空将直接拒绝）：</div>
+          <div style="font-size:13px;color:var(--text-secondary);">${esc(tr("可填写拒绝原因或调整建议（留空将直接拒绝）：", "Optionally enter a rejection reason or revision feedback (leave blank to reject directly):"))}</div>
           <div class="form-row">
-            <label class="form-label" for="modalRejectReasonInput">拒绝原因（可选）</label>
-            <input class="compact-input" id="modalRejectReasonInput" type="text" placeholder="例如：请先补充第 2 步的单元测试..." />
+            <label class="form-label" for="modalRejectReasonInput">${esc(tr("拒绝原因（可选）", "Rejection Reason (optional)"))}</label>
+            <input class="compact-input" id="modalRejectReasonInput" type="text" placeholder="${esc(tr("例如：请先补充第 2 步的单元测试...", "e.g., Please add unit tests for step 2 first..."))}" />
           </div>
         </div>`,
-        `<button class="btn" id="modalCancel" type="button">取消</button><button class="btn btn-danger-text" id="modalConfirmReject" type="button">确认拒绝</button>`
+        `<button class="btn" id="modalCancel" type="button">${esc(tr("取消", "Cancel"))}</button><button class="btn btn-danger-text" id="modalConfirmReject" type="button">${esc(tr("确认拒绝", "Confirm Reject"))}</button>`
       );
       modalPromptResolver = resolve;
       const cancelBtn = $("modalCancel");
@@ -8656,43 +9093,72 @@
     if (action === "reject") {
       if (upgradedFromRelayed) {
         level = "ok";
-        text = "已将该转发拒绝升级为本机直连确认 (direct_verified)";
+        text = tr("已将该转发拒绝升级为本机直连确认 (direct_verified)", "Upgraded relayed rejection to direct local confirmation (direct_verified)");
       } else {
         level = "info";
         text = alreadyDecided
-          ? "该审批请求此前已拒绝，状态已同步"
-          : (category === "plan_dispatch" ? "已拒绝该计划" : "已拒绝该审批请求");
+          ? tr("该审批请求此前已拒绝，状态已同步", "This approval was already rejected; state synced")
+          : (category === "plan_dispatch" ? tr("已拒绝该计划", "Plan rejected") : tr("已拒绝该审批请求", "Approval request rejected"));
       }
     } else if (alreadyAuto && !switchedMode) {
       if (typeof d.message === "string" && d.message.trim()) {
-        text = `${d.message.trim()}${sweptSuffix}`;
+        text = `${localizeDaemonMessage(d.message.trim())}${sweptSuffix}`;
       } else if (upgradedFromRelayed) {
-        text = `已将转发审批升级为本机直连确认；当前项目已处于「全自动 (auto)」模式，无需重复切换${sweptSuffix}`;
+        text = tr(
+          `已将转发审批升级为本机直连确认；当前项目已处于「全自动 (auto)」模式，无需重复切换${sweptSuffix}`,
+          `Upgraded relayed approval to direct confirmation; project is already in Full Auto (auto) mode${sweptSuffix}`
+        );
       } else if (upgradedToAlways || alreadyDecided) {
-        text = `当前操作已批准，且项目已处于「全自动 (auto)」模式，无需重复切换${sweptSuffix}`;
+        text = tr(
+          `当前操作已批准，且项目已处于「全自动 (auto)」模式，无需重复切换${sweptSuffix}`,
+          `Action is already approved and project is already in Full Auto (auto) mode${sweptSuffix}`
+        );
       } else {
-        text = `已允许当前操作；当前项目已处于「全自动 (auto)」模式，无需重复切换${sweptSuffix}`;
+        text = tr(
+          `已允许当前操作；当前项目已处于「全自动 (auto)」模式，无需重复切换${sweptSuffix}`,
+          `Allowed action; project is already in Full Auto (auto) mode${sweptSuffix}`
+        );
       }
       if (alreadyDecided && !upgradedFromRelayed) level = "info";
     } else if (upgradedFromRelayed && switchedMode) {
-      text = `已将转发审批升级为本机直连确认，并切换本项目为「全自动 (auto)」模式${sweptSuffix}`;
+      text = tr(
+        `已将转发审批升级为本机直连确认，并切换本项目为「全自动 (auto)」模式${sweptSuffix}`,
+        `Upgraded relayed approval to direct confirmation and switched project to Full Auto (auto)${sweptSuffix}`
+      );
     } else if (upgradedFromRelayed && createdGrant) {
-      text = "已将转发审批升级为本机直连确认，并创建窄范围永久授权（可在「设置 → 永久授权」随时撤销）";
+      text = tr(
+        "已将转发审批升级为本机直连确认，并创建窄范围永久授权（可在「设置 → 永久授权」随时撤销）",
+        "Upgraded relayed approval to direct confirmation and created a scoped standing grant (revoke anytime in Settings → Standing Grants)"
+      );
     } else if (upgradedFromRelayed) {
-      text = "已将该转发审批升级为本机直连确认 (direct_verified)";
+      text = tr("已将该转发审批升级为本机直连确认 (direct_verified)", "Upgraded relayed approval to direct local confirmation (direct_verified)");
     } else if (upgradedToAlways && switchedMode) {
-      text = `原审批保持通过，已切换本项目为「全自动 (auto)」模式${sweptSuffix}`;
+      text = tr(
+        `原审批保持通过，已切换本项目为「全自动 (auto)」模式${sweptSuffix}`,
+        `Original approval preserved; switched project to Full Auto (auto) mode${sweptSuffix}`
+      );
     } else if (upgradedToAlways && createdGrant) {
-      text = "原审批保持通过，已追加创建窄范围永久授权（可在「设置 → 永久授权」随时撤销）";
+      text = tr(
+        "原审批保持通过，已追加创建窄范围永久授权（可在「设置 → 永久授权」随时撤销）",
+        "Original approval preserved; added a scoped standing grant (revoke anytime in Settings → Standing Grants)"
+      );
     } else if (switchedMode) {
-      text = `已允许并切换本项目为「全自动 (auto)」模式${sweptSuffix}`;
+      text = tr(
+        `已允许并切换本项目为「全自动 (auto)」模式${sweptSuffix}`,
+        `Allowed and switched project to Full Auto (auto) mode${sweptSuffix}`
+      );
     } else if (createdGrant) {
-      text = "已允许并创建窄范围永久授权（可在「设置 → 永久授权」随时撤销）";
+      text = tr(
+        "已允许并创建窄范围永久授权（可在「设置 → 永久授权」随时撤销）",
+        "Allowed and created a scoped standing grant (revoke anytime in Settings → Standing Grants)"
+      );
     } else if (alreadyDecided) {
       level = "info";
-      text = "该审批请求此前已允许，状态已同步";
+      text = tr("该审批请求此前已允许，状态已同步", "This approval was already allowed; state synced");
     } else {
-      text = category === "plan_dispatch" ? "已允许计划，正在派发任务" : "已允许该审批请求";
+      text = category === "plan_dispatch"
+        ? tr("已允许计划，正在派发任务", "Plan approved; dispatching tasks")
+        : tr("已允许该审批请求", "Approval request allowed");
     }
 
     return {
@@ -8720,21 +9186,34 @@
       : ((matchedPrj && matchedPrj.name) || "");
     const projectLabel = rawName
       ? (targetPid && rawName !== targetPid ? `${rawName} (${targetPid})` : rawName)
-      : (targetPid || "目标项目");
-    const title = `确认将项目「${projectLabel}」切换为「全自动 (auto)」模式？`;
-    const body =
-      `目标项目：${projectLabel}\n\n` +
-      "确认后将：\n" +
-      "1. 立即批准该审批卡片；\n" +
-      `2. 将项目「${projectLabel}」的权限模式切换为「全自动 (auto)」；\n` +
-      "3. 自动取消该项目待处理的单步/计划审批卡片（未派发计划本身保持可派发状态），后续计划派发与超限重试将自动放行，但高危提权 (permission_escalation) 仍需你通过卡片单独确认。\n\n" +
-      "随时可在项目顶栏或设置中切回「计划批了就放手 (plan)」或「每步问我 (supervised)」。";
+      : (targetPid || tr("目标项目", "Target project"));
+    const title = tr(
+      `确认将项目「${projectLabel}」切换为「全自动 (auto)」模式？`,
+      `Switch project "${projectLabel}" to Full Auto (auto) mode?`
+    );
+    const body = isEnglish()
+      ? (
+        `Target project: ${projectLabel}\n\n` +
+        "Confirming will:\n" +
+        "1. Immediately allow this approval card;\n" +
+        `2. Switch project "${projectLabel}" to Full Auto (auto) permission mode;\n` +
+        "3. Automatically cancel pending step/plan approval cards for this project (undispatched plans remain dispatchable). Future plan dispatches and over-limit retries will be auto-allowed, while permission_escalation will still require explicit card approval.\n\n" +
+        "You can switch back to \"Plan (plan)\" or \"Supervised (supervised)\" anytime from the project header or Settings."
+      )
+      : (
+        `目标项目：${projectLabel}\n\n` +
+        "确认后将：\n" +
+        "1. 立即批准该审批卡片；\n" +
+        `2. 将项目「${projectLabel}」的权限模式切换为「全自动 (auto)」；\n` +
+        "3. 自动取消该项目待处理的单步/计划审批卡片（未派发计划本身保持可派发状态），后续计划派发与超限重试将自动放行，但高危提权 (permission_escalation) 仍需你通过卡片单独确认。\n\n" +
+        "随时可在项目顶栏或设置中切回「计划批了就放手 (plan)」或「每步问我 (supervised)」。"
+      );
     return {
       projectId: targetPid,
       projectLabel,
       title,
       body,
-      confirmLabel: "确认切换为全自动并允许"
+      confirmLabel: tr("确认切换为全自动并允许", "Switch to Full Auto & Allow")
     };
   }
 
@@ -8765,7 +9244,7 @@
       opHash
     });
     if (!clickGuard.ok) {
-      toast(clickGuard.message || "审批卡片状态已变化，请核对后重试", clickGuard.reason === "layout_shift_guard" ? "warn" : "err");
+      toast(clickGuard.message || tr("审批卡片状态已变化，请核对后重试", "Approval card state changed; please verify and retry"), clickGuard.reason === "layout_shift_guard" ? "warn" : "err");
       return;
     }
 
@@ -8787,13 +9266,13 @@
       let finalReason = typeof reason === "string" ? reason.trim() : "";
       if (action === "reject" && !finalReason && promptReason) {
         const rejectTargetSummary = matchedPlan
-          ? `计划 v${matchedPlan.version || 1}：${matchedPlan.title || "执行计划"}`
-          : (hydrated.summary || formatApprovalOpName(hydrated));
+          ? tr(`计划 v${matchedPlan.version || 1}：${matchedPlan.title || "执行计划"}`, `Plan v${matchedPlan.version || 1}: ${matchedPlan.title || "Execution Plan"}`)
+          : (hydrated.summary ? localizeDaemonCardBody(hydrated, hydrated.summary) : formatApprovalOpName(hydrated));
         const prompted = await promptOptionalRejectReason(
-          effCategory === "plan_dispatch" ? "拒绝执行计划" : "拒绝审批请求",
+          effCategory === "plan_dispatch" ? tr("拒绝执行计划", "Reject Execution Plan") : tr("拒绝审批请求", "Reject Approval Request"),
           {
             approvalId,
-            categoryLabel: GATE_CATEGORY_LABELS[effCategory] || effCategory || "审批请求",
+            categoryLabel: getGateCategoryLabel(effCategory) || tr("审批请求", "Approval Request"),
             summary: rejectTargetSummary
           }
         );
@@ -8815,7 +9294,7 @@
 
       if (effCategory === "plan_dispatch") {
         if (!effPlanHash) {
-          toast("审批按钮缺少计划校验摘要 (plan_hash)，请刷新后重试", "err");
+          toast(tr("审批按钮缺少计划校验摘要 (plan_hash)，请刷新后重试", "Approval button is missing plan_hash; please refresh and retry"), "err");
           return;
         }
         payload.plan_hash = effPlanHash;
@@ -8824,7 +9303,7 @@
         if (effOpHash) payload.op_hash = effOpHash;
       } else {
         if (!effOpHash) {
-          toast("审批按钮缺少审批校验摘要 (op_hash)，请刷新后重试", "err");
+          toast(tr("审批按钮缺少审批校验摘要 (op_hash)，请刷新后重试", "Approval button is missing op_hash; please refresh and retry"), "err");
           return;
         }
         payload.op_hash = effOpHash;
@@ -8887,7 +9366,7 @@
           copy.confirmLabel
         );
         if (!confirmed) {
-          toast("已取消切换为全自动模式", "info");
+          toast(tr("已取消切换为全自动模式", "Cancelled switching to Full Auto mode"), "info");
           return;
         }
         res = await apiCall("approval.decide", Object.assign({}, payload, { confirm_auto_mode: true }));
@@ -8911,7 +9390,7 @@
         {
           plan: matchedPlan,
           action,
-          label: action === "reject" ? "已拒绝" : "已允许",
+          label: action === "reject" ? tr("已拒绝", "Rejected") : tr("已允许", "Allowed"),
           projectId: hydrated.project_id || (matchedPlan && matchedPlan.project_id) || STATE.activeProjectId || null
         }
       );
@@ -8937,13 +9416,23 @@
 
     if (nextMode === "auto") {
       const ok = await showConfirmDialog(
-        "确认切换项目权限模式为「全自动 (auto)」？",
-        `将项目「${prj.name || prj.id}」切换为「全自动 (auto)」后：\n` +
-        "- 现有待处理的计划/单步审批卡片将自动取消（未派发计划本身保持可派发状态）；\n" +
-        "- 后续计划派发无需等待计划卡片确认，Lead 将直接派发执行；\n" +
-        "- 超限重试 (retry_over_limit) 将自动放行；\n" +
-        "- 高危提权 (permission_escalation) 仍需你在审批卡片上单独授权。",
-        "确认切换为全自动"
+        tr("确认切换项目权限模式为「全自动 (auto)」？", "Switch project permission mode to Full Auto (auto)?"),
+        isEnglish()
+          ? (
+            `After switching project "${prj.name || prj.id}" to Full Auto (auto):\n` +
+            "- Existing pending plan/step approval cards will be cancelled automatically (undispatched plans remain dispatchable);\n" +
+            "- Future plan dispatches will proceed directly without waiting for plan card approval;\n" +
+            "- Over-limit retries (retry_over_limit) will be auto-allowed;\n" +
+            "- High-risk permission escalations (permission_escalation) still require explicit approval."
+          )
+          : (
+            `将项目「${prj.name || prj.id}」切换为「全自动 (auto)」后：\n` +
+            "- 现有待处理的计划/单步审批卡片将自动取消（未派发计划本身保持可派发状态）；\n" +
+            "- 后续计划派发无需等待计划卡片确认，Lead 将直接派发执行；\n" +
+            "- 超限重试 (retry_over_limit) 将自动放行；\n" +
+            "- 高危提权 (permission_escalation) 仍需你在审批卡片上单独授权。"
+          ),
+        tr("确认切换为全自动", "Switch to Full Auto")
       );
       if (!ok) {
         renderAll();
@@ -8954,7 +9443,7 @@
     const res = await apiCall("project.set_permission_mode", {
       project_id: prj.id,
       permission_mode: nextMode,
-      reason: `桌面端将权限模式切换为 ${nextMode}`
+      reason: tr(`桌面端将权限模式切换为 ${nextMode}`, `Desktop switched permission mode to ${nextMode}`)
     });
     if (!res.ok) {
       toast(formatErrorMessage(res.error), "err");
@@ -8972,9 +9461,9 @@
       markApprovalsTerminalLocally(allSwept, "cancelled");
     }
     STATE.chatPermissionMode = nextMode;
-    const meta = PERMISSION_MODE_META[nextMode] || PERMISSION_MODE_META.plan;
+    const meta = getPermissionModeMeta(nextMode);
     const sweptSuffix = formatSweptApprovalsSuffix(cancelledSteps, cancelledPlans);
-    toast(`项目权限模式已切换为「${meta.label}」${sweptSuffix}`, "ok");
+    toast(tr(`项目权限模式已切换为「${meta.label}」${sweptSuffix}`, `Project permission mode switched to "${meta.label}"${sweptSuffix}`), "ok");
     await loadAllWorkspaceData();
   }
 
@@ -8986,7 +9475,7 @@
     const det = STATE.agentDetails[agentName] || ag;
     const allowed = Array.isArray(det.allowed_models) ? det.allowed_models : [];
     if (allowed.length && !allowed.includes(model)) {
-      toast(`模型 ${model} 不在 ${agentName} 允许的模型列表 (allowed_models) 中`, "err");
+      toast(tr(`模型 ${model} 不在 ${agentName} 允许的模型列表 (allowed_models) 中`, `Model ${model} is not in ${agentName}'s allowed_models list`), "err");
       return;
     }
     const payload = { name: agentName, default_model: model };
@@ -8997,7 +9486,7 @@
       return;
     }
     delete STATE.agentDetails[agentName];
-    toast(`已将 ${agentName} 默认模型切换为 ${model}（下回合生效）`, "ok");
+    toast(tr(`已将 ${agentName} 默认模型切换为 ${model}（下回合生效）`, `Switched ${agentName} default model to ${model} (effective next turn)`), "ok");
     await loadAllWorkspaceData();
   }
 
@@ -9009,7 +9498,7 @@
     const det = STATE.agentDetails[agentName] || ag;
     const allowed = Array.isArray(det.allowed_efforts) ? det.allowed_efforts : [];
     if (allowed.length && !allowed.includes(effort)) {
-      toast(`推理强度 ${effort} 不在 ${agentName} 允许的列表 (allowed_efforts) 中`, "err");
+      toast(tr(`推理强度 ${effort} 不在 ${agentName} 允许的列表 (allowed_efforts) 中`, `Reasoning effort ${effort} is not in ${agentName}'s allowed_efforts list`), "err");
       return;
     }
     const payload = { name: agentName, default_effort: effort };
@@ -9020,7 +9509,7 @@
       return;
     }
     delete STATE.agentDetails[agentName];
-    toast(`已将 ${agentName} 推理强度切换为 ${effort}（下回合生效）`, "ok");
+    toast(tr(`已将 ${agentName} 推理强度切换为 ${effort}（下回合生效）`, `Switched ${agentName} reasoning effort to ${effort} (effective next turn)`), "ok");
     await loadAllWorkspaceData();
   }
 
@@ -9029,13 +9518,13 @@
     if (!grantId) return;
     const res = await apiCall("grant.revoke", {
       grant_id: grantId,
-      reason: "用户在桌面端设置中撤销永久授权"
+      reason: tr("用户在桌面端设置中撤销永久授权", "User revoked standing grant in desktop settings")
     });
     if (!res.ok) {
       toast(formatErrorMessage(res.error), "err");
       return;
     }
-    toast("已撤销该永久授权", "ok");
+    toast(tr("已撤销该永久授权", "Standing grant revoked"), "ok");
     await loadGrants();
     renderSettingsView();
   }
@@ -9045,7 +9534,7 @@
     const escaped = (window.CSS && typeof window.CSS.escape === "function") ? window.CSS.escape(approvalId) : approvalId;
     const card = document.querySelector(`[data-card-approval-id="${escaped}"]`);
     if (!card) {
-      toast("对应审批卡片不在当前可见历史中，请向上滚动加载更早记录", "info");
+      toast(tr("对应审批卡片不在当前可见历史中，请向上滚动加载更早记录", "Approval card is not in currently loaded history; scroll up to load older messages"), "info");
       return;
     }
     card.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -9065,22 +9554,25 @@
     }
     if (prj.lead === agentName) return;
 
+    const defaultLeadReason = tr("桌面端切换项目 Lead", "Switched project Lead from desktop");
     openModal(
-      `切换项目 Lead 为 ${agentName}`,
+      tr(`切换项目 Lead 为 ${agentName}`, `Switch Project Lead to ${agentName}`),
       `<div class="form-stack">
-        <div style="font-size:13px;color:var(--text-secondary);">将当前项目的 Lead 从 <span class="mono">${esc(prj.lead || "--")}</span> 切换为 <span class="mono">${esc(agentName)}</span>。</div>
-        <div class="form-row"><label class="form-label">切换原因 (将记入审计记录)</label><input class="compact-input" id="modalLeadReason" type="text" value="桌面端切换项目 Lead" /></div>
+        <div style="font-size:13px;color:var(--text-secondary);">${isEnglish()
+          ? `Switch current project's Lead from <span class="mono">${esc(prj.lead || "--")}</span> to <span class="mono">${esc(agentName)}</span>.`
+          : `将当前项目的 Lead 从 <span class="mono">${esc(prj.lead || "--")}</span> 切换为 <span class="mono">${esc(agentName)}</span>。`}</div>
+        <div class="form-row"><label class="form-label">${esc(tr("切换原因 (将记入审计记录)", "Reason (recorded in audit log)"))}</label><input class="compact-input" id="modalLeadReason" type="text" value="${esc(defaultLeadReason)}" /></div>
       </div>`,
-      `<button class="btn" id="modalCancel" type="button">取消</button><button class="btn btn-primary" id="modalConfirmSetLead" type="button">确认切换</button>`
+      `<button class="btn" id="modalCancel" type="button">${esc(tr("取消", "Cancel"))}</button><button class="btn btn-primary" id="modalConfirmSetLead" type="button">${esc(tr("确认切换", "Confirm Switch"))}</button>`
     );
     $("modalCancel").onclick = closeModal;
     $("modalConfirmSetLead").onclick = async () => {
       if (!canMutate()) { toast(disabledReason(), "err"); closeModal(); return; }
-      const reason = ($("modalLeadReason").value || "").trim() || "桌面端切换项目 Lead";
+      const reason = ($("modalLeadReason").value || "").trim() || defaultLeadReason;
       const res = await apiCall("project.set_lead", { project_id: prj.id, agent: agentName, reason });
       closeModal();
       if (!res.ok) { toast(formatErrorMessage(res.error), "err"); return; }
-      toast(`已切换 Lead 为 ${agentName}`, "ok");
+      toast(tr(`已切换 Lead 为 ${agentName}`, `Switched Lead to ${agentName}`), "ok");
       await loadAllWorkspaceData();
     };
   }
@@ -9091,42 +9583,48 @@
 
     if (op === "accept") {
       const res = await apiCall("task.accept", { task_id: t.id });
-      if (res.ok) { toast("任务已验收通过", "ok"); await loadAllWorkspaceData(); }
+      if (res.ok) { toast(tr("任务已验收通过", "Task accepted"), "ok"); await loadAllWorkspaceData(); }
       else toast(formatErrorMessage(res.error), "err");
       return;
     }
 
     if (op === "merge") {
       const res = await apiCall("task.merge", { task_id: t.id });
-      if (res.ok) { toast("任务分支合并成功", "ok"); await loadAllWorkspaceData(); }
+      if (res.ok) { toast(tr("任务分支合并成功", "Task branch merged"), "ok"); await loadAllWorkspaceData(); }
       else toast(formatErrorMessage(res.error), "err");
       return;
     }
 
     if (op === "retry") {
-      const res = await apiCall("task.retry", { task_id: t.id, reason: "桌面端触发重试" });
-      if (res.ok) { toast("任务已重新排队", "ok"); await loadAllWorkspaceData(); }
+      const res = await apiCall("task.retry", { task_id: t.id, reason: tr("桌面端触发重试", "Retry triggered from desktop") });
+      if (res.ok) { toast(tr("任务已重新排队", "Task re-queued"), "ok"); await loadAllWorkspaceData(); }
       else toast(formatErrorMessage(res.error), "err");
       return;
     }
 
     if (op === "reject_task" || op === "cancel" || op === "escalate") {
-      const titleMap = { reject_task: "打回返工", cancel: "取消任务", escalate: "升级异常" };
+      const titleMap = {
+        reject_task: tr("打回返工", "Request Rework"),
+        cancel: tr("取消任务", "Cancel Task"),
+        escalate: tr("升级异常", "Escalate Issue")
+      };
       const rpcMap = { reject_task: "task.reject", cancel: "task.cancel", escalate: "task.escalate" };
-      const defReason = op === "cancel" ? "用户在桌面端取消任务" : (op === "escalate" ? "用户在桌面端升级异常" : "");
+      const defReason = op === "cancel"
+        ? tr("用户在桌面端取消任务", "User cancelled task from desktop")
+        : (op === "escalate" ? tr("用户在桌面端升级异常", "User escalated task from desktop") : "");
       openModal(
         `${titleMap[op]} · ${t.title || t.id}`,
-        `<div class="form-row"><label class="form-label">说明原因</label><textarea class="compact-input" id="modalReasonInput" rows="3" placeholder="说明原因或返工要点...">${esc(defReason)}</textarea></div>`,
-        `<button class="btn" id="modalCancel" type="button">取消</button><button class="btn btn-primary" id="modalConfirmReason" type="button">确认提交</button>`
+        `<div class="form-row"><label class="form-label">${esc(tr("说明原因", "Reason"))}</label><textarea class="compact-input" id="modalReasonInput" rows="3" placeholder="${esc(tr("说明原因或返工要点...", "Explain the reason or rework instructions..."))}">${esc(defReason)}</textarea></div>`,
+        `<button class="btn" id="modalCancel" type="button">${esc(tr("取消", "Cancel"))}</button><button class="btn btn-primary" id="modalConfirmReason" type="button">${esc(tr("确认提交", "Submit"))}</button>`
       );
       $("modalCancel").onclick = closeModal;
       $("modalConfirmReason").onclick = async () => {
         if (!canMutate()) { toast(disabledReason(), "err"); closeModal(); return; }
         const reason = ($("modalReasonInput").value || "").trim();
-        if (!reason) { toast("请填写原因", "warn"); return; }
+        if (!reason) { toast(tr("请填写原因", "Please provide a reason"), "warn"); return; }
         const res = await apiCall(rpcMap[op], { task_id: t.id, reason });
         closeModal();
-        if (res.ok) { toast("操作已执行", "ok"); await loadAllWorkspaceData(); }
+        if (res.ok) { toast(tr("操作已执行", "Action completed"), "ok"); await loadAllWorkspaceData(); }
         else toast(formatErrorMessage(res.error), "err");
       };
       return;
@@ -9136,28 +9634,28 @@
       const mergedPeers = STATE.tasks.filter(x => x.project_id === t.project_id && x.status === "merged" && x.id !== t.id);
       const peerOpts = mergedPeers.map(x => `<option value="${esc(x.id)}">${esc(x.title || x.id)} (${esc(x.id)})</option>`).join("");
       openModal(
-        `替代关闭任务`,
+        tr("替代关闭任务", "Close Task as Superseded"),
         `<div class="form-stack">
-          <div style="font-size:12.5px;color:var(--text-secondary);">将此代码任务标记为由另一个已合并任务覆盖关闭。</div>
+          <div style="font-size:12.5px;color:var(--text-secondary);">${esc(tr("将此代码任务标记为由另一个已合并任务覆盖关闭。", "Mark this code task as superseded and closed by another merged task."))}</div>
           ${mergedPeers.length
-            ? `<div class="form-row"><label class="form-label">已合并替代任务</label><select class="compact-select" id="modalCloseSupSelect">${peerOpts}</select></div>`
-            : `<div class="form-row"><label class="form-label">已合并替代任务 ID</label><input class="compact-input mono" id="modalCloseSupInput" type="text" placeholder="输入同项目已合并任务 tsk_..." /></div>`}
-          <div class="form-row"><label class="form-label">备注 (可选)</label><input class="compact-input" id="modalCloseReason" type="text" placeholder="可选说明..." /></div>
+            ? `<div class="form-row"><label class="form-label">${esc(tr("已合并替代任务", "Superseding Merged Task"))}</label><select class="compact-select" id="modalCloseSupSelect">${peerOpts}</select></div>`
+            : `<div class="form-row"><label class="form-label">${esc(tr("已合并替代任务 ID", "Superseding Merged Task ID"))}</label><input class="compact-input mono" id="modalCloseSupInput" type="text" placeholder="${esc(tr("输入同项目已合并任务 tsk_...", "Enter merged task ID tsk_... in the same project"))}" /></div>`}
+          <div class="form-row"><label class="form-label">${esc(tr("备注 (可选)", "Note (optional)"))}</label><input class="compact-input" id="modalCloseReason" type="text" placeholder="${esc(tr("可选说明...", "Optional note..."))}" /></div>
         </div>`,
-        `<button class="btn" id="modalCancel" type="button">取消</button><button class="btn btn-primary" id="modalConfirmClose" type="button">确认关闭</button>`
+        `<button class="btn" id="modalCancel" type="button">${esc(tr("取消", "Cancel"))}</button><button class="btn btn-primary" id="modalConfirmClose" type="button">${esc(tr("确认关闭", "Confirm Close"))}</button>`
       );
       $("modalCancel").onclick = closeModal;
       $("modalConfirmClose").onclick = async () => {
         if (!canMutate()) { toast(disabledReason(), "err"); closeModal(); return; }
         const supEl = $("modalCloseSupSelect") || $("modalCloseSupInput");
         const supersededBy = supEl ? (supEl.value || "").trim() : "";
-        if (!supersededBy) { toast("请指定替代任务 ID", "warn"); return; }
+        if (!supersededBy) { toast(tr("请指定替代任务 ID", "Please specify superseding task ID"), "warn"); return; }
         const reason = ($("modalCloseReason") && $("modalCloseReason").value.trim()) || "";
         const payload = { task_id: t.id, superseded_by: supersededBy };
         if (reason) payload.reason = reason;
         const res = await apiCall("task.close", payload);
         closeModal();
-        if (res.ok) { toast("任务已替代关闭", "ok"); await loadAllWorkspaceData(); }
+        if (res.ok) { toast(tr("任务已替代关闭", "Task closed as superseded"), "ok"); await loadAllWorkspaceData(); }
         else toast(formatErrorMessage(res.error), "err");
       };
       return;
@@ -9165,12 +9663,14 @@
 
     if (op === "release_run") {
       const openRun = STATE.runs.find(r => r.task_id === t.id && (r.status === "starting" || r.status === "running"));
-      if (!openRun) { toast("未找到运行中的进程", "warn"); return; }
+      if (!openRun) { toast(tr("未找到运行中的进程", "No active run found"), "warn"); return; }
       const flagName = openRun.kind === "merge_test" ? "force_merge_held" : "force_seen_unusable";
       openModal(
-        `释放卡住的运行锁`,
-        `<div style="font-size:13px;color:var(--text-secondary);">将对 <span class="mono">${esc(openRun.id)}</span> 执行强制释放租约并标记为 lost，请确认对应进程已退出。</div>`,
-        `<button class="btn" id="modalCancel" type="button">取消</button><button class="btn btn-primary" id="modalConfirmRelease" type="button">确认释放</button>`
+        tr("释放卡住的运行锁", "Release Stuck Run Lock"),
+        `<div style="font-size:13px;color:var(--text-secondary);">${isEnglish()
+          ? `Force-release the lease for <span class="mono">${esc(openRun.id)}</span> and mark it as lost. Please confirm the process has already exited.`
+          : `将对 <span class="mono">${esc(openRun.id)}</span> 执行强制释放租约并标记为 lost，请确认对应进程已退出。`}</div>`,
+        `<button class="btn" id="modalCancel" type="button">${esc(tr("取消", "Cancel"))}</button><button class="btn btn-primary" id="modalConfirmRelease" type="button">${esc(tr("确认释放", "Confirm Release"))}</button>`
       );
       $("modalCancel").onclick = closeModal;
       $("modalConfirmRelease").onclick = async () => {
@@ -9179,7 +9679,7 @@
         payload[flagName] = true;
         const res = await apiCall("run.release", payload);
         closeModal();
-        if (res.ok) { toast("运行锁已释放", "ok"); await loadAllWorkspaceData(); }
+        if (res.ok) { toast(tr("运行锁已释放", "Run lock released"), "ok"); await loadAllWorkspaceData(); }
         else toast(formatErrorMessage(res.error), "err");
       };
       return;
@@ -9190,30 +9690,31 @@
       const isInitialAssign = t.status === "created";
       const workerOpts = STATE.agents.filter(a => !a.disabled).map(a => {
         const isLead = prj && prj.lead === a.name;
-        return `<option value="${esc(a.name)}" ${t.assignee === a.name ? "selected" : ""} ${isLead ? "disabled" : ""}>${esc(a.name)} (${esc(a.adapter)})${isLead ? " [当前 Lead 不可指派]" : ""}</option>`;
+        return `<option value="${esc(a.name)}" ${t.assignee === a.name ? "selected" : ""} ${isLead ? "disabled" : ""}>${esc(a.name)} (${esc(a.adapter)})${isLead ? esc(tr(" [当前 Lead 不可指派]", " [Current Lead cannot be assigned]")) : ""}</option>`;
       }).join("");
+      const defReassignReason = tr("桌面端人工改派", "Manual reassignment from desktop");
       openModal(
-        `${isInitialAssign ? "指派执行者" : "改派执行者"}`,
+        isInitialAssign ? tr("指派执行者", "Assign Worker") : tr("改派执行者", "Reassign Worker"),
         `<div class="form-stack">
-          <div class="form-row"><label class="form-label">目标 Worker</label><select class="compact-select" id="modalAssignTo">${workerOpts}</select></div>
-          ${!isInitialAssign ? `<div class="form-row"><label class="form-label">改派原因</label><input class="compact-input" id="modalAssignReason" type="text" value="桌面端人工改派" /></div>` : ""}
+          <div class="form-row"><label class="form-label">${esc(tr("目标 Worker", "Target Worker"))}</label><select class="compact-select" id="modalAssignTo">${workerOpts}</select></div>
+          ${!isInitialAssign ? `<div class="form-row"><label class="form-label">${esc(tr("改派原因", "Reassignment Reason"))}</label><input class="compact-input" id="modalAssignReason" type="text" value="${esc(defReassignReason)}" /></div>` : ""}
         </div>`,
-        `<button class="btn" id="modalCancel" type="button">取消</button><button class="btn btn-primary" id="modalConfirmAssign" type="button">确认</button>`
+        `<button class="btn" id="modalCancel" type="button">${esc(tr("取消", "Cancel"))}</button><button class="btn btn-primary" id="modalConfirmAssign" type="button">${esc(tr("确认", "Confirm"))}</button>`
       );
       $("modalCancel").onclick = closeModal;
       $("modalConfirmAssign").onclick = async () => {
         if (!canMutate()) { toast(disabledReason(), "err"); closeModal(); return; }
         const to = $("modalAssignTo").value;
-        if (!to) { toast("请选择目标 Worker", "warn"); return; }
+        if (!to) { toast(tr("请选择目标 Worker", "Please select a target Worker"), "warn"); return; }
         let res;
         if (isInitialAssign) {
           res = await apiCall("task.assign", { task_id: t.id, to });
         } else {
-          const reason = ($("modalAssignReason").value || "").trim() || "桌面端人工改派";
+          const reason = ($("modalAssignReason").value || "").trim() || defReassignReason;
           res = await apiCall("task.reassign", { task_id: t.id, to, reason });
         }
         closeModal();
-        if (res.ok) { toast("指派完成", "ok"); await loadAllWorkspaceData(); }
+        if (res.ok) { toast(tr("指派完成", "Worker assigned"), "ok"); await loadAllWorkspaceData(); }
         else toast(formatErrorMessage(res.error), "err");
       };
     }
@@ -9232,10 +9733,10 @@
       }
       const rowsHtml = items.length ? `
         <table class="clean-table">
-          <thead><tr><th>Lead</th><th>来源</th><th>原因</th><th>开始</th><th>结束</th></tr></thead>
-          <tbody>${items.map(it => `<tr><td class="mono">${esc(it.agent || "--")}</td><td class="mono">${esc(it.via || "--")}</td><td>${esc(it.reason || "--")}</td><td class="mono">${esc(formatDateTime(it.started_at))}</td><td class="mono">${it.ended_at ? esc(formatDateTime(it.ended_at)) : "当前在任"}</td></tr>`).join("")}</tbody>
-        </table>` : `<div class="empty-state">暂无 Lead 交接记录</div>`;
-      openModal(`Lead 交接历史`, rowsHtml, `<button class="btn" type="button" data-close-modal="1">关闭</button>`);
+          <thead><tr><th>Lead</th><th>${esc(tr("来源", "Via"))}</th><th>${esc(tr("原因", "Reason"))}</th><th>${esc(tr("开始", "Started"))}</th><th>${esc(tr("结束", "Ended"))}</th></tr></thead>
+          <tbody>${items.map(it => `<tr><td class="mono">${esc(it.agent || "--")}</td><td class="mono">${esc(it.via || "--")}</td><td>${esc(it.reason ? localizeDaemonMessage(it.reason) : "--")}</td><td class="mono">${esc(formatDateTime(it.started_at))}</td><td class="mono">${it.ended_at ? esc(formatDateTime(it.ended_at)) : esc(tr("当前在任", "Current"))}</td></tr>`).join("")}</tbody>
+        </table>` : `<div class="empty-state">${esc(tr("暂无 Lead 交接记录", "No Lead handoff history"))}</div>`;
+      openModal(tr("Lead 交接历史", "Lead Handoff History"), rowsHtml, `<button class="btn" type="button" data-close-modal="1">${esc(tr("关闭", "Close"))}</button>`);
       return;
     }
 
@@ -9244,7 +9745,7 @@
 
     if (op === "pause" || op === "resume") {
       const res = await apiCall(`project.${op}`, { project_id: prj.id });
-      if (res.ok) { toast(op === "pause" ? "项目已暂停" : "项目已恢复", "ok"); await loadAllWorkspaceData(); }
+      if (res.ok) { toast(op === "pause" ? tr("项目已暂停", "Project paused") : tr("项目已恢复", "Project resumed"), "ok"); await loadAllWorkspaceData(); }
       else toast(formatErrorMessage(res.error), "err");
       return;
     }
@@ -9252,19 +9753,22 @@
     if (op === "cancel" || op === "deliver") {
       const isCancel = op === "cancel";
       const desc = isCancel
-        ? "取消项目将终止未完成任务与活跃 Lead 回合，并将项目标记为已取消。确定继续吗？"
-        : `将集成分支 ${prj.integration_branch || "--"} 本地快进合并 (fast-forward) 至基准分支 ${prj.base_branch || "--"}（不会 push 到远端）。确定交付吗？`;
+        ? tr("取消项目将终止未完成任务与活跃 Lead 回合，并将项目标记为已取消。确定继续吗？", "Cancelling this project will stop unfinished tasks and active Lead turns, and mark the project as cancelled. Continue?")
+        : tr(
+          `将集成分支 ${prj.integration_branch || "--"} 本地快进合并 (fast-forward) 至基准分支 ${prj.base_branch || "--"}（不会 push 到远端）。确定交付吗？`,
+          `Fast-forward merge integration branch ${prj.integration_branch || "--"} into local base branch ${prj.base_branch || "--"} (will not push to remote). Proceed?`
+        );
       openModal(
-        isCancel ? "确认取消项目" : "确认交付到本地分支",
+        isCancel ? tr("确认取消项目", "Confirm Cancel Project") : tr("确认交付到本地分支", "Confirm Deliver to Local Branch"),
         `<div style="font-size:13px;color:var(--text-secondary);line-height:1.6;">${esc(desc)}</div>`,
-        `<button class="btn" id="modalCancel" type="button">取消</button><button class="btn ${isCancel ? "btn-danger-text" : "btn-primary"}" id="modalConfirmPrjDanger" type="button">${isCancel ? "确认取消项目" : "确认交付"}</button>`
+        `<button class="btn" id="modalCancel" type="button">${esc(tr("取消", "Cancel"))}</button><button class="btn ${isCancel ? "btn-danger-text" : "btn-primary"}" id="modalConfirmPrjDanger" type="button">${esc(isCancel ? tr("确认取消项目", "Confirm Cancel") : tr("确认交付", "Confirm Deliver"))}</button>`
       );
       $("modalCancel").onclick = closeModal;
       $("modalConfirmPrjDanger").onclick = async () => {
         if (!canMutate()) { toast(disabledReason(), "err"); closeModal(); return; }
         const res = await apiCall(`project.${op}`, { project_id: prj.id });
         closeModal();
-        if (res.ok) { toast(isCancel ? "项目已取消" : "已成功交付到本地分支", "ok"); await loadAllWorkspaceData(); }
+        if (res.ok) { toast(isCancel ? tr("项目已取消", "Project cancelled") : tr("已成功交付到本地分支", "Delivered to local branch"), "ok"); await loadAllWorkspaceData(); }
         else toast(formatErrorMessage(res.error), "err");
       };
       return;
@@ -9272,12 +9776,12 @@
 
     if (op === "update") {
       openModal(
-        "更新项目目标与验收标准",
+        tr("更新项目目标与验收标准", "Update Project Goal & Acceptance Criteria"),
         `<div class="form-stack">
-          <div class="form-row"><label class="form-label">项目目标</label><textarea class="compact-input" id="modalUpdGoal" rows="3">${esc(prj.goal || "")}</textarea></div>
-          <div class="form-row"><label class="form-label">追加验收标准（可选，每行一条或分号分隔）</label><textarea class="compact-input" id="modalUpdCriteria" rows="2" placeholder="输入新的验收标准..."></textarea></div>
+          <div class="form-row"><label class="form-label">${esc(tr("项目目标", "Project Goal"))}</label><textarea class="compact-input" id="modalUpdGoal" rows="3">${esc(prj.goal || "")}</textarea></div>
+          <div class="form-row"><label class="form-label">${esc(tr("追加验收标准（可选，每行一条或分号分隔）", "Add Acceptance Criteria (optional, one per line or semicolon-separated)"))}</label><textarea class="compact-input" id="modalUpdCriteria" rows="2" placeholder="${esc(tr("输入新的验收标准...", "Enter new acceptance criteria..."))}"></textarea></div>
         </div>`,
-        `<button class="btn" id="modalCancel" type="button">取消</button><button class="btn btn-primary" id="modalConfirmUpd" type="button">保存</button>`
+        `<button class="btn" id="modalCancel" type="button">${esc(tr("取消", "Cancel"))}</button><button class="btn btn-primary" id="modalConfirmUpd" type="button">${esc(tr("保存", "Save"))}</button>`
       );
       $("modalCancel").onclick = closeModal;
       $("modalConfirmUpd").onclick = async () => {
@@ -9285,13 +9789,13 @@
         const goal = ($("modalUpdGoal").value || "").trim();
         const rawCriteria = ($("modalUpdCriteria") && $("modalUpdCriteria").value) || "";
         const criteria = rawCriteria.split(/[\n;；]+/).map(s => s.trim()).filter(Boolean);
-        if (!goal && !criteria.length) { toast("目标与新增验收标准不能同时为空", "warn"); return; }
+        if (!goal && !criteria.length) { toast(tr("目标与新增验收标准不能同时为空", "Goal and new criteria cannot both be empty"), "warn"); return; }
         const payload = { project_id: prj.id };
         if (goal && (goal !== (prj.goal || "").trim() || !criteria.length)) payload.goal = goal;
         if (criteria.length) payload.criterion = criteria;
         const res = await apiCall("project.update", payload);
         closeModal();
-        if (res.ok) { toast("项目已更新", "ok"); await loadAllWorkspaceData(); }
+        if (res.ok) { toast(tr("项目已更新", "Project updated"), "ok"); await loadAllWorkspaceData(); }
         else toast(formatErrorMessage(res.error), "err");
       };
       return;
@@ -9301,13 +9805,13 @@
       const criteria = prj.criteria || [];
       const rows = criteria.map((cr, idx) => `
         <div class="form-row">
-          <label class="form-label">${esc(cr.text)}</label>
-          <input class="compact-input" data-crit-id="${esc(cr.id)}" type="text" value="桌面端确认已达成 #${idx + 1}" />
+          <label class="form-label">${esc(localizeDaemonMessage(cr.text))}</label>
+          <input class="compact-input" data-crit-id="${esc(cr.id)}" type="text" value="${esc(tr(`桌面端确认已达成 #${idx + 1}`, `Confirmed met from desktop #${idx + 1}`))}" />
         </div>`).join("");
       openModal(
-        "提交项目完成报告",
-        `<div class="form-stack">${rows || "<div>确认完成该项目</div>"}</div>`,
-        `<button class="btn" id="modalCancel" type="button">取消</button><button class="btn btn-primary" id="modalConfirmComplete" type="button">提交完成</button>`
+        tr("提交项目完成报告", "Submit Project Completion Report"),
+        `<div class="form-stack">${rows || `<div>${esc(tr("确认完成该项目", "Confirm marking this project as completed"))}</div>`}</div>`,
+        `<button class="btn" id="modalCancel" type="button">${esc(tr("取消", "Cancel"))}</button><button class="btn btn-primary" id="modalConfirmComplete" type="button">${esc(tr("提交完成", "Submit Completion"))}</button>`
       );
       $("modalCancel").onclick = closeModal;
       $("modalConfirmComplete").onclick = async () => {
@@ -9321,7 +9825,7 @@
         };
         const res = await apiCall("project.complete", { project_id: prj.id, report });
         closeModal();
-        if (res.ok) { toast("项目已标记完成", "ok"); await loadAllWorkspaceData(); }
+        if (res.ok) { toast(tr("项目已标记完成", "Project marked completed"), "ok"); await loadAllWorkspaceData(); }
         else toast(formatErrorMessage(res.error), "err");
       };
     }
@@ -9377,29 +9881,38 @@
     const maxProf = PROFILE_ORDER.includes(maxUnapproved) ? maxUnapproved : "dev";
     const flags = getAdapterProfileFlags(aid, profile);
     const flagsDisplay = flags.length ? flags.join(" ") : `(adapter=${aid}, profile=${profile})`;
+    const warnBoxHtml = isEnglish()
+      ? `You are setting this agent's <span class="mono">default_profile</span> to <span class="mono">${esc(profile)}</span>, which exceeds <span class="mono">max_unapproved_profile=${esc(maxProf)}</span>.`
+      : `你正在将 Agent 的默认权限档位 <span class="mono">default_profile</span> 设为 <span class="mono">${esc(profile)}</span>，高于 <span class="mono">max_unapproved_profile=${esc(maxProf)}</span>。`;
+    const importantHtml = isEnglish()
+      ? `<strong>Important:</strong> Only Lead-initiated tasks trigger the approval gate; <strong>tasks dispatched directly by you via desktop or CLI will not prompt again</strong> and will run with the following vendor CLI flags:`
+      : `<strong>重要说明：</strong>仅 Lead 发起的任务会触发审批门控；<strong>你通过桌面端或 CLI 直接派发的任务不会再次确认</strong>，会直接使用以下厂商 CLI 参数运行：`;
+    const flagsSecLabel = tr("厂商 CLI 权限参数 (vendor flag)", "Vendor CLI Permission Flags");
+    const cancelLbl = tr("取消", "Cancel");
+    const confirmLbl = tr(`确认使用 ${profile}`, `Confirm Use ${profile}`);
     return new Promise(resolve => {
       closeConfirmModal(false);
       confirmModalResolver = resolve;
-      $("confirmModalTitle").textContent = `确认高权限默认档位 · ${profile}`;
+      $("confirmModalTitle").textContent = tr(`确认高权限默认档位 · ${profile}`, `Confirm High-Privilege Profile · ${profile}`);
       $("confirmModalBody").innerHTML = `
         <div class="form-stack">
           <div class="inspector-note-box red">
-            你正在将 Agent 的默认权限档位 <span class="mono">default_profile</span> 设为 <span class="mono">${esc(profile)}</span>，高于 <span class="mono">max_unapproved_profile=${esc(maxProf)}</span>。
+            ${warnBoxHtml}
           </div>
           <div style="font-size:12.5px;color:var(--text-secondary);line-height:1.55;">
-            <strong>重要说明：</strong>仅 Lead 发起的任务会触发审批门控；<strong>你通过桌面端或 CLI 直接派发的任务不会再次确认</strong>，会直接使用以下厂商 CLI 参数运行：
+            ${importantHtml}
           </div>
           <div class="kv-list">
             <div class="kv-row"><span class="kv-k">Adapter</span><span class="kv-v mono">${esc(aid)}</span></div>
             <div class="kv-row"><span class="kv-k">default_profile</span><span class="kv-v mono">${esc(profile)}</span></div>
             <div class="kv-row"><span class="kv-k">max_unapproved_profile</span><span class="kv-v mono">${esc(maxProf)}</span></div>
           </div>
-          <div class="inspector-sec-label">厂商 CLI 权限参数 (vendor flag)</div>
+          <div class="inspector-sec-label">${esc(flagsSecLabel)}</div>
           <pre class="log-box">${esc(flagsDisplay)}</pre>
         </div>`;
       $("confirmModalFoot").innerHTML = `
-        <button class="btn" id="confirmModalCancel" type="button">取消</button>
-        <button class="btn btn-danger-text" id="confirmModalOk" type="button" disabled>确认使用 ${esc(profile)}</button>`;
+        <button class="btn" id="confirmModalCancel" type="button">${esc(cancelLbl)}</button>
+        <button class="btn btn-danger-text" id="confirmModalOk" type="button" disabled>${esc(confirmLbl)}</button>`;
       $("confirmModalBackdrop").classList.remove("hidden");
       const cancelBtn = $("confirmModalCancel");
       const okBtn = $("confirmModalOk");
@@ -9472,31 +9985,31 @@
     const isHeld = Boolean(ad && ad.launch_reason === "launch_held");
 
     if (!supported.length) {
-      selectEl.innerHTML = `<option value="">(该工具不支持启动权限档位)</option>`;
+      selectEl.innerHTML = `<option value="">${esc(tr("(该工具不支持启动权限档位)", "(This adapter does not support launch profiles)"))}</option>`;
       selectEl.disabled = true;
     } else {
       selectEl.disabled = false;
       const opts = [];
       if (!isCreate && currentStoredProfile && !supported.includes(currentStoredProfile)) {
-        opts.push(`<option value="__keep__" selected>保持当前 (${esc(currentStoredProfile)} · 不受支持)</option>`);
+        opts.push(`<option value="__keep__" selected>${esc(tr(`保持当前 (${currentStoredProfile} · 不受支持)`, `Keep current (${currentStoredProfile} · unsupported)`))}</option>`);
       } else if (isCreate && !safeDef) {
-        opts.push(`<option value="" selected>(请显式选择权限档位)</option>`);
+        opts.push(`<option value="" selected>${esc(tr("(请显式选择权限档位)", "(Please explicitly select a profile)"))}</option>`);
       }
       supported.forEach(p => {
         const sel = isCreate
           ? (p === safeDef)
           : (p === currentStoredProfile);
-        opts.push(`<option value="${esc(p)}" ${sel ? "selected" : ""}>${esc(PROFILE_LABELS[p] || p)}</option>`);
+        opts.push(`<option value="${esc(p)}" ${sel ? "selected" : ""}>${esc(getProfileLabel(p))}</option>`);
       });
       selectEl.innerHTML = opts.join("");
     }
 
     if (warnEl) {
       const notes = [];
-      if (isHeld) notes.push(`工具 ${aid} 当前处于 ${ad.launch_milestone || "M5"} 暂停状态，不会自动启动。`);
-      if (!safeDef && supported.length) notes.push(`工具 ${aid} 仅支持高权限档位 (${supported.join(", ")})，不会自动设为默认。`);
+      if (isHeld) notes.push(tr(`工具 ${aid} 当前处于 ${ad.launch_milestone || "M5"} 暂停状态，不会自动启动。`, `Adapter ${aid} is currently held (${ad.launch_milestone || "M5"}) and will not launch automatically.`));
+      if (!safeDef && supported.length) notes.push(tr(`工具 ${aid} 仅支持高权限档位 (${supported.join(", ")})，不会自动设为默认。`, `Adapter ${aid} only supports high-privilege profiles (${supported.join(", ")}) and will not be auto-selected as default.`));
       if (!isCreate && currentStoredProfile && !supported.includes(currentStoredProfile)) {
-        notes.push(`当前已保存档位 "${currentStoredProfile}" 不在支持列表内，建议切换为安全档位。`);
+        notes.push(tr(`当前已保存档位 "${currentStoredProfile}" 不在支持列表内，建议切换为安全档位。`, `Saved profile "${currentStoredProfile}" is not supported; switching to a safe profile is recommended.`));
       }
       warnEl.textContent = notes.join(" ");
       warnEl.classList.toggle("hidden", !notes.length);
@@ -9515,42 +10028,42 @@
       return `<option value="${esc(a.id)}"${unavailAttrs}>${esc(a.id)} (${esc(formatAdapterFriendlyStatus(a).text)}${esc(holdTag)})</option>`;
     };
     const adapterOpts = [
-      availableAdapters.length ? `<optgroup label="可用工具">${availableAdapters.map(a => fmtAdapterOpt(a, false)).join("")}</optgroup>` : "",
-      unavailableAdapters.length ? `<optgroup label="暂不可用 / 高级 (held / stub)">${unavailableAdapters.map(a => fmtAdapterOpt(a, true)).join("")}</optgroup>` : ""
+      availableAdapters.length ? `<optgroup label="${esc(tr("可用工具", "Available Adapters"))}">${availableAdapters.map(a => fmtAdapterOpt(a, false)).join("")}</optgroup>` : "",
+      unavailableAdapters.length ? `<optgroup label="${esc(tr("暂不可用 / 高级 (held / stub)", "Unavailable / Advanced (held / stub)"))}">${unavailableAdapters.map(a => fmtAdapterOpt(a, true)).join("")}</optgroup>` : ""
     ].join("");
     openModal(
-      "新建 Agent",
+      tr("新建 Agent", "New Agent"),
       `<div class="form-stack">
         <div class="form-row-grid">
-          <div class="form-row"><label class="form-label">名称 (必填)</label><input class="compact-input" id="newAgName" type="text" placeholder="例如：codex-worker" /></div>
+          <div class="form-row"><label class="form-label">${esc(tr("名称 (必填)", "Name (required)"))}</label><input class="compact-input" id="newAgName" type="text" placeholder="${esc(tr("例如：codex-worker", "e.g., codex-worker"))}" /></div>
           <div class="form-row">
-            <label class="form-label">AI 工具 (Adapter)</label>
+            <label class="form-label">${esc(tr("AI 工具 (Adapter)", "AI Tool (Adapter)"))}</label>
             <select class="compact-select" id="newAgAdapter">${adapterOpts}</select>
-            ${unavailableAdapters.length ? `<label style="display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--text-muted);margin-top:4px;"><input type="checkbox" id="newAgShowAdvancedAdapters" /> 允许选择暂不可用/高级工具</label>` : ""}
+            ${unavailableAdapters.length ? `<label style="display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--text-muted);margin-top:4px;"><input type="checkbox" id="newAgShowAdvancedAdapters" /> ${esc(tr("允许选择暂不可用/高级工具", "Allow selecting unavailable/advanced adapters"))}</label>` : ""}
           </div>
-          <div class="form-row"><label class="form-label">投递模式</label><select class="compact-select" id="newAgDelivery"><option value="launch">launch</option><option value="inbox">inbox</option></select></div>
-          <div class="form-row"><label class="form-label">最大并发</label><input class="compact-input" id="newAgConc" type="number" min="1" value="1" /></div>
+          <div class="form-row"><label class="form-label">${esc(tr("投递模式", "Delivery Mode"))}</label><select class="compact-select" id="newAgDelivery"><option value="launch">launch</option><option value="inbox">inbox</option></select></div>
+          <div class="form-row"><label class="form-label">${esc(tr("最大并发", "Max Concurrency"))}</label><input class="compact-input" id="newAgConc" type="number" min="1" value="1" /></div>
         </div>
         <div class="form-row">
-          <label class="form-label">默认权限档位 (仅显示受支持档位)</label>
+          <label class="form-label">${esc(tr("默认权限档位 (仅显示受支持档位)", "Default Permission Profile (supported profiles only)"))}</label>
           <select class="compact-select" id="newAgDefaultProfile"></select>
           <div class="inspector-note-box amber hidden" id="newAgProfileWarn"></div>
         </div>
         <div class="form-row">
-          <label class="form-label" id="newAgAllowedModelsLabel">允许模型 allowed_models (launch 模式必填，逗号分隔)</label>
-          <input class="compact-input mono" id="newAgAllowedModels" type="text" placeholder="点击下方快捷预设或自由输入模型 ID" />
+          <label class="form-label" id="newAgAllowedModelsLabel">${esc(tr("允许模型 allowed_models (launch 模式必填，逗号分隔)", "Allowed Models (required for launch mode, comma-separated)"))}</label>
+          <input class="compact-input mono" id="newAgAllowedModels" type="text" placeholder="${esc(tr("点击下方快捷预设或自由输入模型 ID", "Click quick presets below or type model IDs"))}" />
           <div id="newAgModelChips"></div>
           <div id="newAgModelHints" style="font-size:11.5px;color:var(--text-muted);"></div>
         </div>
         <div class="form-row">
-          <label class="form-label">默认模型 default_model (可选，须在允许模型内)</label>
-          <input class="compact-input mono" id="newAgDefaultModel" type="text" placeholder="留空默认取第一项" />
+          <label class="form-label">${esc(tr("默认模型 default_model (可选，须在允许模型内)", "Default Model (optional, must be in allowed_models)"))}</label>
+          <input class="compact-input mono" id="newAgDefaultModel" type="text" placeholder="${esc(tr("留空默认取第一项", "Leave blank to use first allowed model"))}" />
         </div>
         <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
-          <input type="checkbox" id="newAgCanLead" /> 允许作为项目 Lead
+          <input type="checkbox" id="newAgCanLead" /> ${esc(tr("允许作为项目 Lead", "Allow as Project Lead"))}
         </label>
       </div>`,
-      `<button class="btn" id="modalCancel" type="button">取消</button><button class="btn btn-primary" id="modalSaveAgent" type="button">创建</button>`
+      `<button class="btn" id="modalCancel" type="button">${esc(tr("取消", "Cancel"))}</button><button class="btn btn-primary" id="modalSaveAgent" type="button">${esc(tr("创建", "Create"))}</button>`
     );
 
     const adapterSel = $("newAgAdapter");
@@ -9576,31 +10089,31 @@
         allowedInp.value = "";
         defaultInp.value = "";
         renderModelPresetChips(chipsEl, [], allowedInp);
-        if (hintsEl) hintsEl.textContent = "none 仅支持收件箱模式，无需填写模型";
+        if (hintsEl) hintsEl.textContent = tr("none 仅支持收件箱模式，无需填写模型", "none only supports inbox delivery; no models needed");
         return;
       }
       deliverySel.disabled = false;
       allowedInp.disabled = false;
       defaultInp.disabled = false;
       renderModelPresetChips(chipsEl, [], allowedInp);
-      if (hintsEl) hintsEl.textContent = "正在查询可用模型...";
+      if (hintsEl) hintsEl.textContent = tr("正在查询可用模型...", "Querying available models...");
       const res = await apiCall("adapter.models", { adapter_id: aid });
       if (!$("newAgAdapter") || $("newAgAdapter").value !== aid) return;
       const models = (res.ok && res.data && Array.isArray(res.data.models)) ? res.data.models : null;
       if (models && models.length) {
         if (!allowedInp.value.trim()) allowedInp.value = models.slice(0, 3).join(", ");
         renderModelPresetChips(chipsEl, models, allowedInp);
-        if (hintsEl) hintsEl.textContent = `可选模型 (${models.length})：点击标签快速增删`;
+        if (hintsEl) hintsEl.textContent = tr(`可选模型 (${models.length})：点击标签快速增删`, `Available models (${models.length}): click chips to add/remove`);
       } else {
         const preset = getAdapterModelPresets(aid);
         if (preset) {
           const defAllowed = Array.isArray(preset.default_allowed) ? preset.default_allowed : [];
           if (!allowedInp.value.trim() && defAllowed.length) allowedInp.value = defAllowed.join(", ");
           renderModelPresetChips(chipsEl, preset.chips, allowedInp);
-          if (hintsEl) hintsEl.textContent = preset.note || "";
+          if (hintsEl) hintsEl.textContent = preset.note ? localizeAdapterModelNote(aid, preset.note) : "";
         } else {
           renderModelPresetChips(chipsEl, [], allowedInp);
-          if (hintsEl) hintsEl.textContent = "请手动输入模型 ID";
+          if (hintsEl) hintsEl.textContent = tr("请手动输入模型 ID", "Please enter model IDs manually");
         }
       }
     }
@@ -9640,20 +10153,20 @@
     $("modalSaveAgent").onclick = async () => {
       if (!canMutate()) { toast(disabledReason(), "err"); closeModal(); return; }
       const name = ($("newAgName").value || "").trim();
-      if (!name) { toast("请输入 Agent 名称", "warn"); return; }
+      if (!name) { toast(tr("请输入 Agent 名称", "Please enter an agent name"), "warn"); return; }
       const adapter = $("newAgAdapter").value;
-      if (!adapter) { toast("请选择可用的工具", "warn"); return; }
+      if (!adapter) { toast(tr("请选择可用的工具", "Please select an available adapter"), "warn"); return; }
       const delivery = $("newAgDelivery").value;
       const defaultProfile = profileSel && !profileSel.disabled ? (profileSel.value || "").trim() : "";
       const allowedModels = parseModelList($("newAgAllowedModels").value);
       const defaultModel = ($("newAgDefaultModel").value || "").trim();
 
       if (delivery === "launch" && adapter !== "none" && !allowedModels.length) {
-        toast("launch 模式必须填写至少一个模型", "warn");
+        toast(tr("launch 模式必须填写至少一个模型", "Launch mode requires at least one allowed model"), "warn");
         return;
       }
       if (defaultModel && allowedModels.length && !allowedModels.includes(defaultModel)) {
-        toast("默认模型必须包含在允许模型列表中", "warn");
+        toast(tr("默认模型必须包含在允许模型列表中", "Default model must be included in allowed_models"), "warn");
         return;
       }
       if (defaultModel && delivery === "inbox" && adapter !== "none" && !allowedModels.length) {
@@ -9680,7 +10193,7 @@
       const res = await apiCall("agent.create", payload);
       if (res.ok) {
         closeModal();
-        toast(`Agent ${name} 创建成功`, "ok");
+        toast(tr(`Agent ${name} 创建成功`, `Agent ${name} created`), "ok");
         await loadAllWorkspaceData();
       } else {
         toast(formatErrorMessage(res.error), "err");
@@ -9701,30 +10214,30 @@
     const editSeq = ++editAgentModalSeq;
 
     openModal(
-      `编辑 Agent · ${ag.name}`,
+      tr(`编辑 Agent · ${ag.name}`, `Edit Agent · ${ag.name}`),
       `<div class="form-stack">
         <div class="form-row-grid">
-          <div class="form-row"><label class="form-label">名称</label><input class="compact-input mono" type="text" value="${esc(ag.name)}" disabled /></div>
-          <div class="form-row"><label class="form-label">工具 / 模式</label><input class="compact-input mono" type="text" value="${esc(ag.adapter)} · ${esc(ag.delivery)}" disabled /></div>
-          <div class="form-row"><label class="form-label">最大并发</label><input class="compact-input" id="editAgConc" type="number" min="1" value="${esc(String(ag.max_concurrency || 1))}" /></div>
-          <div class="form-row"><label class="form-label">默认权限档位</label><select class="compact-select" id="editAgDefaultProfile"></select></div>
+          <div class="form-row"><label class="form-label">${esc(tr("名称", "Name"))}</label><input class="compact-input mono" type="text" value="${esc(ag.name)}" disabled /></div>
+          <div class="form-row"><label class="form-label">${esc(tr("工具 / 模式", "Adapter / Delivery"))}</label><input class="compact-input mono" type="text" value="${esc(ag.adapter)} · ${esc(ag.delivery)}" disabled /></div>
+          <div class="form-row"><label class="form-label">${esc(tr("最大并发", "Max Concurrency"))}</label><input class="compact-input" id="editAgConc" type="number" min="1" value="${esc(String(ag.max_concurrency || 1))}" /></div>
+          <div class="form-row"><label class="form-label">${esc(tr("默认权限档位", "Default Profile"))}</label><select class="compact-select" id="editAgDefaultProfile"></select></div>
         </div>
         <div class="inspector-note-box amber hidden" id="editAgProfileWarn"></div>
         <div class="form-row">
-          <label class="form-label">允许模型 allowed_models</label>
+          <label class="form-label">${esc(tr("允许模型 allowed_models", "Allowed Models (allowed_models)"))}</label>
           <input class="compact-input mono" id="editAgAllowedModels" type="text" value="${esc(allowedInit)}" ${isNone ? "disabled" : ""} />
           <div id="editAgModelChips"></div>
           <div id="editAgModelHints" style="font-size:11.5px;color:var(--text-muted);"></div>
         </div>
         <div class="form-row">
-          <label class="form-label">默认模型 default_model</label>
+          <label class="form-label">${esc(tr("默认模型 default_model", "Default Model (default_model)"))}</label>
           <input class="compact-input mono" id="editAgDefaultModel" type="text" value="${esc(defaultModelInit)}" ${isNone ? "disabled" : ""} />
         </div>
         <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
-          <input type="checkbox" id="editAgCanLead" ${ag.can_lead ? "checked" : ""} /> 允许作为项目 Lead
+          <input type="checkbox" id="editAgCanLead" ${ag.can_lead ? "checked" : ""} /> ${esc(tr("允许作为项目 Lead", "Allow as Project Lead"))}
         </label>
       </div>`,
-      `<button class="btn" id="modalCancel" type="button">取消</button><button class="btn btn-primary" id="modalUpdateAgent" type="button">保存修改</button>`
+      `<button class="btn" id="modalCancel" type="button">${esc(tr("取消", "Cancel"))}</button><button class="btn btn-primary" id="modalUpdateAgent" type="button">${esc(tr("保存修改", "Save Changes"))}</button>`
     );
 
     const profileSel = $("editAgDefaultProfile");
@@ -9743,11 +10256,11 @@
       let defaultModel = isNone ? "" : ($("editAgDefaultModel").value || "").trim();
 
       if (ag.delivery === "launch" && !isNone) {
-        if (!allowedModels.length) { toast("launch 模式必须填写至少一个模型", "warn"); return; }
+        if (!allowedModels.length) { toast(tr("launch 模式必须填写至少一个模型", "Launch mode requires at least one allowed model"), "warn"); return; }
         if (!defaultModel) defaultModel = allowedModels[0];
-        else if (!allowedModels.includes(defaultModel)) { toast("默认模型必须包含在允许模型中", "warn"); return; }
+        else if (!allowedModels.includes(defaultModel)) { toast(tr("默认模型必须包含在允许模型中", "Default model must be included in allowed_models"), "warn"); return; }
       } else if (!isNone && defaultModel && !allowedModels.includes(defaultModel)) {
-        toast("默认模型必须包含在允许模型中", "warn");
+        toast(tr("默认模型必须包含在允许模型中", "Default model must be included in allowed_models"), "warn");
         return;
       }
 
@@ -9774,7 +10287,7 @@
       if (res.ok) {
         delete STATE.agentDetails[ag.name];
         closeModal();
-        toast(`Agent ${ag.name} 已更新`, "ok");
+        toast(tr(`Agent ${ag.name} 已更新`, `Agent ${ag.name} updated`), "ok");
         await loadAllWorkspaceData();
       } else {
         toast(formatErrorMessage(res.error), "err");
@@ -9782,21 +10295,21 @@
     };
 
     if (!isNone) {
-      if (hintsEl) hintsEl.textContent = "正在查询可用模型...";
+      if (hintsEl) hintsEl.textContent = tr("正在查询可用模型...", "Querying available models...");
       const modRes = await apiCall("adapter.models", { adapter_id: aid });
       if (editSeq !== editAgentModalSeq || !$("editAgAllowedModels")) return;
       const models = (modRes.ok && modRes.data && Array.isArray(modRes.data.models)) ? modRes.data.models : null;
       if (models && models.length) {
         renderModelPresetChips(chipsEl, models, allowedInp);
-        if (hintsEl) hintsEl.textContent = `可选模型 (${models.length})`;
+        if (hintsEl) hintsEl.textContent = tr(`可选模型 (${models.length})`, `Available models (${models.length})`);
       } else {
         const preset = getAdapterModelPresets(aid);
         if (preset) {
           renderModelPresetChips(chipsEl, preset.chips, allowedInp);
-          if (hintsEl) hintsEl.textContent = preset.note || "";
+          if (hintsEl) hintsEl.textContent = preset.note ? localizeAdapterModelNote(aid, preset.note) : "";
         } else {
           renderModelPresetChips(chipsEl, [], allowedInp);
-          if (hintsEl) hintsEl.textContent = "请手动输入模型 ID";
+          if (hintsEl) hintsEl.textContent = tr("请手动输入模型 ID", "Please enter model IDs manually");
         }
       }
     }
@@ -9806,7 +10319,7 @@
     if (!canMutate()) { toast(disabledReason(), "err"); return; }
     const openProjects = STATE.projects.filter(p => p.status !== "completed" && p.status !== "cancelled");
     if (!openProjects.length) {
-      toast("当前没有活跃项目，请先发起一个项目对话", "warn");
+      toast(tr("当前没有活跃项目，请先发起一个项目对话", "No active projects; please start a project chat first"), "warn");
       return;
     }
     const activePrj = getActiveProject();
@@ -9818,46 +10331,46 @@
       `<option value="${esc(p.id)}" ${p.id === defaultPrj.id ? "selected" : ""}>${esc(p.name || p.id)}</option>`
     ).join("");
     const profileOpts = ["", "readonly", "edit", "dev", "elevated", "unrestricted"].map(pf =>
-      `<option value="${esc(pf)}">${pf ? esc(pf) : "(使用 Agent 默认)"}</option>`
+      `<option value="${esc(pf)}">${pf ? esc(pf) : esc(tr("(使用 Agent 默认)", "(Use Agent default)"))}</option>`
     ).join("");
     const effortOpts = ["", "low", "medium", "high", "xhigh", "max", "ultra", "ultracode"].map(ef =>
-      `<option value="${esc(ef)}">${ef ? esc(ef) : "(默认)"}</option>`
+      `<option value="${esc(ef)}">${ef ? esc(ef) : esc(tr("(默认)", "(Default)"))}</option>`
     ).join("");
 
     const hasRepo = Boolean(defaultPrj.repo);
     openModal(
-      "手工创建任务（高级）",
+      tr("手工创建任务（高级）", "Create Task Manually (Advanced)"),
       `<div class="form-stack">
-        <div class="form-row"><label class="form-label" for="newTaskTitle">任务标题 (必填)</label><input class="compact-input" id="newTaskTitle" type="text" placeholder="简要描述要做的事..." /></div>
-        <div class="form-row"><label class="form-label" for="newTaskSpec">详细说明 (必填)</label><textarea class="compact-input" id="newTaskSpec" rows="3" placeholder="具体要求与验收要点..."></textarea></div>
+        <div class="form-row"><label class="form-label" for="newTaskTitle">${esc(tr("任务标题 (必填)", "Task Title (required)"))}</label><input class="compact-input" id="newTaskTitle" type="text" placeholder="${esc(tr("简要描述要做的事...", "Briefly describe the task..."))}" /></div>
+        <div class="form-row"><label class="form-label" for="newTaskSpec">${esc(tr("详细说明 (必填)", "Detailed Specification (required)"))}</label><textarea class="compact-input" id="newTaskSpec" rows="3" placeholder="${esc(tr("具体要求与验收要点...", "Detailed requirements and acceptance points..."))}"></textarea></div>
         <div class="form-row-grid">
-          <div class="form-row"><label class="form-label" for="newTaskAssignee">执行 Worker</label><select class="compact-select" id="newTaskAssignee"></select></div>
-          <div class="form-row"><label class="form-label" for="newTaskProject">所属项目</label><select class="compact-select" id="newTaskProject">${projectOpts}</select></div>
+          <div class="form-row"><label class="form-label" for="newTaskAssignee">${esc(tr("执行 Worker", "Worker"))}</label><select class="compact-select" id="newTaskAssignee"></select></div>
+          <div class="form-row"><label class="form-label" for="newTaskProject">${esc(tr("所属项目", "Project"))}</label><select class="compact-select" id="newTaskProject">${projectOpts}</select></div>
         </div>
         <details class="config-raw-details">
-          <summary>高级参数（类型 / 档位 / 模型 / 超时 / 依赖）</summary>
+          <summary>${esc(tr("高级参数（类型 / 档位 / 模型 / 超时 / 依赖）", "Advanced Parameters (Kind / Profile / Model / Timeout / Dependencies)"))}</summary>
           <div class="form-stack" style="margin-top:10px;">
             <div class="form-row-grid">
               <div class="form-row">
-                <label class="form-label" for="newTaskKind">任务类型</label>
+                <label class="form-label" for="newTaskKind">${esc(tr("任务类型", "Task Kind"))}</label>
                 <select class="compact-select" id="newTaskKind">
-                  <option value="general" ${!hasRepo ? "selected" : ""}>通用任务 (general)</option>
-                  <option value="code" ${hasRepo ? "selected" : ""}>代码任务 (code)</option>
+                  <option value="general" ${!hasRepo ? "selected" : ""}>${esc(tr("通用任务 (general)", "General (general)"))}</option>
+                  <option value="code" ${hasRepo ? "selected" : ""}>${esc(tr("代码任务 (code)", "Code (code)"))}</option>
                 </select>
               </div>
-              <div class="form-row"><label class="form-label" for="newTaskProfile">权限档位</label><select class="compact-select" id="newTaskProfile">${profileOpts}</select></div>
-              <div class="form-row"><label class="form-label" for="newTaskModel">模型</label><input class="compact-input mono" id="newTaskModel" type="text" placeholder="留空使用默认" /></div>
-              <div class="form-row"><label class="form-label" for="newTaskEffort">推理强度</label><select class="compact-select" id="newTaskEffort">${effortOpts}</select></div>
-              <div class="form-row"><label class="form-label" for="newTaskPriority">优先级</label><input class="compact-input mono" id="newTaskPriority" type="number" min="-1000000" max="1000000" placeholder="0" /></div>
-              <div class="form-row"><label class="form-label" for="newTaskMaxAttempts">最大重试次数</label><input class="compact-input mono" id="newTaskMaxAttempts" type="number" min="1" max="10" placeholder="3" /></div>
-              <div class="form-row"><label class="form-label" for="newTaskTimeout">超时秒数</label><input class="compact-input mono" id="newTaskTimeout" type="number" min="1" max="604800" placeholder="3600" /></div>
-              <div class="form-row"><label class="form-label" for="newTaskIdleTimeout">空闲超时秒数</label><input class="compact-input mono" id="newTaskIdleTimeout" type="number" min="0" max="604800" placeholder="0" /></div>
+              <div class="form-row"><label class="form-label" for="newTaskProfile">${esc(tr("权限档位", "Profile"))}</label><select class="compact-select" id="newTaskProfile">${profileOpts}</select></div>
+              <div class="form-row"><label class="form-label" for="newTaskModel">${esc(tr("模型", "Model"))}</label><input class="compact-input mono" id="newTaskModel" type="text" placeholder="${esc(tr("留空使用默认", "Leave blank for default"))}" /></div>
+              <div class="form-row"><label class="form-label" for="newTaskEffort">${esc(tr("推理强度", "Reasoning Effort"))}</label><select class="compact-select" id="newTaskEffort">${effortOpts}</select></div>
+              <div class="form-row"><label class="form-label" for="newTaskPriority">${esc(tr("优先级", "Priority"))}</label><input class="compact-input mono" id="newTaskPriority" type="number" min="-1000000" max="1000000" placeholder="0" /></div>
+              <div class="form-row"><label class="form-label" for="newTaskMaxAttempts">${esc(tr("最大重试次数", "Max Attempts"))}</label><input class="compact-input mono" id="newTaskMaxAttempts" type="number" min="1" max="10" placeholder="3" /></div>
+              <div class="form-row"><label class="form-label" for="newTaskTimeout">${esc(tr("超时秒数", "Timeout (s)"))}</label><input class="compact-input mono" id="newTaskTimeout" type="number" min="1" max="604800" placeholder="3600" /></div>
+              <div class="form-row"><label class="form-label" for="newTaskIdleTimeout">${esc(tr("空闲超时秒数", "Idle Timeout (s)"))}</label><input class="compact-input mono" id="newTaskIdleTimeout" type="number" min="0" max="604800" placeholder="0" /></div>
             </div>
-            <div class="form-row"><label class="form-label" for="newTaskDependsOn">前置依赖任务 ID (逗号分隔)</label><input class="compact-input mono" id="newTaskDependsOn" type="text" placeholder="tsk_..." /></div>
+            <div class="form-row"><label class="form-label" for="newTaskDependsOn">${esc(tr("前置依赖任务 ID (逗号分隔)", "Depends On Task IDs (comma-separated)"))}</label><input class="compact-input mono" id="newTaskDependsOn" type="text" placeholder="tsk_..." /></div>
           </div>
         </details>
       </div>`,
-      `<button class="btn" id="modalCancel" type="button">取消</button><button class="btn btn-primary" id="modalSaveTask" type="button">创建任务</button>`
+      `<button class="btn" id="modalCancel" type="button">${esc(tr("取消", "Cancel"))}</button><button class="btn btn-primary" id="modalSaveTask" type="button">${esc(tr("创建任务", "Create Task"))}</button>`
     );
 
     const prjSel = $("newTaskProject");
@@ -9881,11 +10394,11 @@
       if (assigneeSel) {
         const workers = STATE.agents.filter(a => !a.disabled && a.name !== leadName);
         const firstWorker = workers[0] ? workers[0].name : "";
-        const opts = [`<option value="">(暂不指派)</option>`].concat(
+        const opts = [`<option value="">${esc(tr("(暂不指派)", "(Unassigned)"))}</option>`].concat(
           STATE.agents.filter(a => !a.disabled).map(a => {
             const isLead = Boolean(leadName && a.name === leadName);
             const sel = !isLead && a.name === firstWorker;
-            return `<option value="${esc(a.name)}" ${sel ? "selected" : ""} ${isLead ? "disabled" : ""}>${esc(a.name)} (${esc(a.adapter)})${isLead ? " [当前 Lead 不可指派]" : ""}</option>`;
+            return `<option value="${esc(a.name)}" ${sel ? "selected" : ""} ${isLead ? "disabled" : ""}>${esc(a.name)} (${esc(a.adapter)})${isLead ? esc(tr(" [当前 Lead 不可指派]", " [Current Lead cannot be assigned]")) : ""}</option>`;
           })
         );
         assigneeSel.innerHTML = opts.join("");
@@ -9912,7 +10425,7 @@
       const rawMaxAttempts = ($("newTaskMaxAttempts").value || "").trim();
       const rawDeps = ($("newTaskDependsOn").value || "").trim();
 
-      if (!project || !title || !spec) { toast("请填写项目、任务标题与说明", "warn"); return; }
+      if (!project || !title || !spec) { toast(tr("请填写项目、任务标题与说明", "Please fill in project, task title, and specification"), "warn"); return; }
 
       const payload = { project, title, spec };
       if (kind) payload.kind = kind;
@@ -9922,22 +10435,22 @@
       if (effort) payload.effort = effort;
       if (rawPriority !== "") {
         const prio = Number(rawPriority);
-        if (!Number.isInteger(prio) || prio < -1000000 || prio > 1000000) { toast("优先级须为整数", "warn"); return; }
+        if (!Number.isInteger(prio) || prio < -1000000 || prio > 1000000) { toast(tr("优先级须为整数", "Priority must be an integer"), "warn"); return; }
         payload.priority = prio;
       }
       if (rawTimeout !== "") {
         const to = Number(rawTimeout);
-        if (!Number.isInteger(to) || to < 1 || to > 604800) { toast("超时秒数范围 1..604800", "warn"); return; }
+        if (!Number.isInteger(to) || to < 1 || to > 604800) { toast(tr("超时秒数范围 1..604800", "Timeout must be between 1 and 604800 seconds"), "warn"); return; }
         payload.timeout = to;
       }
       if (rawIdleTimeout !== "") {
         const ito = Number(rawIdleTimeout);
-        if (!Number.isInteger(ito) || ito < 0 || ito > 604800) { toast("空闲超时秒数范围 0..604800", "warn"); return; }
+        if (!Number.isInteger(ito) || ito < 0 || ito > 604800) { toast(tr("空闲超时秒数范围 0..604800", "Idle timeout must be between 0 and 604800 seconds"), "warn"); return; }
         payload.idle_timeout = ito;
       }
       if (rawMaxAttempts !== "") {
         const ma = Number(rawMaxAttempts);
-        if (!Number.isInteger(ma) || ma < 1 || ma > 10) { toast("最大重试次数范围 1..10", "warn"); return; }
+        if (!Number.isInteger(ma) || ma < 1 || ma > 10) { toast(tr("最大重试次数范围 1..10", "Max attempts must be between 1 and 10"), "warn"); return; }
         payload.max_attempts = ma;
       }
       if (rawDeps) {
@@ -9952,7 +10465,7 @@
         STATE.ui.draftNewChat = false;
         STATE.activeProjectId = project;
         if (res.data && res.data.id) STATE.activeTaskId = res.data.id;
-        toast("任务创建成功", "ok");
+        toast(tr("任务创建成功", "Task created"), "ok");
         await loadAllWorkspaceData();
       } else {
         toast(formatErrorMessage(res.error), "err");
@@ -10011,7 +10524,7 @@
             if (res && res.ok) updateWindowMaxButton(false);
             else if (res && !res.ok && !errored) { errored = true; toast(formatErrorMessage(res.error), "err"); }
           } catch (err) {
-            if (!errored) { errored = true; toast(`调整窗口大小失败: ${err && err.message ? err.message : String(err)}`, "err"); }
+            if (!errored) { errored = true; toast(tr(`调整窗口大小失败: ${err && err.message ? err.message : String(err)}`, `Failed to resize window: ${err && err.message ? err.message : String(err)}`), "err"); }
           } finally {
             inFlight = false;
             if (pending) rafId = window.requestAnimationFrame(flushResize);
@@ -10102,7 +10615,7 @@
               if (!stopped) restored = true;
               else if (hasApi() && typeof window.pywebview.api.window_drag_end === "function") Promise.resolve(window.pywebview.api.window_drag_end()).catch(() => {});
             } else if (res && !res.ok) { toast(formatErrorMessage(res.error), "err"); cleanup(); }
-          } catch (err) { toast(`拖动还原窗口失败: ${err && err.message ? err.message : String(err)}`, "err"); cleanup(); }
+          } catch (err) { toast(tr(`拖动还原窗口失败: ${err && err.message ? err.message : String(err)}`, `Failed to restore window while dragging: ${err && err.message ? err.message : String(err)}`), "err"); cleanup(); }
           return;
         }
         if (!restored) return;
@@ -10185,8 +10698,8 @@
     startDurationTicker();
 
     const reportWindowCtrlError = (actionLabel, err) => {
-      const msg = err && err.message ? err.message : String(err || "未知错误");
-      toast(`${actionLabel}失败: ${msg}`, "err");
+      const msg = err && err.message ? err.message : String(err || tr("未知错误", "Unknown error"));
+      toast(tr(`${actionLabel}失败: ${msg}`, `${actionLabel} failed: ${msg}`), "err");
     };
 
     if ($("btnWinMin")) {
@@ -10195,7 +10708,7 @@
           try {
             const res = await window.pywebview.api.window_minimize();
             if (res && !res.ok) toast(formatErrorMessage(res.error), "err");
-          } catch (err) { reportWindowCtrlError("最小化窗口", err); }
+          } catch (err) { reportWindowCtrlError(tr("最小化窗口", "Minimize window"), err); }
         }
       });
     }
@@ -10205,7 +10718,7 @@
           const res = await window.pywebview.api.window_toggle_maximize();
           if (res && res.ok && res.data && typeof res.data.maximized === "boolean") updateWindowMaxButton(res.data.maximized);
           else if (res && !res.ok) toast(formatErrorMessage(res.error), "err");
-        } catch (err) { reportWindowCtrlError("切换最大化", err); }
+        } catch (err) { reportWindowCtrlError(tr("切换最大化", "Toggle maximize"), err); }
       }
     };
     if ($("btnWinMax")) $("btnWinMax").addEventListener("click", toggleMaximize);
@@ -10216,7 +10729,7 @@
           try {
             const res = await window.pywebview.api.window_close();
             if (res && !res.ok) toast(formatErrorMessage(res.error), "err");
-          } catch (err) { reportWindowCtrlError("关闭窗口", err); }
+          } catch (err) { reportWindowCtrlError(tr("关闭窗口", "Close window"), err); }
         }
       });
     }
@@ -10228,6 +10741,17 @@
           await loadGrants();
           renderSettingsView();
         }
+      });
+    }
+
+    if ($("btnQuickLang")) {
+      $("btnQuickLang").addEventListener("click", () => {
+        toggleLanguage();
+      });
+    }
+    if ($("btnWizardLang")) {
+      $("btnWizardLang").addEventListener("click", () => {
+        toggleLanguage();
       });
     }
 
@@ -10289,9 +10813,9 @@
         STATE.ui.repoDrawerOpen = !STATE.ui.repoDrawerOpen;
         renderComposer();
       } else if (prj.repo) {
-        toast(`已绑定仓库：${prj.repo}（分支 ${prj.base_branch || "--"}）`, "info");
+        toast(tr(`已绑定仓库：${prj.repo}（分支 ${prj.base_branch || "--"}）`, `Bound repo: ${prj.repo} (branch ${prj.base_branch || "--"})`), "info");
       } else {
-        toast("当前项目为通用对话项目；点左侧 + 新建对话可绑定本地 Git 仓库", "info");
+        toast(tr("当前项目为通用对话项目；点左侧 + 新建对话可绑定本地 Git 仓库", "This is a general chat project; click + New Chat on the left to bind a local Git repository"), "info");
       }
     });
     if ($("btnCloseRepoDrawer")) {
@@ -10398,13 +10922,15 @@
       const lenHint = $("wizardPassLenHint");
       const matchHint = $("wizardPassMatchHint");
       if (lenHint) {
-        lenHint.textContent = p1.length >= 12 ? `口令长度符合要求 (${p1.length} 位)` : `当前长度：${p1.length} / 12`;
+        lenHint.textContent = p1.length >= 12
+          ? tr(`口令长度符合要求 (${p1.length} 位)`, `Passphrase length OK (${p1.length} chars)`)
+          : tr(`当前长度：${p1.length} / 12`, `Length: ${p1.length} / 12`);
         lenHint.className = `wizard-field-hint ${p1.length >= 12 ? "ok" : ""}`;
       }
       if (matchHint) {
         if (!p2) { matchHint.textContent = ""; matchHint.className = "wizard-field-hint"; }
-        else if (p1 === p2) { matchHint.textContent = "两次输入的口令一致"; matchHint.className = "wizard-field-hint ok"; }
-        else { matchHint.textContent = "两次输入的口令不一致"; matchHint.className = "wizard-field-hint err"; }
+        else if (p1 === p2) { matchHint.textContent = tr("两次输入的口令一致", "Passphrases match"); matchHint.className = "wizard-field-hint ok"; }
+        else { matchHint.textContent = tr("两次输入的口令不一致", "Passphrases do not match"); matchHint.className = "wizard-field-hint err"; }
       }
     };
     if ($("wizardPassInput")) $("wizardPassInput").addEventListener("input", syncWizardPassHints);
@@ -10429,9 +10955,9 @@
           const res = await window.pywebview.api.doctor_report();
           if (res && res.ok) {
             STATE.doctor = res.data;
-            openModal("环境诊断", `<pre class="log-box">${esc(JSON.stringify(res.data, null, 2))}</pre>`, `<button class="btn" type="button" data-close-modal="1">关闭</button>`);
+            openModal(tr("环境诊断", "Diagnostics"), `<pre class="log-box">${esc(JSON.stringify(res.data, null, 2))}</pre>`, `<button class="btn" type="button" data-close-modal="1">${esc(tr("关闭", "Close"))}</button>`);
           } else toast(formatErrorMessage(res && res.error), "err");
-        } catch (err) { toast(`环境诊断失败: ${String(err)}`, "err"); }
+        } catch (err) { toast(tr(`环境诊断失败: ${String(err)}`, `Diagnostics failed: ${String(err)}`), "err"); }
       });
     }
     if ($("btnWizardRescanClis")) $("btnWizardRescanClis").addEventListener("click", scanWizardClis);
@@ -10553,7 +11079,7 @@
       if (copyBtn) {
         const text = copyBtn.getAttribute("data-copy-code") || "";
         if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(text).then(() => toast("已复制到剪贴板", "ok")).catch(() => {});
+          navigator.clipboard.writeText(text).then(() => toast(tr("已复制到剪贴板", "Copied to clipboard"), "ok")).catch(() => {});
         }
         return;
       }
@@ -10655,7 +11181,7 @@
         return;
       }
 
-      // STEP 1 + A3: Inline Approval Card & Sticky Strip buttons (允许 / 始终允许 / 拒绝)
+      // STEP 1 + A3: Inline Approval Card & Sticky Strip buttons (Allow / Always Allow / Reject)
       const decideBtn = target.closest("[data-decide-approval]");
       if (decideBtn) {
         e.stopPropagation();
@@ -10890,7 +11416,7 @@
         const name = setDefLead.getAttribute("data-set-default-lead");
         closeAllPopovers();
         const res = await apiCall("config.set", { key: "lead.default_agent", value: name });
-        if (res.ok) { toast(`已将 ${name} 设为默认 Lead`, "ok"); await loadAllWorkspaceData(); }
+        if (res.ok) { toast(tr(`已将 ${name} 设为默认 Lead`, `Set ${name} as default Lead`), "ok"); await loadAllWorkspaceData(); }
         else toast(formatErrorMessage(res.error), "err");
         return;
       }
@@ -10942,13 +11468,14 @@
         const prj = getActiveProject();
         if (!prj || !planId) return;
         const plan = STATE.plans.find(p => p.id === planId);
+        const defCancelPlanReason = tr("用户在高级面板取消计划", "User cancelled plan from Advanced panel");
         openModal(
-          `取消执行计划${plan ? ` v${plan.version || 1}` : ""}`,
+          tr(`取消执行计划${plan ? ` v${plan.version || 1}` : ""}`, `Cancel Execution Plan${plan ? ` v${plan.version || 1}` : ""}`),
           `<div class="form-stack">
-            <div style="font-size:13px;color:var(--text-secondary);">将取消未派发的计划「${esc((plan && plan.title) || planId)}」及其关联的待确认门控。</div>
-            <div class="form-row"><label class="form-label">取消原因</label><input class="compact-input" id="modalCancelPlanReason" type="text" value="用户在高级面板取消计划" /></div>
+            <div style="font-size:13px;color:var(--text-secondary);">${esc(tr(`将取消未派发的计划「${(plan && plan.title) || planId}」及其关联的待确认门控。`, `This will cancel undispatched plan "${(plan && plan.title) || planId}" and its pending approval gate.`))}</div>
+            <div class="form-row"><label class="form-label">${esc(tr("取消原因", "Cancellation Reason"))}</label><input class="compact-input" id="modalCancelPlanReason" type="text" value="${esc(defCancelPlanReason)}" /></div>
           </div>`,
-          `<button class="btn" id="modalCancel" type="button">返回</button><button class="btn btn-danger-text" id="modalConfirmCancelPlan" type="button">确认取消计划</button>`
+          `<button class="btn" id="modalCancel" type="button">${esc(tr("返回", "Back"))}</button><button class="btn btn-danger-text" id="modalConfirmCancelPlan" type="button">${esc(tr("确认取消计划", "Confirm Cancel Plan"))}</button>`
         );
         $("modalCancel").onclick = closeModal;
         let cancelPlanSubmitting = false;
@@ -10959,10 +11486,10 @@
           cancelPlanSubmitting = true;
           if (btn) btn.disabled = true;
           try {
-            const reason = ($("modalCancelPlanReason").value || "").trim() || "用户在高级面板取消计划";
+            const reason = ($("modalCancelPlanReason").value || "").trim() || defCancelPlanReason;
             const res = await apiCall("plan.cancel", { project_id: prj.id, plan_id: planId, reason });
             closeModal();
-            if (res.ok) { toast("计划已取消", "ok"); await loadActiveProjectLight(); }
+            if (res.ok) { toast(tr("计划已取消", "Plan cancelled"), "ok"); await loadActiveProjectLight(); }
             else toast(formatErrorMessage(res.error), "err");
           } finally {
             cancelPlanSubmitting = false;
@@ -10991,8 +11518,8 @@
       if (target.closest("#btnAdvancedAudit") || target.closest("#btnSettingsAudit")) {
         const res = await apiCall("audit.verify", {});
         if ((res && res.ok && res.data) || (res && !res.ok && res.error && res.error.code === "AUDIT_MISMATCH")) {
-          const modalTitle = res.ok ? "审计哈希链校验（通过）" : "审计哈希链校验（检测到异常）";
-          openModal(modalTitle, renderAuditVerifyModalBodyHtml(res), `<button class="btn" type="button" data-close-modal="1">关闭</button>`);
+          const modalTitle = res.ok ? tr("审计哈希链校验（通过）", "Audit Hash Chain Verification (Passed)") : tr("审计哈希链校验（检测到异常）", "Audit Hash Chain Verification (Mismatch Detected)");
+          openModal(modalTitle, renderAuditVerifyModalBodyHtml(res), `<button class="btn" type="button" data-close-modal="1">${esc(tr("关闭", "Close"))}</button>`);
         } else toast(formatErrorMessage(res && res.error), "err");
         return;
       }
@@ -11012,9 +11539,9 @@
 
       // CLI / Agent management actions
       if (target.closest("#btnProbeAllAdapters")) {
-        toast("正在探测本机 AI 工具...", "info");
+        toast(tr("正在探测本机 AI 工具...", "Probing local AI tools..."), "info");
         const res = await apiCall("adapter.probe", {});
-        if (res.ok) { toast("工具探测完成", "ok"); await loadAllWorkspaceData({ includeAdapters: true }); }
+        if (res.ok) { toast(tr("工具探测完成", "Adapter probe complete"), "ok"); await loadAllWorkspaceData({ includeAdapters: true }); }
         else toast(formatErrorMessage(res.error), "err");
         return;
       }
@@ -11022,7 +11549,7 @@
       if (probeBtn) {
         const aid = probeBtn.getAttribute("data-adapter-probe");
         const res = await apiCall("adapter.probe", { adapter_id: aid });
-        if (res.ok) { toast(`${aid} 探测完成`, "ok"); await loadAllWorkspaceData({ includeAdapters: true }); }
+        if (res.ok) { toast(tr(`${aid} 探测完成`, `${aid} probe complete`), "ok"); await loadAllWorkspaceData({ includeAdapters: true }); }
         else toast(formatErrorMessage(res.error), "err");
         return;
       }
@@ -11033,7 +11560,7 @@
           apiCall("adapter.show", { adapter_id: aid }),
           apiCall("adapter.models", { adapter_id: aid })
         ]);
-        openModal(`工具详情 · ${aid}`, `<pre class="log-box">${esc(JSON.stringify({ show: showRes.ok ? showRes.data : showRes.error, models: modRes.ok ? modRes.data : modRes.error }, null, 2))}</pre>`, `<button class="btn" type="button" data-close-modal="1">关闭</button>`);
+        openModal(tr(`工具详情 · ${aid}`, `Adapter Details · ${aid}`), `<pre class="log-box">${esc(JSON.stringify({ show: showRes.ok ? showRes.data : showRes.error, models: modRes.ok ? modRes.data : modRes.error }, null, 2))}</pre>`, `<button class="btn" type="button" data-close-modal="1">${esc(tr("关闭", "Close"))}</button>`);
         return;
       }
       if (target.closest("#btnCreateAgentModal")) { openCreateAgentModal(); return; }
@@ -11045,7 +11572,7 @@
         const ag = getAgentByName(name);
         if (!ag) return;
         const res = await apiCall("agent.update", { name, can_lead: !ag.can_lead });
-        if (res.ok) { delete STATE.agentDetails[name]; toast(`已更新 ${name} Lead 资格`, "ok"); await loadAllWorkspaceData(); }
+        if (res.ok) { delete STATE.agentDetails[name]; toast(tr(`已更新 ${name} Lead 资格`, `Updated Lead role for ${name}`), "ok"); await loadAllWorkspaceData(); }
         else toast(formatErrorMessage(res.error), "err");
         return;
       }
@@ -11055,7 +11582,7 @@
         const ag = getAgentByName(name);
         if (!ag) return;
         const res = await apiCall(ag.disabled ? "agent.enable" : "agent.disable", { name });
-        if (res.ok) { delete STATE.agentDetails[name]; toast(`已${ag.disabled ? "启用" : "禁用"} ${name}`, "ok"); await loadAllWorkspaceData(); }
+        if (res.ok) { delete STATE.agentDetails[name]; toast(ag.disabled ? tr(`已启用 ${name}`, `Enabled ${name}`) : tr(`已禁用 ${name}`, `Disabled ${name}`), "ok"); await loadAllWorkspaceData(); }
         else toast(formatErrorMessage(res.error), "err");
         return;
       }
@@ -11063,7 +11590,7 @@
       if (agShow) {
         const name = agShow.getAttribute("data-agent-show");
         const res = await apiCall("agent.show", { name });
-        openModal(`Agent 详情 · ${name}`, `<pre class="log-box">${esc(JSON.stringify(res.ok ? res.data : res.error, null, 2))}</pre>`, `<button class="btn" type="button" data-close-modal="1">关闭</button>`);
+        openModal(tr(`Agent 详情 · ${name}`, `Agent Details · ${name}`), `<pre class="log-box">${esc(JSON.stringify(res.ok ? res.data : res.error, null, 2))}</pre>`, `<button class="btn" type="button" data-close-modal="1">${esc(tr("关闭", "Close"))}</button>`);
         return;
       }
 
@@ -11083,7 +11610,7 @@
         if (hasApi()) await window.pywebview.api.clear_passphrase();
         await refreshConnectionAndAuth();
         resetLockedWorkspaceState();
-        toast("已清除内存口令并锁定", "info");
+        toast(tr("已清除内存口令并锁定", "Passphrase cleared and session locked"), "info");
         renderAll({ forceSettings: true });
         return;
       }
@@ -11096,14 +11623,14 @@
           const res = await window.pywebview.api.doctor_report();
           if (res && res.ok) { STATE.doctor = res.data; renderSettingsView({ force: true }); }
           else toast(formatErrorMessage(res && res.error), "err");
-        } catch (err) { toast(`环境诊断失败: ${String(err)}`, "err"); }
+        } catch (err) { toast(tr(`环境诊断失败: ${String(err)}`, `Diagnostics failed: ${String(err)}`), "err"); }
         return;
       }
       if (target.closest("#btnSettingsPruneWs")) {
         if (!canMutate()) { toast(disabledReason(), "err"); return; }
         const res = await apiCall("workspace.prune", {});
         if (res.ok && res.data) {
-          openModal("工作区清理结果", `<pre class="log-box">${esc(JSON.stringify(res.data, null, 2))}</pre>`, `<button class="btn" type="button" data-close-modal="1">关闭</button>`);
+          openModal(tr("工作区清理结果", "Workspace Cleanup Result"), `<pre class="log-box">${esc(JSON.stringify(res.data, null, 2))}</pre>`, `<button class="btn" type="button" data-close-modal="1">${esc(tr("关闭", "Close"))}</button>`);
           await loadAllWorkspaceData();
         } else toast(formatErrorMessage(res.error), "err");
         return;
@@ -11115,7 +11642,15 @@
 
     document.addEventListener("change", async e => {
       const t = e.target;
-      if (t.id === "projectPermissionModeSelect") {
+      if (t.id === "selectUiLanguage") {
+        setLanguage(t.value, { persist: true, syncBridge: true, rerender: true });
+        const syncPromise = languageSyncPromise;
+        syncPromise.then(ok => {
+          if (ok && syncPromise === languageSyncPromise) {
+            toast(tr("界面语言已切换", "Interface language updated"), "ok");
+          }
+        });
+      } else if (t.id === "projectPermissionModeSelect") {
         const prj = getActiveProject();
         if (prj) await handleChangeProjectPermissionMode(prj.id, t.value);
       } else if (t.id === "settingsProjectPermissionMode") {
@@ -11137,7 +11672,7 @@
           const res = await window.pywebview.api.set_desktop_prefs({ close_to_tray: t.value === "true" });
           if (res && res.ok && res.data) {
             STATE.desktopPrefs = Object.assign({}, STATE.desktopPrefs, res.data);
-            toast("托盘偏好已保存", "ok");
+            toast(tr("托盘偏好已保存", "Tray preference saved"), "ok");
             renderSettingsView({ force: true });
             renderAll();
           } else {
@@ -11149,7 +11684,7 @@
         if (!canMutate()) { toast(disabledReason(), "err"); renderSettingsView({ force: true }); return; }
         const val = t.value || null;
         const res = await apiCall("config.set", { key: "lead.default_agent", value: val });
-        if (res.ok) { toast(`默认 Lead 已更新为 ${val || "未设置"}`, "ok"); await loadAllWorkspaceData(); }
+        if (res.ok) { toast(tr(`默认 Lead 已更新为 ${val || "未设置"}`, `Default Lead updated to ${val || "None"}`), "ok"); await loadAllWorkspaceData(); }
         else { toast(formatErrorMessage(res.error), "err"); renderSettingsView({ force: true }); }
       } else if (t.hasAttribute("data-config-key")) {
         if (!canMutate()) { toast(disabledReason(), "err"); renderSettingsView({ force: true }); return; }
@@ -11157,7 +11692,7 @@
         const valType = t.getAttribute("data-config-type");
         const value = valType === "bool" ? (t.value === "true") : t.value;
         const res = await apiCall("config.set", { key, value });
-        if (res.ok) { toast("配置已保存", "ok"); await loadAllWorkspaceData(); }
+        if (res.ok) { toast(tr("配置已保存", "Configuration saved"), "ok"); await loadAllWorkspaceData(); }
         else { toast(formatErrorMessage(res.error), "err"); renderSettingsView({ force: true }); }
       }
     });
@@ -11176,27 +11711,35 @@
 
   function formatAuditMismatchTag(key) {
     const k = String(key || "");
-    if (k.startsWith("project_plan_gate:")) return "计划门控模式 (plan_gate_mode) 异常";
-    if (k.startsWith("project_mode:")) return "权限模式 (permission_mode) 异常";
-    if (k.startsWith("grant:")) return "永久授权 (standing_grants) 异常";
-    if (k.startsWith("plan:") || k.startsWith("plan_tasks:") || k.startsWith("task_plan:")) return "计划与派发绑定异常";
-    if (k.startsWith("chat:")) return "对话记录异常";
-    if (k.startsWith("project:")) return "项目状态异常";
-    if (k.startsWith("task:")) return "任务状态异常";
-    if (k.startsWith("credential:")) return "凭据状态异常";
-    if (k.startsWith("i4:")) return "状态机不变量异常";
-    return k || "状态异常";
+    if (k.startsWith("project_plan_gate:")) return tr("计划门控模式 (plan_gate_mode) 异常", "Plan Gate Mode (plan_gate_mode) Mismatch");
+    if (k.startsWith("project_mode:")) return tr("权限模式 (permission_mode) 异常", "Permission Mode (permission_mode) Mismatch");
+    if (k.startsWith("grant:")) return tr("永久授权 (standing_grants) 异常", "Standing Grants Mismatch");
+    if (k.startsWith("plan:") || k.startsWith("plan_tasks:") || k.startsWith("task_plan:")) return tr("计划与派发绑定异常", "Plan & Dispatch Binding Mismatch");
+    if (k.startsWith("chat:")) return tr("对话记录异常", "Chat Log Mismatch");
+    if (k.startsWith("project:")) return tr("项目状态异常", "Project State Mismatch");
+    if (k.startsWith("task:")) return tr("任务状态异常", "Task State Mismatch");
+    if (k.startsWith("credential:")) return tr("凭据状态异常", "Credential State Mismatch");
+    if (k.startsWith("i4:")) return tr("状态机不变量异常", "State Machine Invariant Mismatch");
+    return k || tr("状态异常", "State Mismatch");
   }
 
   function renderAuditVerifyModalBodyHtml(res) {
     if (res && res.ok && res.data) {
       const d = res.data;
-      const summaryLine = `已校验 ${Number(d.events_verified || 0)} 条事件、${Number(d.approvals_verified || 0)} 条审批（直连 ${Number(d.direct_decisions || 0)} · 转发 ${Number(d.relayed_decisions || 0)} · 委派 ${Number(d.delegated_decisions || 0)}）`;
+      const evCnt = Number(d.events_verified || 0);
+      const aprCnt = Number(d.approvals_verified || 0);
+      const dirCnt = Number(d.direct_decisions || 0);
+      const relCnt = Number(d.relayed_decisions || 0);
+      const delCnt = Number(d.delegated_decisions || 0);
+      const summaryLine = tr(
+        `已校验 ${evCnt} 条事件、${aprCnt} 条审批（直连 ${dirCnt} · 转发 ${relCnt} · 委派 ${delCnt}）`,
+        `Verified ${evCnt} events and ${aprCnt} approvals (direct ${dirCnt} · relayed ${relCnt} · delegated ${delCnt})`
+      );
       return `
         <div class="inspector-note-box" data-audit-status="ok" style="margin-bottom:10px;">
           <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-            <span class="status-pill green">校验通过</span>
-            <strong>事件哈希链、审批签名、plan_gate_mode 与 permission_mode 历史一致</strong>
+            <span class="status-pill green">${esc(tr("校验通过", "Passed"))}</span>
+            <strong>${esc(tr("事件哈希链、审批签名、plan_gate_mode 与 permission_mode 历史一致", "Event hash chain, approval signatures, plan_gate_mode, and permission_mode history are consistent"))}</strong>
           </div>
           <div style="margin-top:6px;font-size:12.5px;color:var(--text-secondary);">${esc(summaryLine)}</div>
         </div>
@@ -11217,11 +11760,14 @@
     return `
       <div class="inspector-note-box amber" data-audit-status="mismatch" style="margin-bottom:10px;">
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-          <span class="status-pill red">校验失败</span>
-          <strong>${esc(err.message || ERROR_LABELS.AUDIT_MISMATCH)}</strong>
+          <span class="status-pill red">${esc(tr("校验失败", "Failed"))}</span>
+          <strong>${esc(err.message ? localizeDaemonMessage(err.message) : getErrorLabel("AUDIT_MISMATCH"))}</strong>
         </div>
         <div style="margin-top:6px;font-size:12.5px;color:var(--text-secondary);">
-          异常事件 ${brokenEvents.length} 条 · 异常审批 ${brokenApprovals.length} 条 · 状态不一致 ${stateMismatches.length} 项
+          ${esc(tr(
+            `异常事件 ${brokenEvents.length} 条 · 异常审批 ${brokenApprovals.length} 条 · 状态不一致 ${stateMismatches.length} 项`,
+            `Broken events: ${brokenEvents.length} · Broken approvals: ${brokenApprovals.length} · State mismatches: ${stateMismatches.length}`
+          ))}
         </div>
         ${mismatchTagsHtml}
         ${reasonsHtml}
@@ -11245,6 +11791,13 @@
       APPROVAL_RESOLVED_PLACEHOLDER_MS,
       REFRESH_DEBOUNCE_MS,
       REFRESH_DEBOUNCE_MAX_WAIT_MS,
+      getLanguagePref,
+      getLanguage,
+      isEnglish,
+      tr,
+      setLanguage,
+      toggleLanguage,
+      applyI18nToDom,
       bumpProjectSwitchGen,
       bumpSidebarLoadSeq,
       setApprovals,
@@ -11341,6 +11894,7 @@
     };
   }
   if (typeof document !== "undefined" && typeof window !== "undefined") {
+    applyI18nToDom();
     bindStaticHandlers();
     if (hasApi()) {
       bootstrapBridge();
