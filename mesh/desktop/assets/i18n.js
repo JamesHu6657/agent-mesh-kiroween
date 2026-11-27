@@ -461,8 +461,9 @@
     return isEn() ? entry.en : entry.zh;
   }
 
-  function isInsideOpenModal(el) {
+  function isOpenModalTitle(el) {
     if (!el || typeof el.closest !== "function") return false;
+    if (el.id !== "modalTitle" && el.id !== "confirmModalTitle") return false;
     return Boolean(el.closest(".modal-backdrop:not(.hidden), .confirm-modal-backdrop:not(.hidden)"));
   }
 
@@ -480,13 +481,12 @@
     if (typeof doc.querySelectorAll !== "function") return;
 
     doc.querySelectorAll("[data-i18n]").forEach((el) => {
-      if (isInsideOpenModal(el)) return;
+      if (isOpenModalTitle(el)) return;
       const key = el.getAttribute("data-i18n");
       const val = getDomString(key);
       if (val) el.textContent = val;
     });
     doc.querySelectorAll("[data-i18n-title]").forEach((el) => {
-      if (isInsideOpenModal(el)) return;
       const key = el.getAttribute("data-i18n-title");
       const val = getDomString(key);
       if (val) {
@@ -497,13 +497,11 @@
       }
     });
     doc.querySelectorAll("[data-i18n-placeholder]").forEach((el) => {
-      if (isInsideOpenModal(el)) return;
       const key = el.getAttribute("data-i18n-placeholder");
       const val = getDomString(key);
       if (val) el.placeholder = val;
     });
     doc.querySelectorAll("[data-i18n-aria-label]").forEach((el) => {
-      if (isInsideOpenModal(el)) return;
       const key = el.getAttribute("data-i18n-aria-label");
       const val = getDomString(key);
       if (val) el.setAttribute("aria-label", val);

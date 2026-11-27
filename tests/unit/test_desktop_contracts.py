@@ -482,6 +482,8 @@ class TestDesktopUiPayloadContracts(unittest.TestCase):
         # Step 2: detect_local_clis -> pick ONE lead -> creates <cli>-lead + <cli>-worker -> vendor_leads=true -> chat
         scan_fn = _extract_js_block(self.app_js, "async function scanWizardClis()")
         self.assertIn("window.pywebview.api.detect_local_clis()", scan_fn)
+        self.assertIn("STATE.wizard.scanQueued = true", scan_fn)
+        self.assertIn("restartIfQueued()", scan_fn)
 
         finish_fn = _extract_js_block(self.app_js, "async function handleWizardFinish()")
         self.assertIn("const leadName = `${chosen}-lead`", finish_fn)
@@ -4603,6 +4605,12 @@ class TestDesktopUiBehaviorContracts(unittest.TestCase):
 
     def test_english_ui_i18n_rendering_and_live_language_switch(self) -> None:
         """Verify full English UI mode, daemon card translation, DOM applyToDom, and live zh-CN/en toggle."""
+        app_js_src = APP_JS_PATH.read_text(encoding="utf-8")
+        self.assertIn("trackLanguageSync(", app_js_src)
+        self.assertIn(".catch(() => false)", app_js_src)
+        self.assertIn("return synced;", app_js_src)
+        self.assertIn("notifyLanguageSyncFailure()", app_js_src)
+
         i18n_js_lit = json.dumps(str(APP_JS_PATH.parent / "i18n.js"))
         self._run_node(
             f"const i18n = require({i18n_js_lit});\n"
@@ -4782,18 +4790,32 @@ class TestDesktopUiBehaviorContracts(unittest.TestCase):
             assert.ok(!xssPlanHtml.includes("<img src=x"), "plan.version must be HTML-escaped: " + xssPlanHtml);
             assert.ok(xssPlanHtml.includes("&lt;img src=x"), xssPlanHtml);
 
-            // (b) applyToDom must NOT overwrite title inside an open modal
+            // (b) applyToDom must NOT overwrite dynamic titles inside an open modal,
+            // while still updating static controls such as the close-button tooltip
             const openModalTitle = {
+              id: "modalTitle",
               textContent: "Confirm High-Privilege Profile · elevated",
               attributes: { "data-i18n": "modal.defaultTitle" },
               getAttribute(k) { return this.attributes[k] || null; },
               closest(sel) { return sel.includes(".modal-backdrop:not(.hidden)") ? {} : null; },
             };
+            const openModalClose = {
+              title: "关闭",
+              attributes: { "data-i18n-title": "modal.closeTitle" },
+              getAttribute(k) { return this.attributes[k] || null; },
+              removeAttribute(k) { delete this.attributes[k]; },
+              closest(sel) { return sel.includes(".modal-backdrop:not(.hidden)") ? {} : null; },
+            };
             i18n.applyToDom({
               documentElement: { setAttribute() {} },
-              querySelectorAll(sel) { return sel === "[data-i18n]" ? [openModalTitle] : []; },
+              querySelectorAll(sel) {
+                if (sel === "[data-i18n]") return [openModalTitle];
+                if (sel === "[data-i18n-title]") return [openModalClose];
+                return [];
+              },
             });
             assert.equal(openModalTitle.textContent, "Confirm High-Privilege Profile · elevated");
+            assert.equal(openModalClose.title, "Close");
 
             // (c) Daemon PLAN_APPROVAL_REQUIRED & default acceptance criterion leak zero CJK in English mode
             const planReqErr = app.formatErrorMessage({

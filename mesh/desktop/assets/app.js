@@ -27,6 +27,24 @@
     return I18N ? I18N.tr(zh, en) : zh;
   }
 
+  let languageSyncSeq = 0;
+  let languageSyncPromise = Promise.resolve(true);
+
+  function notifyLanguageSyncFailure() {
+    if (typeof document === "undefined") return;
+    toast(tr(
+      "界面语言已切换，但同步到桌面后端失败；托盘语言可能不会更新",
+      "Interface language changed locally, but syncing to the desktop backend failed; tray language may not update"
+    ), "warn");
+  }
+
+  function trackLanguageSync(promise, syncSeq) {
+    languageSyncPromise = promise;
+    promise.then(ok => {
+      if (!ok && syncSeq === languageSyncSeq) notifyLanguageSyncFailure();
+    });
+  }
+
   function applyI18nToDom() {
     if (I18N && typeof document !== "undefined") {
       I18N.applyToDom(document);
@@ -166,33 +184,45 @@
     if (rerender) {
       rerenderActiveUi();
     }
-    if (syncBridge && hasApi() && STATE.bridgeReady && typeof window.pywebview.api.set_desktop_prefs === "function") {
-      try {
-        const beforeEffective = getLanguage();
-        Promise.resolve(window.pywebview.api.set_desktop_prefs({ language: nextPref }))
-          .then(res => {
-            if (res && res.ok && res.data) {
-              STATE.desktopPrefs = Object.assign({}, STATE.desktopPrefs, res.data);
-              if (I18N && typeof I18N.setSystemLang === "function" && res.data.effective_language) {
-                I18N.setSystemLang(res.data.effective_language);
-              }
-              if (getLanguage() !== beforeEffective) {
-                applyI18nToDom();
-                if (rerender) rerenderActiveUi();
-              }
-            }
-            if (rerender) {
-              if (STATE.wizard && STATE.wizard.active && STATE.wizard.step === 2 && !STATE.wizard.scanningClis) {
-                scanWizardClis().catch(() => {});
-              }
-              if (STATE.ui.repoDrawerOpen && STATE.ui.repoInspection && STATE.ui.repoInspection.path) {
-                handleInspectRepoPath(STATE.ui.repoInspection.path, { autoFillDefaults: false }).catch(() => {});
-              }
-            }
-          })
-          .catch(() => {});
-      } catch (_err) {
-        // ignore bridge sync errors
+    if (syncBridge) {
+      const syncSeq = ++languageSyncSeq;
+      if (hasApi() && STATE.bridgeReady && typeof window.pywebview.api.set_desktop_prefs === "function") {
+        try {
+          const beforeEffective = getLanguage();
+          trackLanguageSync(
+            Promise.resolve(window.pywebview.api.set_desktop_prefs({ language: nextPref }))
+              .then(res => {
+                if (syncSeq !== languageSyncSeq) return true;
+                let synced = false;
+                if (res && res.ok && res.data) {
+                  synced = true;
+                  STATE.desktopPrefs = Object.assign({}, STATE.desktopPrefs, res.data);
+                  if (I18N && typeof I18N.setSystemLang === "function" && res.data.effective_language) {
+                    I18N.setSystemLang(res.data.effective_language);
+                  }
+                  if (getLanguage() !== beforeEffective) {
+                    applyI18nToDom();
+                    if (rerender) rerenderActiveUi();
+                  }
+                }
+                if (rerender) {
+                  if (STATE.wizard && STATE.wizard.active && STATE.wizard.step === 2) {
+                    scanWizardClis().catch(() => {});
+                  }
+                  if (STATE.ui.repoDrawerOpen && STATE.ui.repoInspection && STATE.ui.repoInspection.path) {
+                    handleInspectRepoPath(STATE.ui.repoInspection.path, { autoFillDefaults: false }).catch(() => {});
+                  }
+                }
+                return synced;
+              })
+              .catch(() => false),
+            syncSeq
+          );
+        } catch (_err) {
+          trackLanguageSync(Promise.resolve(false), syncSeq);
+        }
+      } else {
+        trackLanguageSync(Promise.resolve(false), syncSeq);
       }
     }
     return getLanguage();
@@ -451,6 +481,7 @@
       step: 1, // 1 = init passphrase, 2 = pick your lead
       skipped: false,
       scanningClis: false,
+      scanQueued: false,
       submitting: false,
       clis: [],
       cliModels: {},       // adapter_id -> string[] from adapter.models
@@ -3343,8 +3374,17 @@
 
   async function scanWizardClis() {
     if (!hasApi() || typeof window.pywebview.api.detect_local_clis !== "function") return;
+    if (STATE.wizard.scanningClis) {
+      STATE.wizard.scanQueued = true;
+      return;
+    }
     STATE.wizard.scanningClis = true;
     renderWizard();
+    const restartIfQueued = () => {
+      if (!STATE.wizard.scanQueued) return;
+      STATE.wizard.scanQueued = false;
+      scanWizardClis().catch(() => {});
+    };
     try {
       const res = await window.pywebview.api.detect_local_clis();
       if (res && res.ok && res.data) {
@@ -3381,6 +3421,7 @@
           );
           renderWizard();
         }
+        restartIfQueued();
         return;
       }
     } catch (_) {
@@ -3388,6 +3429,7 @@
     }
     STATE.wizard.scanningClis = false;
     renderWizard();
+    restartIfQueued();
   }
 
   function renderWizard() {
@@ -11602,7 +11644,12 @@
       const t = e.target;
       if (t.id === "selectUiLanguage") {
         setLanguage(t.value, { persist: true, syncBridge: true, rerender: true });
-        toast(tr("界面语言已切换", "Interface language updated"), "ok");
+        const syncPromise = languageSyncPromise;
+        syncPromise.then(ok => {
+          if (ok && syncPromise === languageSyncPromise) {
+            toast(tr("界面语言已切换", "Interface language updated"), "ok");
+          }
+        });
       } else if (t.id === "projectPermissionModeSelect") {
         const prj = getActiveProject();
         if (prj) await handleChangeProjectPermissionMode(prj.id, t.value);
