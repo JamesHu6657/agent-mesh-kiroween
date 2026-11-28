@@ -21,6 +21,18 @@ from mesh.errors import MeshError
 
 if sys.platform != "win32":
     from mesh.platform import _posix
+else:
+    _posix: Any = None
+
+
+def _posix_mod() -> Any:
+    """Lazily import POSIX helpers (supports mocked Linux tests on Windows)."""
+    global _posix
+    if _posix is None:
+        from mesh.platform import _posix as posix_mod
+
+        _posix = posix_mod
+    return _posix
 
 # Well-known Windows SID strings
 LOCAL_SYSTEM_SID = "S-1-5-18"
@@ -1032,7 +1044,7 @@ def set_private_dir_acl(path_or_fd: Union[str, int], mode: int = 0o700) -> None:
     if sys.platform == "win32":
         set_private_dir_acl_win(path_or_fd, mode)
         return
-    _posix.set_private_dir_acl(path_or_fd, mode)
+    _posix_mod().set_private_dir_acl(path_or_fd, mode)
 
 
 def set_private_file_acl(path_or_fd: Union[str, int], mode: int = 0o600) -> None:
@@ -1040,7 +1052,7 @@ def set_private_file_acl(path_or_fd: Union[str, int], mode: int = 0o600) -> None
     if sys.platform == "win32":
         set_private_file_acl_win(path_or_fd, mode)
         return
-    _posix.set_private_file_acl(path_or_fd, mode)
+    _posix_mod().set_private_file_acl(path_or_fd, mode)
 
 
 def fchmod_private(fd: int, mode: int = 0o600) -> None:
@@ -1048,7 +1060,7 @@ def fchmod_private(fd: int, mode: int = 0o600) -> None:
     if sys.platform == "win32":
         fchmod_private_win(fd, mode)
         return
-    _posix.fchmod_private(fd, mode)
+    _posix_mod().fchmod_private(fd, mode)
 
 
 def chmod_private(path: str, mode: int = 0o600) -> None:
@@ -1056,7 +1068,7 @@ def chmod_private(path: str, mode: int = 0o600) -> None:
     if sys.platform == "win32":
         chmod_private_win(path, mode)
         return
-    _posix.chmod_private(path, mode)
+    _posix_mod().chmod_private(path, mode)
 
 
 def verify_private_owner_and_perms(
@@ -1077,7 +1089,7 @@ def verify_private_owner_and_perms(
             exit_code=exit_code,
         )
         return
-    _posix.verify_private_owner_and_perms(
+    _posix_mod().verify_private_owner_and_perms(
         fd_or_path,
         is_dir=is_dir,
         label=label,
@@ -1102,7 +1114,7 @@ def verify_dir_not_other_writable(
             exit_code=exit_code,
         )
         return
-    _posix.verify_dir_not_other_writable(
+    _posix_mod().verify_dir_not_other_writable(
         path,
         label=label,
         error_code=error_code,
@@ -1251,7 +1263,7 @@ def is_owned_by_current_user(path: str) -> bool:
     """Return True if *path* is owned by the current user."""
     if sys.platform == "win32":
         return is_owned_by_current_user_win(path)
-    return _posix.is_owned_by_current_user(path)
+    return _posix_mod().is_owned_by_current_user(path)
 
 
 def verify_owner_and_set_private_dir_acl_win(
@@ -1397,4 +1409,4 @@ def ensure_owned_dir_writable(
     """Ensure owned directory *path* is writable; return True if permissions changed."""
     if sys.platform == "win32":
         return ensure_owned_dir_writable_win(path, st=st)
-    return _posix.ensure_owned_dir_writable(path, st=st, uid=uid)
+    return _posix_mod().ensure_owned_dir_writable(path, st=st, uid=uid)

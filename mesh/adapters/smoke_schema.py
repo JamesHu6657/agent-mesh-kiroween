@@ -14,7 +14,9 @@ Per-adapter rules (smoke-codex-claude-devin), all checked by ``validate``:
 
 import hashlib
 import json
+import ntpath
 import os
+import posixpath
 import re
 import sys
 import tempfile
@@ -196,6 +198,15 @@ def _is_num(v: Any) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
+def _is_recorded_absolute_path(path: str) -> bool:
+    """Whether a recorded executable path is absolute on the platform that captured it.
+
+    Results documents are validated on machines other than the one that ran the smoke
+    capture, so POSIX and Windows absolute path forms must both be recognized.
+    """
+    return posixpath.isabs(path) or ntpath.isabs(path)
+
+
 def validate(doc: Any, repo_root: str, fixture_root: Optional[str] = None) -> List[str]:
     """Every problem with a results document (empty list = valid).
 
@@ -223,7 +234,7 @@ def validate(doc: Any, repo_root: str, fixture_root: Optional[str] = None) -> Li
     for key in ("binary", "mesh_commit", "model", "consent_ref"):
         if not isinstance(doc.get(key), str) or not doc.get(key):
             errs.append(f"{key} must be a non-empty string")
-    if isinstance(doc.get("binary"), str) and not os.path.isabs(doc["binary"]):
+    if isinstance(doc.get("binary"), str) and not _is_recorded_absolute_path(doc["binary"]):
         errs.append("binary must be absolute")
     if doc.get("model") == "auto":
         errs.append("model 'auto' is refused")
