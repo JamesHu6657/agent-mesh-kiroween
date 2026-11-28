@@ -204,7 +204,9 @@ def _is_recorded_absolute_path(path: str) -> bool:
     Results documents are validated on machines other than the one that ran the smoke
     capture, so POSIX and Windows absolute path forms must both be recognized.
     """
-    return posixpath.isabs(path) or ntpath.isabs(path)
+    drive, tail = ntpath.splitdrive(path)
+    windows_absolute = bool(drive) and tail.startswith(("/", "\\"))
+    return posixpath.isabs(path) or windows_absolute
 
 
 def validate(doc: Any, repo_root: str, fixture_root: Optional[str] = None) -> List[str]:
