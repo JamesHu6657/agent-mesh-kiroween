@@ -435,6 +435,14 @@ class SchemaTest(unittest.TestCase):
         root = os.path.join(self.tmp, "fx")
         doc = self.make_doc(root)
         self.assertEqual(smoke_schema.validate(doc, REPO_ROOT, fixture_root=root), [])
+        for binary in ("/usr/local/bin/droid", r"C:\Tools\droid.exe"):
+            platform_doc = json.loads(json.dumps(doc))
+            platform_doc["binary"] = binary
+            self.assertEqual(smoke_schema.validate(platform_doc, REPO_ROOT, fixture_root=root), [], binary)
+        for binary in (r"C:droid.exe", r"\Tools\droid.exe"):
+            platform_doc = json.loads(json.dumps(doc))
+            platform_doc["binary"] = binary
+            self.assertIn("binary must be absolute", smoke_schema.validate(platform_doc, REPO_ROOT, fixture_root=root), binary)
         # The committed checkout has no droid 1.6.0 tree: the fixture is missing there.
         self.assertTrue(smoke_schema.validate(doc, REPO_ROOT))
 

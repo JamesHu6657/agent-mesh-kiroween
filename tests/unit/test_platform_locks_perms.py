@@ -100,6 +100,15 @@ class TestPlatformLocksPermsImportHygiene(unittest.TestCase):
         )
         self.assertEqual(res.returncode, 0, f"stderr={res.stderr}\nstdout={res.stdout}")
 
+    def test_perms_posix_mod_resolves_lazily_when_none(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "secret.tok")
+            pathlib.Path(path).write_text("x", encoding="utf-8")
+            with mock.patch.object(perms, "_posix", None), \
+                    mock.patch.object(perms.sys, "platform", "linux"):
+                perms.chmod_private(path, 0o600)
+                self.assertIsNotNone(perms._posix)
+
 
 class TestPosixLocksAndPerms(unittest.TestCase):
     """POSIX lock contention, crash cleanup, and permission parity checks."""

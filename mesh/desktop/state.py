@@ -188,17 +188,19 @@ class DesktopStateStore:
             doc = self._read_raw_locked()
         by_home = doc.get("by_home")
         raw_prefs: Optional[Dict[str, Any]] = None
+        scoped_prefs = False
         if isinstance(by_home, dict) and isinstance(by_home.get(self.home_key), dict):
             cand = by_home[self.home_key].get("prefs")
             if isinstance(cand, dict):
                 raw_prefs = cand
+                scoped_prefs = True
         if raw_prefs is None and isinstance(doc.get("prefs"), dict):
             raw_prefs = doc["prefs"]
         if isinstance(raw_prefs, dict):
             for key in _ALLOWED_PREF_KEYS:
                 if key in raw_prefs and isinstance(raw_prefs[key], bool):
                     prefs[key] = raw_prefs[key]
-            if "language" in raw_prefs:
+            if scoped_prefs and "language" in raw_prefs:
                 norm_lang = normalize_language_pref(raw_prefs["language"])
                 if norm_lang is not None:
                     prefs["language"] = norm_lang
@@ -239,7 +241,8 @@ class DesktopStateStore:
             entry["prefs"] = prefs
             by_home[self.home_key] = entry
             doc["version"] = 1
-            doc["prefs"] = dict(prefs)
+            global_prefs = {key: prefs[key] for key in _ALLOWED_PREF_KEYS if key in prefs}
+            doc["prefs"] = global_prefs
             doc["by_home"] = by_home
             self._write_raw_locked(doc)
             return dict(prefs)

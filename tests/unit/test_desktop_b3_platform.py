@@ -125,6 +125,9 @@ class TestDesktopStateStore(unittest.TestCase):
             # Scoped per home
             store_b = DesktopStateStore(home_b, path=state_path)
             self.assertNotEqual(home_state_key(home_a), home_state_key(home_b))
+            self.assertEqual(store_b.load_prefs()["language"], "auto")
+            raw_doc = json.loads(Path(state_path).read_text(encoding="utf-8"))
+            self.assertNotIn("language", raw_doc.get("prefs", {}))
             self.assertTrue(store_b.save_window_bounds(x=10, y=20, width=1100, height=720, maximized=True))
             self.assertEqual(store_a.load_window_bounds()["width"], 1400)
             self.assertEqual(store_b.load_window_bounds()["maximized"], True)
